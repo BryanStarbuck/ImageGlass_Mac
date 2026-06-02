@@ -307,6 +307,181 @@ final class ThemePackTests: XCTestCase {
         XCTAssertThrowsError(try installer.install(archive: archive))
     }
 
+    // MARK: - Validator
+
+    func testValidatorAcceptsWellFormedPack() throws {
+        let folder = try makeSyntheticThemeFolder(named: "Kobe.Duong-Dieu-Phap")
+        let pack = try ThemePack.load(fromFolder: folder)
+        let issues = pack.validate()
+        // Should be zero warnings, possibly some info-level notes about
+        // unmapped icon slots — but the validator only reports on slots
+        // that ARE mapped, so a minimal pack should be clean.
+        let warnings = issues.filter { $0.severity == .warning }
+        XCTAssertEqual(warnings, [], "Unexpected warnings: \(warnings)")
+    }
+
+    func testValidatorFlagsBadFolderName() throws {
+        let folder = try makeSyntheticThemeFolder(named: "NoDot")
+        let pack = try ThemePack.load(fromFolder: folder)
+        let issues = pack.validate()
+        XCTAssertTrue(issues.contains(where: { $0.code == .folderNameConvention }))
+    }
+
+    func testValidatorFlagsMissingPreviewAndIcons() throws {
+        let folder = tmpDir.appendingPathComponent("Broken.Author", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+
+        let manifest = ThemeManifest(
+            metadata: .init(version: "9.0"),
+            info: .init(name: "Broken", author: "Author"),
+            settings: .init(previewImage: "nope.webp"),
+            colors: .init(),
+            toolbarIcons: .init(zoomIn: "missing.svg", crop: "crop.png")
+        )
+        let data = try JSONEncoder().encode(manifest)
+        try data.write(to: folder.appendingPathComponent("igtheme.json"))
+
+        let pack = try ThemePack.load(fromFolder: folder)
+        let issues = pack.validate()
+        XCTAssertTrue(issues.contains(where: { $0.code == .previewImageMissing }))
+        XCTAssertTrue(issues.contains(where: { $0.code == .toolbarIconFileMissing }))
+        XCTAssertTrue(issues.contains(where: { $0.code == .toolbarIconNotSVG }))
+    }
+
+    func testValidatorFlagsMetadataVersionMismatch() throws {
+        let folder = try makeSyntheticThemeFolder(named: "Old.Author")
+        // Overwrite manifest with a non-current _Metadata.Version.
+        let manifest = ThemeManifest(
+            metadata: .init(version: "8.0"),
+            info: .init(name: "Old", author: "Author"),
+            settings: .init(),
+            colors: .init(),
+            toolbarIcons: .init()
+        )
+        let data = try JSONEncoder().encode(manifest)
+        try data.write(to: folder.appendingPathComponent("igtheme.json"))
+        let pack = try ThemePack.load(fromFolder: folder)
+        let issues = pack.validate()
+        XCTAssertTrue(issues.contains(where: { $0.code == .metadataVersionMismatch }))
+    }
+
+    func testFolderNameConventionMatcher() {
+        XCTAssertTrue(ThemePackValidator.isValidFolderName("Kobe.Duong-Dieu-Phap"))
+        XCTAssertTrue(ThemePackValidator.isValidFolderName("X.Y"))
+        XCTAssertFalse(ThemePackValidator.isValidFolderName("NoDot"))
+        XCTAssertFalse(ThemePackValidator.isValidFolderName(".LeadingDot"))
+        XCTAssertFalse(ThemePackValidator.isValidFolderName("TrailingDot."))
+        XCTAssertFalse(ThemePackValidator.isValidFolderName("Too.Many.Dots"))
+    }
+
+    // MARK: - Export
+
+    func testExportInstalledThemeRoundTrips() throws {
+        guard FileManager.default.fileExists(atPath: "/usr/bin/zip"),
+              FileManager.default.fileExists(atPath: "/usr/bin/unzip") else {
+            throw XCTSkip("System zip/unzip not available")
+        }
+
+        let source = try makeSyntheticThemeFolder(named: "Export.Author")
+        let installer = ThemeInstaller()
+        _ = try installer.install(folder: source)
+
+        let archiveDest = tmpDir.appendingPathComponent("Exported.igtheme")
+        let resultURL = try installer.exportInstalled(folderName: "Export.Author", to: archiveDest)
+        XCTAssertEqual(resultURL, archiveDest)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: archiveDest.path))
+
+        // The exported archive must be installable again — round-trip.
+        try installer.uninstall(folderName: "Export.Author")
+        let pack = try installer.install(archive: archiveDest)
+        XCTAssertEqual(pack.folderName, "Export.Author")
+        XCTAssertEqual(pack.displayName, "Export")
+    }
+
+    func testExportOverwritesExistingFile() throws {
+        guard FileManager.default.fileExists(atPath: "/usr/bin/zip") else {
+            throw XCTSkip("System zip not available")
+        }
+        let source = try makeSyntheticThemeFolder(named: "Re.Author")
+        let installer = ThemeInstaller()
+        _ = try installer.install(folder: source)
+
+        let archiveDest = tmpDir.appendingPathComponent("Re.igtheme")
+        try Data("stale".utf8).write(to: archiveDest)
+
+        _ = try installer.exportInstalled(folderName: "Re.Author", to: archiveDest)
+        let exported = try Data(contentsOf: archiveDest)
+        // PKZIP signature: "PK\x03\x04".
+        XCTAssertEqual(Array(exported.prefix(4)), [0x50, 0x4B, 0x03, 0x04])
+    }
+
+    func testExportThrowsForUnknownFolder() throws {
+        let installer = ThemeInstaller()
+        let dest = tmpDir.appendingPathComponent("Missing.igtheme")
+        XCTAssertThrowsError(try installer.exportInstalled(folderName: "Does.NotExist", to: dest)) { err in
+            XCTAssertEqual(err as? ThemePackError, .themeNotInstalled(folderName: "Does.NotExist"))
+        }
+    }
+
+    // MARK: - MCP tools (install / uninstall / export / validate)
+
+    func testMCPInstallUninstallFlow() throws {
+        let source = try makeSyntheticThemeFolder(named: "MCP.Author")
+        let tools = ThemeMCPTools()
+
+        let installResult = try tools.call(
+            name: "install_theme_pack",
+            arguments: ["path": source.path]
+        )
+        XCTAssertFalse(installResult.isError ?? false)
+        let installed = AppPaths.themesDir.appendingPathComponent("MCP.Author")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: installed.path))
+
+        let validateResult = try tools.call(
+            name: "validate_theme_pack",
+            arguments: ["folder_name": "MCP.Author"]
+        )
+        XCTAssertFalse(validateResult.isError ?? false)
+
+        let uninstallResult = try tools.call(
+            name: "uninstall_theme_pack",
+            arguments: ["folder_name": "MCP.Author"]
+        )
+        XCTAssertFalse(uninstallResult.isError ?? false)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: installed.path))
+    }
+
+    func testMCPValidateRejectsUnknownTheme() throws {
+        let tools = ThemeMCPTools()
+        let result = try tools.call(
+            name: "validate_theme_pack",
+            arguments: ["folder_name": "Nope.NotHere"]
+        )
+        XCTAssertTrue(result.isError ?? false)
+    }
+
+    func testMCPExportFlow() throws {
+        guard FileManager.default.fileExists(atPath: "/usr/bin/zip") else {
+            throw XCTSkip("System zip not available")
+        }
+        let source = try makeSyntheticThemeFolder(named: "Mx.Author")
+        let tools = ThemeMCPTools()
+        _ = try tools.call(
+            name: "install_theme_pack",
+            arguments: ["path": source.path]
+        )
+        let dest = tmpDir.appendingPathComponent("Exported.igtheme")
+        let result = try tools.call(
+            name: "export_theme_pack",
+            arguments: [
+                "folder_name": "Mx.Author",
+                "destination": dest.path,
+            ]
+        )
+        XCTAssertFalse(result.isError ?? false)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: dest.path))
+    }
+
     // MARK: - Helpers
 
     /// Build a synthetic theme folder with manifest, preview, and one SVG.

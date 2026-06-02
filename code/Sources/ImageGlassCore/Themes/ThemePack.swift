@@ -110,9 +110,11 @@ public enum ThemePackError: Error, CustomStringConvertible, Equatable {
     case manifestMissing(folder: URL)
     case manifestInvalid(folder: URL, underlying: Error)
     case archiveExtractionFailed(archive: URL, exitCode: Int32, stderr: String)
+    case archiveCreationFailed(destination: URL, exitCode: Int32, stderr: String)
     case archiveContainsNoThemeFolder(archive: URL)
     case archiveContainsMultipleThemeFolders(archive: URL, found: [String])
     case unzipUnavailable
+    case zipUnavailable
     case themeNotInstalled(folderName: String)
 
     public var description: String {
@@ -123,12 +125,16 @@ public enum ThemePackError: Error, CustomStringConvertible, Equatable {
             return "igtheme.json invalid in folder \(folder.path): \(underlying)"
         case .archiveExtractionFailed(let archive, let code, let stderr):
             return "Failed to extract \(archive.lastPathComponent) (exit \(code)): \(stderr)"
+        case .archiveCreationFailed(let dest, let code, let stderr):
+            return "Failed to create \(dest.lastPathComponent) (exit \(code)): \(stderr)"
         case .archiveContainsNoThemeFolder(let archive):
             return "Archive \(archive.lastPathComponent) does not contain a theme folder with igtheme.json"
         case .archiveContainsMultipleThemeFolders(let archive, let found):
             return "Archive \(archive.lastPathComponent) contains multiple theme folders: \(found)"
         case .unzipUnavailable:
             return "/usr/bin/unzip is not available on this system"
+        case .zipUnavailable:
+            return "/usr/bin/zip is not available on this system"
         case .themeNotInstalled(let folderName):
             return "No installed theme found with folder name: \(folderName)"
         }
@@ -144,11 +150,15 @@ public enum ThemePackError: Error, CustomStringConvertible, Equatable {
             return a == b
         case (.archiveExtractionFailed(let a1, let c1, _), .archiveExtractionFailed(let a2, let c2, _)):
             return a1 == a2 && c1 == c2
+        case (.archiveCreationFailed(let a1, let c1, _), .archiveCreationFailed(let a2, let c2, _)):
+            return a1 == a2 && c1 == c2
         case (.archiveContainsNoThemeFolder(let a), .archiveContainsNoThemeFolder(let b)):
             return a == b
         case (.archiveContainsMultipleThemeFolders(let a1, let f1), .archiveContainsMultipleThemeFolders(let a2, let f2)):
             return a1 == a2 && f1 == f2
         case (.unzipUnavailable, .unzipUnavailable):
+            return true
+        case (.zipUnavailable, .zipUnavailable):
             return true
         case (.themeNotInstalled(let a), .themeNotInstalled(let b)):
             return a == b
