@@ -14,17 +14,20 @@ public struct MCPTools {
     public let toolStorage: ExternalToolStorage
     public let lock: MCPLock
     public let themeTools: ThemeMCPTools
+    public let panelTools: PanelMCPTools
 
     public init(
         storage: LocalStorage = .shared,
         toolStorage: ExternalToolStorage = .shared,
         lock: MCPLock = .shared,
-        themeTools: ThemeMCPTools = ThemeMCPTools()
+        themeTools: ThemeMCPTools = ThemeMCPTools(),
+        panelTools: PanelMCPTools = PanelMCPTools()
     ) {
         self.storage = storage
         self.toolStorage = toolStorage
         self.lock = lock
         self.themeTools = themeTools
+        self.panelTools = panelTools
     }
 
     // MARK: - Descriptors
@@ -274,6 +277,9 @@ public struct MCPTools {
         // Theme subsystem descriptors (list_themes, get/set_current_theme).
         // See Themes/ThemeMCPTools.swift.
         base.append(contentsOf: themeTools.descriptors())
+        // Panel framework descriptors (list_panels, show/hide/move/tab,
+        // apply_layout_preset, ...). See Panels/PanelMCPTools.swift.
+        base.append(contentsOf: panelTools.descriptors())
         return base
     }
 
@@ -326,6 +332,10 @@ public struct MCPTools {
                 // ThemeMCPTools. See Themes/ThemeMCPTools.swift.
                 if ThemeMCPTools.toolNames.contains(name) {
                     return try themeTools.call(name: name, arguments: arguments)
+                }
+                // Route panel-framework tools through PanelMCPTools.
+                if PanelMCPTools.toolNames.contains(name) {
+                    return try panelTools.call(name: name, arguments: arguments)
                 }
                 return .text("Unknown tool: \(name)", isError: true)
             }

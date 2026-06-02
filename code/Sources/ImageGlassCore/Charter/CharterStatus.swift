@@ -172,21 +172,39 @@ public enum CharterStatus {
     }
 
     private static func evaluateModularPanels() -> CharterGoalStatus {
-        // The panel host lives in the SwiftUI app target, not core, so we
-        // can't import it from here. Verify what the overview promises at
-        // the charter level: there is a documented panel column with a
-        // directory/filename panel and two view modes (list + tree).
+        // The panel host lives in the SwiftUI app target, but the panel
+        // catalog, layout schema, MCP surface, presets, and store live in
+        // core so we can verify them from here.
         var evidence: [String] = []
-        evidence.append("Charter promises a new column hosting modular panels (overview.mdx §2).")
-        evidence.append("docs/panels.mdx tracks the per-panel architecture spec.")
+        let catalog = BuiltInPanelCatalog.all.map { $0.id }.sorted()
+        evidence.append("BuiltInPanelCatalog publishes \(catalog.count) panels: \(catalog.joined(separator: ", ")).")
+        evidence.append("Layout schema (PanelLayout.schema_version = \(PanelLayout.currentSchemaVersion)) with DockPosition / TabGroup / FloatingPanel / HiddenPanelState.")
+        evidence.append("Built-in presets: " + BuiltInPreset.allCases.map { $0.rawValue }.joined(separator: ", ") + ".")
+        let panelMCPNames = PanelMCPTools().descriptors().map { $0.name }.sorted()
+        evidence.append("Panel MCP surface: \(panelMCPNames.joined(separator: ", ")).")
+        evidence.append("LayoutStore persists layout.json at \(AppPaths.layoutFile.path) with atomic write + .bak rollback.")
         evidence.append("App-side: DirectoryFilenamePanel + FileTreeNode + AppState.PanelViewMode (list/tree).")
+        var gaps: [String] = []
+        let requiredMCP: Set<String> = [
+            "list_panels", "show_panel", "hide_panel", "move_panel",
+            "set_panel_size", "tab_panels", "untab_panel",
+            "apply_layout_preset", "save_current_layout", "delete_layout_preset",
+            "get_layout_state", "set_layout_state",
+        ]
+        let missing = requiredMCP.subtracting(panelMCPNames).sorted()
+        if !missing.isEmpty {
+            gaps.append("Panel MCP tools missing: \(missing.joined(separator: ", ")).")
+        }
+        // Drag-snap and tab-via-drag come from the AppKit `NSSplitViewController`
+        // bridge described in panels.mdx §8.1 — the SwiftUI host renders the
+        // layout but real drag-to-snap requires `NSPanGestureRecognizer` work
+        // tracked under the panels subsystem.
+        gaps.append("Drag-to-snap (NSPanGestureRecognizer) and snap-preview overlay (panels.mdx §5.1) are spec'd; SwiftUI host renders the resolved layout for now.")
         return CharterGoalStatus(
             goal: .modularPanels,
-            state: .implemented,
+            state: missing.isEmpty ? .implemented : .partial,
             evidence: evidence,
-            openGaps: [
-                "Long-term panel registry / show-hide-reorder lives in panels.mdx and is owned by the panels subsystem agent.",
-            ]
+            openGaps: gaps
         )
     }
 

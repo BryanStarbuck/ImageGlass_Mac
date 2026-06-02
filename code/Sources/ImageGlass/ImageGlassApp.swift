@@ -40,6 +40,55 @@ struct ImageGlassApp: App {
                 }
             }
             viewerMenuCommands
+            panelMenuCommands
+        }
+    }
+
+    // MARK: - View → Panels & Layout (spec §10)
+
+    @CommandsBuilder
+    private var panelMenuCommands: some Commands {
+        CommandMenu("Panels") {
+            Menu("Layout Preset") {
+                ForEach(BuiltInPreset.allCases, id: \.self) { preset in
+                    Button(preset.rawValue) {
+                        state.panelLayout.applyPreset(preset.rawValue)
+                    }
+                    .keyboardShortcut(KeyEquivalent(Character("\(preset.shortcutIndex)")),
+                                      modifiers: [.control, .command])
+                }
+            }
+            Divider()
+            Button("Toggle File Panel") {
+                state.panelLayout.togglePanel("file_panel")
+            }
+            .keyboardShortcut("l", modifiers: [.command])
+            Button("Toggle Toolbar") {
+                state.panelLayout.togglePanel("toolbar")
+            }
+            .keyboardShortcut("t", modifiers: [.option, .command])
+            Button("Toggle Status Bar") {
+                state.panelLayout.togglePanel("status_bar")
+            }
+            .keyboardShortcut("s", modifiers: [.option, .command])
+            Button("Toggle Metadata") {
+                state.panelLayout.togglePanel("metadata")
+            }
+            .keyboardShortcut("i", modifiers: [.option, .command])
+            Button("Toggle Histogram") {
+                state.panelLayout.togglePanel("histogram")
+            }
+            Button("Toggle Gallery Strip") {
+                state.panelLayout.togglePanel("gallery_strip")
+            }
+            Button("Toggle Scope Editor") {
+                state.panelLayout.togglePanel("scope_editor")
+            }
+            Divider()
+            Button("Reset Panel Positions") {
+                state.panelLayout.resetToActivePreset()
+            }
+            .keyboardShortcut("0", modifiers: [.control, .command])
         }
     }
 
