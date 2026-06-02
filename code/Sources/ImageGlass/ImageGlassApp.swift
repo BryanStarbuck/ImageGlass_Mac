@@ -12,10 +12,17 @@ struct ImageGlassApp: App {
     // so the default Apple About panel is replaced by `AboutView`.
     @NSApplicationDelegateAdaptor(AboutAppDelegate.self) private var aboutDelegate
 
+    // Intercept `--help` / `-h` / `/?` at process start so the user gets
+    // a real CLI help message instead of a window opening; then parse the
+    // remaining `/Name=Value` overrides and positional file args into the
+    // initial AppState.
     init() {
+        let raw = Array(CommandLine.arguments.dropFirst())
+        if CLIArguments.wantsHelp(raw) {
+            print(CLIArguments.helpText())
+            exit(0)
+        }
         let s = AppState()
-        // Parse `/Name=Value` overrides and positional file args at launch.
-        // `CommandLine.arguments[0]` is the program path, so skip it.
         let parsed = ImageGlassLaunchArguments.parse(CommandLine.arguments)
         s.applyLaunchArguments(parsed)
         _state = State(wrappedValue: s)

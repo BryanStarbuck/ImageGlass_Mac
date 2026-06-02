@@ -72,9 +72,6 @@ public struct ImageGlassLaunchArguments: Equatable, Sendable {
         return result
     }
 
-    /// Setting names must look like config keys — alphanumerics plus `.` and
-    /// `_`. We require at least one character. This is what distinguishes
-    /// `/ShowToolbar=false` (override) from `/Users/me/photo.jpg` (path).
     static func isValidSettingName(_ s: String) -> Bool {
         guard !s.isEmpty else { return false }
         for ch in s {
@@ -90,5 +87,73 @@ public struct ImageGlassLaunchArguments: Equatable, Sendable {
             return String(s.dropFirst().dropLast())
         }
         return s
+    }
+}
+
+/// Catalog of the `/Name=Value` switches the main `ImageGlass` binary
+/// accepts at launch (per `docs/command-line.mdx`).
+///
+/// Sits next to `ImageGlassLaunchArguments` (the parser); this is metadata
+/// for `--help` printing and tests that assert every documented switch maps
+/// to a real `Config` field.
+public enum CLIArguments {
+
+    public struct Switch: Sendable, Equatable {
+        public let name: String
+        public let valueSyntax: String
+        public let summary: String
+    }
+
+    public static let switches: [Switch] = [
+        .init(name: "ShowToolbar",     valueSyntax: "true|false",
+              summary: "Show or hide the top toolbar."),
+        .init(name: "ShowGallery",     valueSyntax: "true|false",
+              summary: "Show or hide the thumbnail gallery strip."),
+        .init(name: "ShowStatusBar",   valueSyntax: "true|false",
+              summary: "Show or hide the bottom status bar."),
+        .init(name: "FullScreen",      valueSyntax: "true|false",
+              summary: "Launch the window in full-screen mode."),
+        .init(name: "Frameless",       valueSyntax: "true|false",
+              summary: "Launch with a borderless / frameless window chrome."),
+        .init(name: "WindowFit",       valueSyntax: "true|false",
+              summary: "Resize the window to match the image."),
+        .init(name: "WindowBackdrop",  valueSyntax: "None|Acrylic|Mica|Vibrant",
+              summary: "Window backdrop / vibrancy style."),
+        .init(name: "ZoomMode",        valueSyntax: "auto|lock|width|height|fit|fill",
+              summary: "Initial zoom mode."),
+        .init(name: "Theme",           valueSyntax: "<theme-name>",
+              summary: "Override the theme by name."),
+        .init(name: "Language",        valueSyntax: "<locale>",
+              summary: "Override the UI language."),
+        .init(name: "StartupBoost",    valueSyntax: "true|false",
+              summary: "Enable Startup Boost preloading (v9.1+)."),
+    ]
+
+    public static func helpText() -> String {
+        var lines: [String] = []
+        lines.append("ImageGlass — Mac-native image viewer")
+        lines.append("")
+        lines.append("Usage:")
+        lines.append("  ImageGlass [/Name=Value ...] [--startup-boost] [file ...]")
+        lines.append("")
+        lines.append("Switches (any igconfig.json setting can be overridden):")
+        for s in switches {
+            let head = "/\(s.name)=\(s.valueSyntax)"
+            let pad = head.padding(toLength: 44, withPad: " ", startingAt: 0)
+            lines.append("  \(pad)\(s.summary)")
+        }
+        lines.append("")
+        lines.append("Long-form switches:")
+        lines.append("  --startup-boost    Equivalent to /StartupBoost=true")
+        lines.append("")
+        lines.append("Positional arguments are interpreted as file paths to open.")
+        return lines.joined(separator: "\n")
+    }
+
+    public static func wantsHelp(_ args: [String]) -> Bool {
+        for a in args {
+            if a == "--help" || a == "-h" || a == "/?" { return true }
+        }
+        return false
     }
 }
