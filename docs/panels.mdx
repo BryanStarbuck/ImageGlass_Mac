@@ -1,0 +1,825 @@
+---
+title: Panels and Window Layout
+description: Product and engineering specification for the modular panel framework in ImageGlass_Mac — movable, snappable, dockable, floating panels with persistent layouts, layout presets, MCP-driven reconfiguration, and a single Swift protocol for adding new panels.
+---
+
+# Panels and Window Layout
+
+This page is the **complete product + engineering specification** for the
+movable/snappable/dockable panel framework that is the Mac fork's
+single largest architectural change over upstream Windows ImageGlass.
+
+It is the contract that the SwiftUI window scene, the `AppKit`
+split-view bridge, the on-disk `layout.json`, the layout-preset menu,
+and the panel-related MCP tools all must satisfy.
+
+It cross-references:
+
+* [Starbuck Fork](./starbuck-fork.mdx) §2 — *Modular UI Panels*. The
+  charter that this spec implements.
+* [Settings → Layout](./settings.mdx) §4.5 — the discoverable
+  visibility / preset index. Settings binds to and from the layout
+  state but does not own it.
+* [File List Panel](./list_of_files.mdx) — the single most important
+  panel built on top of this framework.
+* [Crop](./crop.mdx) — the crop tool ships as a panel that lives in
+  this framework.
+
+The Mac stack used throughout: **Swift 6 + SwiftUI** for layout and panel
+contents, **AppKit** (`NSSplitViewController`, `NSPanel`, `NSToolbar`,
+`NSPanGestureRecognizer`) for window-level behavior SwiftUI does not
+expose, **Metal** for the central viewer canvas, and **`FSEventStream`**
+for live config reload.
+
+---
+
+## 1. Why the Fork Adds a Panel Framework
+
+Upstream Windows ImageGlass is a fixed three-region layout: toolbar
+along the top, an optional horizontal/vertical thumbnail strip along
+one edge, and the picture canvas filling the rest. "Tool windows"
+(color picker, page nav, crop) are floating `ToolForm` windows the
+user can drag around the screen but cannot **dock** back into the main
+window. There is no general-purpose panel framework.
+
+Verified from upstream source:
+
+* `Source/ImageGlass/FrmMain.Designer.cs` — main form is a single
+  hard-coded layout of `Toolbar` (top), `Gallery` (one of the four
+  edges, configured by `Config.Layout`), and `PicMain` (fill).
+* `Source/Components/ImageGlass.Settings/Forms/ToolForm.cs` — the base
+  class for floating tool windows; uses `WS_EX_NOACTIVATE` so the tool
+  window never steals focus from the main viewer.
+* `Source/ImageGlass/FrmMain/FrmMain.IGMethods.cs:615` —
+  `IG_ToggleGallery(bool?)` is the only general-purpose
+  "show/hide a region" entry point; everything else is hard-coded.
+* `Source/Components/ImageGlass.Settings/Config.cs:583` —
+  `public static Dictionary<string, string?> Layout { get; set; }` is
+  a string-keyed dictionary of region settings (`"Bottom;0"` etc.),
+  not a general scene graph.
+
+The fork's product brief demands more: a **first-class column** for
+modular panels, plus the ability to add new panels (file list, scope
+editor, MCP activity, metadata, histogram, plugin-provided panels)
+without surgery on the main viewer. The simplest way to deliver that
+on Mac is a general panel host with snapping, docking, floating, tab
+grouping, and named presets — which is what this spec defines.
+
+---
+
+## 2. Goals and Non-goals
+
+### 2.1 Goals
+
+* **Modularity.** Every UI region except the viewer canvas itself is a
+  panel. The viewer is the only fixed surface; everything else is
+  pluggable.
+* **User control.** The user can drag a panel by its header to any
+  edge of the main window, to any tab group, or out of the window
+  entirely into a floating `NSPanel`. The user can resize splits with
+  a divider drag. The user can collapse a panel by double-clicking
+  its divider. The user can save a configuration as a named preset
+  and switch between presets.
+* **Persistence.** Every layout change writes `layout.json`. The next
+  launch restores the exact same configuration. Restart is invisible.
+* **Programmability.** MCP exposes the layout: list panels, show, hide,
+  move, dock, float, switch preset, save preset. An external LLM can
+  reconfigure the UI to match the user's task.
+* **Native feel.** Snap previews use macOS materials and accent color.
+  Splits look and feel like `NSSplitView`. Floating panels are
+  proper `NSPanel`s with HUD-style chrome.
+* **Stability.** A panel cannot lock the user out of the viewer. A
+  bad preset cannot corrupt state — every load validates and falls
+  back to the default layout if validation fails.
+
+### 2.2 Non-goals
+
+* Not a window-management toolkit for arbitrary apps. The framework
+  is bounded to ImageGlass_Mac's main window plus tear-off
+  `NSPanel`s.
+* Not a generic plugin sandbox in v1. Plugin panels share the host
+  process; sandboxing is a v2 concern.
+* Not a tiling window manager. There is no Magnet-style global
+  hotkey to "send to right half of screen." Panel placement is
+  relative to the ImageGlass window, not to the desktop.
+
+---
+
+## 3. Concepts
+
+### 3.1 Panel
+
+A **panel** is a self-contained SwiftUI view that displays one
+coherent piece of information or one tool, with a well-defined
+contract for showing/hiding, sizing, docking, floating, and reading
+shared viewer state.
+
+Every panel implements:
+
+```swift
+protocol ImageGlassPanel: Sendable {
+    /// Stable identifier. Used as the key in layout.json and as the
+    /// MCP id. Must not change across releases without a migration.
+    static var id: String { get }
+
+    /// Human-readable label for the View menu and the panel header.
+    /// Localized via the language pack.
+    var title: String { get }
+
+    /// SF Symbol name or asset id for the panel header / View menu.
+    var icon: String { get }
+
+    /// The SwiftUI content. The framework wraps this in chrome and a
+    /// drag-handle header.
+    @MainActor @ViewBuilder var content: AnyView { get }
+
+    /// Minimum content size. The framework will not allow a divider
+    /// to shrink the panel below this. Use `.zero` to mean
+    /// "framework default" (32 pt × 32 pt).
+    var minSize: CGSize { get }
+
+    /// Preferred starting size when the panel is first added.
+    var preferredSize: CGSize { get }
+
+    /// Whether the panel can be torn out into a floating NSPanel.
+    /// Most panels return true; the canvas would return false.
+    var supportsFloating: Bool { get }
+
+    /// Optional MCP capabilities the panel wants to expose. Empty by
+    /// default; see `MCPCapablePanel` below.
+    var mcpCapabilities: [MCPPanelCapability] { get }
+}
+```
+
+A panel that wants to expose its own MCP tools beyond the framework's
+generic show/hide/move surface implements `MCPCapablePanel`:
+
+```swift
+protocol MCPCapablePanel: ImageGlassPanel {
+    /// Tools registered with the MCP server while this panel is
+    /// loaded. Unregistered when the panel is unloaded.
+    func mcpTools() -> [MCPTool]
+}
+```
+
+### 3.2 Dock position
+
+A panel that is part of the window's layout (as opposed to floating)
+occupies one of these positions:
+
+```swift
+enum DockPosition: String, Codable, Sendable {
+    case left                  // left of the central viewer
+    case right                 // right of the central viewer
+    case top                   // above the central viewer
+    case bottom                // below the central viewer
+    case centerOverlay         // overlaid on the central viewer (e.g. crop)
+    case floating              // outside the main window, in an NSPanel
+}
+```
+
+The viewer canvas is the only thing in the `center` slot and is not
+itself a panel.
+
+### 3.3 Tab group
+
+Multiple panels may share the same dock position by being **tabbed**.
+A `TabGroup` has an id, a position, an ordered list of panel ids, and
+an active-tab index. The user creates a tab group by dragging a panel
+header onto another panel's header.
+
+```swift
+struct TabGroup: Codable, Sendable {
+    var id: UUID
+    var position: DockPosition
+    var panelIDs: [String]      // ordered
+    var activeIndex: Int
+    var size: CGFloat?          // the *across* dimension, in points; nil = framework default
+}
+```
+
+### 3.4 Layout
+
+A **layout** is the complete arrangement of panels in the window plus
+any floating panels:
+
+```swift
+struct Layout: Codable, Sendable {
+    var schemaVersion: Int = 1
+
+    /// All visible panels arranged in tab groups. A solo panel is a
+    /// tab group of size 1.
+    var groups: [TabGroup]
+
+    /// Floating panels (each is its own NSPanel).
+    var floating: [FloatingPanel]
+
+    /// Panels that are hidden but remembered (so re-showing them
+    /// restores their last size).
+    var hidden: [String: HiddenPanelState]
+
+    /// The active preset name. Empty string for "Unnamed / custom".
+    var activePreset: String
+}
+
+struct FloatingPanel: Codable, Sendable {
+    var id: String              // panel id
+    var frame: CGRect           // screen coordinates
+    var screenID: String        // CGDirectDisplayID stringified
+}
+
+struct HiddenPanelState: Codable, Sendable {
+    var lastPosition: DockPosition
+    var lastSize: CGSize
+}
+```
+
+### 3.5 Preset
+
+A **preset** is a named saved layout. Presets ship with the app
+(built-in) and the user can save their own. Built-in presets are
+identified by name and re-rendered from code each launch (so a
+schema upgrade improves them automatically); user presets are stored
+as `layout/presets/<name>.json`.
+
+---
+
+## 4. Panel Inventory
+
+### 4.1 Panels inherited from upstream behavior
+
+| Panel id | Title | Default position | Notes |
+| --- | --- | --- | --- |
+| `toolbar` | Toolbar | top | Replaces upstream `Toolbar`. Uses `NSToolbar`-backed content. See [Settings → Toolbar](./settings.mdx) §4.11. |
+| `status_bar` | Status bar | bottom | Replaces upstream status strip. Image info, zoom %, EXIF DateTimeOriginal. |
+| `gallery_strip` | Thumbnail strip | bottom | Horizontal `HorizontalStrip` mode of the gallery. Upstream `Gallery` with `View.HorizontalStrip`. |
+| `color_picker` | Color picker | floating | Upstream `FrmColorPicker`, a `ToolForm`. |
+| `frame_nav` | Page / frame navigator | floating | Upstream multi-frame navigator. |
+| `crop` | Crop | centerOverlay + floating | Crop tool. See [crop.mdx](./crop.mdx). The visible "selection rectangle" is part of the viewer canvas; the controls live in a docked or floating panel. |
+| `image_info` | Image info overlay | centerOverlay | The text overlay listing EXIF/file tags. See [Settings → Image](./settings.mdx) §4.2. |
+
+### 4.2 Panels new to the fork
+
+| Panel id | Title | Default position | Notes |
+| --- | --- | --- | --- |
+| `file_panel` | Files | left | The new directory/filename panel. Five view modes; see [list_of_files.mdx](./list_of_files.mdx). |
+| `scope_editor` | Scopes | left (tabbed with `file_panel`) | Edit the active scope's source criteria. Writes `scopes/<name>.json`. |
+| `metadata` | Metadata | right | EXIF, IPTC, XMP, GPS, ICC profile. Reads via `CGImageSourceCopyPropertiesAtIndex`. |
+| `histogram` | Histogram | right (tabbed with `metadata`) | RGBA histogram via Core Image. |
+| `mcp_activity` | MCP activity | right | Live log of MCP tool calls, with client identity and latency. Toggled via `advanced.mcp.audit_log`. |
+| `local_storage` | Local storage | floating | Browse saved scope evaluations, last-run timestamps, file counts. See [Starbuck Fork](./starbuck-fork.mdx) §4. |
+| `plugins_log` | Plugins log | floating | Diagnostic panel for plugin authors. Hidden by default. |
+
+For each, the data source, contents, and interaction model are
+documented in the linked spec. This page covers the **framework** the
+panels live in; only the framework constraints (min/preferred size,
+supportsFloating) are in scope here.
+
+---
+
+## 5. Layout Mechanics
+
+### 5.1 Snapping during drag
+
+Dragging a panel header initiates a snap-during-drag interaction
+managed by `LayoutDragController` (an `@MainActor` class wired to a
+window-level `NSPanGestureRecognizer`).
+
+While dragging, the controller computes the **closest snap target**:
+
+* If the pointer is within `snapTrigger = 24 pt` of an edge of the
+  main window, the target is dock-at-that-edge.
+* If the pointer is within `snapTrigger` of a panel divider, the
+  target is dock-on-that-side-of-the-divider.
+* If the pointer is over another panel's header, the target is
+  tab-into-that-group.
+* If no target is within trigger range, the panel is in *free* mode
+  and will become floating on release.
+
+A translucent **snap preview** overlay (a transient borderless
+`NSWindow` with `NSVisualEffectView.material = .selection`) is drawn
+at the target rectangle while dragging. On release, the controller
+mutates `Layout` and the view tree animates into place with a 200 ms
+`.easeInOut` transition.
+
+### 5.2 Docking via menu
+
+A panel that is hard to grab can also be docked via:
+
+* The panel's header context menu → "Move to → Left / Right / Top /
+  Bottom / Float".
+* The View menu → "Reset panel position" (puts the panel back where
+  it was when the active preset was loaded).
+* MCP: `move_panel(id, position)`.
+
+### 5.3 Resize
+
+Splits between panels are `NSSplitViewItem` dividers. Each divider
+respects the involved panels' `minSize`. Dragging beyond the
+neighbor's min collapses to the min, *not* past it.
+
+Double-clicking a divider collapses the smaller panel to zero (i.e.
+hides it; it remains in `hidden`). A subsequent double-click on the
+same divider restores it. Hidden panels also appear in the View menu
+with their normal Show/Hide checkbox.
+
+### 5.4 Float / tear off
+
+Dragging a panel header out of the main window's bounds turns it into
+a floating panel: the framework removes it from its `TabGroup`,
+creates a new `NSPanel` with HUD-style chrome (translucent, narrow
+title bar), parents the panel's content view there, and adds an entry
+to `Layout.floating`.
+
+A floating panel's NSPanel has these `NSWindow` properties:
+
+* `styleMask = [.titled, .closable, .resizable, .utilityWindow,
+  .nonactivatingPanel]` — `nonactivatingPanel` so clicking it does
+  not steal focus from the main window.
+* `level = .floating` — stays above the main window but not above
+  modal dialogs.
+* `collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]` —
+  follows the main window into a Space and into full-screen mode.
+* `isMovableByWindowBackground = true` — the user can drag from any
+  empty area.
+
+Dragging a floating panel header *back* over the main window snaps
+it back into the dock — same snap logic as §5.1.
+
+### 5.5 Tab groups
+
+Two ways to create a tab group:
+
+1. Drop a panel header onto another panel's header during drag —
+   the dropped panel becomes a new tab in the target group.
+2. Right-click a panel header → "Tab with → <other panel>".
+
+A tab group's header is a row of `NSTabView`-style tabs with the
+active tab styled with the system accent color. Click a tab to
+activate it. Drag a tab off the row to break it back into its own
+panel.
+
+### 5.6 Collapsed / minimized panels
+
+Distinct from "hidden", a panel can also be **collapsed** to a thin
+strip (just the header) that the user can click to expand. Collapse
+is per-position: collapse-from-left pins the strip to the left edge.
+
+Collapsed strips support hover-to-peek: hovering for `hoverDelay =
+600 ms` triggers a transient expanded preview that auto-collapses
+when the pointer leaves. This is the macOS-Finder sidebar-toggle
+analog.
+
+### 5.7 Constraints
+
+* The viewer canvas always exists and always has the central slot.
+* At least one panel must be visible at any time (this constraint
+  exists so the View menu can always restore something even after
+  the user hides everything). The framework enforces this by
+  preventing the last visible panel from being hidden — instead the
+  Hide action becomes a no-op with a soft toast.
+* A panel's minimum width across all view-mode states must be `≥ 64
+  pt`; below that, snap-and-resize math breaks down. Panels that
+  conceptually need narrower widths are implemented as collapsed
+  strips, not narrow panels.
+
+---
+
+## 6. layout.json
+
+The full on-disk schema, with a worked example showing a "Browser"
+preset.
+
+### 6.1 JSON schema
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ImageGlass_Mac layout.json",
+  "type": "object",
+  "required": ["schema_version", "groups", "floating", "hidden", "active_preset"],
+  "properties": {
+    "schema_version": { "type": "integer", "const": 1 },
+    "active_preset":  { "type": "string" },
+    "groups": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "position", "panel_ids", "active_index"],
+        "properties": {
+          "id":             { "type": "string", "format": "uuid" },
+          "position":       { "enum": ["left", "right", "top", "bottom", "center_overlay"] },
+          "panel_ids":      { "type": "array", "items": { "type": "string" } },
+          "active_index":   { "type": "integer", "minimum": 0 },
+          "size":           { "type": "number" },
+          "collapsed":      { "type": "boolean", "default": false }
+        }
+      }
+    },
+    "floating": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "frame", "screen_id"],
+        "properties": {
+          "id":        { "type": "string" },
+          "frame":     {
+            "type": "array",
+            "items": { "type": "number" },
+            "minItems": 4, "maxItems": 4,
+            "description": "[x, y, w, h] in screen coordinates"
+          },
+          "screen_id": { "type": "string" }
+        }
+      }
+    },
+    "hidden": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["last_position", "last_size"],
+        "properties": {
+          "last_position": { "enum": ["left", "right", "top", "bottom", "center_overlay", "floating"] },
+          "last_size": {
+            "type": "array",
+            "items": { "type": "number" },
+            "minItems": 2, "maxItems": 2
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+### 6.2 Worked example — Browser preset
+
+```json
+{
+  "schema_version": 1,
+  "active_preset": "Browser",
+  "groups": [
+    {
+      "id": "1B5C5F4A-3E26-4B6D-A540-6B3C0D9E1A22",
+      "position": "top",
+      "panel_ids": ["toolbar"],
+      "active_index": 0,
+      "size": 44
+    },
+    {
+      "id": "2F1E83A5-9B7E-4F4A-9C66-7C1D8E2D5A11",
+      "position": "left",
+      "panel_ids": ["file_panel", "scope_editor"],
+      "active_index": 0,
+      "size": 280
+    },
+    {
+      "id": "3A5C92D6-0E12-4F3A-B0C3-D2B6E0A7E9B5",
+      "position": "bottom",
+      "panel_ids": ["gallery_strip", "status_bar"],
+      "active_index": 0,
+      "size": 140
+    }
+  ],
+  "floating": [],
+  "hidden": {
+    "metadata":    { "last_position": "right", "last_size": [320, 600] },
+    "histogram":   { "last_position": "right", "last_size": [320, 240] },
+    "mcp_activity":{ "last_position": "right", "last_size": [360, 480] }
+  }
+}
+```
+
+### 6.3 Writes
+
+`layout.json` is rewritten by `LayoutStore` (an `actor`) every time
+the user finishes a drag, finishes a resize, switches a preset, or
+toggles a panel. Writes are debounced 200 ms and use an atomic-rename
+temp-file pattern so a crash mid-write cannot corrupt the file.
+
+The previous file becomes `layout.json.bak` on every successful
+write. On load, if `layout.json` is missing or fails schema
+validation, the framework falls back to `layout.json.bak`; if that
+also fails, the built-in default preset (`Browser`) is materialized.
+
+### 6.4 Reads
+
+`FSEventStream` watches `layout.json`. An MCP-driven edit triggers
+a reload: the framework diffs the new vs. current state and animates
+the difference (panels move, groups re-form, sizes change) over 200
+ms. Bindings the user is actively dragging are not overwritten until
+the drag ends.
+
+---
+
+## 7. Built-in Presets
+
+Five presets ship with the app. The user picks one in [Settings →
+Layout](./settings.mdx) §4.5 or via View menu → Layout Presets, or
+keyboard: ⌃⌘1 through ⌃⌘5.
+
+### 7.1 Viewer only (⌃⌘1)
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                                                                │
+│                                                                │
+│                                                                │
+│                         (viewer canvas)                        │
+│                                                                │
+│                                                                │
+│                                                                │
+└────────────────────────────────────────────────────────────────┘
+```
+
+No panels. The window chrome is the only non-canvas pixel. T1 casual
+viewing.
+
+### 7.2 Browser (⌃⌘2) — default
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│ [Toolbar]                                                      │
+├──────────────┬─────────────────────────────────────────────────┤
+│              │                                                 │
+│  Files       │              (viewer canvas)                    │
+│  scope_editor│                                                 │
+│              │                                                 │
+│              │                                                 │
+├──────────────┴─────────────────────────────────────────────────┤
+│ [Gallery strip]                                  [Status bar]  │
+└────────────────────────────────────────────────────────────────┘
+```
+
+Toolbar top, left-dock file panel (tabbed with scope editor), bottom
+gallery strip. T1/T2 default — matches "open a folder and browse it"
+intuition.
+
+### 7.3 Photographer (⌃⌘3)
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│ [Toolbar]                                                      │
+├──────────────┬───────────────────────────────┬─────────────────┤
+│              │                               │                 │
+│  Files       │       (viewer canvas)         │  Metadata       │
+│  (tree mode) │                               │  Histogram      │
+│              │                               │                 │
+│              │                               │                 │
+├──────────────┴───────────────────────────────┴─────────────────┤
+│ [Status bar]                                                   │
+└────────────────────────────────────────────────────────────────┘
+```
+
+Files in tree mode on the left, metadata + histogram tabbed on the
+right, status bar at the bottom. No bottom gallery strip — the file
+panel is rich enough.
+
+### 7.4 Power user (⌃⌘4)
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│ [Toolbar]                                                      │
+├────────┬─────────────────────────────────┬────────────────────-┤
+│ Scope  │                                 │  Metadata           │
+│        │                                 │  MCP activity       │
+├────────┤                                 ├─────────────────────┤
+│ Files  │     (viewer canvas)             │  Histogram          │
+│        │                                 │                     │
+│        │                                 │                     │
+├────────┴─────────────────────────────────┴─────────────────────┤
+│ [Status bar]                                                   │
+└────────────────────────────────────────────────────────────────┘
+```
+
+Left column split: scope editor on top, file panel below. Right
+column split: metadata + MCP tabbed on top, histogram below.
+
+### 7.5 Slideshow (⌃⌘5)
+
+Activated automatically by the slideshow controller; same as Viewer
+only plus the main window becomes full-screen and ignores
+[`layout.hide_*_fullscreen`](./settings.mdx#46-slideshow) overrides.
+
+---
+
+## 8. Implementation Notes
+
+### 8.1 Why AppKit `NSSplitViewController` instead of SwiftUI
+
+SwiftUI 2024 `NavigationSplitView` and `HSplitView` provide divider
+drag and animation but do not expose:
+
+* Per-divider snap-to-min behavior with an explicit
+  collapse-at-double-click.
+* Drag-to-tab gestures across split children.
+* Drag-out-of-window-to-float gestures.
+
+Building those on top of SwiftUI would require so much
+`UIViewRepresentable`-style bridging that the natural choice is to
+host an `NSSplitViewController` at the window root and put SwiftUI
+panels inside each `NSSplitViewItem`'s view controller. The
+`PanelHostController` is a small `NSViewController` whose `view`
+property hosts a `NSHostingView<AnyView>` that renders the panel.
+
+### 8.2 PanelRegistry
+
+```swift
+@MainActor
+final class PanelRegistry {
+    static let shared = PanelRegistry()
+
+    private(set) var registered: [String: any ImageGlassPanel] = [:]
+
+    func register(_ panel: any ImageGlassPanel) {
+        registered[type(of: panel).id] = panel
+        // notify the MCP server so list_panels returns the new entry
+    }
+
+    func unregister(id: String) { registered.removeValue(forKey: id) }
+
+    func panel(for id: String) -> (any ImageGlassPanel)? {
+        registered[id]
+    }
+}
+```
+
+Built-in panels register at app launch. Plugin panels register when
+their plugin is loaded. The MCP server reads this registry to answer
+`list_panels`.
+
+### 8.3 LayoutCoordinator
+
+`LayoutCoordinator` owns the source of truth for the current layout
+and coordinates between three actors that may all want to mutate it:
+
+* The user (drag, resize, menu actions) — main actor.
+* The MCP server (writes via `set_setting("layout.*"...)` or via the
+  layout-specific tools) — actor-isolated.
+* `FSEventStream` (an external edit to `layout.json`) — main actor
+  via `Task { @MainActor in ... }`.
+
+Mutations go through `LayoutCoordinator.applyChange(_:source:)`
+which validates the change against the schema, animates the diff,
+and writes back to `LayoutStore`.
+
+### 8.4 Avoiding state inversion
+
+A common bug in panel frameworks: the layout drives the views; an
+animation in flight; the user starts a new drag; the source-of-truth
+diverges from what's drawn. This framework prevents that with two
+rules:
+
+1. **Mutations are atomic w.r.t. animations.** A new mutation does
+   not start until the previous animation completes (or is canceled
+   and snapped to its end state immediately).
+2. **Active drags freeze the published layout.** During a drag the
+   `LayoutCoordinator` publishes the *target* state to the views but
+   does not write to `LayoutStore` until the drag completes
+   successfully. A canceled drag (Escape key) reverts to the
+   pre-drag published state and writes nothing.
+
+### 8.5 Custom window chrome
+
+Frameless mode (`general.frameless = true`) requires custom traffic
+lights. The framework draws them as a small `NSStackView` of three
+`NSButton`s with `.closableWindowButton`, `.miniaturizableWindowButton`,
+`.zoomButton` types, parented to the window's titlebar accessory.
+This survives Window-Material changes and respects the user's
+"reduce transparency" accessibility setting.
+
+---
+
+## 9. MCP Surface
+
+| Tool | What it does |
+| --- | --- |
+| `list_panels()` | Return every registered panel: id, title, icon, current position, visible, floating frame (if floating). |
+| `show_panel(id)` | Show a hidden panel at its `last_position` and `last_size`. If it has never been shown, use `preferredSize` and `DockPosition.right`. |
+| `hide_panel(id)` | Hide a panel and record its current size/position to `Layout.hidden[id]`. Cannot hide the last visible panel; returns an error if attempted. |
+| `move_panel(id, position)` | Move a panel to a docked position or `floating`. When `floating`, the panel takes its preferred size at the screen center. |
+| `set_panel_size(id, size)` | Resize a panel; respects `minSize` and the neighbor's `minSize`. |
+| `tab_panels(target_id, source_id)` | Make `source_id` a tab in the same group as `target_id`. |
+| `untab_panel(id)` | Break a panel out of its tab group into its own group at the same position. |
+| `apply_layout_preset(name)` | Switch to a named preset (built-in or user). |
+| `save_current_layout(name)` | Snapshot the current layout to `layout/presets/<name>.json`. Refuses to overwrite a built-in preset name. |
+| `delete_layout_preset(name)` | Delete a user preset. Built-in presets cannot be deleted. |
+| `get_layout_state()` | Return the raw `layout.json` value. |
+| `set_layout_state(layout)` | Replace `layout.json`; the framework validates and animates the diff. |
+| `register_panel_capability(panel_id, mcp_tool)` | **Plugins only.** Register an MCP tool that lives as long as the panel does. |
+
+All tools are journaled to `logs/layout.log` with the calling MCP
+client identity and a timestamp.
+
+### 9.1 Example — Claude Code reconfiguring for a photo-review session
+
+```
+> "Switch to the Photographer layout but float the metadata panel
+>  so I can move it to my second display."
+
+Claude Code calls:
+  apply_layout_preset("Photographer")
+  move_panel("metadata", "floating")
+  set_panel_size("metadata", [380, 720])
+```
+
+The user sees the layout animate into place and then the metadata
+panel detach into a floating window the user can drag to the second
+display.
+
+---
+
+## 10. Keybindings
+
+| Action | Default | Notes |
+| --- | --- | --- |
+| Layout preset 1–5 | ⌃⌘1 .. ⌃⌘5 | Switch among built-in presets. |
+| Toggle file panel | ⌘L | Mirrors upstream `IG_ToggleGallery`. |
+| Toggle toolbar | ⌥⌘T | |
+| Toggle status bar | ⌥⌘S | |
+| Toggle metadata | ⌥⌘I | |
+| Float / dock active panel | ⌃⌘F | The panel that has focus (or, if none, the panel under the cursor). |
+| Reset panel positions | ⌃⌘0 | Reloads the active preset's saved state. |
+
+All keybindings are configurable via [Settings → Keyboard](./settings.mdx) §4.9.
+
+---
+
+## 11. Migration from Upstream
+
+| Upstream concept | Mac equivalent |
+| --- | --- |
+| `FrmMain` hard-coded layout | `WindowSceneController` hosting `NSSplitViewController` + panel groups. |
+| `Toolbar` control (top) | `toolbar` panel in the `top` group. |
+| `Gallery` control (one of four edges) | `file_panel` (left) and/or `gallery_strip` (bottom). The upstream's edge choice becomes a preset choice. |
+| `ToolForm` floating window | A panel with `supportsFloating = true` and `DockPosition.floating`. |
+| `Config.Layout` string-keyed dict | `layout.json` (this spec). The importer translates the upstream string format. |
+| `ShowGallery / ShowToolbar / ShowFrameNavTool` | Per-panel `visible` flag in `Layout.groups[].panel_ids` (present = visible) + `Layout.hidden` (absent and not present). |
+| `HideToolbarInFullscreen / HideGalleryInFullscreen` | Preserved as Settings flags; the framework respects them when entering full-screen. |
+
+The importer (see [Settings](./settings.mdx) §2.6) translates the
+upstream `Layout` dict by:
+
+1. Reading the upstream `Gallery` position from the dict (one of
+   `"Bottom;<n>"`, `"Top;<n>"`, `"Left;<n>"`, `"Right;<n>"`).
+2. Mapping it to a single `TabGroup` containing the `gallery_strip`
+   panel at the matching `DockPosition`.
+3. Adding the `toolbar` panel at `top` (always, per upstream).
+4. Setting `active_preset` to `Browser` (a near match) so a user
+   exploring the View menu sees a coherent name.
+
+---
+
+## 12. Testing
+
+* **Snap visit**: drag each panel header to all four edges, two tab
+  targets, and two floating destinations; every snap target produces
+  the expected post-release `Layout` value.
+* **Round-trip**: save 20 random layouts (panels in different groups
+  at different sizes with random floating panels), kill the process,
+  relaunch; every layout reloads byte-for-byte equivalent to its
+  saved form.
+* **Mutation race**: drive 100 concurrent MCP `move_panel` calls
+  while the user is actively dragging a panel; the drag completes,
+  the queued moves apply in order, no UI state is lost.
+* **Crash safety**: `killall -9` mid-write 100 times; load comes up
+  with either current or `layout.json.bak`.
+* **Schema rollback**: hand-corrupt `layout.json` to invalid JSON;
+  app loads the default preset and logs the failure.
+* **Accessibility**: every panel header is keyboard-traversable via
+  Cmd-F6 (the macOS-standard "rotate through window UI areas" key);
+  VoiceOver announces each panel by `title`.
+
+---
+
+## 13. Open Questions
+
+* **Per-monitor presets.** Should a multi-monitor user be able to
+  have a different preset auto-apply when the window moves to a
+  different display? Tentative answer: not in v1; allow MCP to do it
+  via `apply_layout_preset` driven by a `windowDidChangeScreen`
+  observer in a future plugin.
+* **Panel themes.** Today every panel respects the global app theme.
+  A future option could let panels declare their own dark/light
+  override (e.g. histogram always dark).
+* **Plugin sandboxing.** A misbehaving plugin panel can crash the
+  host process. v2 will move plugin panels into XPC services.
+
+---
+
+## 14. References
+
+* `Source/ImageGlass/FrmMain.Designer.cs` — upstream main form
+  layout.
+* `Source/ImageGlass/FrmMain/FrmMain.Configs.cs:1200` —
+  `LoadAppLayout`, parser for the upstream `Layout` dict.
+* `Source/ImageGlass/FrmMain/FrmMain.IGMethods.cs:587, 615, 3126,
+  3157, 3186` — `IG_ToggleToolbar`, `IG_ToggleGallery`,
+  `IG_ToggleCropTool`, `IG_ToggleColorPicker`, `IG_ToggleFrameNav`.
+* `Source/Components/ImageGlass.Settings/Forms/ToolForm.cs:28` —
+  `ToolForm : ThemedForm` floating-tool-window base class with
+  `WS_EX_NOACTIVATE`.
+* `Source/Components/ImageGlass.Settings/Config.cs:583` —
+  `Dictionary<string, string?> Layout`.
+* `Source/Components/ImageGlass.Gallery/Enums.cs:368` — gallery
+  `View` enum (`Thumbnails`, `HorizontalStrip`, `VerticalStrip`).

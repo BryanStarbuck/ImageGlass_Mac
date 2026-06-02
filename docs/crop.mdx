@@ -1,0 +1,700 @@
+---
+title: Crop
+description: Product and engineering specification for the crop tool in ImageGlass_Mac — the overlay drawn on the viewer canvas, the docked/floating crop panel, the in-app crop pipeline (Core Image plus a true lossless JPEG path via libjpeg-turbo), MCP-driven scripted cropping, and persisted defaults.
+---
+
+# Crop
+
+This page is the **complete product + engineering specification** for
+the crop tool in ImageGlass_Mac.
+
+It cross-references:
+
+* [Starbuck Fork](./starbuck-fork.mdx) — overall fork goals.
+* [Settings → Tools → Crop](./settings.mdx#414-tools--crop) — the
+  persisted crop defaults.
+* [Panels](./panels.mdx) — the framework the crop tool's controls
+  live in (as a docked or floating panel).
+* [File List Panel](./list_of_files.mdx) — when batch-cropping, the
+  file panel drives the file iteration.
+
+The Mac stack used throughout: **Swift 6 + SwiftUI** for the crop
+panel's controls, **AppKit + Metal** for the overlay drawn over the
+viewer canvas, **Core Image** for the standard re-encode crop,
+**libjpeg-turbo** for the true lossless JPEG crop path, and
+**ImageIO** (`CGImageDestination`) for writing output files with
+preserved metadata.
+
+---
+
+## 1. Audience and Goals
+
+### 1.1 Audiences
+
+| Tier | Audience | What they want from crop |
+| --- | --- | --- |
+| T1 | Casual user | Quick rectangular crop, drag-and-confirm, save. Five seconds. |
+| T2 | Photographer | Aspect-ratio locking (1:1, 4:3, 3:2, 16:9, custom), pixel-precise dimensions, lossless JPEG crop where possible, batch with a persistent selection across the file list. |
+| T3 | Designer | Exact-pixel input fields, snap-to-grid, rule-of-thirds overlay, golden-ratio overlay, save to multiple sizes. |
+| T4 | Power user / MCP | Drive crop from Claude Code via an MCP tool that takes `(path, x, y, w, h, output)` and returns the new file path. |
+
+### 1.2 Goals
+
+* **Match upstream's UX** for the cases where it already works well
+  (eight handles, modifier-key constraints, aspect-ratio presets) so
+  users moving from Windows ImageGlass do not need to relearn.
+* **Add lossless JPEG crop.** Upstream re-encodes every JPEG. The Mac
+  fork adds a true lossless path using libjpeg-turbo's `tjTransform`
+  for MCU-aligned rectangles. The user sees no quality loss for any
+  JPEG crop with edges aligned to the 8 px / 16 px MCU grid (which is
+  most crops).
+* **Preserve metadata by default.** EXIF, IPTC, XMP, ICC profile, and
+  GPS coordinates are carried through every write unless the user
+  explicitly opts out.
+* **Live preview.** The crop result is shown in real time as the user
+  drags. No "preview" button.
+* **Persistable selection.** A T2 batch-cropping a folder can lock the
+  selection and walk the file list, applying the same crop to each
+  image.
+* **Programmable.** MCP can drive a crop without GUI input. A Claude
+  Code workflow can crop a directory of screenshots to the same
+  region.
+
+### 1.3 Non-goals
+
+* No content-aware crop (no AI fill, no seam carving). The crop tool
+  produces a strictly-smaller rectangular subset of the source.
+* No perspective correction or skew correction. Those are different
+  tools.
+* No multi-rectangle / non-rectangular crop in v1.
+* No video cropping (motion JPEGs and Live Photos are rendered as a
+  single still during crop; the user is informed).
+
+---
+
+## 2. The Crop UI
+
+The crop UI has two parts: a **panel** (docked or floating, per
+[panels.mdx](./panels.mdx)) and an **overlay** drawn over the viewer
+canvas.
+
+### 2.1 Overlay
+
+The overlay is drawn by the Metal viewer renderer as a second pass
+after the image. It consists of:
+
+* A translucent dim mask covering the entire canvas (default 60 %
+  black; respects `appearance.background` and the user's reduce-transparency
+  accessibility setting).
+* A sharp rectangular cutout (the selection) — fully transparent so
+  the image shows through.
+* The selection's border, drawn 1 pt wide with the system accent
+  color.
+* Eight resize handles at the corners and edge midpoints, drawn
+  inside transparent AppKit `NSView` overlays so they receive mouse
+  events directly. Handle visual: 10 pt × 10 pt rounded square,
+  accent fill, 1 pt white outline. The corner handles are slightly
+  larger (12 pt) per the upstream `_resizeHandleSize` convention.
+* An optional grid overlay (rule of thirds, golden ratio, golden
+  spiral diagonals, 8 × 8 grid, or none) — drawn inside the
+  selection.
+
+ASCII sketch (handles abbreviated as `■`):
+
+```
+┌───────────────────────────────────────────────────┐
+│░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░│
+│░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░│
+│░░░░░░░■───────────■───────────■░░░░░░░░░░░░░░░░░░░│
+│░░░░░░░│           |           │░░░░░░░░░░░░░░░░░░░│
+│░░░░░░░│           |           │░░░░░░░░░░░░░░░░░░░│
+│░░░░░░░■-----------+-----------■░░░░░░░░░░░░░░░░░░░│
+│░░░░░░░│           |           │░░░░░░░░░░░░░░░░░░░│
+│░░░░░░░│           |           │░░░░░░░░░░░░░░░░░░░│
+│░░░░░░░■───────────■───────────■░░░░░░░░░░░░░░░░░░░│
+│░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░│
+│░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░│
+└───────────────────────────────────────────────────┘
+```
+
+Z-order, bottom to top, matches upstream `DrawSelectionLayer` in
+`Source/Components/ImageGlass.Viewer/ViewerCanvas.cs` (lines
+1788–1912):
+
+1. Image.
+2. Dim mask outside selection.
+3. Grid lines inside selection.
+4. Selection border.
+5. Handles.
+
+This z-order is preserved on Mac so that handles always paint over
+the border (the user can grab them at the corners) and grid lines
+always paint over the image but never over the border.
+
+### 2.2 Grid overlays
+
+Five grid modes — same as upstream:
+
+| Mode | Lines drawn |
+| --- | --- |
+| `none` | None. |
+| `thirds` | Two horizontal at 1/3 and 2/3; two vertical at 1/3 and 2/3. |
+| `goldenRatio` | Lines at φ ≈ 0.382 and 0.618 (both axes). |
+| `goldenSpiralDiagonals` | The two long diagonals of the golden rectangle. |
+| `grid8` | Even 8 × 8 grid. |
+
+The mode is `tools.crop.grid_mode` in Settings; the user can also
+cycle modes with the `G` key while the crop tool is active.
+
+### 2.3 The crop panel
+
+The panel hosts the numeric / preset controls. Default position is
+`floating` (a small `NSPanel` parented to the main window), with the
+user free to dock it via the panel framework. Its `preferredSize`
+is `280 × 360 pt`.
+
+Full control reference:
+
+| Control | Type | Bound to | Notes |
+| --- | --- | --- | --- |
+| Aspect ratio | `Picker` | `CropController.aspectRatio` | Presets: Free, Original, 1:1, 1:2, 2:1, 2:3, 3:2, 3:4, 4:3, 9:16, 16:9, Custom (upstream `SelectionAspectRatio` — verified from `Source/Components/ImageGlass.Base/Types/Enums.cs:157`). |
+| Custom W | `NumberField` | `CropController.aspectRatioValues[0]` | Enabled only when aspect = Custom. |
+| Custom H | `NumberField` | `CropController.aspectRatioValues[1]` | Same. |
+| Lock aspect | `Toggle` | `CropController.lockAspect` | When on, all resizes preserve the current aspect. Shift-drag is the transient equivalent (see §3.2). |
+| X | `NumberField` (px) | `CropController.rect.minX` | Updates the overlay on edit-complete (return / focus loss). |
+| Y | `NumberField` (px) | `CropController.rect.minY` | |
+| Width | `NumberField` (px) | `CropController.rect.width` | |
+| Height | `NumberField` (px) | `CropController.rect.height` | |
+| Units toggle | `Segmented` (`px` / `%`) | `CropController.unitsDisplay` | UI-only; internal state is always px. |
+| Grid overlay | `Menu` (`none` / `thirds` / `golden` / `goldenSpiral` / `grid8`) | `CropController.gridMode` | |
+| Snap to grid | `Toggle` | `CropController.snapToGrid` | When on, all drags snap to integer pixels (no subpixel selection). |
+| Crop | `Button` (primary) | `CropController.applyAndReplace()` | In-app replace; pushes onto Undo. |
+| Save | `Button` | `CropController.applySaveInPlace()` | Atomic-rename write back to the source file. |
+| Save As… | `Button` | `CropController.applySaveAs()` | `NSSavePanel`. |
+| Copy | `Button` | `CropController.copyToClipboard()` | Writes cropped CGImage to `NSPasteboard.general` plus the file-data flavors for the source format. |
+| Reset | `Button` | `CropController.resetSelection()` | Reverts to `tools.crop.init_selection`. |
+| Settings… | `Button` | opens Settings → Tools → Crop | One click to defaults. |
+| Persistent selection | `Toggle` | `CropController.persistent` | When on, navigating to the next image keeps the rectangle in pixel coords (clipped to the new image's bounds). |
+| Output format | `Picker` | `CropController.outputFormat` | `auto / jpeg / png / webp / heic / avif / tiff`. Default `auto`. |
+| Quality | `Slider` (1–100) | `CropController.outputQuality` | Hidden when format is png/tiff. |
+| Lossless JPEG | `Toggle` | `CropController.preferLossless` | Auto-set true for JPEG sources. See §4.3. |
+
+### 2.4 Keyboard
+
+| Key | Action |
+| --- | --- |
+| Arrow | Nudge selection 1 px |
+| Shift+Arrow | Nudge selection 10 px |
+| ⌘+Arrow | Resize selection 1 px (grows the far edge) |
+| ⌘⇧+Arrow | Resize selection 10 px |
+| Return | Apply crop (in-app replace) |
+| ⌘S | Save in place |
+| ⌘⇧S | Save As |
+| ⌘C | Copy |
+| Esc | Cancel — close the crop tool without applying |
+| Tab | Cycle focus through the panel controls |
+| G | Cycle grid mode |
+| 1 | Aspect = Free |
+| 2 | Aspect = 1:1 |
+| 3 | Aspect = 4:3 |
+| 4 | Aspect = 3:2 |
+| 5 | Aspect = 16:9 |
+
+### 2.5 Drag semantics (modifier keys)
+
+Verified from upstream `FrmCrop.cs:557` (`FrmMain_KeyDown` handling
+the square-ratio modifier):
+
+| Modifier during drag | Effect |
+| --- | --- |
+| (none) | Free drag of the selected edge / corner / interior. |
+| Shift | Constrain aspect ratio to the current value (free-aspect becomes 1:1, matching upstream `_squareRatioSelectionKeyPressed`). |
+| Option | Resize from the opposite edge / corner (i.e., the geometric center is held fixed). |
+| Shift+Option | Both — constrained aspect, centered resize. |
+
+### 2.6 Drag state machine
+
+```
+       click on canvas (no selection yet)
+                │
+                ▼
+  ┌─────────────────────────────┐
+  │  state: drawing             │
+  │  cursor: crosshair          │
+  └──────────────┬──────────────┘
+                 │ mouseUp
+                 ▼
+  ┌─────────────────────────────┐
+  │  state: idle (have rect)    │
+  │  cursor: arrow              │
+  └──┬─────────────┬────────────┘
+     │             │
+  click-handle  click-inside
+     │             │
+     ▼             ▼
+ resizing       moving
+     │             │
+  mouseUp       mouseUp
+     │             │
+     └──────┬──────┘
+            ▼
+        idle
+```
+
+`Esc` from any state cancels back to "no rect" (or to the prior rect
+if the user was resizing/moving an existing rect).
+
+### 2.7 Persistence modes
+
+`CropController.persistent` (panel toggle, mirrored from
+`tools.crop.persistent_selection` in Settings) controls what happens
+when the active image changes (via Next, Previous, or a file-panel
+selection change):
+
+| Persistent | Behavior on image change |
+| --- | --- |
+| `false` (default) | Selection is cleared. The crop tool stays open. The user starts a new selection on the new image. |
+| `true` | Selection is preserved in pixel coordinates. If the new image is smaller in either axis, the rect is clipped to fit. The user can immediately Save / Crop without re-drawing. |
+
+Persistent mode is the batch-crop workflow described in §6.2.
+
+---
+
+## 3. Initial Selection
+
+When the crop tool is opened, the initial selection comes from
+`tools.crop.init_selection` ([Settings § 4.14.1](./settings.mdx#4141-tools--crop)):
+
+| InitSelectionType | Initial rect |
+| --- | --- |
+| `useLastSelection` | The user's last selection on any image in this session. |
+| `customArea` | `tools.crop.init_rect` (a fixed pixel rect). |
+| `selectAll` | Image bounds. |
+| `selectNone` | No initial rect; user must click-drag. |
+| `selectNPercent` (10/20/25/30/onThird/40/50/60/twoThirds/70/75/80/90) | A centered rect of that percent of each axis. |
+
+`tools.crop.auto_center` (default `true`) further centers a custom-area
+rect on the image. Verified from `CropToolConfig.cs:68`.
+
+---
+
+## 4. Output Pipeline
+
+### 4.1 The four save paths
+
+| Action | What it does |
+| --- | --- |
+| **Crop (in-app replace)** | Replaces the in-memory image with the cropped CGImage. No file write. Pushes an Undo entry. Useful before further edits or before saving. |
+| **Save** | Writes the cropped image back to the source file using the source format. Atomic-rename write so a crash mid-save cannot corrupt the source. Preserves the file's mtime if `general.preserve_modified_date = true`. |
+| **Save As…** | Opens `NSSavePanel`. The default name is `<basename>_cropped.<ext>`. The user can change the format here. |
+| **Copy** | Writes the cropped CGImage to `NSPasteboard.general` (raw bitmap + the source-format file data + a PNG fallback). |
+
+### 4.2 Per-format encoder
+
+Selecting an output format selects an `ImageIO` writer or a
+specialized writer:
+
+| Format | Writer | Notes |
+| --- | --- | --- |
+| `jpeg` | libjpeg-turbo `tjTransform` (lossless path) OR `CGImageDestination` (re-encode path) | See §4.3. |
+| `png` | `CGImageDestination(public.png)` | Lossless by definition. |
+| `webp` | `CGImageDestination(org.webmproject.webp)` | macOS 14+ writes natively. Quality respected. |
+| `heic` | `CGImageDestination(public.heic)` | Quality respected. HDR preserved if source is HDR. |
+| `avif` | `CGImageDestination(org.aomedia.avif)` | macOS 14+. |
+| `tiff` | `CGImageDestination(public.tiff)` | Lossless; LZW compression on by default. |
+
+The output quality (`tools.crop.default_output_quality`, default 90)
+maps to `kCGImageDestinationLossyCompressionQuality` for JPEG / WebP /
+HEIC / AVIF.
+
+### 4.3 The lossless JPEG path
+
+This is the biggest single-feature divergence from upstream. Upstream
+uses `WicBitmapSource.FromSourceRect` (verified from
+`Source/Components/ImageGlass.Base/Photoing/Photoing.cs`) which always
+re-encodes the JPEG, losing quality at every crop. The Mac fork adds a
+**true lossless** path:
+
+1. When the user clicks Save / Save As with a JPEG source and
+   `tools.crop.lossless_jpeg = true`:
+2. The pipeline rounds the crop rectangle outward to the nearest MCU
+   boundary. Standard JPEG MCUs are 8 px (grayscale) or 16 px
+   (4:2:0-chroma; the most common). The rounding may add up to 15 px
+   on each side.
+3. If the rounded rect equals the user's rect (the user's rect was
+   already MCU-aligned), the path is a pure lossless transform: the
+   pipeline calls libjpeg-turbo's `tjTransform` with `TJXOP_NONE`
+   and `TJXOPT_CROP` set to the rounded rect. The result is bit-exact
+   to the source minus the cropped DCT blocks.
+4. If the rounded rect is larger than the user's rect (most common),
+   the panel shows a one-line caption — "Lossless crop nearest the
+   MCU boundary; the rectangle was expanded by N px" — and writes the
+   lossless rect. The user can disable this and force re-encode via
+   the panel's `Lossless JPEG` toggle.
+5. EXIF, IPTC, XMP, ICC profile, and Adobe APP14 markers are
+   preserved verbatim by libjpeg-turbo when `TJXOPT_COPYNONE` is
+   *not* set.
+
+For PNG / WebP / HEIC / AVIF / TIFF the standard `CGImageDestination`
+path is used.
+
+### 4.4 Metadata preservation
+
+| Metadata | Source | How preserved |
+| --- | --- | --- |
+| EXIF | `kCGImagePropertyExifDictionary` | Copied with `CGImageDestinationCopyImageSource(_:image:options:)`. EXIF orientation is rewritten to `.up` because the cropped CGImage is already in display orientation. |
+| IPTC | `kCGImagePropertyIPTCDictionary` | Same. |
+| XMP | `kCGImagePropertyMetadataKey` | Same. |
+| ICC profile | `kCGImagePropertyProfileName` + the actual color space of the CGImage | Set on the destination via `kCGImageDestinationEmbedThumbnail` / `kCGImagePropertyColorModel`. |
+| GPS | `kCGImagePropertyGPSDictionary` | Copied. The user can opt out per-export in Save As (a "Strip GPS" checkbox). |
+| Adobe APP14 | Only relevant to JPEG | Preserved by libjpeg-turbo. |
+
+The user can opt out of metadata preservation globally via
+`edit.preserve_exif = false` ([Settings § 4.7](./settings.mdx#47-edit)).
+
+---
+
+## 5. Wiring
+
+### 5.1 CropController
+
+```swift
+@MainActor @Observable
+final class CropController {
+    /// The current selection, in image pixel coordinates.
+    /// nil means "no selection".
+    var rect: CGRect?
+
+    /// Current aspect-ratio policy.
+    var aspectRatio: SelectionAspectRatio = .freeRatio
+    var aspectRatioValues: [Int] = [0, 0]
+    var lockAspect: Bool = false
+
+    /// Display units; internal rect is always px.
+    var unitsDisplay: Units = .pixels
+
+    /// Visual aids.
+    var gridMode: GridMode = .thirds
+    var snapToGrid: Bool = true
+
+    /// Output policy.
+    var outputFormat: OutputFormat = .auto
+    var outputQuality: Int = 90
+    var preferLossless: Bool = true
+
+    /// Cross-image behavior.
+    var persistent: Bool = false
+
+    /// Apply a crop in-app and push to Undo.
+    func applyAndReplace() async throws { /* … */ }
+
+    /// Save in place (atomic-rename).
+    func applySaveInPlace() async throws -> URL { /* … */ }
+
+    /// Save As via NSSavePanel.
+    func applySaveAs() async throws -> URL? { /* … */ }
+
+    /// Copy to NSPasteboard.
+    func copyToClipboard() async throws { /* … */ }
+
+    /// Reset to the configured initial-selection policy.
+    func resetSelection() { /* … */ }
+}
+```
+
+`CropController` is owned by the active window scene. It observes the
+viewer's `activeImage` and reacts to changes per `persistent`.
+
+### 5.2 Overlay rendering
+
+The overlay is rendered by `ViewerRenderer.renderCropOverlay(_:)` as
+a second pass after the image pass in the Metal `MTKView`:
+
+```swift
+extension ViewerRenderer {
+    func renderCropOverlay(in pass: MTLRenderCommandEncoder) {
+        guard let rect = cropController.rect else { return }
+        encodeDimMask(pass, excluding: rect)
+        encodeGrid(pass, in: rect, mode: cropController.gridMode)
+        encodeBorder(pass, around: rect, color: .accent)
+        // handles are AppKit NSViews layered above MTKView — not in this pass
+    }
+}
+```
+
+Handles are eight transparent `NSView`s positioned via
+`CALayer.frame` updates, parented to the Metal view's superview.
+This is the simplest way to get reliable mouse-event delivery on a
+Metal-rendered surface. Each handle has a `NSCursor` set
+appropriately (corner-resize cursors, edge-resize cursors). An
+alternative "Metal-sprite handles + manual hit-test" implementation
+is documented for future consideration but is not v1.
+
+### 5.3 Hit-test rules
+
+For a click at point `p` in canvas coordinates:
+
+* If `p` is inside a handle's frame → start `resizing` with that
+  handle.
+* Else if `p` is inside `rect` → start `moving`.
+* Else (no selection or click outside the selection) → start
+  `drawing` a new rect from `p`.
+
+This matches upstream `ViewerCanvas.cs:325–490`.
+
+### 5.4 Undo
+
+Every `applyAndReplace()` pushes onto the standard `UndoManager` of
+the active window. The undo entry holds the prior CGImage handle.
+`Save in place` does *not* push to Undo (it is a file write; the
+file write is reversible only via the backup file).
+
+### 5.5 The crop.json side-file
+
+For batch-crop workflows the user can persist a per-image crop in a
+side-file:
+
+`<dir>/.imageglass/crop/<basename>.json`
+
+```json
+{
+  "rect": [x, y, w, h],
+  "applied": false,
+  "saved_to": null,
+  "updated_at": "2026-06-02T18:34:21Z"
+}
+```
+
+This is opt-in via `tools.crop.write_side_files = true` (default
+`false`) and lets a MCP-driven batch worker resume where it left off
+without re-reading the image to find the same selection. The
+side-file directory is hidden by default by `viewer.show_hidden_files`.
+
+---
+
+## 6. Workflow Scenarios
+
+### 6.1 Quick crop (T1, 5 seconds)
+
+1. User has an image open. Presses ⌘K (crop).
+2. Overlay appears with a centered 50 % rectangle (per default
+   `tools.crop.init_selection = select50Percent`).
+3. User drags a corner to tighten.
+4. User presses Return → Crop applied in app.
+5. User presses ⌘S → file written back, original replaced.
+
+### 6.2 Photographer batch crop to 16:9 (T2)
+
+1. Open the folder; the file panel lists 80 photos.
+2. Open crop (⌘K). Set Aspect ratio = 16:9. Set Persistent selection
+   = on.
+3. Position the rectangle precisely on the first image.
+4. Press ⌘⇧S → Save As, accept the default name, accept JPEG, choose
+   quality 95. (The panel offers Lossless JPEG; for arbitrary
+   16:9-not-MCU-aligned rects the panel will warn that lossless
+   expand will be small or zero.)
+5. Press → (next image). The selection persists. The rectangle
+   automatically clips to the new image's bounds.
+6. Adjust if needed; ⌘⇧S to save.
+7. Repeat for the remaining photos.
+
+### 6.3 Designer asset extraction (T3)
+
+1. User opens a screenshot containing several UI elements.
+2. ⌘K. Sets Aspect ratio = Custom, W = 3, H = 2 (for a 3:2 thumbnail
+   crop).
+3. Types exact pixel values into X, Y, Width, Height for the first
+   element.
+4. ⌘⇧S → name it `dropdown.png` → PNG → save.
+5. Types new X, Y for the second element. ⌘⇧S → name it
+   `radio.png` → save.
+
+### 6.4 Claude Code drives crop via MCP (T4)
+
+```
+User to Claude Code:
+  "Look at ~/screenshots/2026-06-02/*.png, crop just the dialog box
+   from each one — top-left corner is around (40, 80), about 800 by
+   500 — and save as <name>_dialog.png next to the originals."
+
+Claude Code calls:
+  list_files_in_scope("screenshots-2026-06-02")   // returns 12 files
+  for path in paths:
+    crop_image(
+      input_path: path,
+      x: 40, y: 80, width: 800, height: 500,
+      output_path: path.replacing(".png", "_dialog.png"),
+      format: "png"
+    )
+```
+
+The user sees nothing in the GUI; the files appear on disk. No GUI
+focus is stolen. Each call is journaled to `logs/crop.log`.
+
+### 6.5 Lossless JPEG crop of a 50 MP photo
+
+* Source: 8688 × 5792 px JPEG, 24 MB.
+* User draws a 6000 × 4000 rect roughly centered. The rect is not
+  MCU-aligned.
+* The pipeline rounds outward to the nearest 16-px boundary →
+  6016 × 4000 from (1344 → 1344, 896 → 896). Total expansion: 16 px
+  on the right.
+* libjpeg-turbo `tjTransform(..., TJXOP_NONE, TJXOPT_CROP, ...)` runs
+  in ~80 ms on M3 Apple Silicon, producing a 12.4 MB JPEG.
+* The output is bit-exact to the source minus the cropped DCT
+  blocks — no quality loss, no re-encode artifacts.
+* EXIF, IPTC, XMP, ICC profile are preserved verbatim.
+
+Timing table (Apple M3 Pro, 12-core CPU):
+
+| Source | Crop method | Time |
+| --- | --- | --- |
+| 50 MP JPEG | Lossless (`tjTransform`) | ~80 ms |
+| 50 MP JPEG | Re-encode at Q=95 | ~620 ms |
+| 50 MP HEIC | `CGImageDestination` re-encode at Q=90 | ~900 ms |
+| 50 MP PNG | `CGImageDestination` lossless | ~1.4 s |
+
+---
+
+## 7. MCP Surface
+
+### 7.1 `crop_image`
+
+```json
+{
+  "name": "crop_image",
+  "description": "Crop an image file to the given rectangle and write the result.",
+  "inputSchema": {
+    "type": "object",
+    "required": ["input_path", "x", "y", "width", "height"],
+    "properties": {
+      "input_path":   { "type": "string", "description": "Absolute path to the source image." },
+      "x":            { "type": "integer", "minimum": 0 },
+      "y":            { "type": "integer", "minimum": 0 },
+      "width":        { "type": "integer", "exclusiveMinimum": 0 },
+      "height":       { "type": "integer", "exclusiveMinimum": 0 },
+      "output_path":  { "type": "string", "description": "Where to write. If omitted, writes <basename>_cropped.<ext> next to the source." },
+      "format":       { "enum": ["auto", "jpeg", "png", "webp", "heic", "avif", "tiff"], "default": "auto" },
+      "quality":      { "type": "integer", "minimum": 1, "maximum": 100, "default": 90 },
+      "lossless_jpeg":{ "type": "boolean", "default": true },
+      "preserve_metadata": { "type": "boolean", "default": true }
+    }
+  },
+  "outputSchema": {
+    "type": "object",
+    "required": ["output_path", "width", "height", "bytes"],
+    "properties": {
+      "output_path":  { "type": "string" },
+      "width":        { "type": "integer" },
+      "height":       { "type": "integer" },
+      "bytes":        { "type": "integer", "description": "File size of the output." },
+      "lossless":     { "type": "boolean", "description": "True if the lossless JPEG path was used." },
+      "actual_rect":  { "type": "array", "items": { "type": "integer" }, "minItems": 4, "maxItems": 4,
+                        "description": "The actual cropped rect — may differ from the requested rect when the lossless path rounded outward." }
+    }
+  }
+}
+```
+
+### 7.2 `get_crop_selection`
+
+```json
+{
+  "name": "get_crop_selection",
+  "description": "Read the active crop selection in the GUI, if any.",
+  "inputSchema": { "type": "object", "properties": {} },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "rect":          { "type": ["array", "null"], "items": { "type": "integer" }, "minItems": 4, "maxItems": 4 },
+      "aspect_ratio":  { "type": "string" },
+      "image_path":    { "type": "string", "description": "Path of the image the selection is on." }
+    }
+  }
+}
+```
+
+### 7.3 `set_crop_selection`
+
+```json
+{
+  "name": "set_crop_selection",
+  "description": "Set the active crop selection in the GUI. Implicitly opens the crop tool if it is closed.",
+  "inputSchema": {
+    "type": "object",
+    "required": ["x", "y", "width", "height"],
+    "properties": {
+      "x":             { "type": "integer", "minimum": 0 },
+      "y":             { "type": "integer", "minimum": 0 },
+      "width":         { "type": "integer", "exclusiveMinimum": 0 },
+      "height":        { "type": "integer", "exclusiveMinimum": 0 },
+      "aspect_ratio":  { "type": "string", "description": "Optional. One of the SelectionAspectRatio names." }
+    }
+  },
+  "outputSchema": {
+    "type": "object",
+    "required": ["rect"],
+    "properties": {
+      "rect":   { "type": "array", "items": { "type": "integer" }, "minItems": 4, "maxItems": 4 }
+    }
+  }
+}
+```
+
+A canonical workflow: an LLM with vision looks at the user's open
+image, decides the right region, calls `set_crop_selection` so the
+user can confirm, then (on user approval) the user presses ⌘S.
+
+---
+
+## 8. Divergence from Upstream
+
+| Upstream | Mac fork |
+| --- | --- |
+| Overlay rendered with `Direct2D` `DXGraphics` | Overlay rendered as a second Metal pass on the same `MTKView`. |
+| Pixel work via WIC `WicBitmapSource.FromSourceRect` | Pixel work via `CIImage.cropped(to:)` for non-JPEG, libjpeg-turbo `tjTransform` for MCU-aligned JPEG. |
+| Always re-encodes JPEG | Lossless JPEG crop path. Substantive new behavior. |
+| Crop tool is a docked side panel | Crop tool's controls live in the new panel framework (docked or floating). The overlay is in the canvas. |
+| Disables crop tool entirely on animated images / WebView2-rendered SVGs (`FrmCrop.cs:142`) | Animated-image block preserved; the panel shows a single-line message instead of silently disabling. SVG block is gone because the fork renders SVG natively (no WebView2). |
+| Shift = 1:1 transient ratio (`_squareRatioSelectionKey`, line 29) | Preserved. |
+| EXIF orientation is reapplied after crop | Preserved. EXIF orientation tag is rewritten to `.up` on the output (the cropped image is already in display orientation). |
+| No content-aware modes | Same — explicitly out of scope (§1.3). |
+
+---
+
+## 9. Open Questions
+
+* **Aspect ratios for vertical video frames.** Photographers wanting
+  to crop iPhone Live Photos to 9:16 want a single click; the
+  `Ratio9_16` preset exists in upstream and is preserved. Should the
+  default preset list be reordered so 9:16 is more prominent on
+  vertical-source images? Tentative: yes, but only if the source has
+  an EXIF Orientation that implies portrait.
+* **Multi-rectangle export.** A designer wanting to extract three
+  thumbnails from one screenshot could benefit from a "queue of
+  rectangles" workflow. Out of scope for v1; reasonable v2 work.
+* **Snap to image features.** A "snap to detected edge" mode would
+  be a meaningful crop-quality improvement and is a natural Vision /
+  Core Image experiment. Out of scope for v1.
+
+---
+
+## 10. References
+
+* `Source/ImageGlass/Tools/FrmCrop.cs` — upstream crop tool form,
+  state machine, keyboard handling.
+* `Source/ImageGlass/Tools/FrmCropSettings.cs` — settings sub-dialog
+  for the crop tool.
+* `Source/Components/ImageGlass.Settings/ToolConfigs/CropToolConfig.cs`
+  — persisted crop config (the field set this spec exposes in
+  Settings).
+* `Source/Components/ImageGlass.Base/Types/Enums.cs:157` —
+  `SelectionAspectRatio` enum.
+* `Source/Components/ImageGlass.Viewer/ViewerCanvas.cs:325–490` —
+  hit-testing for the eight resize handles.
+* `Source/Components/ImageGlass.Viewer/ViewerCanvas.cs:1788–1912` —
+  `DrawSelectionLayer` (overlay z-order).
+* `Source/Components/ImageGlass.Base/Photoing/Photoing.cs` — the
+  upstream `CropImage` call using WIC.
+* `Source/ImageGlass/FrmMain/FrmMain.IGMethods.cs` — `IG_Crop`,
+  `IG_ToggleCropTool`, tool-form positioning.

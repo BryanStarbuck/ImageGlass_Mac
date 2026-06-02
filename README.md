@@ -24,6 +24,36 @@ On top of the Mac-native viewer baseline, this fork adds:
 
 macOS only. Optimized for Apple Silicon.
 
+## Quick Start
+
+```sh
+brew install just              # one-time, if you don't have it
+just bootstrap                 # fetches deps, runs first build
+just run                       # launch the app
+```
+
+`just bootstrap` is the only command a fresh clone needs. It verifies your
+host tooling, runs SwiftPM dependency resolution, fetches any native
+libraries into `vendor/` (none today — Apple's ImageIO covers the current
+format set), and does a debug build.
+
+Run `just` with no arguments to see every recipe. Build settings,
+dependency lists, and the vendor-library policy live in `justfile` and
+`vendor/CLAUDE.md` so they're discoverable from a checkout alone.
+
+## Repository Layout
+
+```
+ImageGlass_Mac/
+├── justfile              # task runner — `just` to list recipes
+├── .gitignore            # excludes .build, .claude/worktrees, vendor contents
+├── code/                 # Swift package (app, MCP server, core lib)
+├── docs/                 # MDX specification
+└── vendor/               # native dependency staging (contents gitignored)
+    ├── README.md
+    └── CLAUDE.md         # spec for adding vendored libraries
+```
+
 ## Upstream
 
 Based on [d2phap/ImageGlass](https://github.com/d2phap/ImageGlass), licensed under GPL v3.

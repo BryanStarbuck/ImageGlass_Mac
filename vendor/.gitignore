@@ -1,0 +1,10 @@
+# Belt-and-suspenders: the root .gitignore already excludes everything in
+# this directory except the three tracked files (.gitignore, README.md,
+# CLAUDE.md). This nested .gitignore makes the rule survive even if the
+# vendor/ tree is checked into a different repo, or if a contributor runs
+# `git add vendor/` from inside this directory.
+
+*
+!.gitignore
+!README.md
+!CLAUDE.md

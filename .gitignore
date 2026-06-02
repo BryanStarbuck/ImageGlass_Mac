@@ -1,2 +1,47 @@
+# macOS
 .DS_Store
-.claude/
+.AppleDouble
+.LSOverride
+Icon?
+._*
+
+# Claude Code agent worktrees — created at runtime, never commit them.
+# Each agent-<hash> directory is a separate git worktree (gitlink). The
+# rest of .claude/ (settings.json, commands/, hooks) is allowed.
+.claude/worktrees/
+
+# Swift / SwiftPM build artifacts
+.build/
+.swiftpm/
+Packages/
+DerivedData/
+*.xcodeproj/project.xcworkspace/xcuserdata/
+*.xcuserdatad/
+xcuserdata/
+
+# Xcode
+*.xcuserstate
+*.perspectivev3
+*.moved-aside
+
+# Vendor libraries — see vendor/README.md.
+# The vendor/ directory itself is tracked (as a placeholder), but every
+# downloaded library underneath it is ignored. `just deps` is the supported
+# way to repopulate it.
+vendor/*
+!vendor/.gitignore
+!vendor/README.md
+!vendor/CLAUDE.md
+
+# Editor / tooling
+.idea/
+.vscode/
+*.swp
+*.swo
+.netrc
+
+# Build output
+build/
+dist/
+*.dmg
+*.app/
