@@ -32,6 +32,16 @@ public final class AppState {
     /// Theme catalog + current selection (see docs/themes.mdx).
     public let themeStore = ThemeStore()
 
+    /// Setting overrides captured from `/Name=Value` flags at launch. The
+    /// configs subsystem layers these on top of the loaded `igconfig.json`.
+    public var cliOverrides: [String: String] = [:]
+
+    /// Positional file/directory paths supplied on the command line.
+    public var cliOpenPaths: [String] = []
+
+    /// True if `--startup-boost` was on the command line.
+    public var cliStartupBoost: Bool = false
+
     public enum PanelViewMode: String, CaseIterable, Identifiable {
         case list, tree
         public var id: String { rawValue }
@@ -46,6 +56,14 @@ public final class AppState {
     private var fileWatcher: FileWatcher?
 
     public init() {}
+
+    /// Apply parsed launch arguments. Safe to call from the app entry point
+    /// before `bootstrap()` runs.
+    public func applyLaunchArguments(_ args: ImageGlassLaunchArguments) {
+        self.cliOverrides = args.overrides
+        self.cliOpenPaths = args.openPaths
+        self.cliStartupBoost = args.startupBoost
+    }
 
     // MARK: - Bootstrap
 

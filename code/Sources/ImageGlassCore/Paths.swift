@@ -48,6 +48,21 @@ public enum AppPaths {
         appSupportDir.appendingPathComponent("audit", isDirectory: true)
     }
 
+    /// Directory holding installed `.iglang` language packs (one JSON per locale).
+    public static var languagesDir: URL {
+        appSupportDir.appendingPathComponent("languages", isDirectory: true)
+    }
+
+    // `themesDir` is declared in Themes/ThemeCatalog.swift.
+
+    /// Marker file used to signal "startup boost" preference on macOS.
+    /// macOS has no first-class preload mechanism comparable to the Windows
+    /// scheduled-task trick, so we record intent as a flag file that a future
+    /// launch-agent installer can act on.
+    public static var startupBoostFlag: URL {
+        appSupportDir.appendingPathComponent("startup_boost.flag")
+    }
+
     public static var configFile: URL {
         appSupportDir.appendingPathComponent("igconfig.json")
     }
@@ -59,7 +74,7 @@ public enum AppPaths {
 
     public static func ensureDirectories() throws {
         let fm = FileManager.default
-        for dir in [appSupportDir, scopesDir, toolsDir, runtimeDir, ruleSetsDir, auditDir] {
+        for dir in [appSupportDir, scopesDir, toolsDir, runtimeDir, ruleSetsDir, auditDir, languagesDir, themesDir] {
             if !fm.fileExists(atPath: dir.path) {
                 try fm.createDirectory(at: dir, withIntermediateDirectories: true)
             }
