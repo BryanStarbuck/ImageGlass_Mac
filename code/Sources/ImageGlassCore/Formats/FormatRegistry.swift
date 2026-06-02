@@ -178,61 +178,78 @@ public final class FormatRegistry: @unchecked Sendable {
             id: "jpeg", displayName: "JPEG",
             extensions: ["jpg", "jpeg", "jpe", "jfif"],
             capabilities: [.read, .write],
-            icon: "photo"
+            icon: "photo",
+            uti: "public.jpeg"
+        ))
+        out.append(.init(
+            id: "jpeg2000", displayName: "JPEG 2000",
+            extensions: ["jp2", "j2k", "jpf", "jpx", "jpm", "mj2"],
+            capabilities: [.read, .write, .alpha],
+            icon: "photo",
+            note: "JPEG 2000 family decoded/encoded by Image I/O.",
+            uti: "public.jpeg-2000"
         ))
         out.append(.init(
             id: "png", displayName: "PNG",
             extensions: ["png", "apng"],
             capabilities: [.read, .write, .animated, .alpha],
-            icon: "photo"
+            icon: "photo",
+            uti: "public.png"
         ))
         out.append(.init(
             id: "gif", displayName: "GIF",
             extensions: ["gif"],
             capabilities: [.read, .write, .animated, .alpha],
-            icon: "photo"
+            icon: "photo",
+            uti: "com.compuserve.gif"
         ))
         out.append(.init(
             id: "tiff", displayName: "TIFF",
             extensions: ["tif", "tiff"],
             capabilities: [.read, .write, .multiFrame, .alpha],
-            icon: "photo"
+            icon: "photo",
+            uti: "public.tiff"
         ))
         out.append(.init(
             id: "bmp", displayName: "BMP",
             extensions: ["bmp", "dib"],
             capabilities: [.read, .write],
-            icon: "photo"
+            icon: "photo",
+            uti: "com.microsoft.bmp"
         ))
 
         // ----- Modern raster -----
         out.append(.init(
             id: "heic", displayName: "HEIC / HEIF",
-            extensions: ["heic", "heif"],
+            extensions: ["heic", "heif", "heics", "heifs"],
             capabilities: [.read, .write, .alpha],
             icon: "photo",
-            note: "Built-in via Image I/O. Non-animated only."
+            note: "Built-in via Image I/O. Non-animated only.",
+            uti: "public.heic"
         ))
         out.append(.init(
             id: "webp", displayName: "WebP",
             extensions: ["webp"],
-            capabilities: [.read, .animated, .alpha],
+            capabilities: [.read, .write, .animated, .alpha],
             icon: "photo",
-            note: "Read via Image I/O (macOS 11+). Animated WebP supported."
+            note: "Image I/O reads on macOS 11+ and writes on macOS 14+. Animated WebP supported on read.",
+            uti: "org.webmproject.webp"
         ))
         out.append(.init(
             id: "jxl", displayName: "JPEG XL",
             extensions: ["jxl"],
-            capabilities: [.read, .alpha, .requiresExternalDelegate],
+            capabilities: [.read, .alpha],
             icon: "photo",
-            note: "Requires external delegate (libjxl) — not bundled."
+            note: "Image I/O reads JPEG XL on macOS 14+.",
+            uti: "public.jpeg-xl"
         ))
         out.append(.init(
             id: "avif", displayName: "AVIF",
-            extensions: ["avif"],
-            capabilities: [.read, .alpha, .requiresExternalDelegate],
+            extensions: ["avif", "avifs"],
+            capabilities: [.read, .alpha, .animated],
             icon: "photo",
-            note: "Native Image I/O support on macOS 13+, fallback otherwise."
+            note: "Image I/O reads AVIF on macOS 13+.",
+            uti: "public.avif"
         ))
 
         // ----- Vector / document -----
@@ -241,35 +258,40 @@ public final class FormatRegistry: @unchecked Sendable {
             extensions: ["svg", "svgz"],
             capabilities: [.read, .vector, .alpha, .animated],
             icon: "vector.path",
-            note: "Rendered via WebKit; animations supported."
+            note: "Rendered via WebKit; animations supported.",
+            uti: "public.svg-image"
         ))
         out.append(.init(
             id: "pdf", displayName: "PDF",
             extensions: ["pdf"],
             capabilities: [.read, .vector, .multiFrame],
             icon: "doc.richtext",
-            note: "Renders via PDFKit (built-in); editing requires Ghostscript."
+            note: "Renders via PDFKit (built-in); editing requires Ghostscript.",
+            uti: "com.adobe.pdf"
         ))
         out.append(.init(
             id: "ai", displayName: "Adobe Illustrator",
             extensions: ["ai"],
             capabilities: [.read, .vector, .requiresExternalDelegate],
             icon: "vector.path",
-            note: "Requires Ghostscript."
+            note: "Requires Ghostscript.",
+            uti: "com.adobe.illustrator.ai-image"
         ))
         out.append(.init(
             id: "eps", displayName: "Encapsulated PostScript",
-            extensions: ["eps"],
+            extensions: ["eps", "epsf", "epsi"],
             capabilities: [.read, .vector, .requiresExternalDelegate],
             icon: "vector.path",
-            note: "Requires Ghostscript."
+            note: "Requires Ghostscript.",
+            uti: "com.adobe.encapsulated-postscript"
         ))
         out.append(.init(
             id: "ps", displayName: "PostScript",
             extensions: ["ps"],
             capabilities: [.read, .vector, .requiresExternalDelegate],
             icon: "doc.richtext",
-            note: "Requires Ghostscript."
+            note: "Requires Ghostscript.",
+            uti: "com.adobe.postscript"
         ))
 
         // ----- Specialized / professional -----
@@ -278,13 +300,22 @@ public final class FormatRegistry: @unchecked Sendable {
             extensions: ["psd", "psb"],
             capabilities: [.read, .multiFrame, .alpha, .requiresExternalDelegate],
             icon: "paintbrush",
-            note: "Flat composite via Image I/O; layered decoding requires ImageMagick."
+            note: "Flat composite via Image I/O; layered decoding requires ImageMagick.",
+            uti: "com.adobe.photoshop-image"
         ))
         out.append(.init(
             id: "ico", displayName: "Windows Icon",
-            extensions: ["ico", "cur"],
+            extensions: ["ico"],
             capabilities: [.read, .multiFrame, .alpha],
-            icon: "photo"
+            icon: "photo",
+            uti: "com.microsoft.ico"
+        ))
+        out.append(.init(
+            id: "cur", displayName: "Windows Cursor",
+            extensions: ["cur"],
+            capabilities: [.read, .multiFrame, .alpha],
+            icon: "photo",
+            uti: "com.microsoft.cur"
         ))
         out.append(.init(
             id: "qoi", displayName: "Quite OK Image",
@@ -312,7 +343,8 @@ public final class FormatRegistry: @unchecked Sendable {
             extensions: ["exr"],
             capabilities: [.read, .alpha, .requiresExternalDelegate],
             icon: "sparkles",
-            note: "Requires external decoder."
+            note: "Requires external decoder.",
+            uti: "com.ilm.openexr-image"
         ))
         out.append(.init(
             id: "bpg", displayName: "Better Portable Graphics",
@@ -322,20 +354,34 @@ public final class FormatRegistry: @unchecked Sendable {
             note: "Requires BPG tools."
         ))
 
+        // ----- Base64 text wrapper (spec §"Special Input Methods") -----
+        // .b64 isn't an image type per se; it's text containing base64-encoded
+        // image bytes. Registered so the scope walker recognizes it and the
+        // loader can route to Base64Loader.
+        out.append(.init(
+            id: "base64", displayName: "Base64 Image",
+            extensions: ["b64"],
+            capabilities: [.read],
+            icon: "doc.plaintext",
+            note: "Plain-text file containing base64-encoded image data."
+        ))
+
         // ----- RAW (camera) — handled natively by Image I/O on macOS -----
         // We register the major extensions; Image I/O's RAW decoder handles
         // the actual pixel pull. Capability is read-only.
         let rawExts = [
-            "arw", "cr2", "cr3", "crw", "dng", "erf", "fff", "mef",
-            "mos", "mrw", "nef", "nrw", "orf", "pef", "raf", "raw",
-            "rw2", "rwl", "sr2", "srf", "srw", "x3f", "3fr", "kdc"
+            "arw", "cr2", "cr3", "crw", "dcr", "dng", "erf", "fff",
+            "iiq", "k25", "kdc", "mef", "mos", "mrw", "nef", "nrw",
+            "orf", "pef", "raf", "raw", "rw2", "rwl", "rwz", "sr2",
+            "srf", "srw", "x3f", "3fr"
         ]
         out.append(.init(
             id: "raw", displayName: "Camera RAW",
             extensions: rawExts,
             capabilities: [.read],
             icon: "camera",
-            note: "Decoded via Image I/O RAW support; exact list depends on macOS version."
+            note: "Decoded via Image I/O RAW support; exact list depends on macOS version.",
+            uti: "public.camera-raw-image"
         ))
 
         return out

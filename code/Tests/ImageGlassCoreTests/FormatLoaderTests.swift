@@ -95,12 +95,13 @@ final class FormatLoaderTests: XCTestCase {
         }
     }
 
-    func testLoadJXLReportsExternalDelegate() throws {
-        // Write a file with a .jxl extension; the loader should refuse to
-        // attempt decoding (sniffing won't find JXL signature; the spec asks
-        // us to report a delegate requirement up front).
-        let url = tmpDir.appendingPathComponent("fake.jxl")
-        try Data([0x00, 0x00, 0x00, 0x0C, 0x4A, 0x58, 0x4C, 0x20]).write(to: url)
+    func testLoadFakeBPGReportsExternalDelegate() throws {
+        // BPG remains spec-marked as needing external tools (see
+        // docs/supported-formats.mdx optional-dependencies table). Image I/O
+        // can't decode BPG, so the loader should report the delegate error
+        // rather than a generic decode failure.
+        let url = tmpDir.appendingPathComponent("fake.bpg")
+        try Data([0x42, 0x50, 0x47, 0xFB, 0x00, 0x00]).write(to: url)
         XCTAssertThrowsError(try FormatLoader.load(url: url)) { err in
             guard case FormatLoaderError.requiresExternalDelegate = err else {
                 XCTFail("expected requiresExternalDelegate, got \(err)")

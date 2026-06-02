@@ -60,22 +60,22 @@ final class FormatRegistryTests: XCTestCase {
         }
     }
 
-    func testJXLAndAVIFFlaggedAsExternalDelegate() {
-        // JXL stays a stub — Image I/O doesn't have a delegate by default.
-        XCTAssertTrue(FormatRegistry.shared.format(forExtension: "jxl")?.needsExternalDelegate == true)
-        // AVIF is registered with the requires-delegate flag too (per spec).
-        XCTAssertTrue(FormatRegistry.shared.format(forExtension: "avif")?.needsExternalDelegate == true)
+    func testJXLAndAVIFAreNativeOnMacOS14() {
+        // Spec lists JXL and AVIF under "Modern raster" with no external
+        // dependency. Image I/O reads JXL on macOS 14+ and AVIF on macOS 13+.
+        XCTAssertEqual(FormatRegistry.shared.format(forExtension: "jxl")?.needsExternalDelegate, false)
+        XCTAssertEqual(FormatRegistry.shared.format(forExtension: "avif")?.needsExternalDelegate, false)
     }
 
     func testDefaultScopeExtensionsExcludeDelegatesAndAreNonEmpty() {
         let exts = FormatRegistry.shared.defaultScopeExtensions()
         XCTAssertFalse(exts.isEmpty)
         // None of the delegate-only ones should appear.
-        for bad in ["jxl", "ai", "eps", "psd", "qoi", "fits", "hdr", "exr", "bpg"] {
+        for bad in ["ai", "eps", "psd", "qoi", "fits", "hdr", "exr", "bpg"] {
             XCTAssertFalse(exts.contains(bad), "Default scope must not contain delegate-only ext .\(bad)")
         }
         // Sanity: classic raster formats present.
-        for good in ["jpg", "png", "gif", "tiff", "webp", "heic", "bmp"] {
+        for good in ["jpg", "png", "gif", "tiff", "webp", "heic", "bmp", "jxl", "avif"] {
             XCTAssertTrue(exts.contains(good), "Default scope missing .\(good)")
         }
     }

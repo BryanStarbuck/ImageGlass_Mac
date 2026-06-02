@@ -44,6 +44,11 @@ public struct FormatInfo: Codable, Sendable, Hashable {
     /// Free-form note shown in settings / about pages. Used for spec
     /// references like "requires Ghostscript".
     public let note: String?
+    /// Canonical Uniform Type Identifier used when calling
+    /// `CGImageDestinationCreateWithURL` for writes, or to compare against
+    /// `CGImageSourceGetType` for reads. nil for formats that don't have a
+    /// stable system UTI (e.g. QOI, BPG, raw FITS).
+    public let uti: String?
 
     public init(
         id: String,
@@ -51,7 +56,8 @@ public struct FormatInfo: Codable, Sendable, Hashable {
         extensions: [String],
         capabilities: FormatCapabilities,
         icon: String = "photo",
-        note: String? = nil
+        note: String? = nil,
+        uti: String? = nil
     ) {
         self.id = id
         self.displayName = displayName
@@ -59,6 +65,7 @@ public struct FormatInfo: Codable, Sendable, Hashable {
         self.capabilities = capabilities
         self.icon = icon
         self.note = note
+        self.uti = uti
     }
 
     public var canRead: Bool { capabilities.contains(.read) }
