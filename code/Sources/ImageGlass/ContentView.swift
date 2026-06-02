@@ -10,7 +10,7 @@ struct ContentView: View {
                 .frame(minWidth: 220, idealWidth: 280)
         } detail: {
             VStack(spacing: 0) {
-                ImageViewer(filePath: state.selectedFile)
+                ImageViewer(state: state, viewer: state.viewer)
                 statusBar
             }
         }
