@@ -196,6 +196,18 @@ public struct MCPTools {
                     "additionalProperties": false,
                 ])
             ),
+
+            // MARK: - Charter (see docs/overview.mdx)
+
+            .init(
+                name: "charter_status",
+                description: "Return a high-level audit of the five fork-charter goals from docs/overview.mdx — MCP support, modular panels, scope controls, Local Storage, and MCP-driven editing. Each goal is reported as implemented / partial / missing with supporting evidence.",
+                inputSchema: AnyCodable([
+                    "type": "object",
+                    "properties": [:] as [String: Any],
+                    "additionalProperties": false,
+                ])
+            ),
         ]
         return base
     }
@@ -332,6 +344,9 @@ public struct MCPTools {
             let id = try requireString(arguments, "id")
             try toolStorage.deleteTool(id)
             return .text("Unregistered external tool '\(id)'.")
+
+        case "charter_status":
+            return .text(prettyJSON(CharterStatus.report()))
 
         case "fire_external_tool":
             let id = try requireString(arguments, "id")

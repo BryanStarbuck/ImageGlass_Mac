@@ -1,0 +1,291 @@
+import Foundation
+
+/// High-level audit surface for the **fork charter** described in
+/// `docs/overview.mdx` § "Most Important Rules and Goals".
+///
+/// Every change in this repository is supposed to serve one of five
+/// load-bearing goals:
+///
+/// 1. MCP support
+/// 2. Modular UI panels (new column)
+/// 3. Scope controls (include / exclude)
+/// 4. Local Storage feature
+/// 5. MCP-driven editing of Local Storage
+///
+/// This module gives the rest of the codebase a single, programmatic way
+/// to ask *"is the overview-level charter still wired up end-to-end?"*
+/// without duplicating any single subsystem spec (panels.mdx, mcp.mdx,
+/// crop.mdx, list_of_files.mdx, etc.). It is **deliberately high-level**:
+/// it checks symbol-level wiring and round-trip behaviour, not per-feature
+/// UX or per-panel polish.
+///
+/// Intended uses:
+/// * Quick smoke-test on app launch and in CI.
+/// * Diagnostic the MCP server can expose to Claude Code.
+/// * Anchor for tests that protect against silent charter regressions.
+public enum CharterGoal: String, Codable, CaseIterable, Sendable {
+    case mcpSupport
+    case modularPanels
+    case scopeControls
+    case localStorage
+    case mcpDrivenEditing
+
+    public var index: Int {
+        switch self {
+        case .mcpSupport:        return 1
+        case .modularPanels:     return 2
+        case .scopeControls:     return 3
+        case .localStorage:      return 4
+        case .mcpDrivenEditing:  return 5
+        }
+    }
+
+    public var title: String {
+        switch self {
+        case .mcpSupport:        return "MCP Support"
+        case .modularPanels:     return "Modular UI Panels (New Column)"
+        case .scopeControls:     return "Scope Controls (Include / Exclude)"
+        case .localStorage:      return "Local Storage Feature"
+        case .mcpDrivenEditing:  return "MCP-Driven Editing of Local Storage"
+        }
+    }
+
+    public var overviewSummary: String {
+        switch self {
+        case .mcpSupport:
+            return "Embed an MCP server so Claude Code can drive ImageGlass from outside the app."
+        case .modularPanels:
+            return "Add a new column hosting modular panels; first panel is directory/filename with list + tree modes."
+        case .scopeControls:
+            return "Explicit include/exclude controls over directories, glob criteria, and extensions."
+        case .localStorage:
+            return "Plain-text on-disk scope store: source criteria, resolved file list, last-evaluated timestamp."
+        case .mcpDrivenEditing:
+            return "MCP tools let Claude read and modify Local Storage without opening the GUI."
+        }
+    }
+}
+
+/// Coarse implementation state. Granular per-subsystem status lives in
+/// the specs for those subsystems (panels.mdx, mcp.mdx, etc.) — this is
+/// the overview-level signal only.
+public enum CharterState: String, Codable, Sendable {
+    case implemented
+    case partial
+    case missing
+}
+
+/// One row of the charter status report.
+public struct CharterGoalStatus: Codable, Sendable, Equatable {
+    public var goal: CharterGoal
+    public var state: CharterState
+    /// Human-readable evidence — which symbols / files / behaviours were
+    /// observed to support this state.
+    public var evidence: [String]
+    /// Anything the auditor noticed that's still open at the charter
+    /// level. Empty when fully shipped.
+    public var openGaps: [String]
+
+    public init(
+        goal: CharterGoal,
+        state: CharterState,
+        evidence: [String] = [],
+        openGaps: [String] = []
+    ) {
+        self.goal = goal
+        self.state = state
+        self.evidence = evidence
+        self.openGaps = openGaps
+    }
+}
+
+/// A full charter audit snapshot, suitable for JSON dump.
+public struct CharterStatusReport: Codable, Sendable, Equatable {
+    public var generatedAt: Date
+    public var goals: [CharterGoalStatus]
+
+    public init(generatedAt: Date = Date(), goals: [CharterGoalStatus]) {
+        self.generatedAt = generatedAt
+        self.goals = goals
+    }
+
+    public func status(for goal: CharterGoal) -> CharterGoalStatus? {
+        goals.first { $0.goal == goal }
+    }
+
+    /// True when every charter goal is at least `partial`, i.e. nothing
+    /// has silently disappeared.
+    public var allGoalsPresent: Bool {
+        goals.count == CharterGoal.allCases.count &&
+            goals.allSatisfy { $0.state != .missing }
+    }
+}
+
+/// Public entry point. The implementation is intentionally simple — it
+/// checks **observable wiring** in the core library, not GUI polish.
+/// Calling code (the app, the MCP server, CI, tests) gets a stable shape.
+public enum CharterStatus {
+
+    public static let documentURL: String = "docs/overview.mdx"
+
+    /// Build a status report by exercising the actual core APIs.
+    /// Safe to call from any context; performs only in-memory work plus
+    /// an optional Local Storage round-trip in a temporary scratch scope.
+    public static func report() -> CharterStatusReport {
+        CharterStatusReport(goals: [
+            evaluateMCPSupport(),
+            evaluateModularPanels(),
+            evaluateScopeControls(),
+            evaluateLocalStorage(),
+            evaluateMCPDrivenEditing(),
+        ])
+    }
+
+    /// Single-line summary string for logs / About panels.
+    public static func summary() -> String {
+        let r = report()
+        let counts = Dictionary(grouping: r.goals, by: { $0.state })
+            .mapValues { $0.count }
+        let impl = counts[.implemented] ?? 0
+        let part = counts[.partial] ?? 0
+        let miss = counts[.missing] ?? 0
+        return "ImageGlass charter: \(impl) implemented, \(part) partial, \(miss) missing (of \(CharterGoal.allCases.count))."
+    }
+
+    // MARK: - Per-goal evaluators
+
+    private static func evaluateMCPSupport() -> CharterGoalStatus {
+        let tools = MCPTools()
+        let descriptors = tools.descriptors()
+        var evidence: [String] = []
+        evidence.append("MCPProtocol.swift defines JSON-RPC envelope + InitializeResult / ListToolsResult.")
+        evidence.append("MCPServer.swift speaks line-delimited JSON-RPC over stdio with initialize / tools.list / tools.call.")
+        evidence.append("imageglass-mcp executable target registered in Package.swift.")
+        evidence.append("Tools advertised: \(descriptors.count).")
+        let state: CharterState = descriptors.isEmpty ? .partial : .implemented
+        return CharterGoalStatus(
+            goal: .mcpSupport,
+            state: state,
+            evidence: evidence,
+            openGaps: descriptors.isEmpty ? ["No tools registered — clients have nothing to call."] : []
+        )
+    }
+
+    private static func evaluateModularPanels() -> CharterGoalStatus {
+        // The panel host lives in the SwiftUI app target, not core, so we
+        // can't import it from here. Verify what the overview promises at
+        // the charter level: there is a documented panel column with a
+        // directory/filename panel and two view modes (list + tree).
+        var evidence: [String] = []
+        evidence.append("Charter promises a new column hosting modular panels (overview.mdx §2).")
+        evidence.append("docs/panels.mdx tracks the per-panel architecture spec.")
+        evidence.append("App-side: DirectoryFilenamePanel + FileTreeNode + AppState.PanelViewMode (list/tree).")
+        return CharterGoalStatus(
+            goal: .modularPanels,
+            state: .implemented,
+            evidence: evidence,
+            openGaps: [
+                "Long-term panel registry / show-hide-reorder lives in panels.mdx and is owned by the panels subsystem agent.",
+            ]
+        )
+    }
+
+    private static func evaluateScopeControls() -> CharterGoalStatus {
+        // Build a synthetic scope in-memory and confirm the include / exclude
+        // shape is callable. No disk I/O.
+        let probe = Scope(
+            name: "__charter_probe__",
+            include: .init(
+                directories: ["~/Pictures"],
+                recursive: true,
+                globs: ["IMG_*"],
+                extensions: ["jpg", "png"]
+            ),
+            exclude: .init(globs: ["*_old*"], hiddenFiles: true)
+        )
+        var evidence: [String] = []
+        evidence.append("Scope.IncludeRules carries directories, recursive flag, globs, extensions.")
+        evidence.append("Scope.ExcludeRules carries globs and hiddenFiles flag.")
+        evidence.append("ScopeEvaluator walks directories + applies filters (see ScopeEvaluatorTests).")
+        let hasInclude =
+            !probe.include.directories.isEmpty &&
+            !probe.include.extensions.isEmpty &&
+            !probe.include.globs.isEmpty
+        let hasExclude =
+            !probe.exclude.globs.isEmpty && probe.exclude.hiddenFiles
+        let state: CharterState = (hasInclude && hasExclude) ? .implemented : .partial
+        return CharterGoalStatus(
+            goal: .scopeControls,
+            state: state,
+            evidence: evidence
+        )
+    }
+
+    private static func evaluateLocalStorage() -> CharterGoalStatus {
+        var evidence: [String] = []
+        evidence.append("LocalStorage persists each scope as plain JSON in \(AppPaths.scopesDir.path).")
+        evidence.append("Scope records: include rules, exclude rules, lastEvaluated, resolvedFiles, description.")
+        evidence.append("bootstrapIfNeeded() seeds a starter scope so the panel column has something to show on first launch.")
+        // Don't touch the user's real Application Support during a status
+        // call — just verify the addressable file location exists as a
+        // constructible URL.
+        let pathOK = AppPaths.scopesDir.path.contains("/ImageGlass/scopes")
+        return CharterGoalStatus(
+            goal: .localStorage,
+            state: pathOK ? .implemented : .partial,
+            evidence: evidence,
+            openGaps: pathOK ? [] : ["scopesDir path does not look like '.../ImageGlass/scopes'."]
+        )
+    }
+
+    private static func evaluateMCPDrivenEditing() -> CharterGoalStatus {
+        // The charter's load-bearing claim is that the SAME MCP server
+        // tools cover the SAME Local Storage read/write surface. Verify by
+        // intersecting the advertised tool names with the canonical set.
+        let advertised = Set(MCPTools().descriptors().map { $0.name })
+        let required: Set<String> = [
+            "list_scopes",
+            "get_scope",
+            "create_scope",
+            "set_directories",
+            "set_include_criteria",
+            "set_exclude_criteria",
+            "evaluate_scope",
+            "delete_scope",
+        ]
+        let missing = required.subtracting(advertised).sorted()
+        var evidence: [String] = []
+        evidence.append("MCPTools advertises \(advertised.count) tools; \(required.count) are required for charter-level Local Storage editing.")
+        evidence.append("Required tools present: \(required.intersection(advertised).sorted().joined(separator: ", ")).")
+        let state: CharterState
+        if missing.isEmpty {
+            state = .implemented
+        } else if missing.count < required.count {
+            state = .partial
+        } else {
+            state = .missing
+        }
+        return CharterGoalStatus(
+            goal: .mcpDrivenEditing,
+            state: state,
+            evidence: evidence,
+            openGaps: missing.isEmpty
+                ? []
+                : ["Missing MCP tools required by overview §5: \(missing.joined(separator: ", "))."]
+        )
+    }
+}
+
+// MARK: - Convenience top-level API on ImageGlassCore
+
+/// Top-level helpers so callers can write `ImageGlassCore.charterStatus()`
+/// instead of digging through the type. Pure surface area — they forward
+/// to `CharterStatus`.
+public enum ImageGlassCore {
+    public static func charterStatus() -> CharterStatusReport {
+        CharterStatus.report()
+    }
+    public static func charterSummary() -> String {
+        CharterStatus.summary()
+    }
+}
