@@ -14,17 +14,20 @@ public struct MCPTools {
     public let toolStorage: ExternalToolStorage
     public let lock: MCPLock
     public let themeTools: ThemeMCPTools
+    public let cropTools: CropMCPTools
 
     public init(
         storage: LocalStorage = .shared,
         toolStorage: ExternalToolStorage = .shared,
         lock: MCPLock = .shared,
-        themeTools: ThemeMCPTools = ThemeMCPTools()
+        themeTools: ThemeMCPTools = ThemeMCPTools(),
+        cropTools: CropMCPTools = CropMCPTools()
     ) {
         self.storage = storage
         self.toolStorage = toolStorage
         self.lock = lock
         self.themeTools = themeTools
+        self.cropTools = cropTools
     }
 
     // MARK: - Descriptors
@@ -277,6 +280,9 @@ public struct MCPTools {
         // Charter additions: rule sets, scope chains, audit, diff, import/export.
         // See Charter/MCPTools+Charter.swift.
         base.append(contentsOf: charterDescriptors())
+        // Crop subsystem descriptors (crop_image, get/set_crop_selection,
+        // read_image_dimensions). See Crop/CropMCPTools.swift.
+        base.append(contentsOf: cropTools.descriptors())
         return base
     }
 
@@ -334,6 +340,11 @@ public struct MCPTools {
                 // ThemeMCPTools. See Themes/ThemeMCPTools.swift.
                 if ThemeMCPTools.toolNames.contains(name) {
                     return try themeTools.call(name: name, arguments: arguments)
+                }
+                // Route crop tools (crop_image, get/set_crop_selection,
+                // read_image_dimensions) through CropMCPTools.
+                if CropMCPTools.toolNames.contains(name) {
+                    return try cropTools.call(name: name, arguments: arguments)
                 }
                 return .text("Unknown tool: \(name)", isError: true)
             }
