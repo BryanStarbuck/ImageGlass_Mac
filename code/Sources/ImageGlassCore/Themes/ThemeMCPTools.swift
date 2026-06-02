@@ -9,12 +9,21 @@ public struct ThemeMCPTools {
         "list_themes",
         "get_current_theme",
         "set_current_theme",
+        "install_theme_pack",
+        "uninstall_theme_pack",
+        "export_theme_pack",
+        "validate_theme_pack",
     ]
 
     private let catalog: ThemeCatalog
+    private let installer: ThemeInstaller
 
-    public init(catalog: ThemeCatalog = ThemeCatalog()) {
+    public init(
+        catalog: ThemeCatalog = ThemeCatalog(),
+        installer: ThemeInstaller = ThemeInstaller()
+    ) {
         self.catalog = catalog
+        self.installer = installer
     }
 
     // MARK: - Descriptors
@@ -48,6 +57,55 @@ public struct ThemeMCPTools {
                         "name": ["type": "string", "description": "Theme name (matches list_themes output)."],
                     ],
                     "required": ["name"],
+                    "additionalProperties": false,
+                ])
+            ),
+            .init(
+                name: "install_theme_pack",
+                description: "Install a .igtheme pack from a local path. Either a .igtheme archive (zip) or an unpacked folder containing igtheme.json. Replaces an existing theme with the same folder name atomically.",
+                inputSchema: AnyCodable([
+                    "type": "object",
+                    "properties": [
+                        "path": ["type": "string", "description": "Absolute path to a .igtheme archive OR a theme folder with igtheme.json."],
+                    ],
+                    "required": ["path"],
+                    "additionalProperties": false,
+                ])
+            ),
+            .init(
+                name: "uninstall_theme_pack",
+                description: "Uninstall an installed theme by folder name (e.g. 'Kobe.Duong-Dieu-Phap'). Does not affect built-in themes.",
+                inputSchema: AnyCodable([
+                    "type": "object",
+                    "properties": [
+                        "folder_name": ["type": "string", "description": "Folder name of the installed theme."],
+                    ],
+                    "required": ["folder_name"],
+                    "additionalProperties": false,
+                ])
+            ),
+            .init(
+                name: "export_theme_pack",
+                description: "Export an installed theme to a .igtheme archive on disk. Useful for distributing a theme you authored locally.",
+                inputSchema: AnyCodable([
+                    "type": "object",
+                    "properties": [
+                        "folder_name": ["type": "string", "description": "Folder name of the installed theme to export."],
+                        "destination": ["type": "string", "description": "Absolute path where the .igtheme file should be written."],
+                    ],
+                    "required": ["folder_name", "destination"],
+                    "additionalProperties": false,
+                ])
+            ),
+            .init(
+                name: "validate_theme_pack",
+                description: "Validate an installed theme against the docs/theme-pack.mdx spec. Returns a list of issues (folder-name convention, missing files, non-SVG icons, metadata version, etc.). Empty list means fully compliant.",
+                inputSchema: AnyCodable([
+                    "type": "object",
+                    "properties": [
+                        "folder_name": ["type": "string", "description": "Folder name of the installed theme to validate."],
+                    ],
+                    "required": ["folder_name"],
                     "additionalProperties": false,
                 ])
             ),
@@ -88,6 +146,77 @@ public struct ThemeMCPTools {
             return .text(prettyJSON([
                 "name": theme.name,
                 "applied": true,
+            ] as [String: Any]))
+
+        case "install_theme_pack":
+            guard let pathArg = arguments["path"] as? String, !pathArg.isEmpty else {
+                throw MCPToolError.missingArgument("path")
+            }
+            let expanded = AppPaths.expandTilde(pathArg)
+            let url = URL(fileURLWithPath: expanded)
+            var isDir: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) else {
+                return .text("Path does not exist: \(pathArg)", isError: true)
+            }
+            let pack: ThemePack
+            if isDir.boolValue {
+                pack = try installer.install(folder: url)
+            } else {
+                pack = try installer.install(archive: url)
+            }
+            return .text(prettyJSON([
+                "installed": true,
+                "folder_name": pack.folderName,
+                "display_name": pack.displayName,
+                "is_dark_mode": pack.isDarkMode,
+            ] as [String: Any]))
+
+        case "uninstall_theme_pack":
+            guard let folder = arguments["folder_name"] as? String, !folder.isEmpty else {
+                throw MCPToolError.missingArgument("folder_name")
+            }
+            try installer.uninstall(folderName: folder)
+            return .text(prettyJSON([
+                "uninstalled": true,
+                "folder_name": folder,
+            ] as [String: Any]))
+
+        case "export_theme_pack":
+            guard let folder = arguments["folder_name"] as? String, !folder.isEmpty else {
+                throw MCPToolError.missingArgument("folder_name")
+            }
+            guard let dest = arguments["destination"] as? String, !dest.isEmpty else {
+                throw MCPToolError.missingArgument("destination")
+            }
+            let destURL = URL(fileURLWithPath: AppPaths.expandTilde(dest))
+            let written = try installer.exportInstalled(folderName: folder, to: destURL)
+            return .text(prettyJSON([
+                "exported": true,
+                "folder_name": folder,
+                "path": written.path,
+            ] as [String: Any]))
+
+        case "validate_theme_pack":
+            guard let folder = arguments["folder_name"] as? String, !folder.isEmpty else {
+                throw MCPToolError.missingArgument("folder_name")
+            }
+            let installedFolder = AppPaths.themesDir.appendingPathComponent(folder, isDirectory: true)
+            guard FileManager.default.fileExists(atPath: installedFolder.path) else {
+                return .text("Theme not installed: \(folder)", isError: true)
+            }
+            let pack = try ThemePack.load(fromFolder: installedFolder)
+            let issues = pack.validate()
+            let payload: [[String: Any]] = issues.map { issue in
+                [
+                    "severity": issue.severity.rawValue,
+                    "code": issue.code.rawValue,
+                    "message": issue.message,
+                ]
+            }
+            return .text(prettyJSON([
+                "folder_name": folder,
+                "issue_count": issues.count,
+                "issues": payload,
             ] as [String: Any]))
 
         default:

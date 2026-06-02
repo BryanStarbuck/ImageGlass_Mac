@@ -31,13 +31,16 @@ public struct ThemeInstaller: Sendable {
 
     public let installRoot: URL
     public let unzipBinary: URL
+    public let zipBinary: URL
 
     public init(
         installRoot: URL = AppPaths.themesDir,
-        unzipBinary: URL = URL(fileURLWithPath: "/usr/bin/unzip")
+        unzipBinary: URL = URL(fileURLWithPath: "/usr/bin/unzip"),
+        zipBinary: URL = URL(fileURLWithPath: "/usr/bin/zip")
     ) {
         self.installRoot = installRoot
         self.unzipBinary = unzipBinary
+        self.zipBinary = zipBinary
     }
 
     // MARK: - Public API
@@ -130,6 +133,70 @@ public struct ThemeInstaller: Sendable {
         try installedThemeFolders().compactMap { folder in
             try? ThemePack.load(fromFolder: folder)
         }
+    }
+
+    // MARK: - Export
+
+    /// Package a theme folder back into a `.igtheme` archive on disk.
+    /// Mirrors the install layout: the archive contains a single top-level
+    /// directory named after the theme folder, with `igtheme.json` and
+    /// assets inside it.
+    ///
+    /// The destination URL is overwritten if it exists. Returns the
+    /// destination URL for convenience.
+    @discardableResult
+    public func exportPack(folder folderURL: URL, to destination: URL) throws -> URL {
+        guard FileManager.default.fileExists(atPath: zipBinary.path) else {
+            throw ThemePackError.zipUnavailable
+        }
+        // Validate that the source is a real theme folder before we zip.
+        _ = try ThemePack.load(fromFolder: folderURL)
+
+        let fm = FileManager.default
+        let parent = destination.deletingLastPathComponent()
+        if !fm.fileExists(atPath: parent.path) {
+            try fm.createDirectory(at: parent, withIntermediateDirectories: true)
+        }
+        // `zip` won't overwrite if the target exists with -X; remove first.
+        if fm.fileExists(atPath: destination.path) {
+            try fm.removeItem(at: destination)
+        }
+
+        let process = Process()
+        process.executableURL = zipBinary
+        // -r recurse, -q quiet, -X strip extra Mac attributes for cleanliness.
+        // We run with `currentDirectoryURL` set to the parent so the archive
+        // stores entries as `<folderName>/...` (matching the install layout).
+        process.currentDirectoryURL = folderURL.deletingLastPathComponent()
+        process.arguments = ["-rqX", destination.path, folderURL.lastPathComponent]
+
+        let stderrPipe = Pipe()
+        process.standardError = stderrPipe
+        process.standardOutput = Pipe()
+
+        try process.run()
+        process.waitUntilExit()
+
+        if process.terminationStatus != 0 {
+            let data = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+            let stderrString = String(data: data, encoding: .utf8) ?? ""
+            throw ThemePackError.archiveCreationFailed(
+                destination: destination,
+                exitCode: process.terminationStatus,
+                stderr: stderrString
+            )
+        }
+        return destination
+    }
+
+    /// Export an installed theme by folder name to a `.igtheme` archive.
+    @discardableResult
+    public func exportInstalled(folderName: String, to destination: URL) throws -> URL {
+        let folder = installRoot.appendingPathComponent(folderName, isDirectory: true)
+        guard FileManager.default.fileExists(atPath: folder.path) else {
+            throw ThemePackError.themeNotInstalled(folderName: folderName)
+        }
+        return try exportPack(folder: folder, to: destination)
     }
 
     // MARK: - Internals
