@@ -5,8 +5,12 @@ import ImageGlassCore
 // Launch with:  swift run imageglass-mcp
 // or after build: ./.build/debug/imageglass-mcp
 
-try? AppPaths.ensureDirectories()
-try? LocalStorage.shared.bootstrapIfNeeded()
+do {
+    try AppPaths.ensureDirectories()
+    _ = try LocalStorage.shared.bootstrapIfNeeded()
+} catch {
+    FileHandle.standardError.write(Data("imageglass-mcp bootstrap warning: \(error)\n".utf8))
+}
 
 let server = MCPServer()
 server.run()
