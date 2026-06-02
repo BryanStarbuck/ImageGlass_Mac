@@ -83,7 +83,10 @@ public enum MCP {
 }
 
 /// Erased JSON value — needed because JSON-RPC `params`/`result` are untyped.
-public struct AnyCodable: Codable, Sendable {
+/// `@unchecked Sendable` because `Any?` is intrinsically untyped; values held
+/// here are JSON-shaped (Bool/Int/Double/String/Array/Dict) and treated as
+/// immutable after construction.
+public struct AnyCodable: Codable, @unchecked Sendable {
     public let value: Any?
 
     public init(_ value: Any?) { self.value = value }
