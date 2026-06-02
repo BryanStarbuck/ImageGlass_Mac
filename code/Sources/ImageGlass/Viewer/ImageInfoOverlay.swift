@@ -7,6 +7,9 @@ import ImageGlassCore
 /// and format / UTI. Toggle via `ViewerState.showInfoOverlay`.
 struct ImageInfoOverlay: View {
     let filePath: String?
+    var frameCount: Int = 1
+    var currentFrameIndex: Int = 0
+    var isAnimated: Bool = false
 
     var body: some View {
         if let filePath, let info = ImageInfo.load(path: filePath) {
@@ -20,6 +23,11 @@ struct ImageInfoOverlay: View {
                 }
                 .font(.system(.caption2, design: .monospaced))
                 .foregroundStyle(.secondary)
+                if frameCount > 1 {
+                    Text(frameLine)
+                        .font(.system(.caption2, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
             }
             .padding(8)
             .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 6))
@@ -29,6 +37,11 @@ struct ImageInfoOverlay: View {
             )
             .padding(10)
         }
+    }
+
+    private var frameLine: String {
+        let kind = isAnimated ? "animation" : "frames"
+        return "\(kind): \(currentFrameIndex + 1) / \(frameCount)"
     }
 }
 

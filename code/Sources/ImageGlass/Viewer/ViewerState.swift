@@ -27,6 +27,8 @@ public final class ViewerState {
     // Overlays
     public var showInfoOverlay: Bool = false
     public var showColorPicker: Bool = false
+    /// Display format for the color picker overlay (HEX, RGBA, HSL ...).
+    public var colorFormat: ColorFormat = .hex
 
     // Window modes
     public var isFullScreen: Bool = false
@@ -36,6 +38,16 @@ public final class ViewerState {
     // Slideshow
     public var slideshowSeconds: Double = 4.0
     public var isSlideshowRunning: Bool = false
+    /// Seconds remaining until the next slide. Driven by the slideshow
+    /// controller; observed by the countdown overlay.
+    public var slideshowRemaining: Double = 0
+
+    // Multi-frame / animation state. The canvas owns the actual frame
+    // buffer; these fields drive the UI controls (Pause, Prev/Next Frame).
+    public var frameCount: Int = 1
+    public var currentFrameIndex: Int = 0
+    public var isAnimated: Bool = false
+    public var isAnimationPaused: Bool = false
 
     // Hover state for the color picker overlay (image-pixel coordinates).
     public var hoverPixel: CGPoint? = nil
@@ -65,4 +77,15 @@ public final class ViewerState {
     public func zoomIn()  { lockedZoom = ZoomMath.clamp(lockedZoom * 1.25); zoomMode = .lock }
     public func zoomOut() { lockedZoom = ZoomMath.clamp(lockedZoom / 1.25); zoomMode = .lock }
     public func zoomToActual() { lockedZoom = 1.0; zoomMode = .lock; panOffset = .zero }
+
+    // Frame navigation (multi-frame stills + paused animations).
+    public func nextFrame() {
+        guard frameCount > 1 else { return }
+        currentFrameIndex = (currentFrameIndex + 1) % frameCount
+    }
+    public func previousFrame() {
+        guard frameCount > 1 else { return }
+        currentFrameIndex = (currentFrameIndex - 1 + frameCount) % frameCount
+    }
+    public func toggleAnimationPaused() { isAnimationPaused.toggle() }
 }

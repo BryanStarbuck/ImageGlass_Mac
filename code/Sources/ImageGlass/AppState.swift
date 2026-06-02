@@ -63,6 +63,11 @@ public final class AppState {
 
     private let storage = LocalStorage.shared
     private var fileWatcher: FileWatcher?
+    /// Watchers for the source directories of the active scope. Spec §
+    /// "Animation & Multi-Frame Support" → "real-time file change monitoring":
+    /// re-evaluate the scope when an external tool drops a new file into a
+    /// watched directory.
+    private var sourceWatchers: [FileWatcher] = []
 
     public init() {}
 
@@ -142,6 +147,7 @@ public final class AppState {
             resolvedFiles = scope.resolvedFiles
             lastEvaluated = scope.lastEvaluated
             selectedFile = resolvedFiles.first
+            rebuildSourceWatchers()
         }
         if let f = selectedFile { cropController.loadImage(at: f) }
     }
@@ -155,6 +161,32 @@ public final class AppState {
         lastEvaluated = scope.lastEvaluated
         if selectedFile == nil || !(resolvedFiles.contains(selectedFile ?? "")) {
             selectedFile = resolvedFiles.first
+        }
+        rebuildSourceWatchers()
+    }
+
+    /// (Re)attach FileWatchers to each include-rule directory in the active
+    /// scope so external changes (new screenshots, deleted files, renames)
+    /// trigger a re-evaluation. Called after every scope activation.
+    private func rebuildSourceWatchers() {
+        sourceWatchers.forEach { $0.cancel() }
+        sourceWatchers.removeAll()
+        guard let scope = activeScope else { return }
+        var seen = Set<String>()
+        for dir in scope.include.directories {
+            let expanded = AppPaths.expandTilde(dir)
+            guard seen.insert(expanded).inserted else { continue }
+            var isDir: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: expanded, isDirectory: &isDir),
+                  isDir.boolValue else { continue }
+            let url = URL(fileURLWithPath: expanded)
+            let w = FileWatcher(url: url) { [weak self] in
+                Task { @MainActor in
+                    await self?.reevaluateActive()
+                }
+            }
+            w.start()
+            sourceWatchers.append(w)
         }
     }
 

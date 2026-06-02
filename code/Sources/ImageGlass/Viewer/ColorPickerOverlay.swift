@@ -2,10 +2,13 @@ import SwiftUI
 import ImageGlassCore
 
 /// Tiny readout that follows mouse hovers when the color picker is on.
-/// Renders the sampled pixel's RGBA in three formats (HEX, RGBA, position).
+/// Shows the active color format (HEX, RGBA, HSL, ...) — togglable via the
+/// View > Color Picker Format menu. The format picker is also surfaced
+/// inline so the user can cycle without leaving the canvas.
 struct ColorPickerOverlay: View {
     let pixel: CGPoint?
     let color: RGBA?
+    @Binding var format: ColorFormat
 
     var body: some View {
         if let color, let pixel {
@@ -23,12 +26,20 @@ struct ColorPickerOverlay: View {
                             .stroke(Color.primary.opacity(0.25))
                     )
                 VStack(alignment: .leading, spacing: 1) {
-                    Text(hex(color))
-                    Text("rgba(\(color.r), \(color.g), \(color.b), \(color.a))")
+                    Text(ColorFormatting.format(color, as: format))
                     Text("(\(Int(pixel.x)), \(Int(pixel.y)))")
                         .foregroundStyle(.secondary)
                 }
                 .font(.system(.caption2, design: .monospaced))
+                Picker("", selection: $format) {
+                    ForEach(ColorFormat.allCases, id: \.self) { f in
+                        Text(f.label).tag(f)
+                    }
+                }
+                .pickerStyle(.menu)
+                .labelsHidden()
+                .frame(width: 90)
+                .help("Color format")
             }
             .padding(6)
             .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 6))
@@ -38,9 +49,5 @@ struct ColorPickerOverlay: View {
             )
             .padding(10)
         }
-    }
-
-    private func hex(_ c: RGBA) -> String {
-        String(format: "#%02X%02X%02X%02X", c.r, c.g, c.b, c.a)
     }
 }

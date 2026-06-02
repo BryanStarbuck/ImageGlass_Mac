@@ -14,11 +14,15 @@ final class ImageCanvasView: NSView {
     // Inputs
     private(set) var sourceImage: NSImage?
     private(set) var sourceCGImage: CGImage?
+    private(set) var frameSource: FrameSource?
     private var filteredImage: CGImage?
 
     // Cached for color-picker readouts. May differ from `sourceCGImage` only
     // by colorspace conversion (Generic RGB so RGBA sampling is meaningful).
     private var samplingImage: CGImage?
+
+    // Animation playback
+    private var animationTimer: Timer?
 
     // Live tunables
     var zoomMode: ZoomMode = .auto    { didSet { needsDisplay = true } }
@@ -30,12 +34,28 @@ final class ImageCanvasView: NSView {
     var smoothInterpolation: Bool = true { didSet { needsDisplay = true } }
     var colorChannel: ColorChannel = .all { didSet { rebuildFilteredImage(); needsDisplay = true } }
     var showColorPicker: Bool = false { didSet { needsDisplay = true } }
+    var currentFrameIndex: Int = 0 {
+        didSet {
+            guard oldValue != currentFrameIndex else { return }
+            applyFrame()
+        }
+    }
+    var isAnimationPaused: Bool = false {
+        didSet {
+            guard oldValue != isAnimationPaused else { return }
+            isAnimationPaused ? stopAnimationTimer() : startAnimationTimerIfNeeded()
+        }
+    }
 
     // Callbacks
     /// Called whenever pan, lockedZoom, or zoomMode changes from user input.
     var onUserTransform: ((CGSize, CGFloat, ZoomMode) -> Void)?
     /// Called when the cursor hovers a pixel inside the image while picker is on.
     var onHover: ((CGPoint?, RGBA?) -> Void)?
+    /// Called after a new image is loaded so the host can read frame metadata.
+    var onFrameSourceChanged: ((FrameSource?) -> Void)?
+    /// Called when the animation timer advances the current frame on its own.
+    var onFrameAdvanced: ((Int) -> Void)?
 
     // CIContext is heavyweight — cache it.
     private let ciContext = CIContext(options: [.useSoftwareRenderer: false])
@@ -73,22 +93,72 @@ final class ImageCanvasView: NSView {
     }
 
     func setImage(path: String?) {
-        guard let path, let img = NSImage(contentsOfFile: path) else {
+        stopAnimationTimer()
+        guard let path else {
             sourceImage = nil
+            sourceCGImage = nil
+            frameSource = nil
+            samplingImage = nil
+            filteredImage = nil
+            needsDisplay = true
+            onFrameSourceChanged?(nil)
+            return
+        }
+        let url = URL(fileURLWithPath: path)
+        let fs = FrameSource.load(url: url)
+        frameSource = fs
+        // Fallback: still render with NSImage for tooltip/sourceImage parity.
+        sourceImage = NSImage(contentsOfFile: path)
+        currentFrameIndex = 0
+        applyFrame()
+        panOffset = .zero
+        onFrameSourceChanged?(fs)
+        startAnimationTimerIfNeeded()
+        needsDisplay = true
+    }
+
+    /// Pull the current frame's CGImage out of `frameSource` and refresh
+    /// the sampling + filtered images. Called on load and on frame changes.
+    private func applyFrame() {
+        guard let fs = frameSource, !fs.frames.isEmpty else {
             sourceCGImage = nil
             samplingImage = nil
             filteredImage = nil
             needsDisplay = true
             return
         }
-        sourceImage = img
-        var rect = NSRect(origin: .zero, size: img.size)
-        sourceCGImage = img.cgImage(forProposedRect: &rect, context: nil, hints: nil)
+        let idx = max(0, min(currentFrameIndex, fs.frameCount - 1))
+        sourceCGImage = fs.frames[idx].cgImage
         samplingImage = makeRGBA8(sourceCGImage)
         rebuildFilteredImage()
-        // New image — reset pan so the user sees something sensible.
-        panOffset = .zero
         needsDisplay = true
+    }
+
+    private func startAnimationTimerIfNeeded() {
+        stopAnimationTimer()
+        guard let fs = frameSource, fs.isAnimated, !isAnimationPaused,
+              fs.frames.count > 1 else { return }
+        scheduleNextAnimationTick()
+    }
+
+    private func scheduleNextAnimationTick() {
+        guard let fs = frameSource, fs.isAnimated else { return }
+        let idx = max(0, min(currentFrameIndex, fs.frameCount - 1))
+        let delay = max(0.02, fs.frames[idx].delay) // clamp absurdly fast GIFs
+        let t = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
+            guard let self else { return }
+            let next = (self.currentFrameIndex + 1) % (self.frameSource?.frameCount ?? 1)
+            self.currentFrameIndex = next
+            self.onFrameAdvanced?(next)
+            self.scheduleNextAnimationTick()
+        }
+        RunLoop.main.add(t, forMode: .common)
+        animationTimer = t
+    }
+
+    private func stopAnimationTimer() {
+        animationTimer?.invalidate()
+        animationTimer = nil
     }
 
     private func rebuildFilteredImage() {
