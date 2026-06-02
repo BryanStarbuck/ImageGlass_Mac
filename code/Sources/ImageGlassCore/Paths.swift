@@ -22,13 +22,24 @@ public enum AppPaths {
         appSupportDir.appendingPathComponent("scopes", isDirectory: true)
     }
 
+    /// Directory holding one plain-text JSON file per external tool descriptor.
+    /// Layout mirrors `scopesDir` so the on-disk story is uniform.
+    public static var toolsDir: URL {
+        appSupportDir.appendingPathComponent("tools", isDirectory: true)
+    }
+
+    /// Directory holding runtime sockets (Unix-domain socket for tool IPC).
+    public static var runtimeDir: URL {
+        appSupportDir.appendingPathComponent("runtime", isDirectory: true)
+    }
+
     public static var configFile: URL {
         appSupportDir.appendingPathComponent("igconfig.json")
     }
 
     public static func ensureDirectories() throws {
         let fm = FileManager.default
-        for dir in [appSupportDir, scopesDir] {
+        for dir in [appSupportDir, scopesDir, toolsDir, runtimeDir] {
             if !fm.fileExists(atPath: dir.path) {
                 try fm.createDirectory(at: dir, withIntermediateDirectories: true)
             }

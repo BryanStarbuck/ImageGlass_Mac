@@ -5,15 +5,23 @@ import Foundation
 public struct MCPTools {
 
     public let storage: LocalStorage
+    public let themeTools: ThemeMCPTools
+    public let toolStorage: ExternalToolStorage
 
-    public init(storage: LocalStorage = .shared) {
+    public init(
+        storage: LocalStorage = .shared,
+        themeTools: ThemeMCPTools = ThemeMCPTools(),
+        toolStorage: ExternalToolStorage = .shared
+    ) {
         self.storage = storage
+        self.themeTools = themeTools
+        self.toolStorage = toolStorage
     }
 
     // MARK: - Descriptors
 
     public func descriptors() -> [MCP.ToolDescriptor] {
-        [
+        var base: [MCP.ToolDescriptor] = [
             .init(
                 name: "list_scopes",
                 description: "List all scope names currently stored in Local Storage.",
@@ -119,7 +127,83 @@ public struct MCPTools {
                     "additionalProperties": false,
                 ])
             ),
+
+            // MARK: - External Tools (see docs/build-tools.mdx)
+
+            .init(
+                name: "list_external_tools",
+                description: "List all third-party tools registered with ImageGlass (see docs/build-tools.mdx). Returns the full descriptor for each tool.",
+                inputSchema: AnyCodable([
+                    "type": "object",
+                    "properties": [:] as [String: Any],
+                    "additionalProperties": false,
+                ])
+            ),
+            .init(
+                name: "register_external_tool",
+                description: "Register a third-party tool. The tool descriptor is persisted as plain JSON under ~/Library/Application Support/ImageGlass/tools/<id>.json. 'arguments' supports the <file> placeholder which is replaced with the currently displayed image path when the tool is launched.",
+                inputSchema: AnyCodable([
+                    "type": "object",
+                    "properties": [
+                        "id": ["type": "string", "description": "Unique tool id (no slashes, no leading dot)."],
+                        "display_name": ["type": "string", "description": "Human-readable name."],
+                        "executable_path": ["type": "string", "description": "Absolute path to the tool executable. Tilde-expanded at launch."],
+                        "arguments": ["type": "string", "description": "Argument template; use <file> for the current image path."],
+                        "hotkey": ["type": "string", "description": "Optional hotkey binding string (e.g. cmd+shift+e)."],
+                        "integration": ["type": "boolean", "description": "If true, the tool speaks the IPC protocol back to ImageGlass."],
+                    ],
+                    "required": ["id", "executable_path"],
+                    "additionalProperties": false,
+                ])
+            ),
+            .init(
+                name: "update_external_tool",
+                description: "Update fields on an existing third-party tool. Any omitted field is left unchanged.",
+                inputSchema: AnyCodable([
+                    "type": "object",
+                    "properties": [
+                        "id": ["type": "string"],
+                        "display_name": ["type": "string"],
+                        "executable_path": ["type": "string"],
+                        "arguments": ["type": "string"],
+                        "hotkey": ["type": ["string", "null"]],
+                        "integration": ["type": "boolean"],
+                    ],
+                    "required": ["id"],
+                    "additionalProperties": false,
+                ])
+            ),
+            .init(
+                name: "unregister_external_tool",
+                description: "Remove a third-party tool by id.",
+                inputSchema: AnyCodable([
+                    "type": "object",
+                    "properties": [
+                        "id": ["type": "string"],
+                    ],
+                    "required": ["id"],
+                    "additionalProperties": false,
+                ])
+            ),
+            .init(
+                name: "fire_external_tool",
+                description: "Launch a registered third-party tool, substituting <file> in its argument template with the given image path. Returns the resolved executable and argv that were dispatched.",
+                inputSchema: AnyCodable([
+                    "type": "object",
+                    "properties": [
+                        "id": ["type": "string"],
+                        "file": ["type": "string", "description": "Absolute path of the image to pass to the tool. Optional; if omitted, <file> resolves to empty string."],
+                        "dry_run": ["type": "boolean", "description": "If true, do not actually spawn the process — just return what would be launched."],
+                    ],
+                    "required": ["id"],
+                    "additionalProperties": false,
+                ])
+            ),
         ]
+        // Theme subsystem descriptors (list_themes, get/set_current_theme).
+        // See Themes/ThemeMCPTools.swift.
+        base.append(contentsOf: themeTools.descriptors())
+        return base
     }
 
     // MARK: - Dispatch
@@ -211,6 +295,76 @@ public struct MCPTools {
             let scopeName = try requireString(arguments, "name")
             try storage.deleteScope(scopeName)
             return .text("Deleted scope '\(scopeName)'.")
+
+        // MARK: - External Tools
+
+        case "list_external_tools":
+            let list = try toolStorage.listTools()
+            return .text(prettyJSON(["tools": list]))
+
+        case "register_external_tool":
+            let id = try requireString(arguments, "id")
+            try ExternalToolId.validate(id)
+            if toolStorage.toolExists(id) {
+                return .text("External tool '\(id)' already exists.", isError: true)
+            }
+            let exe = try requireString(arguments, "executable_path")
+            var tool = ExternalTool(
+                id: id,
+                displayName: (arguments["display_name"] as? String) ?? id,
+                executablePath: exe,
+                arguments: (arguments["arguments"] as? String) ?? "",
+                hotkey: arguments["hotkey"] as? String,
+                integration: (arguments["integration"] as? Bool) ?? false
+            )
+            if tool.displayName.isEmpty { tool.displayName = id }
+            try toolStorage.saveTool(tool)
+            return .text(prettyJSON(tool))
+
+        case "update_external_tool":
+            let id = try requireString(arguments, "id")
+            var tool = try toolStorage.loadTool(id)
+            if let dn = arguments["display_name"] as? String { tool.displayName = dn }
+            if let exe = arguments["executable_path"] as? String { tool.executablePath = exe }
+            if let argv = arguments["arguments"] as? String { tool.arguments = argv }
+            if arguments.keys.contains("hotkey") {
+                tool.hotkey = arguments["hotkey"] as? String
+            }
+            if let integ = arguments["integration"] as? Bool { tool.integration = integ }
+            try toolStorage.saveTool(tool)
+            return .text(prettyJSON(tool))
+
+        case "unregister_external_tool":
+            let id = try requireString(arguments, "id")
+            try toolStorage.deleteTool(id)
+            return .text("Unregistered external tool '\(id)'.")
+
+        case "fire_external_tool":
+            let id = try requireString(arguments, "id")
+            let tool = try toolStorage.loadTool(id)
+            let file = arguments["file"] as? String
+            let dryRun = (arguments["dry_run"] as? Bool) ?? false
+            let exe = ExternalToolLauncher.resolvedExecutable(for: tool)
+            let argv = ExternalToolLauncher.buildArguments(template: tool.arguments, filePath: file)
+            if dryRun {
+                return .text(prettyJSON([
+                    "id": tool.id,
+                    "executable": exe,
+                    "argv": argv,
+                    "dryRun": true,
+                ] as [String: Any]))
+            }
+            do {
+                _ = try ExternalToolLauncher().launch(tool, filePath: file)
+            } catch {
+                return .text("Failed to launch '\(id)': \(error)", isError: true)
+            }
+            return .text(prettyJSON([
+                "id": tool.id,
+                "executable": exe,
+                "argv": argv,
+                "launched": true,
+            ] as [String: Any]))
 
         default:
             return .text("Unknown tool: \(name)", isError: true)
