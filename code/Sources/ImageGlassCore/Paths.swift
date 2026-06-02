@@ -4,7 +4,9 @@ public enum AppPaths {
     public static let appName = "ImageGlass"
 
     /// Reads HOME from the live environment so tests can rebind it via
-    /// `setenv("HOME", ...)`. Falls back to `NSHomeDirectory()` if HOME is unset.
+    /// `setenv("HOME", ...)`. Falls back to NSHomeDirectory() if HOME is unset.
+    /// (NSHomeDirectory() ignores HOME mid-process on macOS, so reading the
+    /// env directly is what keeps tests hermetic.)
     public static var homeDirectory: String {
         if let h = ProcessInfo.processInfo.environment["HOME"], !h.isEmpty {
             return h

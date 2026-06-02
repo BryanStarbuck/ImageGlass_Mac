@@ -158,15 +158,5 @@ public enum ThemePackError: Error, CustomStringConvertible, Equatable {
     }
 }
 
-// MARK: - Install location
-
-public extension AppPaths {
-    /// Directory holding installed `.igtheme` packs. One sub-folder per
-    /// theme, named with the `<theme-name>.<author-name>` convention.
-    ///
-    /// The themes.mdx agent's `ThemeCatalog` also reads from this path —
-    /// both agents must agree on the install root.
-    static var themesDir: URL {
-        appSupportDir.appendingPathComponent("themes", isDirectory: true)
-    }
-}
+// Install location (`AppPaths.themesDir`) is declared in ThemeCatalog.swift.
+// Both subsystems agree on the same install root.

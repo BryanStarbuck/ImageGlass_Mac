@@ -29,6 +29,9 @@ public final class AppState {
     /// Settings UI ("where is my config file?").
     public var configPaths: ConfigPaths = ConfigPaths.resolve()
 
+    /// Theme catalog + current selection (see docs/themes.mdx).
+    public let themeStore = ThemeStore()
+
     public enum PanelViewMode: String, CaseIterable, Identifiable {
         case list, tree
         public var id: String { rawValue }
@@ -46,6 +49,7 @@ public final class AppState {
         do {
             try AppPaths.ensureDirectories()
             await loadConfig()
+            themeStore.bootstrap()
             let bootstrapped = try storage.bootstrapIfNeeded()
             await refreshScopeList()
             await activate(scopeNamed: bootstrapped)

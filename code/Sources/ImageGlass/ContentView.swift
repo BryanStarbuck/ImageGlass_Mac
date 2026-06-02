@@ -15,6 +15,8 @@ struct ContentView: View {
             }
         }
         .navigationTitle(windowTitle)
+        .tint(state.themeStore.currentTheme.colors.accentColor)
+        .preferredColorScheme(state.themeStore.currentTheme.preferredColorScheme)
         .task { await state.bootstrap() }
         .toolbar {
             ToolbarItem(placement: .navigation) {

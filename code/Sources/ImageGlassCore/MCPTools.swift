@@ -13,15 +13,18 @@ public struct MCPTools {
     public let storage: LocalStorage
     public let toolStorage: ExternalToolStorage
     public let lock: MCPLock
+    public let themeTools: ThemeMCPTools
 
     public init(
         storage: LocalStorage = .shared,
         toolStorage: ExternalToolStorage = .shared,
-        lock: MCPLock = .shared
+        lock: MCPLock = .shared,
+        themeTools: ThemeMCPTools = ThemeMCPTools()
     ) {
         self.storage = storage
         self.toolStorage = toolStorage
         self.lock = lock
+        self.themeTools = themeTools
     }
 
     // MARK: - Descriptors
@@ -268,6 +271,9 @@ public struct MCPTools {
                 ])
             ),
         ]
+        // Theme subsystem descriptors (list_themes, get/set_current_theme).
+        // See Themes/ThemeMCPTools.swift.
+        base.append(contentsOf: themeTools.descriptors())
         return base
     }
 
@@ -316,6 +322,11 @@ public struct MCPTools {
                 return .text(prettyJSON(CharterStatus.report()))
 
             default:
+                // Route theme tools (list_themes, get/set_current_theme) through
+                // ThemeMCPTools. See Themes/ThemeMCPTools.swift.
+                if ThemeMCPTools.toolNames.contains(name) {
+                    return try themeTools.call(name: name, arguments: arguments)
+                }
                 return .text("Unknown tool: \(name)", isError: true)
             }
         } catch let e as MCPToolError {
