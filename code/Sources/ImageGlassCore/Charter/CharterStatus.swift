@@ -195,13 +195,16 @@ public enum CharterStatus {
         // shape is callable. No disk I/O.
         let probe = Scope(
             name: "__charter_probe__",
-            include: .init(
-                directories: ["~/Pictures"],
-                recursive: true,
-                globs: ["IMG_*"],
-                extensions: ["jpg", "png"]
-            ),
-            exclude: .init(globs: ["*_old*"], hiddenFiles: true)
+            criteria: [
+                Scope.SourceCriterion(
+                    root: "~/Pictures",
+                    recursive: true,
+                    includeExts: ["jpg", "png"],
+                    includeGlobs: ["IMG_*"],
+                    excludeGlobs: ["*_old*"],
+                    includeHidden: false
+                )
+            ]
         )
         var evidence: [String] = []
         evidence.append("Scope.IncludeRules carries directories, recursive flag, globs, extensions.")

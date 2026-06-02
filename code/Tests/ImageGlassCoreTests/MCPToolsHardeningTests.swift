@@ -229,6 +229,99 @@ final class MCPToolsHardeningTests: XCTestCase {
         XCTAssertEqual(createdSet.count, count)
     }
 
+    // MARK: - set_criteria (multi-criteria, spec §3.1)
+
+    func testSetCriteriaReplacesAll() throws {
+        let tools = MCPTools()
+        _ = try tools.call(name: "create_scope", arguments: ["name": "mc"])
+        _ = try tools.call(name: "set_criteria", arguments: [
+            "name": "mc",
+            "criteria": [
+                [
+                    "root": "~/Pictures",
+                    "recursive": true,
+                    "include_exts": ["jpg", "png"] as [Any?],
+                    "exclude_globs": ["**/_archive/**"] as [Any?],
+                    "include_hidden": false,
+                    "max_depth": 3,
+                ] as [String: Any?],
+                [
+                    "root": "/tmp/extra",
+                    "recursive": false,
+                    "include_exts": ["heic"] as [Any?],
+                ] as [String: Any?],
+            ] as [Any?],
+        ])
+        let scope = try LocalStorage.shared.loadScope("mc")
+        XCTAssertEqual(scope.criteria.count, 2)
+        XCTAssertEqual(scope.criteria[0].includeExts, ["jpg", "png"])
+        XCTAssertEqual(scope.criteria[0].excludeGlobs, ["**/_archive/**"])
+        XCTAssertEqual(scope.criteria[0].maxDepth, 3)
+        XCTAssertEqual(scope.criteria[1].root, "/tmp/extra")
+        XCTAssertEqual(scope.criteria[1].recursive, false)
+    }
+
+    // MARK: - set_sort / set_filter persistence (spec §3.1)
+
+    func testSetSortPersists() throws {
+        let tools = MCPTools()
+        _ = try tools.call(name: "create_scope", arguments: ["name": "s"])
+        _ = try tools.call(name: "set_sort", arguments: [
+            "name": "s",
+            "by": "modified",
+            "direction": "desc",
+        ])
+        let scope = try LocalStorage.shared.loadScope("s")
+        XCTAssertEqual(scope.sort.by, .modified)
+        XCTAssertEqual(scope.sort.direction, .desc)
+    }
+
+    func testSetFilterPersists() throws {
+        let tools = MCPTools()
+        _ = try tools.call(name: "create_scope", arguments: ["name": "f"])
+        _ = try tools.call(name: "set_filter", arguments: [
+            "name": "f",
+            "text": "sunset",
+            "min_width": 3000,
+            "max_size": 5_000_000,
+        ])
+        let scope = try LocalStorage.shared.loadScope("f")
+        XCTAssertEqual(scope.filter.text, "sunset")
+        XCTAssertEqual(scope.filter.minWidth, 3000)
+        XCTAssertEqual(scope.filter.maxSize, 5_000_000)
+    }
+
+    // MARK: - schema_version stamped on disk (spec §3.1)
+
+    func testCreatedScopeWritesSchemaVersion() throws {
+        let tools = MCPTools()
+        _ = try tools.call(name: "create_scope", arguments: ["name": "sv"])
+        let data = try Data(contentsOf: LocalStorage.shared.scopeURL(for: "sv"))
+        let text = String(data: data, encoding: .utf8) ?? ""
+        XCTAssertTrue(text.contains("\"schema_version\""), "expected schema_version in: \(text)")
+    }
+
+    // MARK: - resolved schema on disk has per-file metadata (spec §3.1)
+
+    func testEvaluatedScopeWritesResolvedWithMetadata() throws {
+        let dir = tmpHome.appendingPathComponent("imgs2", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try Data("x".utf8).write(to: dir.appendingPathComponent("a.png"))
+
+        let tools = MCPTools()
+        _ = try tools.call(name: "create_scope", arguments: [
+            "name": "rsv",
+            "directories": [dir.path] as [Any?],
+            "extensions": ["png"] as [Any?],
+        ])
+        _ = try tools.call(name: "evaluate_scope", arguments: ["name": "rsv"])
+
+        let scope = try LocalStorage.shared.loadScope("rsv")
+        XCTAssertEqual(scope.resolved.count, 1)
+        XCTAssertNotNil(scope.resolved[0].size)
+        XCTAssertNotNil(scope.resolved[0].modified)
+    }
+
     func testConcurrentEditsOnSameScopeProduceValidYAML() throws {
         // Multiple set_include_criteria calls on the same scope in parallel
         // must not lose the scope file. Whatever the last writer wins, the

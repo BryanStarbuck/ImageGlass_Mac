@@ -175,6 +175,69 @@ public struct MCPTools {
                 ])
             ),
             .init(
+                name: "set_criteria",
+                description: "Replace the full multi-criteria list for a scope (spec §3.1). Each criterion is one source directory plus its own recursive/max_depth/include_exts/exclude_exts/include_globs/exclude_globs/include_hidden/follow_symlinks/bookmark.",
+                inputSchema: AnyCodable([
+                    "type": "object",
+                    "properties": [
+                        "name": ["type": "string"],
+                        "criteria": [
+                            "type": "array",
+                            "items": [
+                                "type": "object",
+                                "required": ["root"],
+                                "properties": [
+                                    "root": ["type": "string"],
+                                    "recursive": ["type": "boolean"],
+                                    "max_depth": ["type": ["integer", "null"]],
+                                    "include_exts": ["type": "array", "items": ["type": "string"]],
+                                    "exclude_exts": ["type": "array", "items": ["type": "string"]],
+                                    "include_globs": ["type": "array", "items": ["type": "string"]],
+                                    "exclude_globs": ["type": "array", "items": ["type": "string"]],
+                                    "include_hidden": ["type": "boolean"],
+                                    "follow_symlinks": ["type": "boolean"],
+                                    "bookmark": ["type": ["string", "null"]],
+                                ] as [String: Any],
+                            ] as [String: Any],
+                        ] as [String: Any],
+                    ],
+                    "required": ["name", "criteria"],
+                    "additionalProperties": false,
+                ])
+            ),
+            .init(
+                name: "set_sort",
+                description: "Set the persisted sort selection on a scope (spec §3.1 / §5.1). `by` is one of name | size | modified | created | exif_date_taken | extension | random | dimensions. `direction` is asc | desc.",
+                inputSchema: AnyCodable([
+                    "type": "object",
+                    "properties": [
+                        "name": ["type": "string"],
+                        "by": ["type": "string"],
+                        "direction": ["type": "string"],
+                    ],
+                    "required": ["name", "by"],
+                    "additionalProperties": false,
+                ])
+            ),
+            .init(
+                name: "set_filter",
+                description: "Set the persisted filter on a scope (spec §3.1 / §5.2). Any omitted field is left unchanged; pass `null` to clear a field.",
+                inputSchema: AnyCodable([
+                    "type": "object",
+                    "properties": [
+                        "name": ["type": "string"],
+                        "text": ["type": ["string", "null"]],
+                        "date_from": ["type": ["string", "null"]],
+                        "date_to": ["type": ["string", "null"]],
+                        "min_width": ["type": ["integer", "null"]],
+                        "min_height": ["type": ["integer", "null"]],
+                        "max_size": ["type": ["integer", "null"]],
+                    ],
+                    "required": ["name"],
+                    "additionalProperties": false,
+                ])
+            ),
+            .init(
                 name: "delete_scope",
                 description: "Delete a scope from Local Storage. Idempotent — deleting a non-existent scope is reported as such but is not an error.",
                 inputSchema: AnyCodable([
@@ -302,6 +365,12 @@ public struct MCPTools {
                 return try lock.withLock { try setExcludeCriteria(arguments) }
             case "evaluate_scope":
                 return try lock.withLock { try evaluateScope(arguments) }
+            case "set_criteria":
+                return try lock.withLock { try setCriteria(arguments) }
+            case "set_sort":
+                return try lock.withLock { try setSort(arguments) }
+            case "set_filter":
+                return try lock.withLock { try setFilter(arguments) }
             case "delete_scope":
                 return try lock.withLock { try deleteScope(arguments) }
 
@@ -443,6 +512,95 @@ public struct MCPTools {
             "fileCount": evaluated.resolvedFiles.count,
             "files": evaluated.resolvedFiles,
         ] as [String: Any]))
+    }
+
+    private func setCriteria(_ args: [String: Any?]) throws -> MCP.CallToolResult {
+        let scopeName = try MCPScopeName.validate(try requireString(args, "name"))
+        guard storage.scopeExists(scopeName) else {
+            throw MCPToolError.unknownScope(scopeName)
+        }
+        var scope = try storage.loadScope(scopeName)
+        guard let raw = args["criteria"] as? [Any?] else {
+            throw MCPToolError.missingArgument("criteria")
+        }
+        var built: [Scope.SourceCriterion] = []
+        for item in raw {
+            guard let dict = item as? [String: Any?] else { continue }
+            guard let root = (dict["root"] as? String) else { continue }
+            let normalizedRoot = MCPPath.normalizeDirectory(root)
+            var c = Scope.SourceCriterion(root: normalizedRoot)
+            if let v = dict["recursive"] as? Bool { c.recursive = v }
+            if let v = dict["max_depth"] as? Int { c.maxDepth = v }
+            if let v = dict["include_exts"] as? [Any?] { c.includeExts = v.compactMap { $0 as? String } }
+            if let v = dict["exclude_exts"] as? [Any?] { c.excludeExts = v.compactMap { $0 as? String } }
+            if let v = dict["include_globs"] as? [Any?] { c.includeGlobs = v.compactMap { $0 as? String } }
+            if let v = dict["exclude_globs"] as? [Any?] { c.excludeGlobs = v.compactMap { $0 as? String } }
+            if let v = dict["include_hidden"] as? Bool { c.includeHidden = v }
+            if let v = dict["follow_symlinks"] as? Bool { c.followSymlinks = v }
+            if let v = dict["bookmark"] as? String { c.bookmark = v }
+            built.append(c)
+        }
+        scope.criteria = built
+        try storage.saveScope(scope)
+        return .text(prettyJSON(scope))
+    }
+
+    private func setSort(_ args: [String: Any?]) throws -> MCP.CallToolResult {
+        let scopeName = try MCPScopeName.validate(try requireString(args, "name"))
+        guard storage.scopeExists(scopeName) else {
+            throw MCPToolError.unknownScope(scopeName)
+        }
+        var scope = try storage.loadScope(scopeName)
+        let byRaw = try requireString(args, "by")
+        guard let by = Scope.ScopeSort.Field(rawValue: byRaw) else {
+            let valid = Scope.ScopeSort.Field.allCases.map(\.rawValue).joined(separator: ", ")
+            return .text("Unknown sort field '\(byRaw)'. Valid: \(valid).", isError: true)
+        }
+        var dir = scope.sort.direction
+        if let dRaw = args["direction"] as? String {
+            switch dRaw {
+            case "asc": dir = .asc
+            case "desc": dir = .desc
+            default:
+                return .text("Unknown direction '\(dRaw)'. Valid: asc, desc.", isError: true)
+            }
+        }
+        scope.sort = Scope.ScopeSort(by: by, direction: dir)
+        try storage.saveScope(scope)
+        return .text(prettyJSON(scope))
+    }
+
+    private func setFilter(_ args: [String: Any?]) throws -> MCP.CallToolResult {
+        let scopeName = try MCPScopeName.validate(try requireString(args, "name"))
+        guard storage.scopeExists(scopeName) else {
+            throw MCPToolError.unknownScope(scopeName)
+        }
+        var scope = try storage.loadScope(scopeName)
+        var f = scope.filter
+        let iso = ISO8601DateFormatter()
+        if args.keys.contains("text") {
+            f.text = args["text"] as? String
+        }
+        if args.keys.contains("date_from") {
+            f.dateFrom = (args["date_from"] as? String).flatMap { iso.date(from: $0) }
+        }
+        if args.keys.contains("date_to") {
+            f.dateTo = (args["date_to"] as? String).flatMap { iso.date(from: $0) }
+        }
+        if args.keys.contains("min_width") {
+            f.minWidth = args["min_width"] as? Int
+        }
+        if args.keys.contains("min_height") {
+            f.minHeight = args["min_height"] as? Int
+        }
+        if args.keys.contains("max_size") {
+            if let i = args["max_size"] as? Int { f.maxSize = Int64(i) }
+            else if let i64 = args["max_size"] as? Int64 { f.maxSize = i64 }
+            else { f.maxSize = nil }
+        }
+        scope.filter = f
+        try storage.saveScope(scope)
+        return .text(prettyJSON(scope))
     }
 
     private func deleteScope(_ args: [String: Any?]) throws -> MCP.CallToolResult {
