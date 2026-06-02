@@ -30,7 +30,9 @@ final class FileWatcher {
             self.pendingWorkItem?.cancel()
             let work = DispatchWorkItem { self.onChange() }
             self.pendingWorkItem = work
-            self.queue.asyncAfter(deadline: .now() + 0.15, execute: work)
+            // Spec §6.6: debounce 250 ms so bulk filesystem ops (e.g. cp -R)
+            // collapse to a single re-evaluation.
+            self.queue.asyncAfter(deadline: .now() + 0.25, execute: work)
         }
         src.setCancelHandler { [weak self] in
             guard let self else { return }

@@ -33,4 +33,28 @@ final class GlobTests: XCTestCase {
         XCTAssertTrue(Glob.match("*.tmp", "draft.tmp"))
         XCTAssertFalse(Glob.match("*_old*", "screenshot.png"))
     }
+
+    // MARK: - matchPath / `**`
+
+    func testMatchPathSingleStarDoesNotCrossSlashes() {
+        XCTAssertTrue(Glob.matchPath("a/*.png", "a/x.png"))
+        XCTAssertFalse(Glob.matchPath("a/*.png", "a/b/x.png"))
+    }
+
+    func testMatchPathDoubleStarCrossesSlashes() {
+        XCTAssertTrue(Glob.matchPath("**/_archive/**", "/photos/2024/_archive/old/img.png"))
+        XCTAssertTrue(Glob.matchPath("**/.imageglass/**", "/photos/.imageglass/state.json"))
+        XCTAssertTrue(Glob.matchPath("**/*.bak", "/a/b/c/foo.bak"))
+        XCTAssertFalse(Glob.matchPath("**/_archive/**", "/photos/foo.png"))
+    }
+
+    func testMatchPathRelativeMatchesAnyDepth() {
+        XCTAssertTrue(Glob.matchPath("foo/*.bak", "/a/b/foo/c.bak"))
+        XCTAssertFalse(Glob.matchPath("foo/*.bak", "/a/b/c.bak"))
+    }
+
+    func testMatchPathDoubleStarLeadingMatchesEmptyPrefix() {
+        XCTAssertTrue(Glob.matchPath("**/img.png", "img.png"))
+        XCTAssertTrue(Glob.matchPath("**/img.png", "/a/img.png"))
+    }
 }
