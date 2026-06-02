@@ -33,10 +33,19 @@ struct ImageViewer: View {
 
             VStack(alignment: .leading, spacing: 6) {
                 if viewer.showInfoOverlay {
-                    ImageInfoOverlay(filePath: state.selectedFile)
+                    ImageInfoOverlay(
+                        filePath: state.selectedFile,
+                        frameCount: viewer.frameCount,
+                        currentFrameIndex: viewer.currentFrameIndex,
+                        isAnimated: viewer.isAnimated
+                    )
                 }
                 if viewer.showColorPicker {
-                    ColorPickerOverlay(pixel: viewer.hoverPixel, color: viewer.hoverColor)
+                    ColorPickerOverlay(
+                        pixel: viewer.hoverPixel,
+                        color: viewer.hoverColor,
+                        format: $viewer.colorFormat
+                    )
                 }
             }
         }
@@ -70,6 +79,15 @@ private struct CanvasHost: NSViewRepresentable {
             viewer.hoverPixel = pixel
             viewer.hoverColor = color
         }
+        v.onFrameSourceChanged = { fs in
+            viewer.frameCount = fs?.frameCount ?? 1
+            viewer.isAnimated = fs?.isAnimated ?? false
+            viewer.currentFrameIndex = 0
+            viewer.isAnimationPaused = false
+        }
+        v.onFrameAdvanced = { idx in
+            viewer.currentFrameIndex = idx
+        }
         return v
     }
 
@@ -88,6 +106,8 @@ private struct CanvasHost: NSViewRepresentable {
         v.smoothInterpolation = viewer.smoothInterpolation
         v.colorChannel = viewer.colorChannel
         v.showColorPicker = viewer.showColorPicker
+        v.currentFrameIndex = viewer.currentFrameIndex
+        v.isAnimationPaused = viewer.isAnimationPaused
     }
 }
 

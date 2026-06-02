@@ -10,9 +10,10 @@ final class SlideshowController {
     static let shared = SlideshowController()
 
     private var window: NSWindow?
-    private var timer: Timer?
+    private var countdownTimer: Timer?
     private var hostingState: ViewerState?
     private var appState: AppState?
+    private var nextAdvanceAt: Date?
 
     private init() {}
 
@@ -23,6 +24,7 @@ final class SlideshowController {
         let viewerState = ViewerState()
         viewerState.zoomMode = .fit
         viewerState.slideshowSeconds = seconds
+        viewerState.slideshowRemaining = seconds
         viewerState.isSlideshowRunning = true
 
         let root = SlideshowRoot(state: appState, viewer: viewerState)
@@ -48,28 +50,46 @@ final class SlideshowController {
     }
 
     func stop() {
-        timer?.invalidate()
-        timer = nil
+        countdownTimer?.invalidate()
+        countdownTimer = nil
+        nextAdvanceAt = nil
         window?.close()
         window = nil
         hostingState?.isSlideshowRunning = false
+        hostingState?.slideshowRemaining = 0
         hostingState = nil
         appState = nil
     }
 
+    /// Re-arm the countdown for a full `seconds` interval. Used after each
+    /// advance and when the user dials a new interval.
     private func scheduleTick(every seconds: Double) {
-        timer?.invalidate()
+        countdownTimer?.invalidate()
         guard seconds > 0 else { return }
-        let t = Timer.scheduledTimer(withTimeInterval: seconds, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.advance() }
+        nextAdvanceAt = Date().addingTimeInterval(seconds)
+        hostingState?.slideshowRemaining = seconds
+        // Tick at 10 Hz so the countdown number ticks smoothly.
+        let t = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.tickCountdown() }
         }
         RunLoop.main.add(t, forMode: .common)
-        timer = t
+        countdownTimer = t
+    }
+
+    private func tickCountdown() {
+        guard let state = hostingState, let target = nextAdvanceAt else { return }
+        let remaining = target.timeIntervalSinceNow
+        if remaining <= 0 {
+            advance()
+        } else {
+            state.slideshowRemaining = remaining
+        }
     }
 
     private func advance() {
-        guard let appState else { return }
+        guard let appState, let state = hostingState else { return }
         appState.selectNext(wrap: true)
+        scheduleTick(every: state.slideshowSeconds)
     }
 }
 
@@ -78,29 +98,49 @@ private struct SlideshowRoot: View {
     @Bindable var viewer: ViewerState
 
     var body: some View {
-        ImageViewer(state: state, viewer: viewer)
-            .background(Color.black)
-            .toolbar {
-                ToolbarItem {
-                    Button {
-                        SlideshowController.shared.stop()
-                    } label: {
-                        Image(systemName: "stop.fill")
-                    }
-                    .help("Stop slideshow")
+        ZStack(alignment: .topTrailing) {
+            ImageViewer(state: state, viewer: viewer)
+                .background(Color.black)
+            countdownBadge
+                .padding(14)
+        }
+        .toolbar {
+            ToolbarItem {
+                Button {
+                    SlideshowController.shared.stop()
+                } label: {
+                    Image(systemName: "stop.fill")
                 }
-                ToolbarItem {
-                    HStack {
-                        Image(systemName: "timer")
-                        Stepper(value: $viewer.slideshowSeconds, in: 1...60, step: 1) {
-                            Text("\(Int(viewer.slideshowSeconds))s")
-                                .monospacedDigit()
-                        }
-                        .onChange(of: viewer.slideshowSeconds) { _, new in
-                            SlideshowController.shared.setInterval(new)
-                        }
+                .help("Stop slideshow")
+            }
+            ToolbarItem {
+                HStack {
+                    Image(systemName: "timer")
+                    Stepper(value: $viewer.slideshowSeconds, in: 1...60, step: 1) {
+                        Text("\(Int(viewer.slideshowSeconds))s")
+                            .monospacedDigit()
+                    }
+                    .onChange(of: viewer.slideshowSeconds) { _, new in
+                        SlideshowController.shared.setInterval(new)
                     }
                 }
             }
+        }
+    }
+
+    /// Spec: "Slideshow ... with configurable countdown timers." The badge
+    /// shows seconds remaining until the next slide, ticking at 10 Hz.
+    private var countdownBadge: some View {
+        let remaining = max(0, viewer.slideshowRemaining)
+        return HStack(spacing: 6) {
+            Image(systemName: "timer")
+            Text(String(format: "%0.1fs", remaining))
+                .monospacedDigit()
+        }
+        .font(.system(.callout, design: .monospaced))
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(.ultraThinMaterial, in: Capsule())
+        .overlay(Capsule().strokeBorder(Color.primary.opacity(0.1)))
     }
 }
