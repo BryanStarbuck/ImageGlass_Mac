@@ -26,7 +26,7 @@ public final class MCPServer {
         output: FileHandle = .standardOutput,
         tools: MCPTools = MCPTools(),
         serverName: String = "imageglass-mcp",
-        serverVersion: String = "0.1.0"
+        serverVersion: String = AppVersion.semverString
     ) {
         self.input = input
         self.output = output

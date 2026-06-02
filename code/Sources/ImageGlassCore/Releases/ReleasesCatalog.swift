@@ -37,11 +37,11 @@ public enum ReleasesCatalog {
         // -----------------------------------------------------------------
         ReleaseNote(
             id: "macfork-0.1",
-            version: "ImageGlass_Mac 0.1",
+            version: AppVersion.catalogVersionLabel,
             date: date(2026, 6, 1),
-            kind: .beta,
+            kind: AppVersion.channel == .stable ? .stable : .beta,
             origin: .macFork,
-            title: "ImageGlass_Mac 0.1 — early preview",
+            title: "\(AppVersion.catalogVersionLabel) — early preview",
             highlights: [
                 "First public preview of the Mac-native ImageGlass rebuild.",
                 "SwiftUI + AppKit interop on macOS 14+.",
@@ -150,6 +150,59 @@ public enum ReleasesCatalog {
         ),
     ]
 
+    // MARK: - End-of-life series
+
+    /// Upstream-Windows release series that no longer receive updates.
+    /// Sourced verbatim from the spec's "End of Life" section.
+    public static let endOfLifeSeries: [EndOfLifeSeries] = [
+        EndOfLifeSeries(
+            series: "8.x",
+            note: "The 8.x series is no longer receiving updates.",
+            recommendation: "Users on 8.x are encouraged to upgrade to 9.x (stable) or try 10 Beta."
+        ),
+    ]
+
+    // MARK: - Roadmap
+
+    /// 2026 roadmap themes from the spec's "Roadmap" section. Surfaced in
+    /// the Releases view's footer so users see where the project is going,
+    /// not just where it's been.
+    public static let roadmapThemes: [RoadmapTheme] = [
+        RoadmapTheme(
+            id: "cross-platform-parity",
+            title: "Cross-platform parity",
+            detail: "Bring all v9 features to Avalonia."
+        ),
+        RoadmapTheme(
+            id: "single-codebase",
+            title: "Single codebase",
+            detail: "Replace the WinForms-era foundations."
+        ),
+        RoadmapTheme(
+            id: "community-transparency",
+            title: "Community transparency",
+            detail: "Public roadmap, public betas, public discussion."
+        ),
+    ]
+
+    /// Maintainer's stated commitment about v9 maintenance during the v10
+    /// beta period. Verbatim from the spec.
+    public static let roadmapMaintenanceNote =
+        "v9 will continue to receive maintenance releases throughout the v10 "
+        + "beta period so users aren't forced to upgrade until v10 reaches stable."
+
+    // MARK: - Social channels
+
+    /// External announcement channels listed in the spec footer. Used by the
+    /// Releases view's "Where to get releases" / "Follow" section.
+    public static let socialChannels: [SocialChannel] = [
+        SocialChannel(name: "Twitter",   url: URL(string: "https://twitter.com/d2phap")!),
+        SocialChannel(name: "YouTube",   url: URL(string: "https://www.youtube.com/@d2phap")!),
+        SocialChannel(name: "Facebook",  url: URL(string: "https://www.facebook.com/imageglass")!),
+        SocialChannel(name: "Instagram", url: URL(string: "https://www.instagram.com/d2phap")!),
+        SocialChannel(name: "Medium",    url: URL(string: "https://medium.com/@d2phap")!),
+    ]
+
     // MARK: - Derived views
 
     /// Releases sorted newest-first. This is the canonical display order for
@@ -163,4 +216,9 @@ public enum ReleasesCatalog {
     public static let knownUpstreamVersions: [String] = [
         "9.1", "9.2", "9.3", "10 Beta 1", "9.5.0.515"
     ]
+
+    /// The current stable upstream version, sourced from the spec's
+    /// "Current Stable" section. Used in About and update-check surfaces
+    /// when reporting which Windows build is the recommended baseline.
+    public static let currentStableUpstreamVersion = "9.5.0.515"
 }

@@ -9,14 +9,22 @@ struct ReleasesView: View {
     private let releases: [ReleaseNote] = ReleasesCatalog.sortedReverseChronological
     private let milestones: [ProjectMilestone] = ReleasesCatalog.milestones
         .sorted { $0.date > $1.date }
+    private let endOfLife: [EndOfLifeSeries] = ReleasesCatalog.endOfLifeSeries
+    private let roadmap: [RoadmapTheme] = ReleasesCatalog.roadmapThemes
+    private let socials: [SocialChannel] = ReleasesCatalog.socialChannels
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
                 header
+                currentStableBanner
                 releaseList
                 Divider().padding(.vertical, 4)
                 milestoneSection
+                Divider().padding(.vertical, 4)
+                endOfLifeSection
+                Divider().padding(.vertical, 4)
+                roadmapSection
                 Divider().padding(.vertical, 4)
                 footer
             }
@@ -24,6 +32,76 @@ struct ReleasesView: View {
             .frame(maxWidth: 720, alignment: .leading)
         }
         .frame(minWidth: 560, idealWidth: 720, minHeight: 480, idealHeight: 640)
+    }
+
+    // MARK: - Current stable banner
+
+    private var currentStableBanner: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "checkmark.seal.fill")
+                .foregroundStyle(.green)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Current Stable").font(.headline)
+                Text("ImageGlass \(ReleasesCatalog.currentStableUpstreamVersion) — stable, Windows.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                Text("This Mac fork: \(AppVersion.displayVersion)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+        }
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.green.opacity(0.10))
+        )
+    }
+
+    // MARK: - End of life
+
+    private var endOfLifeSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("End of Life").font(.title2.bold())
+            ForEach(endOfLife) { eol in
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                        Text("ImageGlass \(eol.series)").font(.headline)
+                    }
+                    Text(eol.note).font(.callout)
+                    Text(eol.recommendation)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.vertical, 4)
+            }
+        }
+    }
+
+    // MARK: - Roadmap
+
+    private var roadmapSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Roadmap").font(.title2.bold())
+            Text("2026 transition from v9 to v10. Key themes:")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            ForEach(roadmap) { theme in
+                HStack(alignment: .top, spacing: 6) {
+                    Text("•").foregroundStyle(.secondary)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(theme.title).font(.callout.weight(.semibold))
+                        Text(theme.detail).font(.callout).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            Text(ReleasesCatalog.roadmapMaintenanceNote)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.top, 4)
+        }
     }
 
     // MARK: - Header
@@ -83,6 +161,14 @@ struct ReleasesView: View {
                  destination: URL(string: "https://imageglass.org")!)
             Link("GitHub Releases (binaries, betas, changelogs)",
                  destination: URL(string: "https://github.com/d2phap/ImageGlass/releases")!)
+
+            Text("Follow")
+                .font(.headline)
+                .padding(.top, 8)
+            ForEach(socials) { ch in
+                Link(ch.name, destination: ch.url)
+            }
+
             Text("Note: the upstream releases listed above are shipped by the original "
                  + "ImageGlass project. This Mac-native fork tracks them for reference; "
                  + "we ship our own ImageGlass_Mac builds separately.")
