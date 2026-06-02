@@ -5,16 +5,13 @@ import Foundation
 public struct MCPTools {
 
     public let storage: LocalStorage
-    public let themeTools: ThemeMCPTools
     public let toolStorage: ExternalToolStorage
 
     public init(
         storage: LocalStorage = .shared,
-        themeTools: ThemeMCPTools = ThemeMCPTools(),
         toolStorage: ExternalToolStorage = .shared
     ) {
         self.storage = storage
-        self.themeTools = themeTools
         self.toolStorage = toolStorage
     }
 
@@ -200,9 +197,6 @@ public struct MCPTools {
                 ])
             ),
         ]
-        // Theme subsystem descriptors (list_themes, get/set_current_theme).
-        // See Themes/ThemeMCPTools.swift.
-        base.append(contentsOf: themeTools.descriptors())
         return base
     }
 
