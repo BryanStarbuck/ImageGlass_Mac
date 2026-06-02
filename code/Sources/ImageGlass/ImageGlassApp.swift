@@ -67,6 +67,10 @@ struct ImageGlassApp: App {
             viewerMenuCommands
             layoutMenuCommands
         }
+
+        Settings {
+            SettingsScene(state: state)
+        }
     }
 
     // MARK: - Viewer (View) menu

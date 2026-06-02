@@ -29,6 +29,15 @@ public final class AppState {
     /// Settings UI ("where is my config file?").
     public var configPaths: ConfigPaths = ConfigPaths.resolve()
 
+    /// Canonical spec-§2.3 `settings.json` model. Loaded from
+    /// `~/Library/Application Support/ImageGlass/settings.json` during
+    /// `bootstrap()`; written back atomically via `saveSettings()`.
+    public var settings: Settings = .defaults
+
+    /// Backing store for `settings`. Owned by `AppState` so it lives as
+    /// long as the running app.
+    public let settingsStore: SettingsStore = SettingsStore()
+
     /// Theme catalog + current selection (see docs/themes.mdx).
     public let themeStore = ThemeStore()
 
@@ -71,6 +80,7 @@ public final class AppState {
         do {
             try AppPaths.ensureDirectories()
             await loadConfig()
+            await loadSettings()
             themeStore.bootstrap()
             let bootstrapped = try storage.bootstrapIfNeeded()
             await refreshScopeList()
@@ -78,6 +88,23 @@ public final class AppState {
             startWatching()
         } catch {
             NSLog("ImageGlass bootstrap failed: \(error)")
+        }
+    }
+
+    /// Loads `settings.json` via the actor-backed `SettingsStore`. Any
+    /// failure (missing file, malformed JSON) leaves `settings` at its
+    /// default value so the app remains usable.
+    public func loadSettings() async {
+        let loaded = await settingsStore.loadOrDefault()
+        self.settings = loaded
+    }
+
+    /// Persists the current `settings` to disk atomically.
+    public func saveSettings() async {
+        do {
+            try await settingsStore.save(settings)
+        } catch {
+            NSLog("ImageGlass settings save failed: \(error)")
         }
     }
 
