@@ -90,6 +90,25 @@ extension AppPaths {
         appSupportDir.appendingPathComponent("current-theme.txt")
     }
 
+    /// Plain-text file recording the user's currently selected LIGHT-side
+    /// theme name. Used when the appearance mode is `.system` (so the OS
+    /// switches between light and dark) or `.light` (locked light).
+    public static var currentLightThemeFile: URL {
+        appSupportDir.appendingPathComponent("current-theme-light.txt")
+    }
+
+    /// Plain-text file recording the user's currently selected DARK-side
+    /// theme name. Counterpart of `currentLightThemeFile`.
+    public static var currentDarkThemeFile: URL {
+        appSupportDir.appendingPathComponent("current-theme-dark.txt")
+    }
+
+    /// Plain-text file recording the user's appearance mode (`light`,
+    /// `dark`, or `system`). One line.
+    public static var appearanceModeFile: URL {
+        appSupportDir.appendingPathComponent("appearance-mode.txt")
+    }
+
     /// Ensure the themes directory exists.
     /// Called separately from `ensureDirectories()` so we don't fight the
     /// scope/MCP bootstrap path — the theme subsystem is self-contained.

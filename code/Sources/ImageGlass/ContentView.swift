@@ -1,9 +1,16 @@
 import SwiftUI
+import AppKit
 import ImageGlassCore
 
 struct ContentView: View {
     @Bindable var state: AppState
     @Bindable var layout: LayoutController
+
+    // Tracks the macOS appearance setting. When the user toggles Light /
+    // Dark in System Settings, SwiftUI republishes this value and the
+    // `onChange` below forwards it to `ThemeStore` so the effective theme
+    // recomputes automatically.
+    @Environment(\.colorScheme) private var systemColorScheme
 
     var body: some View {
         PanelHost(controller: layout) {
@@ -14,8 +21,18 @@ struct ContentView: View {
         }
         .navigationTitle(windowTitle)
         .tint(state.themeStore.currentTheme.colors.accentColor)
-        .preferredColorScheme(state.themeStore.currentTheme.preferredColorScheme)
+        .preferredColorScheme(state.themeStore.appearanceMode.preferredColorScheme)
         .task { await state.bootstrap() }
+        .onAppear {
+            state.themeStore.updateSystemColorScheme(SystemColorScheme(systemColorScheme))
+            applyAppAppearance(state.themeStore.appearanceMode)
+        }
+        .onChange(of: systemColorScheme) { _, newScheme in
+            state.themeStore.updateSystemColorScheme(SystemColorScheme(newScheme))
+        }
+        .onChange(of: state.themeStore.appearanceMode) { _, newMode in
+            applyAppAppearance(newMode)
+        }
         .toolbar {
             ToolbarItem(placement: .navigation) {
                 Button {
@@ -70,5 +87,19 @@ struct ContentView: View {
         let f = RelativeDateTimeFormatter()
         f.unitsStyle = .abbreviated
         return f.localizedString(for: date, relativeTo: Date())
+    }
+
+    /// Propagate the appearance mode to `NSApp` so AppKit-owned chrome
+    /// (About panel, Releases window, Slideshow, etc.) all follow the same
+    /// light/dark setting. SwiftUI's `.preferredColorScheme` only affects
+    /// the view it's attached to.
+    private func applyAppAppearance(_ mode: ThemeAppearanceMode) {
+        let appearance: NSAppearance?
+        switch mode {
+        case .light:  appearance = NSAppearance(named: .aqua)
+        case .dark:   appearance = NSAppearance(named: .darkAqua)
+        case .system: appearance = nil
+        }
+        NSApp.appearance = appearance
     }
 }

@@ -1,21 +1,65 @@
 import Foundation
 import Observation
+#if canImport(SwiftUI)
+import SwiftUI
+#endif
 
 /// Reactive store for the current theme selection.
 ///
-/// - `availableThemes` is the catalog of installed + built-in themes.
-/// - `currentTheme` is whatever the user picked last (persisted in a plain-text
-///   file under `~/Library/Application Support/ImageGlass/current-theme.txt`).
-/// - `setCurrentTheme(byName:)` writes that file and updates `currentTheme`.
+/// Two orthogonal pieces of state:
 ///
-/// SwiftUI consumes this via `@Bindable` or by reading `currentTheme.colors.*`
-/// through the `Color` accessors in `Theme+SwiftUI.swift`.
+/// 1. `appearanceMode` — light / dark / system. `.system` (the default) means
+///    the app follows the macOS appearance setting: a dark theme is used in
+///    Dark Mode, a light theme in Light Mode. `.light` / `.dark` lock the
+///    app to one side regardless of the OS.
+/// 2. `lightTheme` / `darkTheme` — the user's preferred theme on each side
+///    of the light/dark divide. Each theme pack declares an `isDarkMode`
+///    flag, so a single user choice writes to whichever side matches.
+///
+/// `currentTheme` is computed: when `appearanceMode` is `.system` it depends
+/// on the current `systemColorScheme`; otherwise it's whichever side is
+/// locked in.
+///
+/// All three preferences persist as one-line plain-text files under
+/// `~/Library/Application Support/ImageGlass/`:
+///   - `appearance-mode.txt`     (light/dark/system)
+///   - `current-theme-light.txt` (theme name)
+///   - `current-theme-dark.txt`  (theme name)
+///
+/// Backwards compat: `current-theme.txt` is still read on first launch and
+/// migrated to the appropriate light/dark file.
 @MainActor
 @Observable
 public final class ThemeStore {
 
     public private(set) var availableThemes: [Theme] = []
-    public private(set) var currentTheme: Theme = BuiltinThemes.defaultTheme
+
+    /// Active selection on the light side. Used when the system is in
+    /// Light Mode or `appearanceMode == .light`.
+    public private(set) var lightTheme: Theme = BuiltinThemes.light
+
+    /// Active selection on the dark side. Used when the system is in
+    /// Dark Mode or `appearanceMode == .dark`.
+    public private(set) var darkTheme: Theme = BuiltinThemes.dark
+
+    /// Light / Dark / System.
+    public private(set) var appearanceMode: ThemeAppearanceMode = .system
+
+    /// The current OS color scheme. SwiftUI views feed
+    /// `@Environment(\.colorScheme)` into this so `currentTheme` updates
+    /// when the user toggles macOS between Light and Dark.
+    public var systemColorScheme: SystemColorScheme = .light {
+        didSet { /* observed by SwiftUI consumers */ }
+    }
+
+    /// The theme that should be applied to the UI right now.
+    public var currentTheme: Theme {
+        switch appearanceMode {
+        case .light:  return lightTheme
+        case .dark:   return darkTheme
+        case .system: return systemColorScheme == .dark ? darkTheme : lightTheme
+        }
+    }
 
     private let catalog: ThemeCatalog
 
@@ -23,60 +67,156 @@ public final class ThemeStore {
         self.catalog = catalog
     }
 
-    /// Refresh the catalog from disk and apply the persisted selection.
+    // MARK: - Bootstrap
+
+    /// Refresh the catalog from disk and apply the persisted selections.
     /// Safe to call multiple times.
     public func bootstrap() {
         try? AppPaths.ensureThemesDirectory()
         availableThemes = catalog.installedThemes()
-        let persistedName = (try? readPersistedThemeName()) ?? BuiltinThemes.defaultTheme.name
-        if let match = availableThemes.first(where: { $0.name == persistedName }) {
-            currentTheme = match
+
+        // Migrate the legacy single `current-theme.txt` selection on first
+        // launch: classify it by the theme's own dark/light flag and write
+        // it into the matching paired-theme file. We only do this once —
+        // afterwards the paired files own the selection.
+        migrateLegacyCurrentThemeIfNeeded()
+
+        if let mode = (try? readPersistedAppearanceMode()) {
+            appearanceMode = mode
+        }
+
+        if let name = try? readPersistedThemeName(side: .light),
+           let theme = lookup(name), theme.settings.isDarkMode == false {
+            lightTheme = theme
         } else {
-            currentTheme = BuiltinThemes.defaultTheme
+            lightTheme = BuiltinThemes.light
+        }
+
+        if let name = try? readPersistedThemeName(side: .dark),
+           let theme = lookup(name), theme.settings.isDarkMode == true {
+            darkTheme = theme
+        } else {
+            darkTheme = BuiltinThemes.dark
         }
     }
 
     /// Re-scan installed themes without changing the current selection.
+    /// If a previously-selected theme was uninstalled, fall back to the
+    /// built-in default on that side.
     public func refreshAvailable() {
         availableThemes = catalog.installedThemes()
-        // If the current theme was uninstalled, fall back to the default.
-        if !availableThemes.contains(where: { $0.name == currentTheme.name }) {
-            currentTheme = BuiltinThemes.defaultTheme
-            try? writePersistedThemeName(currentTheme.name)
+        if !availableThemes.contains(where: { $0.name == lightTheme.name }) {
+            lightTheme = BuiltinThemes.light
+            try? writePersistedThemeName(lightTheme.name, side: .light)
+        }
+        if !availableThemes.contains(where: { $0.name == darkTheme.name }) {
+            darkTheme = BuiltinThemes.dark
+            try? writePersistedThemeName(darkTheme.name, side: .dark)
         }
     }
 
-    /// Switch to a theme by name. Returns `false` if the name is unknown.
+    // MARK: - Setters
+
+    /// Switch to a theme by name. The theme is assigned to whichever side
+    /// (light/dark) matches its `isDarkMode` flag, and persisted.
+    /// Returns `false` if the name is unknown.
     @discardableResult
     public func setCurrentTheme(byName name: String) -> Bool {
-        guard let theme = availableThemes.first(where: { $0.name == name })
-            ?? catalog.theme(named: name) else {
-            return false
+        guard let theme = lookup(name) else { return false }
+        if theme.settings.isDarkMode {
+            darkTheme = theme
+            try? writePersistedThemeName(theme.name, side: .dark)
+        } else {
+            lightTheme = theme
+            try? writePersistedThemeName(theme.name, side: .light)
         }
-        currentTheme = theme
         if !availableThemes.contains(where: { $0.name == theme.name }) {
             availableThemes.append(theme)
         }
-        try? writePersistedThemeName(theme.name)
         return true
+    }
+
+    /// Switch the user's appearance preference (light / dark / system) and
+    /// persist it.
+    public func setAppearanceMode(_ mode: ThemeAppearanceMode) {
+        appearanceMode = mode
+        try? writePersistedAppearanceMode(mode)
+    }
+
+    /// Update which OS color scheme the app is currently rendering under.
+    /// SwiftUI views observe `@Environment(\.colorScheme)` and forward
+    /// changes to this property so `currentTheme` recomputes.
+    public func updateSystemColorScheme(_ scheme: SystemColorScheme) {
+        if systemColorScheme != scheme {
+            systemColorScheme = scheme
+        }
+    }
+
+    // MARK: - Helpers
+
+    private func lookup(_ name: String) -> Theme? {
+        if let m = availableThemes.first(where: { $0.name == name }) { return m }
+        return catalog.theme(named: name)
     }
 
     // MARK: - Persistence (plain-text, one line)
 
-    private func readPersistedThemeName() throws -> String {
-        let url = AppPaths.currentThemeFile
-        guard FileManager.default.fileExists(atPath: url.path) else {
-            return BuiltinThemes.defaultTheme.name
-        }
+    private enum Side { case light, dark }
+
+    private func readPersistedThemeName(side: Side) throws -> String? {
+        let url = side == .light ? AppPaths.currentLightThemeFile : AppPaths.currentDarkThemeFile
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
         let raw = try String(contentsOf: url, encoding: .utf8)
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? BuiltinThemes.defaultTheme.name : trimmed
+        return trimmed.isEmpty ? nil : trimmed
     }
 
-    private func writePersistedThemeName(_ name: String) throws {
+    private func writePersistedThemeName(_ name: String, side: Side) throws {
         try AppPaths.ensureThemesDirectory()
-        let url = AppPaths.currentThemeFile
-        let body = name + "\n"
-        try body.write(to: url, atomically: true, encoding: .utf8)
+        let url = side == .light ? AppPaths.currentLightThemeFile : AppPaths.currentDarkThemeFile
+        try (name + "\n").write(to: url, atomically: true, encoding: .utf8)
     }
+
+    private func readPersistedAppearanceMode() throws -> ThemeAppearanceMode? {
+        let url = AppPaths.appearanceModeFile
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        let raw = try String(contentsOf: url, encoding: .utf8)
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return ThemeAppearanceMode(rawValue: trimmed)
+    }
+
+    private func writePersistedAppearanceMode(_ mode: ThemeAppearanceMode) throws {
+        try AppPaths.ensureThemesDirectory()
+        let url = AppPaths.appearanceModeFile
+        try (mode.rawValue + "\n").write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    /// Reads the old `current-theme.txt` (if it still exists) and seeds the
+    /// matching paired file, then deletes the legacy file. No-op on a clean
+    /// install or once migration has already happened.
+    private func migrateLegacyCurrentThemeIfNeeded() {
+        let legacy = AppPaths.currentThemeFile
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: legacy.path) else { return }
+        guard let raw = try? String(contentsOf: legacy, encoding: .utf8) else { return }
+        let name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, let theme = lookup(name) else {
+            try? fm.removeItem(at: legacy)
+            return
+        }
+        let side: Side = theme.settings.isDarkMode ? .dark : .light
+        let target = side == .light ? AppPaths.currentLightThemeFile : AppPaths.currentDarkThemeFile
+        if !fm.fileExists(atPath: target.path) {
+            try? writePersistedThemeName(theme.name, side: side)
+        }
+        try? fm.removeItem(at: legacy)
+    }
+}
+
+/// A non-SwiftUI mirror of `SwiftUI.ColorScheme` so the core module stays
+/// usable without forcing SwiftUI down everyone's throat (the CLI / MCP
+/// targets don't link SwiftUI).
+public enum SystemColorScheme: String, Sendable, Equatable {
+    case light
+    case dark
 }

@@ -87,29 +87,65 @@ final class ThemeTests: XCTestCase {
     // MARK: - Store persistence round-trip
 
     @MainActor
-    func testStoreBootstrapDefaultsToBuiltinDark() {
+    func testStoreBootstrapDefaultsToSystemModeAndPairedBuiltins() {
         let store = ThemeStore()
         store.bootstrap()
-        XCTAssertEqual(store.currentTheme.name, Theme.Builtin.darkName)
+        XCTAssertEqual(store.appearanceMode, .system)
+        XCTAssertEqual(store.lightTheme.name, Theme.Builtin.lightName)
+        XCTAssertEqual(store.darkTheme.name, Theme.Builtin.darkName)
         XCTAssertEqual(store.availableThemes.count, 2)
     }
 
     @MainActor
-    func testStorePersistsSelection() throws {
+    func testStoreCurrentThemeFollowsSystemColorScheme() {
+        let store = ThemeStore()
+        store.bootstrap()
+        store.updateSystemColorScheme(.light)
+        XCTAssertEqual(store.currentTheme.name, Theme.Builtin.lightName)
+        store.updateSystemColorScheme(.dark)
+        XCTAssertEqual(store.currentTheme.name, Theme.Builtin.darkName)
+    }
+
+    @MainActor
+    func testStoreLockedLightModeIgnoresSystemColorScheme() {
+        let store = ThemeStore()
+        store.bootstrap()
+        store.setAppearanceMode(.light)
+        store.updateSystemColorScheme(.dark)
+        XCTAssertEqual(store.currentTheme.name, Theme.Builtin.lightName)
+    }
+
+    @MainActor
+    func testStorePersistsLightSelectionToLightFile() throws {
         let store = ThemeStore()
         store.bootstrap()
         XCTAssertTrue(store.setCurrentTheme(byName: Theme.Builtin.lightName))
 
-        // File should exist with that exact contents.
-        let url = AppPaths.currentThemeFile
+        let url = AppPaths.currentLightThemeFile
         XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
         let raw = try String(contentsOf: url, encoding: .utf8)
         XCTAssertEqual(raw.trimmingCharacters(in: .whitespacesAndNewlines), Theme.Builtin.lightName)
 
-        // A fresh store should read that selection back.
+        // Re-bootstrap reads it back.
         let store2 = ThemeStore()
         store2.bootstrap()
-        XCTAssertEqual(store2.currentTheme.name, Theme.Builtin.lightName)
+        XCTAssertEqual(store2.lightTheme.name, Theme.Builtin.lightName)
+    }
+
+    @MainActor
+    func testStorePersistsAppearanceMode() throws {
+        let store = ThemeStore()
+        store.bootstrap()
+        store.setAppearanceMode(.dark)
+
+        let url = AppPaths.appearanceModeFile
+        XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+        let raw = try String(contentsOf: url, encoding: .utf8)
+        XCTAssertEqual(raw.trimmingCharacters(in: .whitespacesAndNewlines), "dark")
+
+        let store2 = ThemeStore()
+        store2.bootstrap()
+        XCTAssertEqual(store2.appearanceMode, .dark)
     }
 
     @MainActor
@@ -117,18 +153,49 @@ final class ThemeTests: XCTestCase {
         let store = ThemeStore()
         store.bootstrap()
         XCTAssertFalse(store.setCurrentTheme(byName: "does-not-exist"))
-        XCTAssertEqual(store.currentTheme.name, Theme.Builtin.darkName)
+        XCTAssertEqual(store.lightTheme.name, Theme.Builtin.lightName)
+        XCTAssertEqual(store.darkTheme.name, Theme.Builtin.darkName)
     }
 
     @MainActor
     func testStoreFallsBackWhenPersistedThemeUninstalled() throws {
-        // Write a current-theme.txt pointing at something missing.
+        // A persisted paired-file pointing at a missing theme — bootstrap
+        // should fall back to the built-in for that side.
         try AppPaths.ensureThemesDirectory()
-        try "ghost-theme\n".write(to: AppPaths.currentThemeFile, atomically: true, encoding: .utf8)
+        try "ghost-theme\n".write(to: AppPaths.currentDarkThemeFile, atomically: true, encoding: .utf8)
 
         let store = ThemeStore()
         store.bootstrap()
-        XCTAssertEqual(store.currentTheme.name, BuiltinThemes.defaultTheme.name)
+        XCTAssertEqual(store.darkTheme.name, Theme.Builtin.darkName)
+    }
+
+    @MainActor
+    func testStoreMigratesLegacyCurrentThemeFile() throws {
+        try AppPaths.ensureThemesDirectory()
+        // Legacy single-file selection of the built-in light theme.
+        try "\(Theme.Builtin.lightName)\n".write(
+            to: AppPaths.currentThemeFile, atomically: true, encoding: .utf8
+        )
+
+        let store = ThemeStore()
+        store.bootstrap()
+        XCTAssertEqual(store.lightTheme.name, Theme.Builtin.lightName)
+
+        // Legacy file is removed and the paired light file now holds the value.
+        XCTAssertFalse(FileManager.default.fileExists(atPath: AppPaths.currentThemeFile.path))
+        let raw = try String(contentsOf: AppPaths.currentLightThemeFile, encoding: .utf8)
+        XCTAssertEqual(raw.trimmingCharacters(in: .whitespacesAndNewlines), Theme.Builtin.lightName)
+    }
+
+    // MARK: - Appearance mode enum
+
+    func testAppearanceModeRoundTrip() {
+        XCTAssertEqual(ThemeAppearanceMode(rawValue: "light"), .light)
+        XCTAssertEqual(ThemeAppearanceMode(rawValue: "dark"), .dark)
+        XCTAssertEqual(ThemeAppearanceMode(rawValue: "system"), .system)
+        XCTAssertEqual(ThemeAppearanceMode(rawValue: "auto"), .system)
+        XCTAssertEqual(ThemeAppearanceMode(rawValue: ""), .system)
+        XCTAssertNil(ThemeAppearanceMode(rawValue: "purple"))
     }
 
     // MARK: - MCP tools
@@ -142,24 +209,27 @@ final class ThemeTests: XCTestCase {
         XCTAssertTrue(body.contains(Theme.Builtin.lightName))
     }
 
-    func testMCPGetCurrentThemeReturnsDefaultOnFirstRun() throws {
+    func testMCPGetCurrentThemeReportsBothSidesAndMode() throws {
         let tools = MCPTools()
         let result = try tools.call(name: "get_current_theme", arguments: [:])
         XCTAssertFalse(result.isError ?? false)
         let body = result.content.first?.text ?? ""
+        XCTAssertTrue(body.contains("appearanceMode"))
+        XCTAssertTrue(body.contains(Theme.Builtin.lightName))
         XCTAssertTrue(body.contains(Theme.Builtin.darkName))
     }
 
-    func testMCPSetCurrentThemePersistsAndIsReadable() throws {
+    func testMCPSetCurrentThemePersistsToCorrectSideFile() throws {
         let tools = MCPTools()
         let setResult = try tools.call(name: "set_current_theme", arguments: [
             "name": Theme.Builtin.lightName,
         ])
         XCTAssertFalse(setResult.isError ?? false)
 
-        // On-disk file matches.
-        let raw = try String(contentsOf: AppPaths.currentThemeFile, encoding: .utf8)
+        // The light file (not the dark file) gets written.
+        let raw = try String(contentsOf: AppPaths.currentLightThemeFile, encoding: .utf8)
         XCTAssertEqual(raw.trimmingCharacters(in: .whitespacesAndNewlines), Theme.Builtin.lightName)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: AppPaths.currentDarkThemeFile.path))
 
         // Subsequent get reflects the change.
         let getResult = try tools.call(name: "get_current_theme", arguments: [:])
@@ -172,11 +242,28 @@ final class ThemeTests: XCTestCase {
         XCTAssertTrue(result.isError ?? false)
     }
 
+    func testMCPGetAndSetAppearanceMode() throws {
+        let tools = MCPTools()
+        let setResult = try tools.call(name: "set_appearance_mode", arguments: ["mode": "dark"])
+        XCTAssertFalse(setResult.isError ?? false)
+
+        let getResult = try tools.call(name: "get_appearance_mode", arguments: [:])
+        XCTAssertTrue((getResult.content.first?.text ?? "").contains("\"dark\""))
+    }
+
+    func testMCPSetAppearanceModeRejectsUnknown() throws {
+        let tools = MCPTools()
+        let result = try tools.call(name: "set_appearance_mode", arguments: ["mode": "purple"])
+        XCTAssertTrue(result.isError ?? false)
+    }
+
     func testMCPDescriptorsExposeThemeTools() {
         let tools = MCPTools()
         let names = Set(tools.descriptors().map { $0.name })
         XCTAssertTrue(names.contains("list_themes"))
         XCTAssertTrue(names.contains("get_current_theme"))
         XCTAssertTrue(names.contains("set_current_theme"))
+        XCTAssertTrue(names.contains("get_appearance_mode"))
+        XCTAssertTrue(names.contains("set_appearance_mode"))
     }
 }
