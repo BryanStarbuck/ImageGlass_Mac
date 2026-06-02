@@ -274,6 +274,9 @@ public struct MCPTools {
         // Theme subsystem descriptors (list_themes, get/set_current_theme).
         // See Themes/ThemeMCPTools.swift.
         base.append(contentsOf: themeTools.descriptors())
+        // Charter additions: rule sets, scope chains, audit, diff, import/export.
+        // See Charter/MCPTools+Charter.swift.
+        base.append(contentsOf: charterDescriptors())
         return base
     }
 
@@ -287,6 +290,11 @@ public struct MCPTools {
     /// `isError: true` result rather than as a JSON-RPC error code.
     public func call(name: String, arguments: [String: Any?]) throws -> MCP.CallToolResult {
         do {
+            // Charter tools (rule sets, chaining, audit, diff, import/export)
+            // get first chance — see Charter/MCPTools+Charter.swift.
+            if let charterResult = try callCharter(name: name, arguments: arguments) {
+                return charterResult
+            }
             switch name {
             case "list_scopes":
                 return try listScopes()
@@ -434,21 +442,30 @@ public struct MCPTools {
             throw MCPToolError.unknownScope(scopeName)
         }
         let scope = try storage.loadScope(scopeName)
-        let evaluated = ScopeEvaluator.evaluate(scope)
+        // Use the charter-flavored evaluator so rule-set composition,
+        // inheritsFrom chaining, diffing, and audit logging all run.
+        let evaluated = ScopeEvaluator.evaluateWithProvenance(scope)
         try storage.saveScope(evaluated)
         let iso = ISO8601DateFormatter().string(from: evaluated.lastEvaluated ?? Date())
-        return .text(prettyJSON([
+        var payload: [String: Any] = [
             "name": evaluated.name,
             "lastEvaluated": iso,
             "fileCount": evaluated.resolvedFiles.count,
             "files": evaluated.resolvedFiles,
-        ] as [String: Any]))
+        ]
+        if let d = evaluated.lastDiff {
+            payload["added"] = d.added
+            payload["removed"] = d.removed
+        }
+        return .text(prettyJSON(payload))
     }
 
     private func deleteScope(_ args: [String: Any?]) throws -> MCP.CallToolResult {
         let scopeName = try MCPScopeName.validate(try requireString(args, "name"))
         let existed = storage.scopeExists(scopeName)
         try storage.deleteScope(scopeName)
+        // Best-effort: prune the per-scope audit log so deletion is total.
+        try? ScopeAuditLog.shared.clear(scopeName: scopeName)
         if existed {
             return .text("Deleted scope '\(scopeName)'.")
         } else {

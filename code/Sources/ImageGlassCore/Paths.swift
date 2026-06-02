@@ -35,6 +35,19 @@ public enum AppPaths {
         appSupportDir.appendingPathComponent("runtime", isDirectory: true)
     }
 
+    /// Named rule-set storage (spec §3 "Named rule sets that can be referenced
+    /// and reused"). One plain-text JSON file per rule set.
+    public static var ruleSetsDir: URL {
+        appSupportDir.appendingPathComponent("rulesets", isDirectory: true)
+    }
+
+    /// Per-scope audit log directory. Each scope gets its own JSONL file
+    /// (`<scope>.log`) recording every evaluation: timestamp, file count,
+    /// and the (added, removed) diff against the previous run.
+    public static var auditDir: URL {
+        appSupportDir.appendingPathComponent("audit", isDirectory: true)
+    }
+
     public static var configFile: URL {
         appSupportDir.appendingPathComponent("igconfig.json")
     }
@@ -46,7 +59,7 @@ public enum AppPaths {
 
     public static func ensureDirectories() throws {
         let fm = FileManager.default
-        for dir in [appSupportDir, scopesDir, toolsDir, runtimeDir] {
+        for dir in [appSupportDir, scopesDir, toolsDir, runtimeDir, ruleSetsDir, auditDir] {
             if !fm.fileExists(atPath: dir.path) {
                 try fm.createDirectory(at: dir, withIntermediateDirectories: true)
             }
