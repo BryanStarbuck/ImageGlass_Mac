@@ -5,15 +5,20 @@ import Foundation
 public struct MCPTools {
 
     public let storage: LocalStorage
+    public let cropTools: CropMCPTools
 
-    public init(storage: LocalStorage = .shared) {
+    public init(
+        storage: LocalStorage = .shared,
+        cropTools: CropMCPTools = CropMCPTools()
+    ) {
         self.storage = storage
+        self.cropTools = cropTools
     }
 
     // MARK: - Descriptors
 
     public func descriptors() -> [MCP.ToolDescriptor] {
-        [
+        var base: [MCP.ToolDescriptor] = [
             .init(
                 name: "list_scopes",
                 description: "List all scope names currently stored in Local Storage.",
@@ -120,6 +125,10 @@ public struct MCPTools {
                 ])
             ),
         ]
+        // Append Crop subsystem descriptors (crop_image, get/set_crop_selection,
+        // read_image_dimensions). See Crop/CropMCPTools.swift.
+        base.append(contentsOf: cropTools.descriptors())
+        return base
     }
 
     // MARK: - Dispatch
@@ -213,6 +222,11 @@ public struct MCPTools {
             return .text("Deleted scope '\(scopeName)'.")
 
         default:
+            // Route crop subsystem tools (crop_image, get/set_crop_selection,
+            // read_image_dimensions) through CropMCPTools.
+            if CropMCPTools.toolNames.contains(name) {
+                return try cropTools.call(name: name, arguments: arguments)
+            }
             return .text("Unknown tool: \(name)", isError: true)
         }
     }

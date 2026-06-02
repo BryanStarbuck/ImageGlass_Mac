@@ -23,6 +23,10 @@ public final class AppState {
         public var label: String { self == .list ? "List" : "Tree" }
     }
 
+    /// Crop subsystem controller. Owned by AppState so the SwiftUI panel
+    /// and the overlay can share one observable instance. See `Crop/`.
+    public let cropController: CropController = CropController()
+
     private let storage = LocalStorage.shared
     private var fileWatcher: FileWatcher?
 
@@ -58,6 +62,7 @@ public final class AppState {
             lastEvaluated = scope.lastEvaluated
             selectedFile = resolvedFiles.first
         }
+        if let f = selectedFile { cropController.loadImage(at: f) }
     }
 
     public func reevaluateActive() async {
