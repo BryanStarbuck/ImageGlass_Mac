@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Combine
 import ImageGlassCore
 
 struct ContentView: View {
@@ -36,10 +37,17 @@ struct ContentView: View {
             // viewer window to the multi-monitor state controller. See
             // docs/multi_monitor.mdx §5.1.
             WindowStateController.shared.bootstrap(appState: state)
+            // Drain any Finder-supplied file URLs that arrived before SwiftUI
+            // mounted (cold-launch Open With).
+            AboutAppDelegate.registerListenerAndFlush()
         }
         .onAppear {
             state.themeStore.updateSystemColorScheme(SystemColorScheme(systemColorScheme))
             applyAppAppearance(state.themeStore.appearanceMode)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .imageGlassOpenURLs)) { note in
+            guard let urls = note.userInfo?["urls"] as? [URL] else { return }
+            for url in urls { state.openExternalFile(url: url) }
         }
         .onChange(of: systemColorScheme) { _, newScheme in
             state.themeStore.updateSystemColorScheme(SystemColorScheme(newScheme))

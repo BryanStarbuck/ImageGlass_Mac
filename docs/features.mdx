@@ -1,11 +1,11 @@
 ---
-title: ImageGlass Features
+title: ImageGlass_Mac Features
 description: Complete feature list — viewing, zoom, editing, metadata, customization.
 ---
 
 # Features
 
-ImageGlass is positioned as a "feature-rich, simple-to-use" image viewer.
+ImageGlass_Mac is a feature-rich, simple-to-use image viewer for macOS.
 The feature set spans casual viewing, animation handling, basic editing,
 metadata inspection, and deep customization for power users.
 
@@ -17,7 +17,7 @@ metadata inspection, and deep customization for power users.
 - Multiple ways to open images:
   - Drag and drop files into the window.
   - Paste clipboard data (image files, raw bitmaps, or file paths) with
-    `Ctrl+V`.
+    `⌘V`.
   - Traditional file open dialog.
   - Open from base-64 encoded text files.
 - **Fast thumbnail previews** of all images in the current folder
@@ -25,7 +25,7 @@ metadata inspection, and deep customization for power users.
 
 ## Animation & Multi-Frame Support
 
-- Animated formats — **GIF, WEBP, APNG, SVG** — are rendered via WebView2.
+- Animated formats — **GIF, WEBP, APNG, SVG** — are rendered natively.
 - **Frame Navigation tool** for multi-frame images such as TIF and ICO:
   - Pause / resume animations.
   - Save individual frames.
@@ -53,7 +53,7 @@ Additional display options:
 ## Information & Metadata
 
 - Built-in **Color Picker** tool with support for multiple color formats.
-- **EXIF metadata viewer** via the external **ExifGlass** tool.
+- **EXIF metadata viewer**.
 - Per-image info display (dimensions, file size, format).
 - **Color channel viewing** (R, G, B, A isolation).
 
@@ -61,16 +61,15 @@ Additional display options:
 
 - Rotate (90° increments).
 - Flip horizontal / vertical.
-- **Crop tool** (upgraded in version 9.2).
-- **Lossless compression** (added in version 9.1).
-- **Image Resize** tool (added in version 9.2).
+- **Crop tool**.
+- **Lossless compression**.
+- **Image Resize** tool.
 
 ## File Management
 
-- Set image as desktop **wallpaper** (via `igcmd.exe`).
-- Set image as **lock screen** background.
+- Set image as desktop **wallpaper** (via `igcmd`).
 - Export frames from animated / multi-frame images.
-- Register ImageGlass as the **default viewer** for any extension.
+- Register ImageGlass_Mac as the **default viewer** for any extension.
 
 ## Customization
 
@@ -86,7 +85,7 @@ Additional display options:
 
 - Register external editors and utilities through the Tools tab in
   Settings, or by editing `igconfig.json` directly.
-- ImageGlass passes the currently displayed image's full path to the
+- ImageGlass_Mac passes the currently displayed image's full path to the
   external tool via a `<file>` argument placeholder.
 - Custom hotkeys can be bound to launch any registered tool.
 
@@ -94,17 +93,5 @@ Additional display options:
 
 - Optimized for **minimal resource consumption** at idle and while
   browsing large folders.
-- **Startup Boost** (v9.1+) — preloads the app for faster launch,
-  toggled via `igcmd.exe set-startup-boost` / `remove-startup-boost`,
-  or by passing `--startup-boost` to `ImageGlass.exe`.
-
-## Version-Specific Notes
-
-| Feature | Introduced |
-| --- | --- |
-| Lossless compression | 9.1 |
-| Startup Boost | 9.1 |
-| Image Resize tool | 9.2 |
-| Upgraded Crop tool | 9.2 |
-| Enhanced Explorer compatibility | 9.3 |
-| Cross-platform rewrite (Avalonia) | 10 (beta) |
+- Native Apple Silicon performance with GPU-accelerated rendering via
+  Metal.

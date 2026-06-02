@@ -10,7 +10,7 @@ the crop tool in ImageGlass_Mac.
 
 It cross-references:
 
-* [Automation](./automation.mdx) — overall fork goals.
+* [Automation](./automation.mdx) — automation, panels, scopes, and Local Storage.
 * [Settings → Tools → Crop](./settings.mdx#414-tools--crop) — the
   persisted crop defaults.
 * [Panels](./panels.mdx) — the framework the crop tool's controls
@@ -40,14 +40,12 @@ preserved metadata.
 
 ### 1.2 Goals
 
-* **Match upstream's UX** for the cases where it already works well
-  (eight handles, modifier-key constraints, aspect-ratio presets) so
-  users moving from Windows ImageGlass do not need to relearn.
-* **Add lossless JPEG crop.** Upstream re-encodes every JPEG. The Mac
-  fork adds a true lossless path using libjpeg-turbo's `tjTransform`
-  for MCU-aligned rectangles. The user sees no quality loss for any
-  JPEG crop with edges aligned to the 8 px / 16 px MCU grid (which is
-  most crops).
+* **Match the standard crop tool UX** for cases that work well
+  (eight handles, modifier-key constraints, aspect-ratio presets).
+* **Add lossless JPEG crop.** ImageGlass_Mac uses a true lossless path
+  via libjpeg-turbo's `tjTransform` for MCU-aligned rectangles. The
+  user sees no quality loss for any JPEG crop with edges aligned to
+  the 8 px / 16 px MCU grid (which is most crops).
 * **Preserve metadata by default.** EXIF, IPTC, XMP, ICC profile, and
   GPS coordinates are carried through every write unless the user
   explicitly opts out.
@@ -94,7 +92,7 @@ after the image. It consists of:
   inside transparent AppKit `NSView` overlays so they receive mouse
   events directly. Handle visual: 10 pt × 10 pt rounded square,
   accent fill, 1 pt white outline. The corner handles are slightly
-  larger (12 pt) per the upstream `_resizeHandleSize` convention.
+  larger (12 pt).
 * An optional grid overlay (rule of thirds, golden ratio, golden
   spiral diagonals, 8 × 8 grid, or none) — drawn inside the
   selection.
@@ -117,9 +115,7 @@ ASCII sketch (handles abbreviated as `■`):
 └───────────────────────────────────────────────────┘
 ```
 
-Z-order, bottom to top, matches upstream `DrawSelectionLayer` in
-`Source/Components/ImageGlass.Viewer/ViewerCanvas.cs` (lines
-1788–1912):
+Z-order, bottom to top:
 
 1. Image.
 2. Dim mask outside selection.
@@ -127,13 +123,13 @@ Z-order, bottom to top, matches upstream `DrawSelectionLayer` in
 4. Selection border.
 5. Handles.
 
-This z-order is preserved on Mac so that handles always paint over
-the border (the user can grab them at the corners) and grid lines
-always paint over the image but never over the border.
+This z-order ensures handles always paint over the border (the user
+can grab them at the corners) and grid lines always paint over the
+image but never over the border.
 
 ### 2.2 Grid overlays
 
-Five grid modes — same as upstream:
+Five grid modes:
 
 | Mode | Lines drawn |
 | --- | --- |
@@ -157,7 +153,7 @@ Full control reference:
 
 | Control | Type | Bound to | Notes |
 | --- | --- | --- | --- |
-| Aspect ratio | `Picker` | `CropController.aspectRatio` | Presets: Free, Original, 1:1, 1:2, 2:1, 2:3, 3:2, 3:4, 4:3, 9:16, 16:9, Custom (upstream `SelectionAspectRatio` — verified from `Source/Components/ImageGlass.Base/Types/Enums.cs:157`). |
+| Aspect ratio | `Picker` | `CropController.aspectRatio` | Presets: Free, Original, 1:1, 1:2, 2:1, 2:3, 3:2, 3:4, 4:3, 9:16, 16:9, Custom. |
 | Custom W | `NumberField` | `CropController.aspectRatioValues[0]` | Enabled only when aspect = Custom. |
 | Custom H | `NumberField` | `CropController.aspectRatioValues[1]` | Same. |
 | Lock aspect | `Toggle` | `CropController.lockAspect` | When on, all resizes preserve the current aspect. Shift-drag is the transient equivalent (see §3.2). |
@@ -202,13 +198,10 @@ Full control reference:
 
 ### 2.5 Drag semantics (modifier keys)
 
-Verified from upstream `FrmCrop.cs:557` (`FrmMain_KeyDown` handling
-the square-ratio modifier):
-
 | Modifier during drag | Effect |
 | --- | --- |
 | (none) | Free drag of the selected edge / corner / interior. |
-| Shift | Constrain aspect ratio to the current value (free-aspect becomes 1:1, matching upstream `_squareRatioSelectionKeyPressed`). |
+| Shift | Constrain aspect ratio to the current value (free-aspect becomes 1:1). |
 | Option | Resize from the opposite edge / corner (i.e., the geometric center is held fixed). |
 | Shift+Option | Both — constrained aspect, centered resize. |
 
@@ -274,7 +267,7 @@ When the crop tool is opened, the initial selection comes from
 | `selectNPercent` (10/20/25/30/onThird/40/50/60/twoThirds/70/75/80/90) | A centered rect of that percent of each axis. |
 
 `tools.crop.auto_center` (default `true`) further centers a custom-area
-rect on the image. Verified from `CropToolConfig.cs:68`.
+rect on the image.
 
 ---
 
@@ -309,11 +302,8 @@ HEIC / AVIF.
 
 ### 4.3 The lossless JPEG path
 
-This is the biggest single-feature divergence from upstream. Upstream
-uses `WicBitmapSource.FromSourceRect` (verified from
-`Source/Components/ImageGlass.Base/Photoing/Photoing.cs`) which always
-re-encodes the JPEG, losing quality at every crop. The Mac fork adds a
-**true lossless** path:
+ImageGlass_Mac uses libjpeg-turbo's `tjTransform` for lossless JPEG
+crops, preserving quality at every crop. The pipeline:
 
 1. When the user clicks Save / Save As with a JPEG source and
    `tools.crop.lossless_jpeg = true`:
@@ -439,8 +429,6 @@ For a click at point `p` in canvas coordinates:
 * Else if `p` is inside `rect` → start `moving`.
 * Else (no selection or click outside the selection) → start
   `drawing` a new rect from `p`.
-
-This matches upstream `ViewerCanvas.cs:325–490`.
 
 ### 5.4 Undo
 
@@ -647,26 +635,11 @@ user can confirm, then (on user approval) the user presses ⌘S.
 
 ---
 
-## 8. Divergence from Upstream
-
-| Upstream | Mac fork |
-| --- | --- |
-| Overlay rendered with `Direct2D` `DXGraphics` | Overlay rendered as a second Metal pass on the same `MTKView`. |
-| Pixel work via WIC `WicBitmapSource.FromSourceRect` | Pixel work via `CIImage.cropped(to:)` for non-JPEG, libjpeg-turbo `tjTransform` for MCU-aligned JPEG. |
-| Always re-encodes JPEG | Lossless JPEG crop path. Substantive new behavior. |
-| Crop tool is a docked side panel | Crop tool's controls live in the new panel framework (docked or floating). The overlay is in the canvas. |
-| Disables crop tool entirely on animated images / WebView2-rendered SVGs (`FrmCrop.cs:142`) | Animated-image block preserved; the panel shows a single-line message instead of silently disabling. SVG block is gone because the fork renders SVG natively (no WebView2). |
-| Shift = 1:1 transient ratio (`_squareRatioSelectionKey`, line 29) | Preserved. |
-| EXIF orientation is reapplied after crop | Preserved. EXIF orientation tag is rewritten to `.up` on the output (the cropped image is already in display orientation). |
-| No content-aware modes | Same — explicitly out of scope (§1.3). |
-
----
-
-## 9. Open Questions
+## 8. Open Questions
 
 * **Aspect ratios for vertical video frames.** Photographers wanting
   to crop iPhone Live Photos to 9:16 want a single click; the
-  `Ratio9_16` preset exists in upstream and is preserved. Should the
+  `Ratio9_16` preset is included. Should the
   default preset list be reordered so 9:16 is more prominent on
   vertical-source images? Tentative: yes, but only if the source has
   an EXIF Orientation that implies portrait.
@@ -677,24 +650,3 @@ user can confirm, then (on user approval) the user presses ⌘S.
   be a meaningful crop-quality improvement and is a natural Vision /
   Core Image experiment. Out of scope for v1.
 
----
-
-## 10. References
-
-* `Source/ImageGlass/Tools/FrmCrop.cs` — upstream crop tool form,
-  state machine, keyboard handling.
-* `Source/ImageGlass/Tools/FrmCropSettings.cs` — settings sub-dialog
-  for the crop tool.
-* `Source/Components/ImageGlass.Settings/ToolConfigs/CropToolConfig.cs`
-  — persisted crop config (the field set this spec exposes in
-  Settings).
-* `Source/Components/ImageGlass.Base/Types/Enums.cs:157` —
-  `SelectionAspectRatio` enum.
-* `Source/Components/ImageGlass.Viewer/ViewerCanvas.cs:325–490` —
-  hit-testing for the eight resize handles.
-* `Source/Components/ImageGlass.Viewer/ViewerCanvas.cs:1788–1912` —
-  `DrawSelectionLayer` (overlay z-order).
-* `Source/Components/ImageGlass.Base/Photoing/Photoing.cs` — the
-  upstream `CropImage` call using WIC.
-* `Source/ImageGlass/FrmMain/FrmMain.IGMethods.cs` — `IG_Crop`,
-  `IG_ToggleCropTool`, tool-form positioning.

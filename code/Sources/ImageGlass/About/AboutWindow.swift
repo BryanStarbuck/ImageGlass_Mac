@@ -57,25 +57,67 @@ enum AboutWindowController {
 /// instead. SwiftUI doesn't expose a first-class hook for replacing the
 /// About item's action; subclassing `NSApplication`'s delegate is the
 /// supported workaround on macOS 14.
+///
+/// This delegate also owns the Cocoa application-lifecycle hooks SwiftUI
+/// still doesn't surface in macOS 14: Finder "Open With…" routing,
+/// dock-icon reopen, and "Open Recent" tracking. The delegate posts
+/// `Notification.Name.imageGlassOpenURLs` whenever the system asks the app
+/// to open files; `ContentView` observes that notification and forwards
+/// the URLs to `AppState.openExternalFile(url:)`.
 final class AboutAppDelegate: NSObject, NSApplicationDelegate {
+    /// URLs received from AppKit before the SwiftUI window finished its
+    /// first `.task` (the cold-launch "Open With…" case). They get
+    /// re-broadcast as soon as a listener appears via `flushPendingOpens`.
+    @MainActor private static var pendingURLs: [URL] = []
+    @MainActor private static var hasListener: Bool = false
+
     @MainActor
     @objc func orderFrontStandardAboutPanel(_ sender: Any?) {
         AboutWindowController.show()
+    }
+
+    // MARK: - Finder "Open With…" / drag-onto-app-icon
+
+    /// Called when the user opens one or more files from Finder by
+    /// double-clicking, drag-drop onto the app icon, or `open -a ImageGlass`.
+    func application(_ sender: NSApplication, openFiles filenames: [String]) {
+        let urls = filenames.map { URL(fileURLWithPath: $0) }
+        Self.routeOpen(urls: urls)
+        sender.reply(toOpenOrPrint: .success)
+    }
+
+    /// Newer URL-based variant (universal links, drag-drop on Sequoia+).
+    func application(_ application: NSApplication, open urls: [URL]) {
+        Self.routeOpen(urls: urls)
+    }
+
+    /// Dock-icon click when there are no visible windows: re-show the
+    /// main window instead of leaving the user staring at the dock.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        if !hasVisibleWindows {
+            for win in sender.windows where win.canBecomeMain {
+                win.makeKeyAndOrderFront(nil)
+                break
+            }
+        }
+        return true
+    }
+
+    /// Mac-native viewers (Preview, Pixea) terminate on last-window-close.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        true
     }
 
     @MainActor
     func applicationDidFinishLaunching(_ notification: Notification) {
         // When launched via `swift run` (no .app bundle), the process can
         // come up as an accessory and never bring its window to the front.
-        // Force a regular activation policy so the SwiftUI window is reachable.
         NSApp.setActivationPolicy(.regular)
-
-        // SwiftUI creates the WindowGroup window lazily — it doesn't exist
-        // when `applicationDidFinishLaunching` fires. Wait for the first
-        // titled window to be created, then recenter it onto the screen
-        // that contains the mouse cursor if SwiftUI restored a frame to a
-        // monitor the user isn't looking at.
+        // Recenter the SwiftUI window on the cursor's screen if it restored
+        // a frame to a monitor the user isn't looking at.
         Self.installFirstWindowRelocator()
+        // Single-line charter audit so a silent regression shows up in logs.
+        NSLog("%@", CharterStatus.summary())
     }
 
     private static nonisolated(unsafe) var mainWindowObserver: NSObjectProtocol?
@@ -102,12 +144,6 @@ final class AboutAppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// SwiftUI's `WindowGroup` restores the previous frame from
-    /// `NSUserDefaults` ("NSWindow Frame …"). If that frame is on a
-    /// monitor the user isn't looking at — or on a monitor that's been
-    /// disconnected — the window is technically visible but practically
-    /// invisible. If the restored frame is on a screen that doesn't contain
-    /// the mouse cursor, recenter on the cursor's screen.
     @MainActor
     private static func relocateIfOffCursorScreen(_ window: NSWindow) {
         let mouse = NSEvent.mouseLocation
@@ -126,4 +162,44 @@ final class AboutAppDelegate: NSObject, NSApplicationDelegate {
         window.setFrame(newFrame, display: true)
         window.makeKeyAndOrderFront(nil)
     }
+
+    @MainActor
+    private static func routeOpen(urls: [URL]) {
+        guard !urls.isEmpty else { return }
+        let docs = NSDocumentController.shared
+        for url in urls {
+            docs.noteNewRecentDocumentURL(url)
+        }
+        if hasListener {
+            NotificationCenter.default.post(
+                name: .imageGlassOpenURLs,
+                object: nil,
+                userInfo: ["urls": urls]
+            )
+        } else {
+            pendingURLs.append(contentsOf: urls)
+        }
+    }
+
+    /// Called by the SwiftUI root once it has subscribed to the notification.
+    /// Drains buffered URLs received during cold-launch Finder "Open With…".
+    @MainActor
+    static func registerListenerAndFlush() {
+        hasListener = true
+        guard !pendingURLs.isEmpty else { return }
+        let urls = pendingURLs
+        pendingURLs.removeAll()
+        NotificationCenter.default.post(
+            name: .imageGlassOpenURLs,
+            object: nil,
+            userInfo: ["urls": urls]
+        )
+    }
+}
+
+extension Notification.Name {
+    /// Posted by `AboutAppDelegate` whenever AppKit asks the app to open
+    /// one or more file URLs from outside the SwiftUI window. Payload:
+    ///   `userInfo["urls"]: [URL]`
+    static let imageGlassOpenURLs = Notification.Name("ImageGlassOpenURLs")
 }

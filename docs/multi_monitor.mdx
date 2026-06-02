@@ -6,10 +6,10 @@ description: Product and engineering specification for monitor-aware window pers
 # Multi-Monitor Window State
 
 This page is the **complete product + engineering specification** for the
-multi-monitor window-state subsystem of the ImageGlass Starbuck fork
-(ImageGlass_Mac). It is the contract that the SwiftUI window scene, the
-`NSWindowDelegate` bridge, the on-disk `settings.json` `window` section,
-and the launch-time restoration path all must satisfy.
+multi-monitor window-state subsystem of ImageGlass_Mac. It is the contract
+that the SwiftUI window scene, the `NSWindowDelegate` bridge, the on-disk
+`settings.json` `window` section, and the launch-time restoration path all
+must satisfy.
 
 It cross-references the sibling specs and does not duplicate them:
 
@@ -25,7 +25,7 @@ It cross-references the sibling specs and does not duplicate them:
   semantics. This spec writes the selected path back to `settings.json`
   but the rules for what is selectable, what "the file tree" is, and how
   selection navigates live there.
-* [Automation](./automation.mdx) — overall fork charter. Read first.
+* [Automation](./automation.mdx) — automation, panels, scopes, and Local Storage.
 
 The Mac stack used throughout this spec is the one declared in
 `CLAUDE.md`: **Swift 6 + SwiftUI + AppKit interop** (`NSWindow`,
@@ -34,18 +34,22 @@ The Mac stack used throughout this spec is the one declared in
 
 ---
 
-## 1. Why the Fork Adds Monitor-Aware State
+## 1. Why ImageGlass_Mac Has Monitor-Aware State
 
-Upstream Windows ImageGlass persists window position and size as a single
-`(x, y, width, height)` tuple in absolute screen coordinates. That works
-on a single-monitor PC. On a Mac with three displays — say a 6K Pro
-Display XDR on the left, a built-in MacBook screen in the middle, and a
-4K Samsung M8 on the right (see `CLAUDE.md`) — the absolute coordinate
-of the upper-left of "the right monitor" depends on how the user has
-arranged displays in System Settings. Two failure modes follow:
+A Mac-native image viewer must behave correctly on multi-display setups,
+which is the common case for the audience this app targets: photographers,
+designers, and power users who routinely run a laptop alongside one or
+more external panels. A naive scheme that persists window position as a
+single `(x, y, width, height)` tuple in absolute screen coordinates
+breaks the moment the display arrangement changes. On a Mac with three
+displays — say a 6K Pro Display XDR on the left, a built-in MacBook
+screen in the middle, and a 4K Samsung M8 on the right (see `CLAUDE.md`)
+— the absolute coordinate of the upper-left of "the right monitor"
+depends entirely on how the user has arranged displays in System
+Settings. Two failure modes follow:
 
 1. **The user undocks the laptop.** The right monitor disappears.
-   ImageGlass relaunches and tries to position the window at
+   ImageGlass_Mac relaunches and tries to position the window at
    `(5760, 0, 1600, 1200)` — coordinates that no longer correspond to
    any attached display. The window opens off-screen and the user has
    to drag it back via the *Window* menu.
@@ -60,14 +64,12 @@ coordinate space**, then on launch resolve the identifier back to a
 currently-attached `NSScreen` before computing the absolute frame. If
 the display is gone, fall back deterministically.
 
-The fork's product brief also adds two things upstream does not:
+ImageGlass_Mac's product brief also includes:
 
-* **Last-selected file in the file panel.** Upstream's "open last seen
-  image" (`general.open_last_image`) re-opens *the last viewed image
-  file*. The fork's panel column (see `panels.mdx`, `list_of_files.mdx`)
-  has an explicit selection in the directory/filename panel — including
-  in tree mode — that needs to survive a restart even when the resolved
-  scope changes between runs.
+* **Last-selected file in the file panel.** The panel column (see
+  `panels.mdx`, `list_of_files.mdx`) has an explicit selection in the
+  directory/filename panel — including in tree mode — that needs to
+  survive a restart even when the resolved scope changes between runs.
 * **Atomic round-trip with the MCP server.** Window state lives in
   `settings.json`, the same file MCP clients (Claude Code) read and
   write. A Claude Code session can set the window to a specific
@@ -93,7 +95,7 @@ The fork's product brief also adds two things upstream does not:
   evaluates, with explicit semantics for "file no longer exists" and
   "file no longer in scope".
 * **Discoverable in settings.json.** Like every other persisted state
-  in the fork, the window state is a named section in `settings.json`,
+  in ImageGlass_Mac, the window state is a named section in `settings.json`,
   inspectable by the user, version-controllable, and editable by MCP.
 * **Crash-safe.** The save path is the same atomic-rename pipeline used
   by the rest of `settings.json` (`settings.mdx` §2.4). A crash mid-save
@@ -537,8 +539,8 @@ already mounted. Aggressively zeroing the field would prevent that.
 
 ### 7.5 Interaction with `general.open_last_image`
 
-`general.open_last_image` (from upstream) is independent and takes
-precedence if both are set. Concretely:
+`general.open_last_image` is independent and takes precedence if both
+are set. Concretely:
 
 * If `general.open_last_image == true` and `general.last_seen_image`
   is set, that file is selected/opened first.

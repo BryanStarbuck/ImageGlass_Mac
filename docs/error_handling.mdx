@@ -7,7 +7,7 @@ description: Product and engineering specification for the error-handling and lo
 
 This page is the **complete product + engineering specification** for
 how ImageGlass_Mac surfaces errors and logs significant events to
-disk. Every subsystem in the fork — the viewer canvas, the panels
+disk. Every subsystem — the viewer canvas, the panels
 framework, the scope walker, Local Storage, the MCP server, the crop
 pipeline, the CLI — calls into the small reusable library defined
 here. No subsystem writes its own log or error file.
@@ -44,7 +44,7 @@ bookmarks for the Application Support directory, and **`Foundation`**
 
 ## 1. Why a Dedicated Logging Subsystem
 
-The fork has three properties that make a thoughtful logging layer
+ImageGlass_Mac has three properties that make a thoughtful logging layer
 non-optional:
 
 1. **MCP is the automation contract.** Claude Code drives
@@ -104,7 +104,7 @@ this spec.
 
 * **No remote log shipping in v1.** No Sentry, no Datadog, no
   network-attached log sink. The user can opt in to copying their
-  files manually; the fork does not phone home.
+  files manually; ImageGlass_Mac does not phone home.
 * **No structured query engine in v1.** Greppable plain text is the
   query interface. A future `igcmd log` subcommand may add `--since`,
   `--level`, `--mcp-tool` filters; not required for v1.

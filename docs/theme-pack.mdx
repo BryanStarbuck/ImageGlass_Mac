@@ -5,7 +5,7 @@ description: How to author a .igtheme pack — folder layout, manifest, icons.
 
 # Building a Theme Pack
 
-A theme pack is a `.igtheme` archive that ImageGlass loads to customize
+A theme pack is a `.igtheme` archive that ImageGlass_Mac_Mac loads to customize
 its visual appearance. Authoring a theme is straightforward — you only
 need a folder, a JSON manifest, a preview image, and a set of SVG icons.
 
@@ -25,7 +25,7 @@ THEME_PACK.igtheme
 <theme-name>.<author-name>
 ```
 
-For example: `Kobe.Duong-Dieu-Phap`.
+For example: `Kobe.Jane-Smith`.
 
 The `.igtheme` file itself is a standard archive containing this folder.
 
@@ -33,7 +33,7 @@ The `.igtheme` file itself is a standard archive containing this folder.
 
 ### 1. `igtheme.json` — manifest
 
-The most important file in the pack. Tells ImageGlass which SVG file
+The most important file in the pack. Tells ImageGlass_Mac which SVG file
 maps to which UI element and declares the theme's metadata and colors.
 
 The manifest has five top-level sections:
@@ -53,7 +53,7 @@ available themes. Filename is declared in `Settings.PreviewImage`.
 
 ### 3. SVG icons
 
-ImageGlass uses SVG icons so the UI looks crisp at all DPIs. The
+ImageGlass_Mac uses SVG icons so the UI looks crisp at all DPIs. The
 manifest's `ToolbarIcons` section maps each named UI function to a
 filename in the theme folder.
 
@@ -71,20 +71,19 @@ The manifest references icons for every interactive element, including:
   toggle, settings, about.
 
 The exact, complete list is enumerated in the `ToolbarIcons` section of
-the manifest schema. If a theme is missing an icon, ImageGlass falls back
+the manifest schema. If a theme is missing an icon, ImageGlass_Mac falls back
 to the default icon for that slot.
 
 ## Distribution
 
 Once you've packaged your `.igtheme` file, you can:
 
-1. **Submit it for inclusion** on the official site by opening a GitHub
-   issue on the ImageGlass repository, **or** emailing
-   `phap@imageglass.org` with the file attached.
+1. **Submit it for inclusion** by opening a GitHub issue on the
+   ImageGlass_Mac repository.
 2. **Self-host** on GitHub or anywhere else; users can install it via the
    Settings UI or via:
    ```text
-   igcmd.exe install-themes "path\to\theme.igtheme"
+   igcmd install-themes "path/to/theme.igtheme"
    ```
 
 ## Tips

@@ -1,19 +1,19 @@
 ---
 title: Supported Image Formats
-description: Complete list of formats ImageGlass can open and save, plus optional dependencies.
+description: Complete list of formats ImageGlass_Mac can open and save, plus optional dependencies.
 ---
 
 # Supported Formats
 
-ImageGlass uses the **ImageMagick** library under the hood, which gives it
-support for an extremely wide range of image formats — well over 90, with
-the exact count depending on the installed ImageMagick build and any
-optional dependencies.
+ImageGlass_Mac uses macOS's native **ImageIO** pipeline as the primary
+decoder, supplemented by **libvips** and **ImageMagick** for formats
+ImageIO doesn't cover natively. The combined surface is well over 90
+formats.
 
 ## Commonly Supported Formats
 
 ### Standard raster
-- **BMP** — Windows Bitmap
+- **BMP** — Bitmap image
 - **GIF** — including animated GIF
 - **JPEG / JPG** — including JPEG 2000 variants
 - **PNG** — including APNG (animated)
@@ -21,7 +21,7 @@ optional dependencies.
 
 ### Modern raster
 - **AVIF** — AV1 Image File Format
-- **HEIC / HEIF** — Apple's High Efficiency Image Format (non-animated only)
+- **HEIC / HEIF** — High Efficiency Image Format (non-animated only)
 - **JXL** — JPEG XL
 - **WebP** — including animated WebP
 
@@ -29,59 +29,48 @@ optional dependencies.
 - **SVG** — Scalable Vector Graphics (animations supported)
 - **AI** — Adobe Illustrator (requires Ghostscript)
 - **EPS** — Encapsulated PostScript (requires Ghostscript)
-- **PDF** — Portable Document Format (requires Ghostscript)
+- **PDF** — Portable Document Format
 
 ### Specialized / professional
 - **PSD** — Adobe Photoshop
-- **ICO / CUR** — Windows icons / cursors
+- **ICO / CUR** — Icon and Cursor formats
 - **QOI** — Quite OK Image format
 - **FITS** — astronomy
 - **HDR** — Radiance HDR
 - **EXR** — OpenEXR
 
 ### RAW (camera)
-- A wide range of RAW formats from major camera manufacturers. Refer to
-  the ImageMagick documentation for the exact list as it depends on the
-  installed delegates.
+- A wide range of RAW formats from major camera manufacturers
+  (CR2/CR3, NEF, ARW, DNG, and more) via the macOS RAW pipeline.
 
 ## Read vs. Write Support
 
 - **Read**: nearly all listed formats.
-- **Save**: a focused subset — most commonly **PNG, JPEG, GIF, TIFF, WebP**.
-  Other formats vary based on ImageMagick delegate availability.
+- **Save**: a focused subset — most commonly **PNG, JPEG, GIF, TIFF,
+  WebP, HEIC, AVIF**.
 
 ## Optional Dependencies
 
 Some formats require additional software to be installed alongside
-ImageGlass:
+ImageGlass_Mac:
 
 | Format | Required Tool |
 | --- | --- |
-| AI, EPS, PDF | Ghostscript |
-| BPG | BPG tools for Windows |
+| AI, EPS | Ghostscript |
 | HEIC / HEIF | (built-in, but **non-animated** images only) |
 | APNG | (built-in) |
 | Animated WebP | (built-in) |
 
 ## Special Input Methods
 
-In addition to opening files normally, ImageGlass can read:
+In addition to opening files normally, ImageGlass_Mac can read:
 
-- **Clipboard** images and image file paths (`Ctrl+V`).
+- **Clipboard** images and image file paths (`⌘V`).
 - **Base-64 encoded text files** — useful when working with image data
   pasted from web tools or APIs.
 
 ## Adding Custom Extensions
 
 The list of recognized extensions is **user-configurable**. Power users
-can add any extension supported by their ImageMagick install by editing
-the configuration files. This means newly supported formats from upstream
-ImageMagick releases can be enabled without waiting for a new ImageGlass
-build.
-
-## Reference
-
-For the canonical, exhaustive list of formats and delegates supported by
-the underlying engine, see the official ImageMagick documentation:
-
-- https://imagemagick.org/script/formats.php
+can add any extension supported by the decoder pipeline by editing the
+configuration files.

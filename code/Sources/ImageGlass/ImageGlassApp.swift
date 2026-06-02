@@ -8,7 +8,9 @@ struct ImageGlassApp: App {
     @State private var state: AppState
 
     // Owns the AppDelegate that overrides `orderFrontStandardAboutPanel`
-    // so the default Apple About panel is replaced by `AboutView`.
+    // so the default Apple About panel is replaced by `AboutView`, and
+    // routes Finder file-open / dock-reopen / Open Recent through to the
+    // running `AppState`. See `AboutWindow.swift`.
     @NSApplicationDelegateAdaptor(AboutAppDelegate.self) private var aboutDelegate
 
     // Intercept `--help` / `-h` / `/?` at process start so the user gets
@@ -44,6 +46,10 @@ struct ImageGlassApp: App {
                 }
             }
             CommandGroup(after: .sidebar) {
+                Button(state.showPanelColumn ? "Hide Panel Column" : "Show Panel Column") {
+                    state.showPanelColumn.toggle()
+                }
+                .keyboardShortcut("0", modifiers: [.command, .option])
                 Button("Re-evaluate Active Scope") {
                     Task { await state.reevaluateActive() }
                 }
@@ -52,8 +58,13 @@ struct ImageGlassApp: App {
             CommandGroup(replacing: .newItem) {
                 Button("Open…") { openFileDialog() }
                     .keyboardShortcut("o", modifiers: [.command])
-                Button("Paste Image from Clipboard") { pasteFromClipboard() }
-                    .keyboardShortcut("v", modifiers: [.command])
+                Menu("Open Recent") {
+                    OpenRecentMenu(state: state)
+                }
+            }
+            CommandGroup(after: .pasteboard) {
+                Button("Paste Image / Path") { pasteFromClipboard() }
+                    .keyboardShortcut("v", modifiers: [.command, .shift])
             }
             CommandGroup(after: .help) {
                 Button("Releases & News…") {
@@ -202,10 +213,37 @@ struct ImageGlassApp: App {
         let panel = NSOpenPanel()
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
-        panel.allowsMultipleSelection = false
+        panel.allowsMultipleSelection = true
         panel.allowedContentTypes = [.image]
-        if panel.runModal() == .OK, let url = panel.url {
+        if panel.runModal() == .OK {
+            for url in panel.urls {
+                state.openExternalFile(url: url)
+            }
+        }
+    }
+
+    /// Cmd-Shift-V — accept image content pasted from the clipboard.
+    /// First tries file URLs (common case), then falls back to raw image
+    /// data which is materialised under the app's cache directory so the
+    /// rest of the viewer can treat it like any other on-disk file.
+    @MainActor
+    private func pasteFromClipboard() {
+        let result = ClipboardLoader.loadFromClipboard()
+        if !result.fileURLs.isEmpty {
+            for url in result.fileURLs { state.openExternalFile(url: url) }
+            return
+        }
+        guard let loaded = result.image else { return }
+        let rep = NSBitmapImageRep(cgImage: loaded.cgImage)
+        guard let data = rep.representation(using: .png, properties: [:]) else { return }
+        let dir = AppPaths.appSupportDir.appendingPathComponent("clipboard", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = dir.appendingPathComponent("paste-\(Int(Date().timeIntervalSince1970)).png")
+        do {
+            try data.write(to: url)
             state.openExternalFile(url: url)
+        } catch {
+            NSLog("Paste image write failed: \(error)")
         }
     }
 
@@ -219,36 +257,6 @@ struct ImageGlassApp: App {
                 .keyboardShortcut(KeyEquivalent(Character("\(idx + 1)")), modifiers: [.command, .option])
             }
         }
-    }
-
-    /// Spec: "Paste clipboard data (image files, raw bitmaps, or file paths)
-    /// with `Ctrl+V`." On macOS Cmd+V — covered above in the menu.
-    private func pasteFromClipboard() {
-        let result = ClipboardLoader.loadFromClipboard()
-        if let url = result.fileURLs.first(where: {
-            FormatRegistry.shared.format(forURL: $0) != nil
-        }) {
-            state.openExternalFile(url: url)
-            return
-        }
-        if let loaded = result.image {
-            do {
-                let scratch = try writeScratchImage(loaded)
-                state.openExternalFile(url: scratch)
-            } catch {
-                NSLog("paste write failed: \(error)")
-            }
-        }
-    }
-
-    private func writeScratchImage(_ image: LoadedImage) throws -> URL {
-        let dir = AppPaths.appSupportDir.appendingPathComponent("ClipboardPaste",
-                                                                isDirectory: true)
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let stamp = Int(Date().timeIntervalSince1970 * 1000)
-        let url = dir.appendingPathComponent("paste-\(stamp).png")
-        try FrameExporter.saveFrame(image.cgImage, to: url)
-        return url
     }
 
     private func saveCurrentFrame() {
@@ -286,6 +294,31 @@ struct ImageGlassApp: App {
                 )
             } catch {
                 NSLog("export frames failed: \(error)")
+            }
+        }
+    }
+}
+
+/// SwiftUI helper that materialises the system's recent-document list into
+/// menu items. Uses `NSDocumentController.shared.recentDocumentURLs` — the
+/// same backing store the AppKit Open Recent menu would use if the app
+/// shipped as an `NSDocument`-based app.
+private struct OpenRecentMenu: View {
+    @Bindable var state: AppState
+
+    var body: some View {
+        let urls = NSDocumentController.shared.recentDocumentURLs
+        if urls.isEmpty {
+            Button("No Recent Files") {}.disabled(true)
+        } else {
+            ForEach(urls, id: \.self) { url in
+                Button(url.lastPathComponent) {
+                    state.openExternalFile(url: url)
+                }
+            }
+            Divider()
+            Button("Clear Menu") {
+                NSDocumentController.shared.clearRecentDocuments(nil)
             }
         }
     }

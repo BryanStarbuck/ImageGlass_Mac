@@ -1,15 +1,14 @@
 ---
 title: Settings
-description: Product and engineering specification for the Settings subsystem of ImageGlass_Mac — every settings page, every field, the Mac-native UI translation, the persistence model, and the MCP integration surface.
+description: Product and engineering specification for the Settings subsystem of ImageGlass_Mac — every settings page, every field, the Mac-native UI, the persistence model, and the MCP integration surface.
 ---
 
 # Settings
 
 This page is the **complete product + engineering specification** for the
-Settings subsystem of the ImageGlass Starbuck fork (ImageGlass_Mac). It is
-the contract that the SwiftUI Settings scene, the on-disk configuration
-files, the migration story from upstream `igconfig.json`, and the
-MCP-driven settings tools all must satisfy.
+Settings subsystem of ImageGlass_Mac. It is the contract that the SwiftUI
+Settings scene, the on-disk configuration files, and the MCP-driven
+settings tools all must satisfy.
 
 It cross-references the sibling specs and does not duplicate them:
 
@@ -23,7 +22,7 @@ It cross-references the sibling specs and does not duplicate them:
   Scope JSON files are not "settings" in the strict sense; the **Gallery**
   page below covers gallery-style file panel defaults, and scope persistence
   is fully spec'd in `list_of_files.mdx`.
-* [Automation](./automation.mdx) — overall fork charter. Read this
+* [Automation](./automation.mdx) — overall product charter. Read this
   first if you have not already.
 
 The Mac stack used throughout this spec is the one declared in
@@ -63,9 +62,6 @@ annotated with the tier it primarily targets.
 * **Atomic durability.** Settings writes are crash-safe: atomic rename of a
   temporary file. A power outage cannot leave the user with a corrupt
   config.
-* **Migration from upstream.** A user coming from Windows ImageGlass with an
-  `igconfig.json` can drop it next to the Mac config and have their
-  preferences honored.
 
 ### 1.3 Non-goals
 
@@ -99,7 +95,7 @@ Justification:
 * **`settings.json` is plain text and inspectable.** It is the same
   philosophy as the Local Storage scope files (see `automation.mdx` §4):
   a binary blob would close off the MCP, hand-editing, and
-  version-control workflows the fork explicitly wants to enable.
+  version-control workflows ImageGlass_Mac explicitly wants to enable.
 
 ### 2.2 File layout
 
@@ -209,32 +205,10 @@ All `set_*` calls return the prior value so callers can implement undo
 without a round-trip. All writes are journaled to `logs/settings.log` with
 the actor (`gui`, `mcp:<client-name>`, `import`).
 
-### 2.6 Migration from upstream `igconfig.json`
+### 2.6 Quick Setup (first run)
 
-The upstream Windows app persists its settings to `igconfig.json` next to
-`ImageGlass.exe` (or, for portable builds, in the same folder). The Mac
-fork supports a one-shot import:
-
-1. On first launch, the app looks for `~/Documents/igconfig.json`,
-   `~/Downloads/igconfig.json`, and `~/Library/Application
-   Support/ImageGlass_Mac/import.json`.
-2. If found, the user is prompted ("Import settings from previous ImageGlass
-   install?") with a diff preview.
-3. The `UpstreamConfigImporter` translates the upstream field names to the
-   fork's schema. Every upstream property has either a direct fork
-   equivalent (table below), a translated equivalent (e.g. Windows
-   `BackdropStyle.Mica` → Mac `AppearanceSettings.WindowMaterial.sidebar`),
-   or is dropped with a logged reason (e.g. `UseWebview2ForSvg` — the fork
-   does not use WebView2).
-
-The mapping table is exhaustive (Appendix A) so a power user can audit
-every translated field.
-
-### 2.7 Quick Setup (first run)
-
-Upstream has a Quick Setup wizard that runs once on first launch. The Mac
-fork preserves the pattern but rewrites it as a SwiftUI sheet with three
-steps:
+A Quick Setup wizard runs once on first launch as a SwiftUI sheet with
+two steps:
 
 1. **Welcome and theme** — pick light, dark, or system. Pick an accent
    color override (or accept the system accent).
@@ -248,13 +222,11 @@ steps:
      "Photographer".
    * *Designer / power user* (T3) — frameless window, gallery hidden, MCP
      server enabled by default, default panel layout "Power user".
-3. **Optionally import upstream settings** — if `igconfig.json` was
-   detected, offer the diff and let the user accept or skip.
 
 `general.quick_setup_version` records that Quick Setup ran, so a future
 breaking-change release can re-trigger it.
 
-### 2.8 Settings scene structure (SwiftUI)
+### 2.7 Settings scene structure (SwiftUI)
 
 The Settings scene uses the SwiftUI 2024+ `Settings` scene with a
 **toolbar tab** layout (Preferences-style icon row across the top, page
@@ -326,37 +298,27 @@ toggles sidebar mode.
 
 ## 3. Page Inventory
 
-The upstream WebUI ships these page sources (verified from
-`Source/Components/ImageGlass.Settings/WebUI/src/FrmSettings/`):
+The Settings scene ships these pages:
 
-```
-TabGeneral    TabImage      TabAppearance  TabLayout
-TabSlideshow  TabEdit       TabViewer      TabMouse
-TabKeyboard   TabGallery    TabToolbar     TabFileAssocs
-TabLanguage   TabTools
-```
-
-The fork maps these 1:1 with three additions and one rename:
-
-| Upstream tab | Fork page | Change |
-| --- | --- | --- |
-| TabGeneral | **General** | Updates renamed to *macOS Software Update integration* |
-| TabImage | **Image** | Identical scope |
-| TabAppearance | **Appearance** | `BackdropStyle.Mica` → macOS `NSVisualEffectView` materials |
-| TabLayout | **Layout** | Delegates to the new panel framework — see `panels.mdx` |
-| TabSlideshow | **Slideshow** | Identical scope |
-| TabEdit | **Edit** | Default editor app picker rewritten for `NSWorkspace` |
-| TabViewer | **Viewer** | Adds macOS trackpad gesture settings |
-| TabMouse | **Mouse** | Mouse-button actions translated for Mac mouse models |
-| TabKeyboard | **Keyboard** | Hotkey capture field uses Carbon `kEventHotKey` chord representation |
-| TabGallery | **Gallery** | Refocused to apply to the new file panel (see `list_of_files.mdx`) |
-| TabToolbar | **Toolbar** | Identical scope |
-| TabFileAssocs | **Finder** | Renamed; rewritten for `Info.plist` UTIs + Launch Services |
-| TabLanguage | **Language** | Identical scope |
-| TabTools | **Tools** | Identical scope (crop, color picker, page nav) |
-| — | **Plugins** | **New**: plugin discovery, enable/disable, ordering, per-plugin settings |
-| — | **MCP** | **New** (under Advanced): server enable, transport, allowlist, audit log |
-| — | **Advanced** | **New**: config file path, schema version, reset, diagnostics, log retention |
+| Page | Description |
+| --- | --- |
+| **General** | Application language, theme, startup, updates, window scoping, confirmations |
+| **Image** | Color management, decoding, interpolation, image-info overlay |
+| **Appearance** | Themes, background colors, window translucency materials |
+| **Layout** | Panel visibility and presets — delegates to the panel framework, see `panels.mdx` |
+| **Slideshow** | Slideshow timing, randomness, fullscreen, sounds |
+| **Edit** | External editor app bindings, after-edit actions, built-in edit defaults |
+| **Viewer** | Zoom, pan, trackpad gestures, navigation, frame navigation |
+| **Mouse** | Mouse-button and wheel action bindings |
+| **Keyboard** | Hotkey customization (Carbon `kEventHotKey` chord capture) |
+| **Gallery** | File panel defaults — refocused to the file panel (see `list_of_files.mdx`) |
+| **Toolbar** | Toolbar items and visual properties |
+| **Finder** | File associations via `Info.plist` UTIs + Launch Services |
+| **Language** | UI language and language pack management |
+| **Tools** | Per-tool settings (crop, color picker, page nav, plugin tools) |
+| **Plugins** | Plugin discovery, enable/disable, ordering, per-plugin settings |
+| **MCP** | Server enable, transport, allowlist, audit log (under Advanced) |
+| **Advanced** | Config file path, schema version, reset, diagnostics, log retention |
 
 Each page is fully spec'd in §4 below.
 
@@ -374,7 +336,7 @@ The settings tables use a uniform column set:
 * **Type** — Swift type.
 * **Default** — initial value if the user has never changed it.
 * **MCP** — R / W / — (see §2.5).
-* **Notes** — constraints, references, divergence from upstream.
+* **Notes** — constraints, references.
 
 ---
 
@@ -411,15 +373,15 @@ help link.
 | Language | `language.code` | `String` (BCP-47) | system | R/W | See §4.13. |
 | Theme override | `general.theme_override` | `enum { system, light, dark }` | `system` | R/W | Drives `NSApp.appearance`; system mode follows `NSAppearance.current`. |
 | Accent color | `general.accent_color` | `RGBA?` | `nil` (use system) | R/W | `nil` means inherit the user's macOS accent. |
-| Open with last seen image | `general.open_last_image` | `Bool` | `true` | R/W | Maps to upstream `ShouldOpenLastSeenImage`. |
-| Allow multiple instances | `general.multi_instance` | `Bool` | `true` | R/W | Maps to upstream `EnableMultiInstances`. When `false`, second launch focuses the running app and forwards the file argument. |
+| Open with last seen image | `general.open_last_image` | `Bool` | `true` | R/W | |
+| Allow multiple instances | `general.multi_instance` | `Bool` | `true` | R/W | When `false`, second launch focuses the running app and forwards the file argument. |
 | Always on top | `general.window_top_most` | `Bool` | `false` | R/W | `NSWindow.level = .floating` when true. |
 | Open in full screen | `general.start_full_screen` | `Bool` | `false` | R/W | Honored on launch only; runtime fullscreen is a viewer action. |
 | Frameless window | `general.frameless` | `Bool` | `false` | R/W | Uses `NSWindow.StyleMask.borderless` + custom traffic-light overlay. |
 | Window fit to image | `general.window_fit` | `Bool` | `false` | R/W | Resizes the window to the image's natural size on load. |
 | Center window-fit window | `general.window_fit_centered` | `Bool` | `true` | R/W | Only meaningful when `window_fit = true`. |
-| Confirm before delete | `general.confirm_delete` | `Bool` | `true` | R/W | Maps to upstream `ShowDeleteConfirmation`. |
-| Confirm before overwrite | `general.confirm_overwrite` | `Bool` | `true` | R/W | Maps to upstream `ShowSaveOverrideConfirmation`. |
+| Confirm before delete | `general.confirm_delete` | `Bool` | `true` | R/W | |
+| Confirm before overwrite | `general.confirm_overwrite` | `Bool` | `true` | R/W | |
 | Preserve modified date | `general.preserve_modified_date` | `Bool` | `false` | R/W | When saving in place, restore the file's pre-edit mtime. |
 | Save As opens current dir | `general.save_as_in_current_dir` | `Bool` | `true` | R/W | NSSavePanel default directory. |
 | Update check cadence | `general.update_cadence` | `enum { never, daily, weekly, monthly }` | `weekly` | R/W | Uses `NSBackgroundActivityScheduler`. |
@@ -478,20 +440,20 @@ Four sections:
 
 | Setting | JSON key | Type | Default | MCP | Notes |
 | --- | --- | --- | --- | --- | --- |
-| Color profile | `image.color_profile` | `enum { currentMonitor, sRGB, displayP3, adobeRGB, custom }` | `currentMonitor` | R/W | `custom` reveals a file picker for a `.icc` file. Maps to upstream `ColorProfile`. |
-| Apply profile to all formats | `image.color_profile_all_formats` | `Bool` | `false` | R/W | Otherwise applied only to formats with an embedded profile (JPEG, PNG, HEIC, TIFF). Upstream `ShouldUseColorProfileForAll`. |
-| Async loading | `image.async_loading` | `Bool` | `true` | R/W | Decode on a background actor; show a placeholder until ready. Upstream `EnableImageAsyncLoading`. |
-| Embedded thumb for RAW | `image.embedded_thumb_raw` | `Bool` | `false` | R/W | Use the embedded JPEG when present. Upstream `UseEmbeddedThumbnailRawFormats`. |
-| Embedded thumb for others | `image.embedded_thumb_other` | `Bool` | `false` | R/W | Upstream `UseEmbeddedThumbnailOtherFormats`. |
+| Color profile | `image.color_profile` | `enum { currentMonitor, sRGB, displayP3, adobeRGB, custom }` | `currentMonitor` | R/W | `custom` reveals a file picker for a `.icc` file. |
+| Apply profile to all formats | `image.color_profile_all_formats` | `Bool` | `false` | R/W | Otherwise applied only to formats with an embedded profile (JPEG, PNG, HEIC, TIFF). |
+| Async loading | `image.async_loading` | `Bool` | `true` | R/W | Decode on a background actor; show a placeholder until ready. |
+| Embedded thumb for RAW | `image.embedded_thumb_raw` | `Bool` | `false` | R/W | Use the embedded JPEG when present. |
+| Embedded thumb for others | `image.embedded_thumb_other` | `Bool` | `false` | R/W | |
 | Embedded thumb min width | `image.embedded_thumb_min_width` | `Int` | `0` | R/W | Below this width, fall through to full decode. |
 | Embedded thumb min height | `image.embedded_thumb_min_height` | `Int` | `0` | R/W | Same, height axis. |
-| Scale-down interpolation | `image.interp_scale_down` | `enum { nearest, linear, lanczos, cubic, mitchell, gaussian }` | `lanczos` | R/W | Mac default switched from `MultiSampleLinear` to `lanczos` because Core Image's Lanczos is GPU-accelerated and is the right default for downscaling. |
-| Scale-up interpolation | `image.interp_scale_up` | `enum { nearest, linear, lanczos, cubic, mitchell, gaussian }` | `nearest` | R/W | Default preserves pixel-art crispness, matches upstream. |
+| Scale-down interpolation | `image.interp_scale_down` | `enum { nearest, linear, lanczos, cubic, mitchell, gaussian }` | `lanczos` | R/W | Core Image's Lanczos is GPU-accelerated and is the right default for downscaling. |
+| Scale-up interpolation | `image.interp_scale_up` | `enum { nearest, linear, lanczos, cubic, mitchell, gaussian }` | `nearest` | R/W | Default preserves pixel-art crispness. |
 | Image info overlay | `image.info_overlay` | `Bool` | `false` | R/W | When true, overlay shows the tags below. |
-| Image info tags | `image.info_tags` | `[String]` | see Appendix B | R/W | Subset of `name`, `size`, `dimensions`, `dpi`, `bit_depth`, `color_space`, `exif_camera`, `exif_lens`, `exif_iso`, `exif_shutter`, `exif_aperture`, `exif_focal_length`, `exif_date_taken`, `gps_lat`, `gps_lon`. Upstream `ImageInfoTags`. |
-| Single-frame formats | `image.single_frame_formats` | `[String]` | `[avif, heic, heif, psd, jxl]` | R/W | Formats for which the viewer never tries to animate. Upstream `SingleFrameFormats`. |
-| Use checkerboard background | `image.checkerboard` | `Bool` | `false` | R/W | Transparency background for PNGs etc. Upstream `ShowCheckerboard`. |
-| Checkerboard image only | `image.checkerboard_image_only` | `Bool` | `false` | R/W | When true, only the image region is checkered; canvas remains the background color. Upstream `ShowCheckerboardOnlyImageRegion`. |
+| Image info tags | `image.info_tags` | `[String]` | see Appendix B | R/W | Subset of `name`, `size`, `dimensions`, `dpi`, `bit_depth`, `color_space`, `exif_camera`, `exif_lens`, `exif_iso`, `exif_shutter`, `exif_aperture`, `exif_focal_length`, `exif_date_taken`, `gps_lat`, `gps_lon`. |
+| Single-frame formats | `image.single_frame_formats` | `[String]` | `[avif, heic, heif, psd, jxl]` | R/W | Formats for which the viewer never tries to animate. |
+| Use checkerboard background | `image.checkerboard` | `Bool` | `false` | R/W | Transparency background for PNGs etc. |
+| Checkerboard image only | `image.checkerboard_image_only` | `Bool` | `false` | R/W | When true, only the image region is checkered; canvas remains the background color. |
 
 #### Backend wiring
 
@@ -550,29 +512,29 @@ Five sections:
 
 | Setting | JSON key | Type | Default | MCP | Notes |
 | --- | --- | --- | --- | --- | --- |
-| Default zoom mode | `viewer.zoom_mode` | `enum { autoZoom, lockZoom, scaleToWidth, scaleToHeight, scaleToFit, scaleToFill, oneToOne }` | `autoZoom` | R/W | Upstream `ZoomMode`. `oneToOne` is the canonical name for 100%. |
-| Zoom lock value | `viewer.zoom_lock_percent` | `Float` | `100` | R/W | Used when `zoom_mode = lockZoom`. Upstream `ZoomLockValue`. |
-| Zoom speed | `viewer.zoom_speed` | `Float` | `0` | R/W | `0` means use the system trackpad/mouse defaults. Positive values multiply. Upstream `ZoomSpeed`. |
-| Pan speed | `viewer.pan_speed` | `Float` | `20` | R/W | Pixels per arrow-key press at 100% zoom. Upstream `PanSpeed`. |
-| Pinch to zoom | `viewer.gesture_pinch_zoom` | `Bool` | `true` | R/W | `MagnifyGesture` on trackpads. **New for Mac**, not in upstream. |
-| Two-finger pan | `viewer.gesture_two_finger_pan` | `Bool` | `true` | R/W | **New for Mac**. |
-| Two-finger swipe to navigate | `viewer.gesture_swipe_nav` | `Bool` | `true` | R/W | Swipe left/right = previous/next image. **New for Mac**. |
-| Smart magnify (double-tap) | `viewer.gesture_smart_magnify` | `Bool` | `true` | R/W | Trackpad two-finger double-tap. `NSEvent.EventType.smartMagnify`. **New for Mac**. |
-| Rotate gesture | `viewer.gesture_rotate` | `Bool` | `false` | R/W | Off by default to avoid accidental rotation. **New for Mac**. |
-| Loop back navigation | `viewer.loop_navigation` | `Bool` | `true` | R/W | After last image, wrap to first. Upstream `EnableLoopBackNavigation`. |
-| Auto-switch sibling dir | `viewer.auto_switch_sibling_dir` | `Bool` | `false` | R/W | When the last image in a dir is reached, jump into the next sibling dir. Upstream `EnableAutoSwitchSiblingDir`. |
-| Recursive loading | `viewer.recursive_loading` | `Bool` | `false` | R/W | Walk subdirectories of the opened dir. Upstream `EnableRecursiveLoading`. |
-| Show hidden images | `viewer.show_hidden_files` | `Bool` | `false` | R/W | Includes dotfiles. Upstream `ShouldLoadHiddenImages`. |
-| Group by directory | `viewer.group_by_dir` | `Bool` | `false` | R/W | Sort groups by directory then by image-order within. Upstream `ShouldGroupImagesByDirectory`. |
-| Real-time file update | `viewer.real_time_file_update` | `Bool` | `true` | R/W | FSEventStream-based hot reload. Upstream `EnableRealTimeFileUpdate`. |
-| Auto-open new added image | `viewer.auto_open_new` | `Bool` | `false` | R/W | When real-time update sees a new file, switch to it. Upstream `ShouldAutoOpenNewAddedImage`. |
-| Image order | `viewer.image_order` | `enum { name, length, creationTime, lastWriteTime, extension, random, exifDate }` | `name` | R/W | Upstream `ImageLoadingOrder`. `exifDate` added (uses EXIF `DateTimeOriginal`). |
-| Image order direction | `viewer.image_order_direction` | `enum { asc, desc }` | `asc` | R/W | Upstream `ImageLoadingOrderType`. |
-| Show frame navigation tool | `viewer.show_frame_nav` | `Bool` | `false` | R/W | Multi-frame GIF/TIFF/PDF nav. Upstream `ShowFrameNavTool`. |
-| Image booster cache count | `viewer.cache_image_count` | `Int` | `1` | R/W | How many neighbors to pre-decode. Upstream `ImageBoosterCacheCount`. |
-| Image booster max dimension | `viewer.cache_max_dim` | `Int` | `8000` | R/W | Skip pre-decode above this pixel dimension. Upstream `ImageBoosterCacheMaxDimension`. |
-| Image booster max file size | `viewer.cache_max_mb` | `Float` | `100` | R/W | Skip pre-decode above this file size (MB). Upstream `ImageBoosterCacheMaxFileSizeInMb`. |
-| Min dimension to use WIC | `viewer.huge_image_threshold` | `Int` | `16000` | R/W | Upstream uses WIC for huge images; the Mac fork uses `libvips` streaming above this dimension. Field name preserved for migration; the semantics are "use the streaming decoder above this many pixels in either axis". |
+| Default zoom mode | `viewer.zoom_mode` | `enum { autoZoom, lockZoom, scaleToWidth, scaleToHeight, scaleToFit, scaleToFill, oneToOne }` | `autoZoom` | R/W | `oneToOne` is the canonical name for 100%. |
+| Zoom lock value | `viewer.zoom_lock_percent` | `Float` | `100` | R/W | Used when `zoom_mode = lockZoom`. |
+| Zoom speed | `viewer.zoom_speed` | `Float` | `0` | R/W | `0` means use the system trackpad/mouse defaults. Positive values multiply. |
+| Pan speed | `viewer.pan_speed` | `Float` | `20` | R/W | Pixels per arrow-key press at 100% zoom. |
+| Pinch to zoom | `viewer.gesture_pinch_zoom` | `Bool` | `true` | R/W | `MagnifyGesture` on trackpads. |
+| Two-finger pan | `viewer.gesture_two_finger_pan` | `Bool` | `true` | R/W | |
+| Two-finger swipe to navigate | `viewer.gesture_swipe_nav` | `Bool` | `true` | R/W | Swipe left/right = previous/next image. |
+| Smart magnify (double-tap) | `viewer.gesture_smart_magnify` | `Bool` | `true` | R/W | Trackpad two-finger double-tap. `NSEvent.EventType.smartMagnify`. |
+| Rotate gesture | `viewer.gesture_rotate` | `Bool` | `false` | R/W | Off by default to avoid accidental rotation. |
+| Loop back navigation | `viewer.loop_navigation` | `Bool` | `true` | R/W | After last image, wrap to first. |
+| Auto-switch sibling dir | `viewer.auto_switch_sibling_dir` | `Bool` | `false` | R/W | When the last image in a dir is reached, jump into the next sibling dir. |
+| Recursive loading | `viewer.recursive_loading` | `Bool` | `false` | R/W | Walk subdirectories of the opened dir. |
+| Show hidden images | `viewer.show_hidden_files` | `Bool` | `false` | R/W | Includes dotfiles. |
+| Group by directory | `viewer.group_by_dir` | `Bool` | `false` | R/W | Sort groups by directory then by image-order within. |
+| Real-time file update | `viewer.real_time_file_update` | `Bool` | `true` | R/W | FSEventStream-based hot reload. |
+| Auto-open new added image | `viewer.auto_open_new` | `Bool` | `false` | R/W | When real-time update sees a new file, switch to it. |
+| Image order | `viewer.image_order` | `enum { name, length, creationTime, lastWriteTime, extension, random, exifDate }` | `name` | R/W | `exifDate` uses EXIF `DateTimeOriginal`. |
+| Image order direction | `viewer.image_order_direction` | `enum { asc, desc }` | `asc` | R/W | |
+| Show frame navigation tool | `viewer.show_frame_nav` | `Bool` | `false` | R/W | Multi-frame GIF/TIFF/PDF nav. |
+| Image booster cache count | `viewer.cache_image_count` | `Int` | `1` | R/W | How many neighbors to pre-decode. |
+| Image booster max dimension | `viewer.cache_max_dim` | `Int` | `8000` | R/W | Skip pre-decode above this pixel dimension. |
+| Image booster max file size | `viewer.cache_max_mb` | `Float` | `100` | R/W | Skip pre-decode above this file size (MB). |
+| Huge-image streaming threshold | `viewer.huge_image_threshold` | `Int` | `16000` | R/W | Switch to the `libvips`-backed streaming decoder above this many pixels in either axis. |
 
 #### Backend wiring
 
@@ -628,11 +590,11 @@ Three sections:
 
 | Setting | JSON key | Type | Default | MCP | Notes |
 | --- | --- | --- | --- | --- | --- |
-| Light theme | `appearance.light_theme` | `String` | `Kobe-Light` | R/W | Theme bundle identifier. Upstream `LightTheme`. |
-| Dark theme | `appearance.dark_theme` | `String` | `Default` | R/W | Upstream `DarkTheme`. |
-| Background color | `appearance.background` | `RGBA?` | `nil` (use theme) | R/W | Upstream `BackgroundColor`. `nil` falls back to the theme's `appBg`. |
-| Slideshow background | `appearance.slideshow_background` | `RGBA` | black | R/W | Upstream `SlideshowBackgroundColor`. |
-| Window material | `appearance.window_material` | `enum { none, sidebar, hudWindow, popover, underWindowBackground, contentBackground, titlebar, menu }` | `underWindowBackground` | R/W | **Translated from upstream `WindowBackdrop` (`Mica`, `Acrylic`, `Tabbed`, `None`).** Mapping: `Mica` → `underWindowBackground`, `Acrylic` → `hudWindow`, `Tabbed` → `titlebar`, `None` → `none`. |
+| Light theme | `appearance.light_theme` | `String` | `Kobe-Light` | R/W | Theme bundle identifier. |
+| Dark theme | `appearance.dark_theme` | `String` | `Default` | R/W | |
+| Background color | `appearance.background` | `RGBA?` | `nil` (use theme) | R/W | `nil` falls back to the theme's `appBg`. |
+| Slideshow background | `appearance.slideshow_background` | `RGBA` | black | R/W | |
+| Window material | `appearance.window_material` | `enum { none, sidebar, hudWindow, popover, underWindowBackground, contentBackground, titlebar, menu }` | `underWindowBackground` | R/W | Maps to an `NSVisualEffectView.Material`. |
 | Allow background drag | `appearance.background_drag` | `Bool` | `true` | R/W | `NSWindow.isMovableByWindowBackground`. |
 | Show toolbar icon | `appearance.show_app_icon` | `Bool` | `true` | R/W | Mirrors `general.show_app_icon` for cross-page convenience. |
 
@@ -689,16 +651,16 @@ Three sections:
 | Setting | JSON key | Type | Default | MCP | Notes |
 | --- | --- | --- | --- | --- | --- |
 | Active preset | `layout.active_preset` | `String` | `Browser` | R/W | One of the registered preset names. The actual rectangle/visibility state is in `layout.json` (see panels.mdx); this field is the *name* the user chose. |
-| Show toolbar | `layout.show_toolbar` | `Bool` | `true` | R/W | Upstream `ShowToolbar`. |
+| Show toolbar | `layout.show_toolbar` | `Bool` | `true` | R/W | |
 | Show status bar | `layout.show_status_bar` | `Bool` | `true` | R/W | |
 | Show file panel | `layout.show_file_panel` | `Bool` | `true` | R/W | See `list_of_files.mdx`. |
 | Show thumbnail strip | `layout.show_thumb_strip` | `Bool` | `false` | R/W | One of the file panel view modes; if both `show_file_panel` and `show_thumb_strip` are true, the strip is the default mode. |
 | Show metadata panel | `layout.show_metadata` | `Bool` | `false` | R/W | EXIF / IPTC / XMP. |
 | Show scope panel | `layout.show_scope` | `Bool` | `false` | R/W | Scope editor. |
 | Show MCP panel | `layout.show_mcp` | `Bool` | `false` | R/W | MCP activity panel. |
-| Hide toolbar in full screen | `layout.hide_toolbar_fullscreen` | `Bool` | `false` | R/W | Upstream `HideToolbarInFullscreen`. |
-| Hide gallery in full screen | `layout.hide_gallery_fullscreen` | `Bool` | `false` | R/W | Upstream `HideGalleryInFullscreen`. |
-| Hide main window in slideshow | `layout.hide_main_in_slideshow` | `Bool` | `true` | R/W | Upstream `HideMainWindowInSlideshow`. |
+| Hide toolbar in full screen | `layout.hide_toolbar_fullscreen` | `Bool` | `false` | R/W | |
+| Hide gallery in full screen | `layout.hide_gallery_fullscreen` | `Bool` | `false` | R/W | |
+| Hide main window in slideshow | `layout.hide_main_in_slideshow` | `Bool` | `true` | R/W | |
 
 #### Backend wiring
 
@@ -747,15 +709,15 @@ Three sections:
 
 | Setting | JSON key | Type | Default | MCP | Notes |
 | --- | --- | --- | --- | --- | --- |
-| Enable slideshow on launch | `slideshow.enabled_on_launch` | `Bool` | `false` | R/W | Upstream `EnableSlideshow`. Rarely useful from Settings; usually triggered ad hoc. |
-| Slideshow interval | `slideshow.interval_seconds` | `Float` | `5.0` | R/W | Upstream `SlideshowInterval`. |
-| Random-interval upper bound | `slideshow.interval_to_seconds` | `Float` | `5.0` | R/W | When `use_random_interval = true`, intervals are uniformly sampled in [`interval_seconds`, `interval_to_seconds`]. Upstream `SlideshowIntervalTo`. |
-| Use random interval | `slideshow.use_random_interval` | `Bool` | `false` | R/W | Upstream `UseRandomIntervalForSlideshow`. |
-| Loop slideshow | `slideshow.loop` | `Bool` | `true` | R/W | Upstream `EnableLoopSlideshow`. |
-| Fullscreen slideshow | `slideshow.fullscreen` | `Bool` | `true` | R/W | Upstream `EnableFullscreenSlideshow`. |
-| Show countdown | `slideshow.show_countdown` | `Bool` | `true` | R/W | Upstream `ShowSlideshowCountdown`. |
-| Hide main window | `slideshow.hide_main_window` | `Bool` | `true` | R/W | When fullscreen, dropping the main window prevents the user from accidentally clicking through. Upstream `HideMainWindowInSlideshow`. |
-| Sound notification every N images | `slideshow.notify_every` | `Int` | `0` | R/W | `0` disables. Upstream `SlideshowImagesToNotifySound`. |
+| Enable slideshow on launch | `slideshow.enabled_on_launch` | `Bool` | `false` | R/W | Rarely useful from Settings; usually triggered ad hoc. |
+| Slideshow interval | `slideshow.interval_seconds` | `Float` | `5.0` | R/W | |
+| Random-interval upper bound | `slideshow.interval_to_seconds` | `Float` | `5.0` | R/W | When `use_random_interval = true`, intervals are uniformly sampled in [`interval_seconds`, `interval_to_seconds`]. |
+| Use random interval | `slideshow.use_random_interval` | `Bool` | `false` | R/W | |
+| Loop slideshow | `slideshow.loop` | `Bool` | `true` | R/W | |
+| Fullscreen slideshow | `slideshow.fullscreen` | `Bool` | `true` | R/W | |
+| Show countdown | `slideshow.show_countdown` | `Bool` | `true` | R/W | |
+| Hide main window | `slideshow.hide_main_window` | `Bool` | `true` | R/W | When fullscreen, dropping the main window prevents the user from accidentally clicking through. |
+| Sound notification every N images | `slideshow.notify_every` | `Int` | `0` | R/W | `0` disables. |
 | Notification sound | `slideshow.notify_sound` | `String` | `"Tink"` | R/W | A system `NSSound` name or a file path. |
 | Slideshow background | `slideshow.background` | `RGBA` | black | R/W | Mirrors `appearance.slideshow_background` for convenience. |
 
@@ -807,9 +769,9 @@ Three sections:
 
 | Setting | JSON key | Type | Default | MCP | Notes |
 | --- | --- | --- | --- | --- | --- |
-| Edit apps map | `edit.apps` | `[EditAppBinding]` | empty | R/W | One entry per extension, schema below. Upstream stored as `Dictionary` keyed by extension. |
-| After editing action | `edit.after_action` | `enum { nothing, reloadImage, openSaveAs }` | `nothing` | R/W | Upstream `AfterEditingAction`. |
-| Image edit quality | `edit.quality` | `Int` (1–100) | `80` | R/W | Used for JPEG / WebP / HEIC / AVIF write quality. Upstream `ImageEditQuality`. |
+| Edit apps map | `edit.apps` | `[EditAppBinding]` | empty | R/W | One entry per extension, schema below. |
+| After editing action | `edit.after_action` | `enum { nothing, reloadImage, openSaveAs }` | `nothing` | R/W | |
+| Image edit quality | `edit.quality` | `Int` (1–100) | `80` | R/W | Used for JPEG / WebP / HEIC / AVIF write quality. |
 | Preserve EXIF metadata | `edit.preserve_exif` | `Bool` | `true` | R/W | Carry EXIF/IPTC/XMP through built-in edits. |
 | Preserve color profile | `edit.preserve_icc` | `Bool` | `true` | R/W | Carry ICC profile through built-in edits. |
 | Default crop behavior | `edit.crop.defaults` | (delegated) | — | R/W | See `crop.mdx` and §4.14.1 below. |
@@ -863,8 +825,8 @@ a picker of all known actions.
 
 | Setting | JSON key | Type | Default | MCP | Notes |
 | --- | --- | --- | --- | --- | --- |
-| Mouse click bindings | `mouse.click_actions` | `[MouseClickEvent: ToggleAction]` | see Appendix C | R/W | Upstream `MouseClickActions`. |
-| Mouse wheel bindings | `mouse.wheel_actions` | `[MouseWheelEvent: MouseWheelAction]` | see Appendix C | R/W | Upstream `MouseWheelActions`. |
+| Mouse click bindings | `mouse.click_actions` | `[MouseClickEvent: ToggleAction]` | see Appendix C | R/W | |
+| Mouse wheel bindings | `mouse.wheel_actions` | `[MouseWheelEvent: MouseWheelAction]` | see Appendix C | R/W | |
 
 ```swift
 enum MouseClickEvent: String, Codable, Sendable {
@@ -886,16 +848,15 @@ enum MouseWheelAction: String, Codable, Sendable {
 }
 ```
 
-#### Mac translation of upstream
+#### Notes
 
-* Upstream `mouse4` / `mouse5` become `backButtonClick` /
-  `forwardButtonClick`. The Magic Mouse and trackpad do not have these
-  buttons; bindings to these events are accepted but have no effect on
-  those input devices.
-* Modifier names are translated: `Ctrl` → `command` (because on Mac the
-  Command key is the primary modifier; Ctrl-click is the
-  right-click-equivalent). The picker UI shows the Mac symbols `⌘ ⌥ ⌃ ⇧`
-  rather than the words.
+* `backButtonClick` / `forwardButtonClick` correspond to the side
+  buttons on multi-button mice (mouse4 / mouse5). The Magic Mouse and
+  trackpad do not have these buttons; bindings to these events are
+  accepted but have no effect on those input devices.
+* The Command key is the primary modifier on Mac; Ctrl-click is the
+  right-click-equivalent. The picker UI shows the Mac symbols
+  `⌘ ⌥ ⌃ ⇧` rather than the words.
 
 #### Backend wiring
 
@@ -937,7 +898,7 @@ A search field across the top filters by action name or chord.
 
 | Setting | JSON key | Type | Default | MCP | Notes |
 | --- | --- | --- | --- | --- | --- |
-| Keybindings | `keyboard.bindings` | `[String: [Hotkey]]` | see Appendix D | R/W | Action name → list of chords. Multiple chords per action are allowed. Upstream uses the same shape (`Dictionary<string, List<Hotkey>>`). |
+| Keybindings | `keyboard.bindings` | `[String: [Hotkey]]` | see Appendix D | R/W | Action name → list of chords. Multiple chords per action are allowed. |
 
 ```swift
 struct Hotkey: Codable, Hashable, Sendable {
@@ -953,15 +914,6 @@ struct Hotkey: Codable, Hashable, Sendable {
     }
 }
 ```
-
-#### Mac translation of upstream
-
-* Upstream uses `Keys` from `System.Windows.Forms`. The default
-  `Ctrl+...` bindings are translated to `Command+...` so they match the
-  Mac convention. `Alt+...` becomes `Option+...`.
-* The Quick Setup wizard offers an opt-in to keep the upstream
-  `Ctrl`-as-primary bindings for users moving from Windows; this writes
-  an alternate default set.
 
 #### Backend wiring
 
@@ -983,14 +935,13 @@ showing the conflicting action.
 
 #### Goals
 
-Configure the legacy thumbnail bar / gallery and the new file panel's
+Configure the thumbnail bar / gallery and the file panel's
 defaults: visibility, columns, item size, scrollbars, filename labels,
 disk cache size.
 
 This page intentionally **delegates** the rich view-mode / scope / tree
 behavior to [list_of_files.mdx](./list_of_files.mdx). The Gallery page
-covers the simple defaults that map to upstream's `Show*` and numeric
-settings.
+covers the simple visibility and numeric defaults.
 
 #### Audience
 
@@ -1010,13 +961,13 @@ Three sections:
 
 | Setting | JSON key | Type | Default | MCP | Notes |
 | --- | --- | --- | --- | --- | --- |
-| Show file panel | `gallery.show` | `Bool` | `true` | R/W | Mirrored from `layout.show_file_panel`; either field updates both. Upstream `ShowGallery`. |
-| Show file names | `gallery.show_filenames` | `Bool` | `true` | R/W | Upstream `ShowGalleryFileName`. |
-| Show scrollbars | `gallery.show_scrollbars` | `Bool` | `false` | R/W | Upstream `ShowGalleryScrollbars`. |
-| Default view mode | `gallery.default_view_mode` | `enum { strip, grid, details, tree, column }` | `strip` | R/W | **New for Mac.** Upstream has only the strip mode. |
-| Thumbnail size | `gallery.thumb_size` | `Int` (px) | `128` | R/W | Upstream `ThumbnailSize` defaulted to `50`; the Mac default is `128` because Retina displays make `50` too small. |
-| Columns (grid mode) | `gallery.grid_columns` | `Int` | `3` | R/W | Upstream `GalleryColumns`. |
-| Disk cache size | `gallery.disk_cache_mb` | `Int` | `400` | R/W | Upstream `GalleryCacheSizeInMb`. |
+| Show file panel | `gallery.show` | `Bool` | `true` | R/W | Mirrored from `layout.show_file_panel`; either field updates both. |
+| Show file names | `gallery.show_filenames` | `Bool` | `true` | R/W | |
+| Show scrollbars | `gallery.show_scrollbars` | `Bool` | `false` | R/W | |
+| Default view mode | `gallery.default_view_mode` | `enum { strip, grid, details, tree, column }` | `strip` | R/W | |
+| Thumbnail size | `gallery.thumb_size` | `Int` (px) | `128` | R/W | Default `128` because Retina displays make smaller sizes hard to read. |
+| Columns (grid mode) | `gallery.grid_columns` | `Int` | `3` | R/W | |
+| Disk cache size | `gallery.disk_cache_mb` | `Int` | `400` | R/W | |
 | Hide gallery in full screen | `gallery.hide_fullscreen` | `Bool` | `false` | R/W | Mirrors `layout.hide_gallery_fullscreen`. |
 
 #### Backend wiring
@@ -1062,11 +1013,11 @@ Drag from left to right to add; right-pane drag to a trash zone to remove.
 
 | Setting | JSON key | Type | Default | MCP | Notes |
 | --- | --- | --- | --- | --- | --- |
-| Show toolbar | `toolbar.show` | `Bool` | `true` | R/W | Mirrors `layout.show_toolbar`. Upstream `ShowToolbar`. |
-| Center toolbar items | `toolbar.centered` | `Bool` | `true` | R/W | Upstream `EnableCenterToolbar`. |
-| Icon height (pt) | `toolbar.icon_height` | `Int` (16, 20, 24, 28, 32, 40, 48) | `24` | R/W | Upstream `ToolbarIconHeight` (default `Const.TOOLBAR_ICON_HEIGHT`). Mac default `24` for `NSToolbar` regular size. |
-| Toolbar buttons | `toolbar.buttons` | `[ToolbarItem]` | default set | R/W | Upstream `ToolbarButtons`. |
-| Show navigation arrows | `toolbar.show_nav_buttons` | `Bool` | `true` | R/W | Floating prev/next arrows over the canvas. Upstream `EnableNavigationButtons`. |
+| Show toolbar | `toolbar.show` | `Bool` | `true` | R/W | Mirrors `layout.show_toolbar`. |
+| Center toolbar items | `toolbar.centered` | `Bool` | `true` | R/W | |
+| Icon height (pt) | `toolbar.icon_height` | `Int` (16, 20, 24, 28, 32, 40, 48) | `24` | R/W | Default `24` for `NSToolbar` regular size. |
+| Toolbar buttons | `toolbar.buttons` | `[ToolbarItem]` | default set | R/W | |
+| Show navigation arrows | `toolbar.show_nav_buttons` | `Bool` | `true` | R/W | Floating prev/next arrows over the canvas. |
 
 ```swift
 struct ToolbarItem: Codable, Hashable, Sendable {
@@ -1099,10 +1050,6 @@ live.
 ---
 
 ### 4.12 Finder (file associations)
-
-> Upstream calls this tab **File Associations** and edits the Windows
-> registry. The Mac fork renames it **Finder** because the underlying
-> mechanism is fundamentally different.
 
 #### Goals
 
@@ -1141,14 +1088,13 @@ Three sections:
 | Enable Services | `file_assoc.enable_services` | `Bool` | `true` | R/W | Toggles the `NSServices` entries: "Open in ImageGlass", "Show in Gallery". |
 | Enable share extension | `file_assoc.enable_share_ext` | `Bool` | `false` | R/W | Off by default to avoid clutter in the share sheet. |
 
-#### Mac translation of upstream
+#### Notes
 
-* Upstream `FileFormats` (`HashSet<string>`) of extensions is replaced by
-  the `Info.plist` `CFBundleDocumentTypes` + `UTExportedTypeDeclarations`
-  / `UTImportedTypeDeclarations`. The user does not edit these at
-  runtime; we ship the right set in `Info.plist` and the user picks which
-  ones we are the default app for via `[Make Default]`.
-* No equivalent of the Windows registry editing UI is provided. Launch
+* File-type ownership is declared via the `Info.plist`
+  `CFBundleDocumentTypes` + `UTExportedTypeDeclarations` /
+  `UTImportedTypeDeclarations`. The user does not edit these at
+  runtime; we ship the right set in `Info.plist` and the user picks
+  which ones we are the default app for via `[Make Default]`. Launch
   Services is the authority.
 * Adding a *new* extension at runtime is not supported (it would require
   rewriting `Info.plist`). The plugin framework (§4.15) can declare

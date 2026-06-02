@@ -5,9 +5,9 @@ description: Product and engineering specification for the modular panel framewo
 
 # Panels and Window Layout
 
-This page is the **complete product + engineering specification** for the
-movable/snappable/dockable panel framework that is the Mac fork's
-single largest architectural change over upstream Windows ImageGlass.
+This page is the **complete product + engineering specification** for
+ImageGlass_Mac's panel framework — a movable/snappable/dockable
+column-based UI architecture.
 
 It is the contract that the SwiftUI window scene, the `AppKit`
 split-view bridge, the on-disk `layout.json`, the layout-preset menu,
@@ -33,35 +33,20 @@ for live config reload.
 
 ---
 
-## 1. Why the Fork Adds a Panel Framework
+## 1. Why ImageGlass_Mac Has a Panel Framework
 
-Upstream Windows ImageGlass is a fixed three-region layout: toolbar
-along the top, an optional horizontal/vertical thumbnail strip along
-one edge, and the picture canvas filling the rest. "Tool windows"
-(color picker, page nav, crop) are floating `ToolForm` windows the
-user can drag around the screen but cannot **dock** back into the main
-window. There is no general-purpose panel framework.
+A modern image viewer needs more than a single canvas plus a fixed
+toolbar. Users want a directory/filename panel, a scope editor, a
+metadata inspector, a histogram, an MCP activity log, and tool
+surfaces like crop and color picker — and they want to arrange those
+surfaces themselves, dock them to any edge, tear them out into
+floating windows, group them as tabs, and save the arrangement as a
+named preset.
 
-Verified from upstream source:
-
-* `Source/ImageGlass/FrmMain.Designer.cs` — main form is a single
-  hard-coded layout of `Toolbar` (top), `Gallery` (one of the four
-  edges, configured by `Config.Layout`), and `PicMain` (fill).
-* `Source/Components/ImageGlass.Settings/Forms/ToolForm.cs` — the base
-  class for floating tool windows; uses `WS_EX_NOACTIVATE` so the tool
-  window never steals focus from the main viewer.
-* `Source/ImageGlass/FrmMain/FrmMain.IGMethods.cs:615` —
-  `IG_ToggleGallery(bool?)` is the only general-purpose
-  "show/hide a region" entry point; everything else is hard-coded.
-* `Source/Components/ImageGlass.Settings/Config.cs:583` —
-  `public static Dictionary<string, string?> Layout { get; set; }` is
-  a string-keyed dictionary of region settings (`"Bottom;0"` etc.),
-  not a general scene graph.
-
-The fork's product brief demands more: a **first-class column** for
+ImageGlass_Mac's product brief demands a **first-class column** for
 modular panels, plus the ability to add new panels (file list, scope
 editor, MCP activity, metadata, histogram, plugin-provided panels)
-without surgery on the main viewer. The simplest way to deliver that
+without surgery on the main viewer. The cleanest way to deliver that
 on Mac is a general panel host with snapping, docking, floating, tab
 grouping, and named presets — which is what this spec defines.
 
@@ -246,19 +231,19 @@ as `layout/presets/<name>.json`.
 
 ## 4. Panel Inventory
 
-### 4.1 Panels inherited from upstream behavior
+### 4.1 Built-in panels
 
 | Panel id | Title | Default position | Notes |
 | --- | --- | --- | --- |
-| `toolbar` | Toolbar | top | Replaces upstream `Toolbar`. Uses `NSToolbar`-backed content. See [Settings → Toolbar](./settings.mdx) §4.11. |
-| `status_bar` | Status bar | bottom | Replaces upstream status strip. Image info, zoom %, EXIF DateTimeOriginal. |
-| `gallery_strip` | Thumbnail strip | bottom | Horizontal `HorizontalStrip` mode of the gallery. Upstream `Gallery` with `View.HorizontalStrip`. |
-| `color_picker` | Color picker | floating | Upstream `FrmColorPicker`, a `ToolForm`. |
-| `frame_nav` | Page / frame navigator | floating | Upstream multi-frame navigator. |
+| `toolbar` | Toolbar | top | Uses `NSToolbar`-backed content. See [Settings → Toolbar](./settings.mdx) §4.11. |
+| `status_bar` | Status bar | bottom | Image info, zoom %, EXIF DateTimeOriginal. |
+| `gallery_strip` | Thumbnail strip | bottom | Horizontal thumbnail strip of the current file list. |
+| `color_picker` | Color picker | floating | Pick a pixel color in multiple formats. |
+| `frame_nav` | Page / frame navigator | floating | Navigate frames/pages within multi-frame images. |
 | `crop` | Crop | centerOverlay + floating | Crop tool. See [crop.mdx](./crop.mdx). The visible "selection rectangle" is part of the viewer canvas; the controls live in a docked or floating panel. |
 | `image_info` | Image info overlay | centerOverlay | The text overlay listing EXIF/file tags. See [Settings → Image](./settings.mdx) §4.2. |
 
-### 4.2 Panels new to the fork
+### 4.2 Additional panels
 
 | Panel id | Title | Default position | Notes |
 | --- | --- | --- | --- |
@@ -734,7 +719,7 @@ display.
 | Action | Default | Notes |
 | --- | --- | --- |
 | Layout preset 1–5 | ⌃⌘1 .. ⌃⌘5 | Switch among built-in presets. |
-| Toggle file panel | ⌘L | Mirrors upstream `IG_ToggleGallery`. |
+| Toggle file panel | ⌘L | Show or hide the file panel. |
 | Toggle toolbar | ⌥⌘T | |
 | Toggle status bar | ⌥⌘S | |
 | Toggle metadata | ⌥⌘I | |
@@ -745,32 +730,7 @@ All keybindings are configurable via [Settings → Keyboard](./settings.mdx) §4
 
 ---
 
-## 11. Migration from Upstream
-
-| Upstream concept | Mac equivalent |
-| --- | --- |
-| `FrmMain` hard-coded layout | `WindowSceneController` hosting `NSSplitViewController` + panel groups. |
-| `Toolbar` control (top) | `toolbar` panel in the `top` group. |
-| `Gallery` control (one of four edges) | `file_panel` (left) and/or `gallery_strip` (bottom). The upstream's edge choice becomes a preset choice. |
-| `ToolForm` floating window | A panel with `supportsFloating = true` and `DockPosition.floating`. |
-| `Config.Layout` string-keyed dict | `layout.json` (this spec). The importer translates the upstream string format. |
-| `ShowGallery / ShowToolbar / ShowFrameNavTool` | Per-panel `visible` flag in `Layout.groups[].panel_ids` (present = visible) + `Layout.hidden` (absent and not present). |
-| `HideToolbarInFullscreen / HideGalleryInFullscreen` | Preserved as Settings flags; the framework respects them when entering full-screen. |
-
-The importer (see [Settings](./settings.mdx) §2.6) translates the
-upstream `Layout` dict by:
-
-1. Reading the upstream `Gallery` position from the dict (one of
-   `"Bottom;<n>"`, `"Top;<n>"`, `"Left;<n>"`, `"Right;<n>"`).
-2. Mapping it to a single `TabGroup` containing the `gallery_strip`
-   panel at the matching `DockPosition`.
-3. Adding the `toolbar` panel at `top` (always, per upstream).
-4. Setting `active_preset` to `Browser` (a near match) so a user
-   exploring the View menu sees a coherent name.
-
----
-
-## 12. Testing
+## 11. Testing
 
 * **Snap visit**: drag each panel header to all four edges, two tab
   targets, and two floating destinations; every snap target produces
@@ -792,7 +752,7 @@ upstream `Layout` dict by:
 
 ---
 
-## 13. Open Questions
+## 12. Open Questions
 
 * **Per-monitor presets.** Should a multi-monitor user be able to
   have a different preset auto-apply when the window moves to a
@@ -807,19 +767,14 @@ upstream `Layout` dict by:
 
 ---
 
-## 14. References
+## 13. References
 
-* `Source/ImageGlass/FrmMain.Designer.cs` — upstream main form
-  layout.
-* `Source/ImageGlass/FrmMain/FrmMain.Configs.cs:1200` —
-  `LoadAppLayout`, parser for the upstream `Layout` dict.
-* `Source/ImageGlass/FrmMain/FrmMain.IGMethods.cs:587, 615, 3126,
-  3157, 3186` — `IG_ToggleToolbar`, `IG_ToggleGallery`,
-  `IG_ToggleCropTool`, `IG_ToggleColorPicker`, `IG_ToggleFrameNav`.
-* `Source/Components/ImageGlass.Settings/Forms/ToolForm.cs:28` —
-  `ToolForm : ThemedForm` floating-tool-window base class with
-  `WS_EX_NOACTIVATE`.
-* `Source/Components/ImageGlass.Settings/Config.cs:583` —
-  `Dictionary<string, string?> Layout`.
-* `Source/Components/ImageGlass.Gallery/Enums.cs:368` — gallery
-  `View` enum (`Thumbnails`, `HorizontalStrip`, `VerticalStrip`).
+* [Automation](./automation.mdx) §2 — *Modular UI Panels* charter.
+* [Settings → Layout](./settings.mdx) §4.5 — layout settings surface.
+* [File List Panel](./list_of_files.mdx) — the primary panel built on
+  this framework.
+* [Crop](./crop.mdx) — crop tool shipped as a panel.
+* Apple AppKit — `NSSplitViewController`, `NSPanel`, `NSToolbar`,
+  `NSPanGestureRecognizer`.
+* Apple SwiftUI — `NavigationSplitView`, `Table`, `OutlineGroup`,
+  `NSHostingView`.
