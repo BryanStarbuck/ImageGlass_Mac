@@ -65,6 +65,23 @@ public struct Config: Codable, Equatable, Sendable {
     /// Built-in developer defaults — priority tier 1 in the spec.
     public static let builtIn = Config()
 
+    /// Stable identifier for each top-level config key. Used by
+    /// `ConfigLoader.Resolution.Layers.lockedKeys` so UI bindings can ask
+    /// "is `WindowBackdrop` admin-locked?" without resorting to strings.
+    public enum Key: String, CaseIterable, Sendable, Hashable {
+        case showToolbar     = "ShowToolbar"
+        case showGallery     = "ShowGallery"
+        case showStatusBar   = "ShowStatusBar"
+        case fullScreen      = "FullScreen"
+        case frameless       = "Frameless"
+        case windowFit       = "WindowFit"
+        case windowBackdrop  = "WindowBackdrop"
+        case zoomMode        = "ZoomMode"
+        case theme           = "Theme"
+        case language        = "Language"
+        case startupBoost    = "StartupBoost"
+    }
+
     // MARK: - Coding
 
     // PascalCase on disk so `igconfig.json` files are interchangeable with
@@ -195,10 +212,26 @@ public struct Config: Codable, Equatable, Sendable {
 
         /// `true` when no field has been set — used to short-circuit merging.
         public var isEmpty: Bool {
-            showToolbar == nil && showGallery == nil && showStatusBar == nil
-                && fullScreen == nil && frameless == nil && windowFit == nil
-                && windowBackdrop == nil && zoomMode == nil
-                && theme == nil && language == nil && startupBoost == nil
+            presentKeys.isEmpty
+        }
+
+        /// The set of `Config.Key` values explicitly present on this layer.
+        /// `ConfigLoader` uses this on the admin layer to expose
+        /// `Resolution.Layers.lockedKeys`.
+        public var presentKeys: Set<Config.Key> {
+            var keys = Set<Config.Key>()
+            if showToolbar    != nil { keys.insert(.showToolbar) }
+            if showGallery    != nil { keys.insert(.showGallery) }
+            if showStatusBar  != nil { keys.insert(.showStatusBar) }
+            if fullScreen     != nil { keys.insert(.fullScreen) }
+            if frameless      != nil { keys.insert(.frameless) }
+            if windowFit      != nil { keys.insert(.windowFit) }
+            if windowBackdrop != nil { keys.insert(.windowBackdrop) }
+            if zoomMode       != nil { keys.insert(.zoomMode) }
+            if theme          != nil { keys.insert(.theme) }
+            if language       != nil { keys.insert(.language) }
+            if startupBoost   != nil { keys.insert(.startupBoost) }
+            return keys
         }
     }
 
