@@ -94,6 +94,13 @@ public enum FormatLoader {
 
         let format = FormatRegistry.shared.format(forURL: url)
 
+        // Spec §"Special Input Methods": .b64 files contain base64-encoded
+        // image bytes. Decode the text, then re-enter the loader with the
+        // resulting binary blob.
+        if format?.id == "base64" {
+            return try Base64Loader.loadFromBase64File(url: url)
+        }
+
         // Hard-fail formats that need a delegate we don't have. We could
         // attempt Image I/O anyway, but the spec asks us to be explicit so
         // the UI layer can show a helpful message instead of a corrupt image.
@@ -167,21 +174,42 @@ public enum FormatLoader {
             }
         }
         if data.count >= 12 {
+            // JPEG 2000 container box header: 00 00 00 0C 6A 50 20 20 0D 0A 87 0A
+            if data[0] == 0x00, data[1] == 0x00, data[2] == 0x00, data[3] == 0x0C,
+               data[4] == 0x6A, data[5] == 0x50, data[6] == 0x20, data[7] == 0x20 {
+                return "jp2"
+            }
             // RIFF....WEBP
             if data[0] == 0x52, data[1] == 0x49, data[2] == 0x46, data[3] == 0x46,
                data[8] == 0x57, data[9] == 0x45, data[10] == 0x42, data[11] == 0x50 {
                 return "webp"
             }
-            // HEIC/HEIF: ftypheic / ftypheix / ftypmif1 / ftypmsf1 / ftypavif
+            // HEIC/HEIF/AVIF: starts with ftyp box at offset 4.
             if data[4] == 0x66, data[5] == 0x74, data[6] == 0x79, data[7] == 0x70 {
                 let brand = String(bytes: data[8..<12], encoding: .ascii)?.lowercased() ?? ""
                 if brand.hasPrefix("heic") || brand.hasPrefix("heix")
+                    || brand.hasPrefix("heim") || brand.hasPrefix("heis")
                     || brand == "mif1" || brand == "msf1" {
                     return "heic"
                 }
-                if brand.hasPrefix("avif") {
+                if brand.hasPrefix("avif") || brand.hasPrefix("avis") {
                     return "avif"
                 }
+                if brand.hasPrefix("jxl ") {
+                    return "jxl"
+                }
+            }
+        }
+        if data.count >= 4 {
+            // JPEG XL codestream signature: FF 0A
+            if data[0] == 0xFF, data[1] == 0x0A {
+                return "jxl"
+            }
+            // JPEG XL container signature: 00 00 00 0C 4A 58 4C 20 0D 0A 87 0A
+            if data.count >= 12,
+               data[0] == 0x00, data[1] == 0x00, data[2] == 0x00, data[3] == 0x0C,
+               data[4] == 0x4A, data[5] == 0x58, data[6] == 0x4C, data[7] == 0x20 {
+                return "jxl"
             }
         }
         if data.count >= 5 {
@@ -198,9 +226,41 @@ public enum FormatLoader {
             }
         }
         if data.count >= 4 {
-            // PSD: 8BPS
+            // PSD/PSB: 8BPS
             if data[0] == 0x38, data[1] == 0x42, data[2] == 0x50, data[3] == 0x53 {
                 return "psd"
+            }
+            // QOI: "qoif"
+            if data[0] == 0x71, data[1] == 0x6F, data[2] == 0x69, data[3] == 0x66 {
+                return "qoi"
+            }
+            // OpenEXR: 76 2F 31 01
+            if data[0] == 0x76, data[1] == 0x2F, data[2] == 0x31, data[3] == 0x01 {
+                return "exr"
+            }
+            // BPG: "BPG\xFB"
+            if data[0] == 0x42, data[1] == 0x50, data[2] == 0x47, data[3] == 0xFB {
+                return "bpg"
+            }
+            // Windows ICO/CUR: 00 00 01 00 (icon) or 00 00 02 00 (cursor)
+            if data[0] == 0x00, data[1] == 0x00, data[3] == 0x00 {
+                if data[2] == 0x01 { return "ico" }
+                if data[2] == 0x02 { return "cur" }
+            }
+        }
+        if data.count >= 6 {
+            // Radiance HDR: "#?RADIANCE" or "#?RGBE"
+            if data[0] == 0x23, data[1] == 0x3F {
+                if let text = String(data: data.prefix(11), encoding: .ascii)?.uppercased() {
+                    if text.hasPrefix("#?RADIANCE") || text.hasPrefix("#?RGBE") {
+                        return "hdr"
+                    }
+                }
+            }
+            // FITS: "SIMPLE"
+            if data[0] == 0x53, data[1] == 0x49, data[2] == 0x4D,
+               data[3] == 0x50, data[4] == 0x4C, data[5] == 0x45 {
+                return "fits"
             }
         }
         return nil
