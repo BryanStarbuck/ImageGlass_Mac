@@ -7,12 +7,23 @@ import ImageGlassCore
 struct ImageGlassApp: App {
     @State private var state = AppState()
 
+    // Owns the AppDelegate that overrides `orderFrontStandardAboutPanel`
+    // so the default Apple About panel is replaced by `AboutView`.
+    @NSApplicationDelegateAdaptor(AboutAppDelegate.self) private var aboutDelegate
+
     var body: some Scene {
         WindowGroup("ImageGlass") {
             ContentView(state: state)
                 .frame(minWidth: 900, minHeight: 600)
         }
         .commands {
+            // Replace the standard "About ImageGlass" item with our own
+            // that opens the custom About window from `AboutWindowController`.
+            CommandGroup(replacing: .appInfo) {
+                Button("About \(AboutInfo.projectName)") {
+                    AboutWindowController.show()
+                }
+            }
             CommandGroup(after: .sidebar) {
                 Button("Re-evaluate Active Scope") {
                     Task { await state.reevaluateActive() }
@@ -22,6 +33,11 @@ struct ImageGlassApp: App {
             CommandGroup(replacing: .newItem) {
                 Button("Open…") { openFileDialog() }
                     .keyboardShortcut("o", modifiers: [.command])
+            }
+            CommandGroup(after: .help) {
+                Button("Releases & News…") {
+                    ReleasesWindowController.shared.show()
+                }
             }
             viewerMenuCommands
         }
