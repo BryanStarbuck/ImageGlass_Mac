@@ -383,8 +383,8 @@ public struct MCPTools {
         // Charter additions: rule sets, scope chains, audit, diff, import/export.
         // See Charter/MCPTools+Charter.swift.
         base.append(contentsOf: charterDescriptors())
-        // Crop subsystem descriptors (crop_image, get/set_crop_selection,
-        // read_image_dimensions). See Crop/CropMCPTools.swift.
+        // Crop subsystem descriptors (crop_image, get/set_crop_selection).
+        // See Crop/CropMCPTools.swift.
         base.append(contentsOf: cropTools.descriptors())
         return base
     }
@@ -458,8 +458,8 @@ public struct MCPTools {
                 if ThemeMCPTools.toolNames.contains(name) {
                     return try themeTools.call(name: name, arguments: arguments)
                 }
-                // Route crop tools (crop_image, get/set_crop_selection,
-                // read_image_dimensions) through CropMCPTools.
+                // Route crop tools (crop_image, get/set_crop_selection)
+                // through CropMCPTools. See Crop/CropMCPTools.swift.
                 if CropMCPTools.toolNames.contains(name) {
                     return try cropTools.call(name: name, arguments: arguments)
                 }

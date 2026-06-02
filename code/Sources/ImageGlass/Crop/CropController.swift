@@ -1,434 +1,312 @@
 import Foundation
-import Observation
+import SwiftUI
+import AppKit
 import CoreGraphics
 import ImageIO
-import AppKit
+import UniformTypeIdentifiers
 import ImageGlassCore
 
-/// Live state of the Crop tool for one open image window.
+/// Window-scoped controller for the crop tool (`docs/crop.mdx §5.1`).
 ///
-/// Spec reference: `docs/crop.mdx` section 4.1. Holds the selection
-/// rectangle (in source-image coordinates), aspect-ratio mode, modifier
-/// keys, and grid/snap options. Mutations happen on the main actor only;
-/// the SwiftUI panel binds to this object directly.
+/// Owns the live crop rectangle (in image pixel coordinates), the panel's
+/// numeric / preset bindings, the keyboard nudge implementations, and
+/// the four save paths (Crop, Save, Save As, Copy).
+///
+/// Observable so the SwiftUI panel rebinds whenever the rect or any
+/// option changes. The overlay reads `rect` and `gridMode` directly.
 @MainActor
 @Observable
 public final class CropController {
 
-    // MARK: Image being cropped
+    // MARK: - Selection state
 
-    /// Absolute path to the active image, if any.
-    public var imagePath: String?
-    /// Source pixel dimensions of the active image. (0, 0) means "no image."
-    public var sourceWidth: Int = 0
-    public var sourceHeight: Int = 0
+    /// Selection in image-pixel coordinates. `nil` when no rect drawn yet.
+    public var rect: CGRect?
 
-    // MARK: Selection state
-
-    /// Selection in *source image* coordinates. nil means "no selection."
-    public var selection: CropRect?
-
-    /// Active aspect-ratio constraint.
-    public var aspectRatio: AspectRatio = .free
-
-    /// Custom aspect ratio input (used when `aspectRatio == .custom`).
-    public var customAspectW: Int = 16
-    public var customAspectH: Int = 9
-
+    public var aspectRatio: SelectionAspectRatio = .freeRatio
+    public var aspectRatioValues: [Int] = [0, 0]
     public var lockAspect: Bool = false
-    public var gridMode: GridMode = .thirds
-    public var snapToPixel: Bool = true
-    public var snapToEdges: Bool = false
-    public var snapEdgeGravityPx: Int = 8
-    public var persistAcrossImages: Bool = false
-    public var losslessJPEGWhenPossible: Bool = true
-    public var stripMetadataOnSave: Bool = false
 
-    public var defaultSelection: DefaultSelectionType = .percent(0.5)
+    public var unitsDisplay: CropUnits = .pixels
+    public var gridMode: CropGridMode = .thirds
+    public var snapToGrid: Bool = true
 
-    // Live modifier-key state — pushed by the canvas view.
-    public var shiftHeld: Bool = false   // forces 1:1
-    public var optionHeld: Bool = false  // resize from center
+    public var outputFormat: CropOutputFormat = .auto
+    public var outputQuality: Int = 90
+    public var preferLossless: Bool = true
+    public var preserveMetadata: Bool = true
+    public var stripGPS: Bool = false
 
-    // Drag state machine.
-    public enum Action: Equatable {
-        case none
-        case drawing
-        case resizing(SelectionResizer.Kind)
-        case moving
-    }
-    public var action: Action = .none
+    public var persistent: Bool = false
 
-    /// MCU-rounded outline (dashed) — populated when the user has
-    /// Lossless JPEG mode on and the rectangle isn't already aligned.
-    public var mcuRoundedOutline: CropRect?
+    /// True iff the tool is "open" (panel shown, overlay drawing).
+    public var isActive: Bool = false
 
-    /// Cached MCU info for the current JPEG (nil for non-JPEG inputs).
-    private var jpegMCU: JPEGLosslessCrop.MCUInfo?
+    /// Cached size of the active image. Updated by `bind(activeImage:path:)`.
+    public var activeImageSize: CGSize = .zero
+    public var activeImagePath: String?
 
-    // MARK: Init
+    /// Last-applied selection across the session (for
+    /// `useLastSelection` initial-selection policy).
+    public var lastSelection: CGRect?
 
-    public init() {
-        let cfg = CropConfigStore.load()
-        applyConfig(cfg)
-    }
+    /// Drag state machine — read by the overlay view to set cursors.
+    public var dragState: CropDragState = .idle
+    /// Which handle is currently being dragged (when `dragState == .resizing`).
+    public var activeHandle: CropHandle?
+    /// Click-origin in image coords for a fresh draw drag.
+    public var drawAnchor: CGPoint?
+    /// Offset (image coords) of the click within the rect for a move drag.
+    public var moveAnchor: CGPoint?
 
-    /// Refresh from on-disk crop.json.
-    public func reloadConfig() {
-        applyConfig(CropConfigStore.load())
-    }
+    /// Initial-selection policy. Mirrored from settings on `open()`.
+    public var initSelectionType: CropInitSelectionType = .select50Percent
+    public var initCustomRect: CGRect?
+    public var autoCenter: Bool = true
 
-    private func applyConfig(_ cfg: CropConfig) {
-        aspectRatio = cfg.aspectRatio
-        if cfg.customAspect.count >= 2 {
-            customAspectW = cfg.customAspect[0]
-            customAspectH = cfg.customAspect[1]
-        }
-        lockAspect = cfg.lockAspect
-        gridMode = cfg.gridMode
-        snapToPixel = cfg.snapToPixel
-        snapToEdges = cfg.snapToEdges
-        snapEdgeGravityPx = cfg.snapEdgeGravityPx
-        persistAcrossImages = cfg.persistAcrossImages
-        losslessJPEGWhenPossible = cfg.losslessJPEGWhenPossible
-        stripMetadataOnSave = cfg.stripMetadataOnSave
-        defaultSelection = cfg.defaultSelection
+    /// Bridge that exposes the live selection to the in-process MCP
+    /// `get_crop_selection` / `set_crop_selection` tools.
+    private let session: CropSession
+
+    public init(session: CropSession = .shared) {
+        self.session = session
     }
 
-    /// Snapshot the current settings back to disk.
-    public func saveConfig() {
-        var cfg = CropConfigStore.load()
-        cfg.aspectRatio = aspectRatio
-        cfg.customAspect = [customAspectW, customAspectH]
-        cfg.lockAspect = lockAspect
-        cfg.gridMode = gridMode
-        cfg.snapToPixel = snapToPixel
-        cfg.snapToEdges = snapToEdges
-        cfg.snapEdgeGravityPx = snapEdgeGravityPx
-        cfg.persistAcrossImages = persistAcrossImages
-        cfg.losslessJPEGWhenPossible = losslessJPEGWhenPossible
-        cfg.stripMetadataOnSave = stripMetadataOnSave
-        cfg.defaultSelection = defaultSelection
-        if let sel = selection { cfg.lastUsedSelection = sel }
-        try? CropConfigStore.save(cfg)
-    }
+    // MARK: - Lifecycle
 
-    // MARK: - Image load
-
-    /// Bind a new image. Resets or reinitializes the selection per the
-    /// `defaultSelection` policy.
-    public func loadImage(at path: String?) {
-        guard let path, !path.isEmpty else {
-            imagePath = nil
-            sourceWidth = 0
-            sourceHeight = 0
-            selection = nil
-            jpegMCU = nil
-            mcuRoundedOutline = nil
-            return
-        }
-
-        let expanded = AppPaths.expandTilde(path)
-        imagePath = expanded
-        if let dim = try? CropPipeline.readDimensions(of: expanded) {
-            sourceWidth = dim.width
-            sourceHeight = dim.height
-        } else {
-            sourceWidth = 0
-            sourceHeight = 0
-        }
-
-        // Initialize the selection from the default policy.
-        let lastUsed = CropConfigStore.load().lastUsedSelection
-        selection = defaultSelection.resolve(
-            sourceWidth: sourceWidth,
-            sourceHeight: sourceHeight,
-            lastUsed: lastUsed
+    /// Open the crop tool, computing the initial rect per
+    /// `initSelectionType`.
+    public func open() {
+        isActive = true
+        let init0 = CropMath.initialRect(
+            for: initSelectionType,
+            imageSize: activeImageSize,
+            customRect: initCustomRect,
+            autoCenter: autoCenter,
+            lastSelection: lastSelection
         )
-
-        loadMCUInfoIfJPEG(path: expanded)
-        recomputeMCURounded()
+        setRect(init0, syncSession: true)
+        session.setAspectRatio(aspectRatio)
     }
 
-    private func loadMCUInfoIfJPEG(path: String) {
-        jpegMCU = nil
-        let ext = (path as NSString).pathExtension.lowercased()
-        guard ext == "jpg" || ext == "jpeg" else { return }
-        // Read the first 65 KB — SOF markers are well within that on
-        // virtually every real JPEG.
-        let url = URL(fileURLWithPath: path)
-        guard let handle = try? FileHandle(forReadingFrom: url) else { return }
-        defer { try? handle.close() }
-        let header = (try? handle.read(upToCount: 65_536)) ?? Data()
-        jpegMCU = JPEGLosslessCrop.detectMCU(jpegData: header)
+    /// Close the crop tool, clearing the overlay and panel state.
+    public func cancel() {
+        isActive = false
+        setRect(nil, syncSession: true)
+        dragState = .idle
     }
 
-    private func recomputeMCURounded() {
-        guard let sel = selection,
-              losslessJPEGWhenPossible,
-              let mcu = jpegMCU,
-              sourceWidth > 0, sourceHeight > 0 else {
-            mcuRoundedOutline = nil
-            return
-        }
-        if JPEGLosslessCrop.isAligned(sel, mcu: mcu, sourceWidth: sourceWidth, sourceHeight: sourceHeight) {
-            mcuRoundedOutline = nil
+    /// Image switched (Next/Previous or panel selection change).
+    public func bind(activeImage cgImage: CGImage?, path: String?) {
+        activeImagePath = path
+        session.setImagePath(path)
+        if let img = cgImage {
+            activeImageSize = CGSize(width: img.width, height: img.height)
+        } else if let path,
+                  let src = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil),
+                  let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+                  let w = (props[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
+                  let h = (props[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue {
+            activeImageSize = CGSize(width: w, height: h)
         } else {
-            mcuRoundedOutline = JPEGLosslessCrop.roundToMCU(sel, mcu: mcu, sourceWidth: sourceWidth, sourceHeight: sourceHeight)
+            activeImageSize = .zero
         }
-    }
-
-    // MARK: - Selection mutations
-
-    public func setSelection(_ rect: CropRect?) {
-        if let r = rect {
-            selection = clampAndSnap(r)
+        guard isActive else { return }
+        if persistent, let r = rect {
+            setRect(CropMath.clip(r, to: activeImageSize), syncSession: true)
         } else {
-            selection = nil
-        }
-        recomputeMCURounded()
-        publishLiveSelection()
-    }
-
-    public func reset() {
-        selection = nil
-        mcuRoundedOutline = nil
-        publishLiveSelection()
-    }
-
-    /// Nudge the selection by (dx, dy) source-pixels.
-    public func nudge(dx: Int, dy: Int) {
-        guard var s = selection else { return }
-        s.x += dx
-        s.y += dy
-        setSelection(s)
-    }
-
-    /// Resize the selection by (dw, dh) source-pixels (anchored top-left).
-    public func resizeBy(dw: Int, dh: Int) {
-        guard var s = selection else { return }
-        s.width = max(1, s.width + dw)
-        s.height = max(1, s.height + dh)
-        if lockAspect, let ratio = effectiveRatio() {
-            let r = CropMath.lockRatio(width: s.width, height: s.height, ratioW: ratio.w, ratioH: ratio.h)
-            s.width = r.w
-            s.height = r.h
-        }
-        setSelection(s)
-    }
-
-    /// Editable numeric fields commit through this method.
-    public func setNumeric(x: Int? = nil, y: Int? = nil, w: Int? = nil, h: Int? = nil) {
-        guard sourceWidth > 0, sourceHeight > 0 else { return }
-        var s = selection ?? CropRect(x: 0, y: 0, width: sourceWidth, height: sourceHeight)
-        if let x = x { s.x = x }
-        if let y = y { s.y = y }
-        if let w = w { s.width = max(1, w) }
-        if let h = h { s.height = max(1, h) }
-        if lockAspect, let ratio = effectiveRatio() {
-            let r = CropMath.lockRatio(width: s.width, height: s.height, ratioW: ratio.w, ratioH: ratio.h)
-            s.width = r.w
-            s.height = r.h
-        }
-        setSelection(s)
-    }
-
-    /// One-tap preset: none, 25%, 50%, 66.66%, all.
-    public func applyPreset(_ kind: PresetKind) {
-        guard sourceWidth > 0, sourceHeight > 0 else { return }
-        switch kind {
-        case .none:
-            setSelection(nil)
-        case .percent(let p):
-            setSelection(CropRect.centered(percent: p, sourceWidth: sourceWidth, sourceHeight: sourceHeight))
-        case .all:
-            setSelection(CropRect(x: 0, y: 0, width: sourceWidth, height: sourceHeight))
+            // Spec §2.7: non-persistent → clear selection; tool stays open.
+            setRect(nil, syncSession: true)
         }
     }
 
-    public enum PresetKind: Equatable {
-        case none
-        case percent(Double)
-        case all
+    // MARK: - Rect mutation
+
+    /// Centralized setter so we can keep `CropSession` in sync.
+    public func setRect(_ r: CGRect?, syncSession: Bool = true) {
+        rect = r
+        if syncSession { session.setRect(r) }
     }
 
-    // MARK: - Drag state machine
-
-    /// Called when the user mouse-downs on the canvas at `imagePoint`
-    /// (source-image coords).
-    public func beginDraw(at imagePoint: CGPoint) {
-        action = .drawing
-        let start = CropRect(x: Int(imagePoint.x), y: Int(imagePoint.y), width: 1, height: 1)
-        setSelection(start)
+    /// Consume any pending selection that an MCP client proposed.
+    /// The viewer calls this from its run-loop tick.
+    public func consumePendingFromMCP() {
+        guard let pending = session.consumePending() else { return }
+        if !isActive { open() }
+        if let a = pending.aspectRatio {
+            aspectRatio = a
+            session.setAspectRatio(a)
+        }
+        setRect(CropMath.clip(pending.rect, to: activeImageSize), syncSession: true)
     }
 
-    /// Called when the user drags from `start` to `current` (both in
-    /// image coords) with `action == .drawing`.
-    public func updateDraw(from start: CGPoint, to current: CGPoint) {
-        let x = min(start.x, current.x)
-        let y = min(start.y, current.y)
-        let w = abs(current.x - start.x)
-        let h = abs(current.y - start.y)
-        var rect = CropRect(x: Int(x), y: Int(y), width: max(1, Int(w)), height: max(1, Int(h)))
-        // Shift forces square.
-        if shiftHeld {
-            let side = min(rect.width, rect.height)
-            rect.width = side
-            rect.height = side
-        } else if lockAspect, let ratio = effectiveRatio() {
-            let r = CropMath.lockRatio(width: rect.width, height: rect.height, ratioW: ratio.w, ratioH: ratio.h)
-            rect.width = r.w
-            rect.height = r.h
-        }
-        setSelection(rect)
+    /// The (w, h) aspect components used for the current selection,
+    /// or nil if free. Honors `lockAspect`.
+    public var effectiveAspect: (w: CGFloat, h: CGFloat)? {
+        guard lockAspect || aspectRatio != .freeRatio else { return nil }
+        return CropMath.ratioComponents(
+            for: aspectRatio == .freeRatio ? .ratio1_1 : aspectRatio,
+            imageSize: activeImageSize,
+            customW: aspectRatioValues[0],
+            customH: aspectRatioValues[1]
+        )
     }
 
-    public func endDrag() {
-        action = .none
-        // Persist last-used selection when in lastUsed/persistAcrossImages mode.
-        if persistAcrossImages, let sel = selection {
-            var cfg = CropConfigStore.load()
-            cfg.lastUsedSelection = sel
-            try? CropConfigStore.save(cfg)
+    /// Aspect for a drag, taking transient Shift into account.
+    public func dragAspect(shift: Bool) -> (w: CGFloat, h: CGFloat)? {
+        if lockAspect, let a = effectiveAspect { return a }
+        if shift {
+            if let a = CropMath.ratioComponents(
+                for: aspectRatio == .freeRatio ? .ratio1_1 : aspectRatio,
+                imageSize: activeImageSize,
+                customW: aspectRatioValues[0],
+                customH: aspectRatioValues[1]
+            ) {
+                return a
+            }
+            return (1, 1)
+        }
+        if aspectRatio != .freeRatio, let a = effectiveAspect { return a }
+        return nil
+    }
+
+    // MARK: - Keyboard
+
+    public func nudge(dx: CGFloat, dy: CGFloat) {
+        guard let r = rect else { return }
+        setRect(CropMath.nudge(rect: r, dx: dx, dy: dy, imageSize: activeImageSize))
+    }
+
+    public func grow(dw: CGFloat, dh: CGFloat) {
+        guard let r = rect else { return }
+        setRect(CropMath.grow(rect: r, dw: dw, dh: dh, imageSize: activeImageSize))
+    }
+
+    public func cycleGrid() { gridMode = gridMode.next }
+
+    public func resetSelection() {
+        let init0 = CropMath.initialRect(
+            for: initSelectionType,
+            imageSize: activeImageSize,
+            customRect: initCustomRect,
+            autoCenter: autoCenter,
+            lastSelection: lastSelection
+        )
+        setRect(init0)
+    }
+
+    // MARK: - Output
+
+    public enum CropError: Error, LocalizedError {
+        case noSelection
+        case noActiveImage
+        case unsupportedSource
+
+        public var errorDescription: String? {
+            switch self {
+            case .noSelection: return "There is no crop selection."
+            case .noActiveImage: return "There is no active image to crop."
+            case .unsupportedSource: return "The current image cannot be cropped."
+            }
         }
     }
 
-    // MARK: - Apply crop (in-memory only — no disk write)
-
-    /// Crop the on-screen image to the current selection. Returns the
-    /// cropped `CGImage`; the caller is responsible for swapping it into
-    /// the viewer and registering an undo step.
-    @discardableResult
-    public func applyCrop() throws -> CGImage {
-        guard let sel = selection else {
-            throw CropPipelineError.invalidRectangle("no selection")
-        }
-        guard let imagePath else {
-            throw CropPipelineError.sourceNotFound("no image loaded")
-        }
-        // Re-decode from disk so we don't carry orientation-baked surprises.
-        let url = URL(fileURLWithPath: imagePath)
+    /// In-app replace. Returns the cropped CGImage so the viewer can
+    /// swap its source. The caller is responsible for pushing onto the
+    /// window's `UndoManager`.
+    public func applyAndReplace() throws -> CGImage {
+        guard var r = rect else { throw CropError.noSelection }
+        guard let path = activeImagePath else { throw CropError.noActiveImage }
+        let url = URL(fileURLWithPath: AppPaths.expandTilde(path))
         guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
               let cg = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
-            throw CropPipelineError.sourceUnreadable(imagePath)
+            throw CropError.unsupportedSource
         }
-        return try CropPipeline.cropCGImage(cg, to: sel)
+        r = CropMath.clip(snapToGrid ? CropMath.snapToIntegerPixels(r) : r, to: activeImageSize)
+        guard let cropped = cg.cropping(to: r) else { throw CropError.unsupportedSource }
+        lastSelection = r
+        return cropped
     }
 
-    // MARK: - Save / Save-As / Copy
-
-    public struct SaveOptions {
-        public var outputURL: URL?
-        public var format: OutputFormat
-        public var quality: Double
-        public var stripMetadata: Bool
-        public init(
-            outputURL: URL? = nil,
-            format: OutputFormat = .auto,
-            quality: Double = 0.92,
-            stripMetadata: Bool = false
-        ) {
-            self.outputURL = outputURL
-            self.format = format
-            self.quality = quality
-            self.stripMetadata = stripMetadata
-        }
+    @discardableResult
+    public func applySaveInPlace() throws -> URL {
+        guard let path = activeImagePath else { throw CropError.noActiveImage }
+        let url = URL(fileURLWithPath: AppPaths.expandTilde(path))
+        let format = outputFormatForSource(url: url)
+        let result = try runPipeline(outputURL: url, format: format)
+        lastSelection = rect
+        return URL(fileURLWithPath: result.outputPath)
     }
 
-    public func save(_ options: SaveOptions = SaveOptions()) throws -> CropResult {
-        guard let sel = selection else { throw CropPipelineError.invalidRectangle("no selection") }
-        guard let imagePath else { throw CropPipelineError.sourceNotFound("no image loaded") }
+    /// Returns the URL the user picked, or nil if they canceled.
+    @discardableResult
+    public func applySaveAs() throws -> URL? {
+        guard let path = activeImagePath else { throw CropError.noActiveImage }
+        guard rect != nil else { throw CropError.noSelection }
+        let sourceURL = URL(fileURLWithPath: AppPaths.expandTilde(path))
+        let resolvedFormat = CropPipeline.resolveFormat(outputFormat, sourceURL: sourceURL)
+        let ext = CropPipeline.defaultExtension(for: resolvedFormat, sourceURL: sourceURL)
+        let base = sourceURL.deletingPathExtension().lastPathComponent
 
-        let opts = CropOptions(
-            format: options.format,
-            quality: options.quality,
-            losslessJPEG: losslessJPEGWhenPossible,
-            stripMetadata: options.stripMetadata || stripMetadataOnSave,
-            overwrite: true
-        )
-        return try CropPipeline.cropFile(
-            inputPath: imagePath,
-            rect: sel,
-            outputPath: options.outputURL?.path,
-            options: opts
-        )
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "\(base)_cropped.\(ext)"
+        panel.allowedContentTypes = utTypes(for: resolvedFormat)
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let outURL = panel.url else { return nil }
+        let result = try runPipeline(outputURL: outURL, format: resolvedFormat)
+        lastSelection = rect
+        return URL(fileURLWithPath: result.outputPath)
     }
 
-    /// Crop, then push to the system pasteboard as TIFF + PNG.
-    public func copyToPasteboard() throws {
-        let cropped = try applyCrop()
+    public func copyToClipboard() throws {
+        let cg = try applyAndReplace()  // also pops up nothing — just runs the crop in memory
+        let rep = NSBitmapImageRep(cgImage: cg)
         let pb = NSPasteboard.general
         pb.clearContents()
-        let rep = NSBitmapImageRep(cgImage: cropped)
-        if let tiff = rep.tiffRepresentation {
-            pb.setData(tiff, forType: .tiff)
-        }
         if let png = rep.representation(using: .png, properties: [:]) {
             pb.setData(png, forType: .png)
         }
+        if let tiff = rep.representation(using: .tiff, properties: [:]) {
+            pb.setData(tiff, forType: .tiff)
+        }
+        let img = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+        pb.writeObjects([img])
     }
 
-    // MARK: - Helpers
+    // MARK: - Pipeline helpers
 
-    /// The numeric W:H ratio currently in force, or nil for `.free`.
-    public func effectiveRatio() -> (w: Int, h: Int)? {
-        switch aspectRatio {
-        case .free:                       return nil
-        case .custom:                     return (customAspectW, customAspectH)
-        case .original:                   return (sourceWidth, sourceHeight)
-        case .ratio(let w, let h):        return (w, h)
-        }
-    }
-
-    /// Apply clamp + pixel snap + edge snap to a candidate rectangle.
-    private func clampAndSnap(_ rect: CropRect) -> CropRect {
-        var r = rect
-        if snapToPixel {
-            // Snap origin to integer (already integer); snap right/bottom too.
-            // Nothing further needed since `CropRect` is already Int-typed.
-        }
-        if snapToEdges, sourceWidth > 0, sourceHeight > 0 {
-            r.x = CropMath.snapToEdge(r.x, bound: sourceWidth, gravity: snapEdgeGravityPx)
-            r.y = CropMath.snapToEdge(r.y, bound: sourceHeight, gravity: snapEdgeGravityPx)
-            let right = r.x + r.width
-            let bottom = r.y + r.height
-            let snappedRight = CropMath.snapToEdge(right, bound: sourceWidth, gravity: snapEdgeGravityPx)
-            let snappedBottom = CropMath.snapToEdge(bottom, bound: sourceHeight, gravity: snapEdgeGravityPx)
-            r.width = max(1, snappedRight - r.x)
-            r.height = max(1, snappedBottom - r.y)
-        }
-        if sourceWidth > 0, sourceHeight > 0 {
-            r = r.clamped(toSourceWidth: sourceWidth, sourceHeight: sourceHeight)
-        }
-        return r
-    }
-
-    // MARK: - MCP plumbing
-
-    /// Publish the current selection state to `crop-live.json` so the
-    /// out-of-process MCP server can read it via `get_crop_selection`.
-    public func publishLiveSelection() {
-        let live = LiveCropSelection(
-            imagePath: imagePath,
-            sourceWidth: sourceWidth,
-            sourceHeight: sourceHeight,
-            selection: selection,
-            aspectRatio: aspectRatio.description,
-            apply: false,
-            updatedAt: Date()
+    private func runPipeline(outputURL: URL, format: CropOutputFormat) throws -> CropPipeline.Result {
+        guard let r = rect else { throw CropError.noSelection }
+        guard let path = activeImagePath else { throw CropError.noActiveImage }
+        let inputURL = URL(fileURLWithPath: AppPaths.expandTilde(path))
+        let cleaned = CropMath.clip(snapToGrid ? CropMath.snapToIntegerPixels(r) : r, to: activeImageSize)
+        let options = CropPipeline.Options(
+            format: format,
+            quality: outputQuality,
+            preferLossless: preferLossless,
+            preserveMetadata: preserveMetadata,
+            stripGPS: stripGPS
         )
-        try? LiveCropSelection.save(live)
+        return try CropPipeline.crop(
+            inputURL: inputURL,
+            rect: cleaned,
+            outputURL: outputURL,
+            options: options
+        )
     }
 
-    /// Pull the latest MCP-side `set_crop_selection` write and apply it.
-    /// Returns true if the file's selection was applied.
-    @discardableResult
-    public func pullLiveSelectionFromDisk() -> Bool {
-        guard let live = LiveCropSelection.load() else { return false }
-        if let sel = live.selection {
-            setSelection(sel)
-            return true
+    private func outputFormatForSource(url: URL) -> CropOutputFormat {
+        CropPipeline.resolveFormat(outputFormat, sourceURL: url)
+    }
+
+    private func utTypes(for format: CropOutputFormat) -> [UTType] {
+        switch format {
+        case .auto, .png:  return [.png]
+        case .jpeg: return [.jpeg]
+        case .webp: return [.webP]
+        case .heic: return [.heic]
+        case .avif: return [UTType("public.avif") ?? .image]
+        case .tiff: return [.tiff]
         }
-        return false
     }
 }

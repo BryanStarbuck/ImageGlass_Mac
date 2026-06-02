@@ -1,0 +1,557 @@
+---
+title: Use Case — MCP File Panel Tour
+description: Step-by-step user-scenario tour for the directory / filename panel and the MCP calls that drive it. Walks through first launch, clicking an image into the viewer, switching to file-tree view, and the four MCP mutations (add directory, remove directory, extension filter, path filter) — each with the YAML written into Local Storage and the line written into log.log. Each scenario lists actions in order with an explicit verify step that proves it worked.
+---
+
+# Use Case — MCP File Panel Tour
+
+This page is a **scenario-by-scenario tour** of the directory /
+filename panel and the MCP calls that drive it. It is written as a
+sequence of user actions: *do this first, then this, then this*, and
+at each step it spells out the on-screen and on-disk result so a
+human (or a test) can verify the step actually worked.
+
+It is the user-facing companion to:
+
+* [Starbuck Fork](../starbuck-fork.mdx) §2 (panels) and §4–§5 (Local
+  Storage + MCP) — the charter being implemented.
+* [Panels](../panels.mdx) — the framework the file panel lives in.
+* [File List Panel](../list_of_files.mdx) — the panel itself, its
+  five view modes, and the MCP tool list.
+* [Error Handling](../error_handling.mdx) §4.2 — the `log.log` record
+  format that every MCP call in this tour must produce.
+
+Nothing in this tour adds new MCP tools. It exercises the existing
+ones from a user's point of view and pins down the verifiable
+outcome of each call.
+
+---
+
+## 0. Common Preconditions
+
+These hold for every scenario unless a scenario explicitly overrides
+them.
+
+* The app is installed and signed; first launch has already happened
+  once (so `~/Library/Application Support/ImageGlass_Mac/` exists).
+* The MCP server is reachable. For Claude Code this is the
+  `imageglass` MCP server registered in the user's MCP config; for
+  the tour it does not matter which transport is used.
+* The Local Storage layout is:
+
+  ```
+  ~/Library/Application Support/ImageGlass_Mac/
+  ├── scopes/
+  │   └── default.yaml            # the active scope (created on first launch)
+  └── logs/
+      └── log.log                 # every MCP call lands here
+  ```
+
+* Scope files in this tour are **YAML** (`.yaml`), not JSON. The
+  field names match the JSON schema in
+  [list_of_files.mdx](../list_of_files.mdx) §3.1 — only the on-disk
+  encoding differs. The MCP server reads and writes YAML; the GUI
+  loads YAML through the same `ScopeStore`.
+* The viewer canvas is in the center. The file panel docks on the
+  **left** by default (see [Panels](../panels.mdx) §7.2 — the
+  *Browser* preset).
+* Test image fixtures live under `~/Pictures/tour/`:
+
+  ```
+  ~/Pictures/tour/
+  ├── beach/
+  │   ├── 001.jpg
+  │   ├── 002.jpg
+  │   └── notes_old.png
+  ├── mountains/
+  │   ├── peak.heic
+  │   └── peak.jpg
+  └── README.txt
+  ```
+
+* "Verify" means: read the named file with `cat`, look at the named
+  pixel region on screen, or read the named log line. Each verify
+  step is a check a human or an XCUITest run can perform.
+
+---
+
+## 1. First Launch — File Panel On By Default, Left Side
+
+### 1.1 Actions, in order
+
+1. Launch ImageGlass_Mac from `/Applications/ImageGlass_Mac.app`.
+2. Wait for the main window to finish drawing.
+
+### 1.2 Expected result
+
+* The main window opens with the *Browser* layout preset (panels
+  §7.2): toolbar on top, **file panel docked on the left**, gallery
+  strip + status bar on the bottom, viewer in the center.
+* The file panel's header reads `Files` and its scope picker reads
+  `default`.
+* `default.yaml` exists at
+  `~/Library/Application Support/ImageGlass_Mac/scopes/default.yaml`
+  with an empty `criteria:` list and a `resolved: []` list. No source
+  directories have been added yet.
+
+### 1.3 Verify
+
+* On screen: the leftmost ~280 pt of the window is the file panel.
+  Its top reads `Files`.
+* On disk:
+
+  ```sh
+  cat ~/Library/Application\ Support/ImageGlass_Mac/scopes/default.yaml
+  ```
+
+  Output begins with:
+
+  ```yaml
+  name: default
+  schema_version: 1
+  criteria: []
+  resolved: []
+  ```
+
+* On disk: `logs/log.log` has a single startup line of the form
+
+  ```
+  2026-06-02T10:00:00.123Z ts=… app=startup msg="layout=Browser scope=default"
+  ```
+
+---
+
+## 2. Click an Image — It Loads in the Main Viewer
+
+### 2.1 Preconditions
+
+* Scenario 1 completed.
+* Add a directory by hand for this scenario (the MCP version is
+  covered in §4):
+  drag `~/Pictures/tour/beach` onto the file panel's drop target.
+  The panel re-walks; its list now shows `001.jpg`, `002.jpg`,
+  `notes_old.png`.
+
+### 2.2 Actions, in order
+
+1. Click the row labeled `001.jpg` in the file panel.
+
+### 2.3 Expected result
+
+* The file panel highlights the clicked row with the system accent
+  color.
+* The viewer canvas loads `~/Pictures/tour/beach/001.jpg` and renders
+  it fit-to-window.
+* The status bar reads the file name, pixel dimensions, and file
+  size of `001.jpg`.
+* The MCP server emits a `selection_changed` push event (file list
+  §8.1) with payload `["/Users/.../beach/001.jpg"]`.
+
+### 2.4 Verify
+
+* On screen: the image is visible in the viewer; the status bar
+  matches the file.
+* On disk:
+
+  ```sh
+  tail -n 1 ~/Library/Application\ Support/ImageGlass_Mac/logs/log.log
+  ```
+
+  contains a `tool=panel.select_file path=…/beach/001.jpg` audit
+  record (the GUI selection runs through the same audit path as
+  MCP-driven `select_file`).
+
+---
+
+## 3. Toggle Into File-Tree View
+
+The same panel can render its file list as either a flat sequence
+(strip / grid / details) or as a hierarchical tree that mirrors the
+source directory layout.
+
+### 3.1 Preconditions
+
+* Scenario 2 completed.
+
+### 3.2 Actions, in order
+
+1. In the file panel toolbar, click the **tree** icon in the view
+   toggle (`▣ ░ ⊟ ┣ ⫯`, the fourth icon — see
+   [list_of_files.mdx](../list_of_files.mdx) §4.1).
+
+### 3.3 Expected result
+
+* The panel re-lays out as an outline:
+
+  ```
+  ▾ beach
+      001.jpg
+      002.jpg
+      notes_old.png
+  ```
+
+* The previously selected `001.jpg` is still selected and the viewer
+  still shows it.
+* The view-mode change is journaled.
+
+### 3.4 Verify
+
+* On screen: the panel shows the directory `beach` as an expandable
+  outline row with its files indented underneath.
+* On disk: a new line in `log.log` of the form
+
+  ```
+  ts=… tool=panel.set_view_mode mode=tree client=gui ok=true
+  ```
+
+---
+
+## 4. MCP Adds a Directory to the Scope
+
+Now the same panel is driven from outside. Claude Code (or any MCP
+client) wants the panel to show a second directory in addition to
+`~/Pictures/tour/beach`.
+
+### 4.1 Preconditions
+
+* Scenario 3 completed. The active scope is `default`. `default.yaml`
+  contains one criterion with `root: ~/Pictures/tour/beach`.
+
+### 4.2 Actions, in order
+
+1. From Claude Code:
+
+   ```
+   update_scope(name="default", patch={
+       "add_criteria": [
+           { "root": "~/Pictures/tour/mountains", "recursive": true }
+       ]
+   })
+   ```
+
+### 4.3 Expected result
+
+* The MCP server validates the patch, applies it to `default.yaml`,
+  and writes the file atomically (temp file + rename).
+* `FSEventStream` fires on the scope file; the panel re-walks both
+  source directories on a background task.
+* Within ~250 ms the panel's list (still in tree mode from §3) shows:
+
+  ```
+  ▾ beach
+      001.jpg
+      002.jpg
+      notes_old.png
+  ▾ mountains
+      peak.heic
+      peak.jpg
+  ```
+
+* `last_evaluated` in `default.yaml` advances to the wall-clock
+  timestamp of the re-walk.
+* Two new lines land in `log.log`: the MCP request, and the
+  re-evaluation result.
+
+### 4.4 Verify
+
+* On disk:
+
+  ```sh
+  cat ~/Library/Application\ Support/ImageGlass_Mac/scopes/default.yaml
+  ```
+
+  contains:
+
+  ```yaml
+  name: default
+  schema_version: 1
+  criteria:
+    - root: /Users/<you>/Pictures/tour/beach
+      recursive: true
+    - root: /Users/<you>/Pictures/tour/mountains
+      recursive: true
+  last_evaluated: 2026-06-02T10:05:11Z
+  resolved:
+    - path: /Users/<you>/Pictures/tour/beach/001.jpg
+    - path: /Users/<you>/Pictures/tour/beach/002.jpg
+    - path: /Users/<you>/Pictures/tour/beach/notes_old.png
+    - path: /Users/<you>/Pictures/tour/mountains/peak.heic
+    - path: /Users/<you>/Pictures/tour/mountains/peak.jpg
+  ```
+
+* On screen: the panel shows both directory roots, expanded.
+* On disk: `log.log` contains the two lines
+
+  ```
+  ts=… tool=mcp.update_scope name=default client=claude-code corr=ab12cd34 ok=true
+  ts=… app=scope.evaluate name=default count=5 elapsed_ms=43
+  ```
+
+  (Both lines share the same `corr=` correlation id so a debugger
+  can join them — see [error_handling.mdx](../error_handling.mdx)
+  §4.2.)
+
+---
+
+## 5. MCP Removes a Directory From the Scope
+
+### 5.1 Preconditions
+
+* Scenario 4 completed. The scope has two criteria.
+
+### 5.2 Actions, in order
+
+1. From Claude Code:
+
+   ```
+   update_scope(name="default", patch={
+       "remove_criteria_with_root": ["~/Pictures/tour/beach"]
+   })
+   ```
+
+### 5.3 Expected result
+
+* The MCP server rewrites `default.yaml` with only the `mountains`
+  criterion. `FSEventStream` fires; the panel re-walks.
+* The viewer's current selection (`001.jpg` from `beach`) is no
+  longer in scope. The panel clears the selection and selects the
+  first item of the new resolved list (`peak.heic`). The viewer
+  loads `peak.heic`.
+* If the user prefers no auto-advance, the
+  `panel.on_remove_active = keep-empty` Setting overrides this
+  behavior — see scenario 9 for the empty-viewer state.
+
+### 5.4 Verify
+
+* On disk: `default.yaml` `criteria:` has one entry (`mountains`)
+  and `resolved:` lists only the two `mountains` files.
+* On screen: the panel shows only the `mountains` outline; the
+  viewer shows `peak.heic`.
+* On disk: two new `log.log` lines —
+  `tool=mcp.update_scope` and `app=scope.evaluate count=2`.
+
+---
+
+## 6. MCP Applies an Extension Filter
+
+### 6.1 Preconditions
+
+* Scenario 4 completed (both directories in scope). Re-add the
+  `beach` criterion first if you ran scenario 5, so this scenario
+  starts with five resolved files.
+
+### 6.2 Actions, in order
+
+1. From Claude Code:
+
+   ```
+   update_scope(name="default", patch={
+       "set_include_exts_global": ["jpg", "jpeg"]
+   })
+   ```
+
+   This sets `include_exts` on every criterion in the scope.
+
+### 6.3 Expected result
+
+* `default.yaml` now records `include_exts: [jpg, jpeg]` on each
+  criterion entry.
+* The walker re-runs; the resolved set narrows to the JPG files
+  only: `001.jpg`, `002.jpg`, `peak.jpg`. The HEIC and PNG files
+  drop out.
+* The panel (still in tree mode) shows:
+
+  ```
+  ▾ beach
+      001.jpg
+      002.jpg
+  ▾ mountains
+      peak.jpg
+  ```
+
+### 6.4 Verify
+
+* On disk: `default.yaml` shows `include_exts: [jpg, jpeg]` on each
+  criterion and `resolved:` lists three entries.
+* On screen: `notes_old.png` and `peak.heic` are no longer visible.
+* On disk: `log.log` shows
+  `tool=mcp.update_scope name=default fields=[criteria.include_exts]`
+  and a matching `scope.evaluate count=3` line.
+
+---
+
+## 7. MCP Applies a Path-Glob Filter
+
+Same scope; now exclude anything whose filename contains `_old`.
+
+### 7.1 Preconditions
+
+* Scenario 6 completed (`include_exts: [jpg, jpeg]`).
+* To show the glob doing real work, temporarily widen the extensions
+  back to `[jpg, jpeg, png]` so `notes_old.png` is in scope again:
+
+  ```
+  update_scope(name="default", patch={
+      "set_include_exts_global": ["jpg", "jpeg", "png"]
+  })
+  ```
+
+  Verify the panel now shows `notes_old.png` again before
+  continuing.
+
+### 7.2 Actions, in order
+
+1. From Claude Code:
+
+   ```
+   update_scope(name="default", patch={
+       "set_exclude_globs_global": ["**/*_old*", "**/.imageglass/**"]
+   })
+   ```
+
+### 7.3 Expected result
+
+* `default.yaml` records `exclude_globs: ["**/*_old*",
+  "**/.imageglass/**"]` on each criterion.
+* The walker re-runs. `notes_old.png` is dropped by the
+  `**/*_old*` glob. The resolved set is back to four files.
+* The panel updates within ~250 ms.
+
+### 7.4 Verify
+
+* On disk: `default.yaml` shows the two `exclude_globs:` patterns on
+  each criterion.
+* On screen: `notes_old.png` is gone.
+* On disk: `log.log` shows
+  `tool=mcp.update_scope fields=[criteria.exclude_globs]` and
+  `scope.evaluate count=4`.
+
+---
+
+## 8. Every MCP Call Is Journaled to `log.log`
+
+This scenario is the union of the audit-trail checks above, stated
+on its own so it is testable as one acceptance criterion.
+
+### 8.1 Actions, in order
+
+1. From a freshly truncated `log.log` (delete it; the next write
+   recreates it), run scenarios 4 → 5 → 6 → 7 back-to-back.
+
+### 8.2 Expected result
+
+* `log.log` contains exactly the following kinds of lines, in the
+  order produced, with no other MCP `tool=mcp.*` lines mixed in
+  (because no other MCP calls happened):
+
+  ```
+  ts=… app=startup …                                   # if app restarted
+  ts=… tool=mcp.update_scope … corr=… ok=true          # §4 add directory
+  ts=… app=scope.evaluate name=default count=5 …       # §4 walk
+  ts=… tool=mcp.update_scope … corr=… ok=true          # §5 remove directory
+  ts=… app=scope.evaluate name=default count=2 …       # §5 walk
+  ts=… tool=mcp.update_scope … corr=… ok=true          # §6 ext filter
+  ts=… app=scope.evaluate name=default count=3 …       # §6 walk
+  ts=… tool=mcp.update_scope … corr=… ok=true          # §7 glob filter
+  ts=… app=scope.evaluate name=default count=4 …       # §7 walk
+  ```
+
+* Every `tool=mcp.*` line records `client=` (which MCP client
+  called), `corr=` (8-char correlation id), `ok=true|false`, and on
+  failure an `err=` field with the error code.
+* Failed calls are also written. To test, send a deliberately
+  malformed `update_scope` (e.g. `criteria` not an array). The line
+  reads `ok=false err=invalid_criteria` and the scope file is **not**
+  modified.
+
+### 8.3 Verify
+
+* On disk:
+
+  ```sh
+  grep "tool=mcp.update_scope" \
+      ~/Library/Application\ Support/ImageGlass_Mac/logs/log.log \
+      | wc -l
+  ```
+
+  prints `4` after the four §4–§7 calls.
+* On disk:
+
+  ```sh
+  grep "app=scope.evaluate" \
+      ~/Library/Application\ Support/ImageGlass_Mac/logs/log.log \
+      | wc -l
+  ```
+
+  prints `4`.
+* Every successful `tool=mcp.update_scope` line is followed (within
+  ~500 ms by wall clock in the timestamps) by a matching
+  `app=scope.evaluate` line.
+
+---
+
+## 9. No Image Previewed — Empty Viewer State
+
+This covers the case where the file panel has zero resolved files,
+or no file is selected. The viewer must remain in a defined empty
+state instead of holding a stale image.
+
+### 9.1 Actions, in order
+
+1. Starting from any scenario above, remove every criterion:
+
+   ```
+   update_scope(name="default", patch={ "clear_criteria": true })
+   ```
+
+### 9.2 Expected result
+
+* `default.yaml` has `criteria: []` and `resolved: []`.
+* The panel renders its empty state: a centered SF Symbol
+  (`photo.on.rectangle.angled`), the label `No files in scope`, and
+  a secondary action `[+ Add directory]` that opens an `NSOpenPanel`.
+* The viewer canvas renders its empty state: a centered placeholder
+  reading `No image previewed` in the theme's secondary-label color.
+  No stale image remains on the canvas.
+* The status bar reads `0 files`.
+* The MCP server keeps responding normally; e.g.
+  `list_files_in_scope(name="default")` returns `[]`.
+
+### 9.3 Verify
+
+* On disk: `default.yaml` shows `criteria: []` and `resolved: []`.
+* On screen: the viewer placeholder text is present; no pixels from
+  the previous image remain.
+* MCP: a follow-up call
+
+  ```
+  list_files_in_scope(name="default")
+  ```
+
+  returns `{ "files": [], "total": 0 }`.
+
+---
+
+## 10. End-to-End Acceptance
+
+A run of this tour passes when **all of**:
+
+* §1 — file panel is on the left by default after a clean launch.
+* §2 — clicking a row in the panel loads the image in the viewer.
+* §3 — tree-view toggle re-lays the same files into an outline that
+  mirrors the source directory tree.
+* §4 — `update_scope` add path persists to YAML, triggers a re-walk,
+  and the new directory appears in the panel.
+* §5 — `update_scope` remove path persists to YAML and the
+  directory disappears from the panel.
+* §6 — extension filter persists and narrows the resolved set.
+* §7 — exclude-glob persists and removes matching files.
+* §8 — every MCP call wrote a `tool=mcp.*` line, every re-walk
+  wrote a matching `app=scope.evaluate` line, and a deliberately
+  malformed call wrote `ok=false err=…` without mutating the scope.
+* §9 — clearing all criteria leaves the viewer in the explicit
+  `No image previewed` empty state with `0 files` in the status bar.
+
+If any step fails, the failing line in `log.log` (with its `corr=`
+correlation id) is the first place to look — joining it against the
+matching `error.err` record reproduces the call in full.

@@ -14,9 +14,16 @@ struct ContentView: View {
 
     var body: some View {
         PanelHost(controller: layout) {
-            VStack(spacing: 0) {
-                ImageViewer(state: state, viewer: state.viewer)
-                statusBar
+            HStack(spacing: 0) {
+                VStack(spacing: 0) {
+                    ImageViewer(state: state, viewer: state.viewer)
+                    statusBar
+                }
+                if state.crop.isActive {
+                    Divider()
+                    CropPanelView(controller: state.crop)
+                        .background(.regularMaterial)
+                }
             }
         }
         .navigationTitle(windowTitle)

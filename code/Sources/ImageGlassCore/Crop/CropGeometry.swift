@@ -371,9 +371,12 @@ public struct SelectionResizer: Equatable, Sendable {
     }
 }
 
-// MARK: - Aspect Lock helpers
+// MARK: - Aspect Lock helpers (legacy)
 
-public enum CropMath {
+/// Legacy aspect/snap helpers from the original crop scaffold. Superseded by
+/// the spec-aligned ``CropMath`` enum in `Crop/CropMath.swift`; retained only
+/// so the older `CropConfig` / `JPEGLosslessCrop` paths keep compiling.
+public enum LegacyCropMath {
     /// Constrain a candidate W,H so it matches a target aspect ratio.
     /// `axis` decides which dimension we trust: `.horizontal` keeps width
     /// (and recomputes height), `.vertical` keeps height. `.either` keeps

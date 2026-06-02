@@ -70,9 +70,7 @@ public enum CropInitialSelection: String, Codable, CaseIterable, Sendable {
     case selectTwoThirds, select70Percent, select75Percent, select80Percent, select90Percent
 }
 
-public enum CropOutputFormat: String, Codable, CaseIterable, Sendable {
-    case auto, jpeg, png, webp, heic, avif, tiff
-}
+// `CropOutputFormat` is defined in `Crop/CropTypes.swift` and shared here.
 
 public enum ColorPickerCopyFormat: String, Codable, CaseIterable, Sendable {
     case rgb, hex, hsl, hsv, cieLab, swift_color, ns_color

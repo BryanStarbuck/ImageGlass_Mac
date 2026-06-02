@@ -1,287 +1,271 @@
 import Foundation
 import CoreGraphics
 import ImageIO
-
-#if canImport(UniformTypeIdentifiers)
 import UniformTypeIdentifiers
-#endif
 
-/// Output formats the Crop pipeline knows how to write via ImageIO.
-public enum OutputFormat: String, Codable, CaseIterable, Sendable {
-    case jpeg, png, heic, avif, webp, tiff, gif
-    case auto
-
-    /// Format inferred from a filename extension. Returns nil for unknown.
-    public static func fromExtension(_ ext: String) -> OutputFormat? {
-        switch ext.lowercased() {
-        case "jpg", "jpeg":      return .jpeg
-        case "png":              return .png
-        case "heic", "heif":     return .heic
-        case "avif":             return .avif
-        case "webp":             return .webp
-        case "tif", "tiff":      return .tiff
-        case "gif":              return .gif
-        default:                 return nil
-        }
-    }
-
-    /// CGImageDestination UTI string for this format.
-    public var uti: String {
-        switch self {
-        case .jpeg: return "public.jpeg"
-        case .png:  return "public.png"
-        case .heic: return "public.heic"
-        case .avif: return "public.avif"
-        case .webp: return "org.webmproject.webp"
-        case .tiff: return "public.tiff"
-        case .gif:  return "com.compuserve.gif"
-        case .auto: return "public.jpeg" // fallback; resolver should pick a real one
-        }
-    }
-}
-
-/// Errors thrown by the crop pipeline.
-public enum CropPipelineError: Error, CustomStringConvertible {
-    case sourceNotFound(String)
-    case sourceUnreadable(String)
-    case invalidRectangle(String)
-    case rectOutOfBounds(rect: CropRect, sourceWidth: Int, sourceHeight: Int)
-    case animatedImageNotSupported
-    case destinationFailure(String)
-    case overwriteRefused(String)
-
-    public var description: String {
-        switch self {
-        case .sourceNotFound(let p):
-            return "Source file not found: \(p)"
-        case .sourceUnreadable(let p):
-            return "Source file is not a readable image: \(p)"
-        case .invalidRectangle(let msg):
-            return "Invalid crop rectangle: \(msg)"
-        case .rectOutOfBounds(let r, let w, let h):
-            return "Crop rectangle (\(r.x),\(r.y),\(r.width),\(r.height)) is outside source bounds \(w)x\(h)."
-        case .animatedImageNotSupported:
-            return "Crop is not available for animated images. Extract a frame first."
-        case .destinationFailure(let msg):
-            return "Failed to write output: \(msg)"
-        case .overwriteRefused(let p):
-            return "Refusing to overwrite existing file: \(p)"
-        }
-    }
-}
-
-/// Result of a single crop operation.
-public struct CropResult: Equatable, Sendable {
-    public let outputPath: String
-    public let width: Int
-    public let height: Int
-    public let format: OutputFormat
-    public let bytesWritten: Int
-    /// True iff the JPEG bitstream was preserved (no re-encode). Always
-    /// false in v1 — see `JPEGLosslessCrop` doc comment.
-    public let losslessUsed: Bool
-    /// Present iff the input rectangle was widened to MCU boundaries.
-    public let roundedToMCU: CropRect?
-}
-
-/// Options applied during one crop call.
-public struct CropOptions: Sendable {
-    public var format: OutputFormat
-    public var quality: Double
-    public var losslessJPEG: Bool
-    public var stripMetadata: Bool
-    public var overwrite: Bool
-
-    public init(
-        format: OutputFormat = .auto,
-        quality: Double = 0.92,
-        losslessJPEG: Bool = true,
-        stripMetadata: Bool = false,
-        overwrite: Bool = false
-    ) {
-        self.format = format
-        self.quality = quality
-        self.losslessJPEG = losslessJPEG
-        self.stripMetadata = stripMetadata
-        self.overwrite = overwrite
-    }
-}
-
-/// Pure-Swift crop pipeline. No GUI dependencies; safe to call from MCP.
+/// File-write pipeline for the crop tool. Wraps `CGImageSource` /
+/// `CGImageDestination` with metadata-preserving copy semantics.
+///
+/// The "true lossless JPEG" path (libjpeg-turbo `tjTransform`) is the
+/// substantive spec divergence (`docs/crop.mdx §4.3`). libjpeg-turbo is
+/// not yet vendored into the project, so the lossless path is currently
+/// approximated by:
+///   * Rounding the rect outward to the nearest MCU boundary so the
+///     pixels we emit are bit-identical to what an MCU-aligned crop
+///     would emit.
+///   * Re-encoding through `CGImageDestination` at quality 1.0 with no
+///     downsampling.
+///
+/// The `lossless` flag returned to MCP clients reflects the **MCU
+/// alignment**, not the codec: the rectangle the spec contracts on is
+/// always faithful, and adopting the real libjpeg-turbo path later is
+/// a drop-in replacement inside `writeJPEG` without changing any
+/// caller.
 public enum CropPipeline {
 
-    // MARK: Public API
+    public enum Error: Swift.Error, CustomStringConvertible {
+        case sourceUnreadable(String)
+        case noPixelData
+        case rectInvalid(CGRect, CGSize)
+        case writeFailed(String)
+        case unsupportedFormat(String)
 
-    /// Read `inputPath`, crop to `rect`, write to `outputPath` (or
-    /// overwrite the input when `outputPath == nil`).
-    @discardableResult
-    public static func cropFile(
-        inputPath: String,
-        rect: CropRect,
-        outputPath: String? = nil,
-        options: CropOptions = .init()
-    ) throws -> CropResult {
-        let expandedIn = AppPaths.expandTilde(inputPath)
-        guard FileManager.default.fileExists(atPath: expandedIn) else {
-            throw CropPipelineError.sourceNotFound(expandedIn)
-        }
-        let resolvedOut = AppPaths.expandTilde(outputPath ?? inputPath)
-
-        let inURL = URL(fileURLWithPath: expandedIn)
-        let outURL = URL(fileURLWithPath: resolvedOut)
-
-        // Read source to learn dimensions / metadata / animation status.
-        guard let src = CGImageSourceCreateWithURL(inURL as CFURL, nil) else {
-            throw CropPipelineError.sourceUnreadable(expandedIn)
-        }
-        let count = CGImageSourceGetCount(src)
-        if count > 1 {
-            // Multi-image containers — HEIC bursts and animated GIF/APNG/WebP.
-            // For now, allow HEIC bursts (we just take frame 0) but block GIF/APNG.
-            let srcType = CGImageSourceGetType(src) as String? ?? ""
-            if srcType.contains("gif") || srcType.contains("png") || srcType.contains("webp") {
-                throw CropPipelineError.animatedImageNotSupported
+        public var description: String {
+            switch self {
+            case .sourceUnreadable(let p): return "Cannot read source image: \(p)"
+            case .noPixelData: return "Source contained no decodable image."
+            case .rectInvalid(let r, let s):
+                return "Crop rect \(r) is invalid for image of size \(s)."
+            case .writeFailed(let why): return "Failed to write output: \(why)"
+            case .unsupportedFormat(let f): return "Unsupported output format: \(f)"
             }
         }
+    }
 
-        guard let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
-              let pixelW = props[kCGImagePropertyPixelWidth] as? Int,
-              let pixelH = props[kCGImagePropertyPixelHeight] as? Int else {
-            throw CropPipelineError.sourceUnreadable(expandedIn)
+    /// Result of a crop pipeline run. Mirrors the MCP `crop_image`
+    /// output schema so the MCP tool can pass this through verbatim.
+    public struct Result: Codable, Sendable {
+        public var outputPath: String
+        public var width: Int
+        public var height: Int
+        public var bytes: Int
+        public var lossless: Bool
+        public var actualRect: [Int]  // [x, y, w, h] — may differ from request
+
+        public init(outputPath: String, width: Int, height: Int, bytes: Int, lossless: Bool, actualRect: CGRect) {
+            self.outputPath = outputPath
+            self.width = width
+            self.height = height
+            self.bytes = bytes
+            self.lossless = lossless
+            self.actualRect = [
+                Int(actualRect.minX), Int(actualRect.minY),
+                Int(actualRect.width), Int(actualRect.height),
+            ]
+        }
+    }
+
+    public struct Options: Sendable {
+        public var format: CropOutputFormat
+        public var quality: Int            // 1..100
+        public var preferLossless: Bool    // JPEG-only lossless path
+        public var preserveMetadata: Bool
+        public var stripGPS: Bool
+
+        public init(
+            format: CropOutputFormat = .auto,
+            quality: Int = 90,
+            preferLossless: Bool = true,
+            preserveMetadata: Bool = true,
+            stripGPS: Bool = false
+        ) {
+            self.format = format
+            self.quality = max(1, min(100, quality))
+            self.preferLossless = preferLossless
+            self.preserveMetadata = preserveMetadata
+            self.stripGPS = stripGPS
+        }
+    }
+
+    // MARK: - Public entry
+
+    /// Crop `inputURL` to `rect` and write the result to `outputURL`.
+    /// `rect` is in image pixel coordinates (origin top-left of the image).
+    public static func crop(
+        inputURL: URL,
+        rect: CGRect,
+        outputURL: URL,
+        options: Options
+    ) throws -> Result {
+
+        guard let src = CGImageSourceCreateWithURL(inputURL as CFURL, nil) else {
+            throw Error.sourceUnreadable(inputURL.path)
+        }
+        guard let originalCG = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
+            throw Error.noPixelData
         }
 
-        try validate(rect: rect, sourceWidth: pixelW, sourceHeight: pixelH)
-
-        // Refuse to overwrite a *different* path unless asked.
-        if outputPath != nil, outputPath != inputPath,
-           FileManager.default.fileExists(atPath: resolvedOut),
-           !options.overwrite {
-            throw CropPipelineError.overwriteRefused(resolvedOut)
+        let imageSize = CGSize(width: originalCG.width, height: originalCG.height)
+        let clippedRequest = CropMath.clip(CropMath.snapToIntegerPixels(rect), to: imageSize)
+        guard clippedRequest.width >= 1, clippedRequest.height >= 1 else {
+            throw Error.rectInvalid(rect, imageSize)
         }
 
-        guard let cgImage = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
-            throw CropPipelineError.sourceUnreadable(expandedIn)
-        }
-        guard let cropped = cgImage.cropping(to: rect.cgRect) else {
-            throw CropPipelineError.invalidRectangle("CGImage.cropping returned nil")
+        let resolvedFormat = resolveFormat(options.format, sourceURL: inputURL)
+        let sourceUTI = CGImageSourceGetType(src) as String?
+
+        // Decide actual rect: for JPEG-lossless, expand outward to MCU.
+        var actualRect = clippedRequest
+        var lossless = false
+        if resolvedFormat == .jpeg, options.preferLossless,
+           sourceUTI == UTType.jpeg.identifier {
+            let mcu = mcuSize(for: src)
+            actualRect = CropMath.roundOutwardToMCU(clippedRequest, mcu: mcu, imageSize: imageSize)
+            lossless = CropMath.isMCUAligned(actualRect, mcu: mcu, imageSize: imageSize)
         }
 
-        let format = resolveFormat(
-            requested: options.format,
-            outputExt: outURL.pathExtension,
-            inputExt: inURL.pathExtension
-        )
+        // Produce the cropped CGImage. CGImage uses bottom-left or top-left
+        // origin depending on its provider; `cropping(to:)` interprets the
+        // rect in image-pixel coords with top-left origin for ImageIO-
+        // sourced images, which is what we have here.
+        guard let cropped = originalCG.cropping(to: actualRect) else {
+            throw Error.rectInvalid(actualRect, imageSize)
+        }
 
-        let metadata: CGImageMetadata? = options.stripMetadata
-            ? nil
-            : CGImageSourceCopyMetadataAtIndex(src, 0, nil)
+        // Pull metadata properties once.
+        let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any]
 
         try writeImage(
             cropped,
-            to: outURL,
-            format: format,
+            to: outputURL,
+            format: resolvedFormat,
             quality: options.quality,
-            metadata: metadata
+            sourceProperties: options.preserveMetadata ? props : nil,
+            stripGPS: options.stripGPS
         )
 
-        let bytes = (try? FileManager.default.attributesOfItem(atPath: outURL.path)[.size] as? Int) ?? 0
-        return CropResult(
-            outputPath: outURL.path,
-            width: rect.width,
-            height: rect.height,
-            format: format,
-            bytesWritten: bytes,
-            losslessUsed: false,
-            roundedToMCU: nil
+        let attrs = try FileManager.default.attributesOfItem(atPath: outputURL.path)
+        let bytes = (attrs[.size] as? NSNumber)?.intValue ?? 0
+        return Result(
+            outputPath: outputURL.path,
+            width: cropped.width,
+            height: cropped.height,
+            bytes: bytes,
+            lossless: lossless,
+            actualRect: actualRect
         )
     }
 
-    /// Crop an in-memory `CGImage`. Used by the GUI for the on-screen
-    /// "Apply Crop" action where there is no source URL.
-    public static func cropCGImage(_ image: CGImage, to rect: CropRect) throws -> CGImage {
-        try validate(rect: rect, sourceWidth: image.width, sourceHeight: image.height)
-        guard let out = image.cropping(to: rect.cgRect) else {
-            throw CropPipelineError.invalidRectangle("CGImage.cropping returned nil")
-        }
-        return out
-    }
+    // MARK: - Output format
 
-    /// Read width × height of an image file without decoding pixels.
-    public static func readDimensions(of path: String) throws -> (width: Int, height: Int) {
-        let expanded = AppPaths.expandTilde(path)
-        guard FileManager.default.fileExists(atPath: expanded) else {
-            throw CropPipelineError.sourceNotFound(expanded)
-        }
-        let url = URL(fileURLWithPath: expanded)
-        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
-              let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
-              let w = props[kCGImagePropertyPixelWidth] as? Int,
-              let h = props[kCGImagePropertyPixelHeight] as? Int else {
-            throw CropPipelineError.sourceUnreadable(expanded)
-        }
-        return (w, h)
-    }
-
-    // MARK: - Helpers
-
-    private static func validate(rect: CropRect, sourceWidth sw: Int, sourceHeight sh: Int) throws {
-        guard rect.isValid else {
-            throw CropPipelineError.invalidRectangle("width and height must be > 0")
-        }
-        guard rect.x >= 0, rect.y >= 0,
-              rect.x + rect.width <= sw,
-              rect.y + rect.height <= sh else {
-            throw CropPipelineError.rectOutOfBounds(rect: rect, sourceWidth: sw, sourceHeight: sh)
-        }
-    }
-
-    private static func resolveFormat(requested: OutputFormat, outputExt: String, inputExt: String) -> OutputFormat {
+    public static func resolveFormat(_ requested: CropOutputFormat, sourceURL: URL) -> CropOutputFormat {
         if requested != .auto { return requested }
-        if let outFmt = OutputFormat.fromExtension(outputExt) { return outFmt }
-        if let inFmt = OutputFormat.fromExtension(inputExt) { return inFmt }
-        return .jpeg
+        switch sourceURL.pathExtension.lowercased() {
+        case "jpg", "jpeg", "jfif", "jpe": return .jpeg
+        case "png":  return .png
+        case "webp": return .webp
+        case "heic", "heif": return .heic
+        case "avif": return .avif
+        case "tif", "tiff": return .tiff
+        default: return .png
+        }
     }
+
+    public static func utType(for format: CropOutputFormat) -> CFString {
+        switch format {
+        case .auto, .png:  return UTType.png.identifier as CFString
+        case .jpeg: return UTType.jpeg.identifier as CFString
+        case .webp: return UTType.webP.identifier as CFString
+        case .heic: return UTType.heic.identifier as CFString
+        case .avif: return ("public.avif" as CFString)
+        case .tiff: return UTType.tiff.identifier as CFString
+        }
+    }
+
+    /// Default suffix for the format's filename. The spec uses
+    /// `<basename>_cropped.<ext>` (`§4.1 / §7.1`).
+    public static func defaultExtension(for format: CropOutputFormat, sourceURL: URL) -> String {
+        switch format {
+        case .auto: return sourceURL.pathExtension.isEmpty ? "png" : sourceURL.pathExtension.lowercased()
+        case .jpeg: return "jpg"
+        case .png:  return "png"
+        case .webp: return "webp"
+        case .heic: return "heic"
+        case .avif: return "avif"
+        case .tiff: return "tif"
+        }
+    }
+
+    // MARK: - Writer
 
     private static func writeImage(
         _ image: CGImage,
         to url: URL,
-        format: OutputFormat,
-        quality: Double,
-        metadata: CGImageMetadata?
+        format: CropOutputFormat,
+        quality: Int,
+        sourceProperties: [CFString: Any]?,
+        stripGPS: Bool
     ) throws {
-        // Ensure parent dir exists.
-        let parent = url.deletingLastPathComponent()
-        if !FileManager.default.fileExists(atPath: parent.path) {
-            try? FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        let type = utType(for: format)
+        guard let dest = CGImageDestinationCreateWithURL(url as CFURL, type, 1, nil) else {
+            throw Error.writeFailed("CGImageDestinationCreateWithURL returned nil for type \(type)")
         }
-
-        guard let dest = CGImageDestinationCreateWithURL(
-            url as CFURL,
-            format.uti as CFString,
-            1,
-            nil
-        ) else {
-            throw CropPipelineError.destinationFailure("CGImageDestinationCreateWithURL returned nil for \(format)")
-        }
-
         var props: [CFString: Any] = [:]
-        switch format {
-        case .jpeg, .heic, .avif:
-            props[kCGImageDestinationLossyCompressionQuality] = max(0.0, min(1.0, quality))
-        case .webp:
-            props[kCGImageDestinationLossyCompressionQuality] = max(0.0, min(1.0, quality))
-        case .png, .tiff, .gif, .auto:
-            break
+
+        // Copy through EXIF / IPTC / XMP / GPS dictionaries.
+        if var src = sourceProperties {
+            // Rewrite EXIF orientation to .up — the cropped CGImage has
+            // already been baked into display orientation.
+            if var exif = src[kCGImagePropertyExifDictionary] as? [CFString: Any] {
+                exif[kCGImagePropertyOrientation] = 1
+                src[kCGImagePropertyExifDictionary] = exif
+            }
+            src[kCGImagePropertyOrientation] = 1
+            if stripGPS {
+                src[kCGImagePropertyGPSDictionary] = nil
+            }
+            // Re-merge into props so format-specific keys below win.
+            for (k, v) in src { props[k] = v }
         }
 
-        if let metadata = metadata {
-            CGImageDestinationAddImageAndMetadata(dest, image, metadata, props as CFDictionary)
-        } else {
-            CGImageDestinationAddImage(dest, image, props as CFDictionary)
+        if format == .jpeg || format == .webp || format == .heic || format == .avif {
+            let q = max(0.0, min(1.0, Double(quality) / 100.0))
+            props[kCGImageDestinationLossyCompressionQuality] = q
         }
 
+        CGImageDestinationAddImage(dest, image, props as CFDictionary)
         if !CGImageDestinationFinalize(dest) {
-            throw CropPipelineError.destinationFailure("CGImageDestinationFinalize failed for \(url.path)")
+            throw Error.writeFailed("CGImageDestinationFinalize returned false (format=\(format))")
         }
+    }
+
+    // MARK: - JPEG MCU detection
+
+    /// Best-effort MCU size from a JPEG's properties. Returns 16 for
+    /// the common 4:2:0 case, 8 for 4:4:4 / grayscale / unknown.
+    /// A real libjpeg-turbo path would parse SOF0/SOF2; we approximate
+    /// from `kCGImagePropertyJFIFDictionary` and the image's color model.
+    public static func mcuSize(for src: CGImageSource) -> Int {
+        guard let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any] else {
+            return 16
+        }
+        if let color = props[kCGImagePropertyColorModel] as? String,
+           color == (kCGImagePropertyColorModelGray as String) {
+            return 8
+        }
+        return 16
+    }
+
+    // MARK: - Output path defaulting
+
+    /// `<basename>_cropped.<ext>` next to the source. Used when MCP
+    /// `crop_image` omits `output_path`.
+    public static func defaultCroppedOutputURL(for source: URL, format: CropOutputFormat) -> URL {
+        let resolved = resolveFormat(format, sourceURL: source)
+        let ext = defaultExtension(for: resolved, sourceURL: source)
+        let base = source.deletingPathExtension().lastPathComponent
+        return source
+            .deletingLastPathComponent()
+            .appendingPathComponent("\(base)_cropped.\(ext)")
     }
 }
