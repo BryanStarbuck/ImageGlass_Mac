@@ -275,7 +275,7 @@ public struct DirectoriesMCPTools: Sendable {
             do { filter = try parseFilter(rawFilter) } catch let e as DirectoriesStoreError {
                 logger.logDirectoryToolCall(
                     toolName: "add_directory", path: raw,
-                    client: client, corr: corr, ok: false, err: "invalid_filter"
+                    client: client, corr: corr, ok: false, err: e.auditCode
                 )
                 return .text(e.description, isError: true)
             }
@@ -403,7 +403,7 @@ public struct DirectoriesMCPTools: Sendable {
         do { filter = try parseFilter(rawFilter) } catch let e as DirectoriesStoreError {
             logger.logDirectoryToolCall(
                 toolName: "update_directory_filter", path: raw, client: client,
-                corr: corr, ok: false, err: "invalid_filter"
+                corr: corr, ok: false, err: e.auditCode
             )
             return .text(e.description, isError: true)
         }
@@ -462,7 +462,7 @@ public struct DirectoriesMCPTools: Sendable {
         do { filter = try parseFilter(rawFilter) } catch let e as DirectoriesStoreError {
             logger.logDirectoryToolCall(
                 toolName: "set_global_filter", path: nil, client: client,
-                corr: corr, ok: false, err: "invalid_filter"
+                corr: corr, ok: false, err: e.auditCode
             )
             return .text(e.description, isError: true)
         }
@@ -577,7 +577,22 @@ public struct DirectoriesMCPTools: Sendable {
     }
 
     /// Parse the on-wire filter shape into a `RootFilter`. Throws
-    /// `DirectoriesStoreError.invalidFilter` on bad input.
+    /// `DirectoriesStoreError.invalidFilter` (or one of its more specific
+    /// siblings — `invalidRegex`, `pathSeparatorInPattern`) on bad input.
+    ///
+    /// Pattern normalization at the MCP boundary
+    /// (`docs/use_cases/mcp_file.mdx` §10B.1):
+    ///
+    /// * A leading `.../` is stripped — it conveys "anywhere under the
+    ///   root, at any depth," which is already the engine's default.
+    ///   The `.../` shorthand never reaches `directories.yaml`.
+    /// * After stripping, a remaining `/` in the pattern is a
+    ///   filename-vs-path-matching mismatch (§10B.8). v1 supports
+    ///   filename matching only, so any leftover `/` triggers
+    ///   `pathSeparatorInPattern`.
+    /// * `kind: regex` patterns are eagerly compiled so a syntactically
+    ///   invalid regex surfaces as `invalid_regex` at MCP-call time
+    ///   instead of silently dropping every file at evaluate-time.
     public static func parseFilterDict(_ raw: [String: Any?]) throws -> RootFilter {
         var filter = RootFilter()
         if let m = raw["match"] as? String {
@@ -596,7 +611,7 @@ public struct DirectoriesMCPTools: Sendable {
             guard let dict = entry as? [String: Any?] else {
                 throw DirectoriesStoreError.invalidFilter("item is not an object")
             }
-            guard let pattern = dict["pattern"] as? String, !pattern.isEmpty else {
+            guard let rawPattern = dict["pattern"] as? String, !rawPattern.isEmpty else {
                 throw DirectoriesStoreError.invalidFilter("item missing `pattern`")
             }
             var kind: RootFilterItem.ItemKind = .glob
@@ -607,10 +622,57 @@ public struct DirectoriesMCPTools: Sendable {
                 kind = parsed
             }
             let negate = (dict["negate"] as? Bool) ?? false
+            let pattern = try Self.normalizePattern(rawPattern, kind: kind)
             items.append(RootFilterItem(pattern: pattern, kind: kind, negate: negate))
         }
         filter.items = items
         return filter
+    }
+
+    /// Apply the §10B.1 boundary normalization to a single pattern.
+    /// Exposed `internal` for direct test coverage.
+    ///
+    /// Steps, in order:
+    ///   1. Strip every leading `.../` ("anywhere under the root"
+    ///      shorthand — implicit, never stored).
+    ///   2. Reject any remaining unescaped `/` separator with
+    ///      `pathSeparatorInPattern` (v1 filenames-only — §10B.8).
+    ///   3. Eagerly compile `kind: regex` patterns so bad syntax
+    ///      surfaces as `invalidRegex` here, not at evaluate-time.
+    static func normalizePattern(_ raw: String, kind: RootFilterItem.ItemKind) throws -> String {
+        var p = raw
+        while p.hasPrefix(".../") {
+            p.removeFirst(4)
+        }
+        if Self.containsUnescapedSlash(p) {
+            throw DirectoriesStoreError.pathSeparatorInPattern(raw)
+        }
+        if kind == .regex {
+            do {
+                _ = try NSRegularExpression(pattern: p)
+            } catch {
+                throw DirectoriesStoreError.invalidRegex(
+                    pattern: p,
+                    reason: String(describing: error)
+                )
+            }
+        }
+        return p
+    }
+
+    private static func containsUnescapedSlash(_ s: String) -> Bool {
+        var i = s.startIndex
+        while i < s.endIndex {
+            let c = s[i]
+            if c == "\\" {
+                i = s.index(after: i)
+                if i < s.endIndex { i = s.index(after: i) }
+                continue
+            }
+            if c == "/" { return true }
+            i = s.index(after: i)
+        }
+        return false
     }
 
     private func parseFilter(_ raw: [String: Any?]) throws -> RootFilter {
@@ -629,8 +691,26 @@ public struct DirectoriesMCPTools: Sendable {
             withJSONObject: dict,
             options: [.prettyPrinted, .sortedKeys]
         ), let s = String(data: data, encoding: .utf8) {
-            return s
+            return Self.normalizeJSON(s)
         }
         return "{}"
+    }
+
+    /// `JSONSerialization` always escapes forward slashes (`\/`) and
+    /// renders empty arrays/objects with whitespace inside (`[\n\n  ]`).
+    /// The mcp_file.mdx verify steps and audit log entries show plain
+    /// `/` and `[]`, so normalize the output to that form. (JSONEncoder
+    /// has `withoutEscapingSlashes` but the payloads here are dynamic
+    /// `[String: Any]`, not Codable, so post-processing the string is
+    /// the simplest faithful path.)
+    static func normalizeJSON(_ s: String) -> String {
+        var out = s.replacingOccurrences(of: "\\/", with: "/")
+        out = out.replacingOccurrences(
+            of: #"\[\s*\]"#, with: "[]", options: .regularExpression
+        )
+        out = out.replacingOccurrences(
+            of: #"\{\s*\}"#, with: "{}", options: .regularExpression
+        )
+        return out
     }
 }

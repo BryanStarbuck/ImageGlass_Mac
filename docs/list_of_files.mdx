@@ -630,12 +630,35 @@ only the rows whose `passesFilter` flipped.
 `RootFilter.evaluate(filename:)`:
 
 * If `items` is empty, returns `true` (no per-root filtering).
-* Otherwise, evaluates each item against the filename: `glob`,
-  `substring`, or `regex` per the item's `kind`.
-* Combines item results by `match`: `any` (default) = logical OR;
-  `all` = logical AND.
-* If an item's `negate` is `true`, a match becomes an exclusion (the
-  item contributes `false` to the combiner instead of `true`).
+* Partition `items` into **positive** items (`negate: false`, the
+  default) and **negative** items (`negate: true`).
+* If there are **no positive items**, the positive result is `true`
+  — i.e. every file that passed the built-in file-kind filter is
+  in scope, and negative items will carve out from that set. This
+  is the special case in
+  [use_cases/mcp_file.mdx §7.0](./use_cases/mcp_file.mdx#70-mental-model--positive-vs-negative-filter-items)
+  that makes "show everything *except* X" expressible as a single
+  negate item.
+* Otherwise, evaluate each positive item against the filename
+  (`glob`, `substring`, or `regex` per the item's `kind`) and
+  combine the results by `match`: `any` (default) = logical OR;
+  `all` = logical AND. Call the combined boolean
+  `positives_passed`.
+* Evaluate each negative item against the filename. If **any**
+  negative item matches, the file is excluded — regardless of
+  `match` and regardless of `positives_passed`. This is the
+  **veto semantic** spelled out in
+  [use_cases/mcp_file.mdx §7.0](./use_cases/mcp_file.mdx#70-mental-model--positive-vs-negative-filter-items).
+* Final result:
+
+  ```
+  included = positives_passed AND NOT any_negative_matched
+  ```
+
+The use-case → filter-item cookbook in
+[use_cases/mcp_file.mdx §7.0.1](./use_cases/mcp_file.mdx#701-use-case--filter-item-cookbook)
+is the contract that this engine must satisfy: every cookbook row
+is a working call and a unit-test case.
 
 ### 3A.8 Directories menu and hotkeys
 

@@ -1,6 +1,6 @@
 ---
 title: Use Case — MCP File Panel Tour
-description: Step-by-step user-scenario tour for the directory / filename panel and the MCP calls that drive it. Walks through first launch, clicking an image into the viewer, switching to file-tree view, and the four MCP mutations (add directory, remove directory, per-root filter, exclude-by-negate filter) — each with the YAML written into directories.yaml and the line written into log.log. Each scenario lists actions in order with an explicit verify step that proves it worked.
+description: Step-by-step user-scenario tour for the directory / filename panel and the MCP calls that drive it. Walks through first launch, clicking an image into the viewer, switching to file-tree view, and the four MCP mutations (add directory, remove directory, per-root filter, exclude-by-negate filter) — each with the YAML written into directories.yaml and the line written into log.log. The tour ends with two real-world rehearsals against `~/BGit/work/into_Work/StarbuckLabs/JFK/UX`: adding it as a root (§10A), then carving out files whose names contain `_DM_` via a single negative-filter item (§10B). §7.0 documents the mental model — positive items add files, negative items veto them — and §7.0.1 is a use-case → filter-item cookbook so every common intent collapses to a single MCP call. Each scenario lists actions in order with an explicit verify step that proves it worked.
 ---
 
 # Use Case — MCP File Panel Tour
@@ -454,6 +454,70 @@ milliseconds even on a large root.
 The same filter shape supports exclusion via a `negate: true` flag
 on any item. This is how the user (or MCP) writes "include all of
 this kind **except** files whose name contains `_old`."
+
+### 7.0 Mental model — positive vs. negative filter items
+
+A root's filter is a flat list of items combined by `match: any`
+(OR, the default) or `match: all` (AND). Each item carries a
+`pattern`, a `kind` (`glob` / `substring` / `regex`), and a
+`negate` flag.
+
+* **Positive items** (`negate: false`, the default) declare what is
+  *in scope*. A positive item that matches the filename contributes
+  `true` to the combiner; one that does not match contributes
+  `false`. Multiple positive items combined by `match: any` produce
+  the **union** of their matches.
+* **Negative items** (`negate: true`) declare what is *carved out*.
+  A negative item is a **veto**: if it matches the filename, the
+  file is excluded regardless of what any positive item said. If it
+  does not match, it contributes nothing — it neither includes nor
+  excludes.
+
+The combined semantic, as implemented by the engine in
+[list_of_files.mdx §3A.7](../list_of_files.mdx#3a7-filter-re-evaluation--no-re-walk):
+
+```
+included = positives_passed( positive_items, match )
+         AND NOT any_negative_matched( negative_items )
+```
+
+with one **special case** that makes the most common real-world
+intent expressible in a single item: if there are **no positive
+items at all**, `positives_passed` is `true` — every file that
+passed the built-in file-kind filter is in scope, and the negative
+items carve out from that set. Without this special case,
+`[ { *_old*, negate: true } ]` (the canonical "everything except
+`_old`" filter) would be `OR-of-nothing = false` and the panel
+would render empty.
+
+This is also why `items: []` in §3A.2 means "include everything":
+no positives + no negatives = `true AND NOT false = true` for every
+file. The §10B rehearsal walks through the canonical
+single-negate-item pattern against a real working directory.
+
+### 7.0.1 Use-case → filter-item cookbook
+
+The mappings below cover the intents that show up over and over.
+Every row is a one-line MCP call where the `filter.items` array
+matches the right-hand column.
+
+| User intent (plain English) | `filter.items` |
+| --- | --- |
+| "Show every image / SVG / video." (the default) | `[]` |
+| "Show only `.jpg` files." | `[ { pattern: "*.jpg", kind: glob } ]` |
+| "Show `.jpg` *and* `.png`." | `[ { pattern: "*.jpg", kind: glob }, { pattern: "*.png", kind: glob } ]` *(combined by `match: any`, the default)* |
+| "Show every image *except* files with `_old` in the name." | `[ { pattern: "*_old*", kind: glob, negate: true } ]` |
+| "Show every image *except* files with `_DM_` in the name." | `[ { pattern: "*_DM_*", kind: glob, negate: true } ]` *(canonical §10B form, glob variant)* |
+| "Show every image *except* `*_DM_*.jpg` specifically — keep `*_DM_*.png` visible." | `[ { pattern: ".*_DM_.*\\.jpg$", kind: regex, negate: true } ]` *(canonical §10B form, regex variant — the form actually stored in `directories.yaml`)* |
+| "Show only JPEG / PNG **and** exclude `_old`." | `[ { pattern: "*.jpg", kind: glob }, { pattern: "*.png", kind: glob }, { pattern: "*_old*", kind: glob, negate: true } ]` |
+| "Show only files whose name starts with `IMG_`." | `[ { pattern: "IMG_*", kind: glob } ]` |
+| "Show only files matching a regex `^[0-9]{4}-shoot-.*$`." | `[ { pattern: "^[0-9]{4}-shoot-.*$", kind: regex } ]` |
+| "Carve out two markers at once: `_DM_` **and** `_WIP_`." | `[ { pattern: "*_DM_*", kind: glob, negate: true }, { pattern: "*_WIP_*", kind: glob, negate: true } ]` *(two independent vetoes — either one excludes)* |
+| "Hide every file under any `_archive/` or `.imageglass/` subtree." | path matching — see §10B.8 (v1.1) |
+
+The cookbook is a contract: each row is a working call against the
+engine. If a future change breaks any row's behavior, the §3A.7
+unit tests should fail.
 
 ### 7.1 Preconditions
 
@@ -940,6 +1004,285 @@ bug, not a logic bug.
   banner with an `[Authorize…]` button that opens `NSOpenPanel`. On
   grant, the call is replayed and the §10A.3 flow proceeds.
 
+### 10A.6 Continues into §10B
+
+§10B picks up where this scenario ends: with the JFK/UX root
+populated and visible in the panel, the user adds a single
+negative filter item to carve `*_DM_*.jpg` files out of the
+subtree. Run §10A first; §10B starts from the state it leaves
+behind.
+
+---
+
+## 10B. Real-World Rehearsal — Carving Out `_DM_` Files via a Negative Filter Item
+
+This scenario continues from §10A. The JFK/UX root is already in
+`directories.yaml`, the walker has populated its in-memory tree,
+and the panel is in tree mode showing every image / SVG / video
+the built-in file-kind filter let through. Among those files are
+several whose names carry an internal `_DM_` marker (used by an
+upstream tool to flag "design markup" exports). The user wants
+those carved out without removing the root, without touching the
+filesystem, and without altering what the rest of the JFK/UX
+hierarchy shows.
+
+This is the canonical exercise of `update_directory_filter` with a
+single `negate: true` item — the smallest possible negative filter,
+applied to a real working directory, that produces a verifiable
+change in the panel and exactly one new field in
+`directories.yaml`.
+
+### 10B.1 The user's request, verbatim
+
+The user types into Claude Code:
+
+> In the JFK/UX root, don't show files whose path matches
+> `".../*_DM_*.jpg"`.
+
+That one sentence carries **three** independent pieces of
+information; the MCP server must decompose them correctly because
+each lands in a different place.
+
+| Pattern fragment | What it means | Where it goes |
+| --- | --- | --- |
+| `.../` | "Anywhere under the root, at any depth." | **Implicit.** Every root in `directories.yaml` is walked recursively; nothing about `.../` is encoded in the filter item itself. The MCP server strips this prefix at the boundary. |
+| `*_DM_*` | "Filename contains the literal substring `_DM_`." | The filter item's `pattern` (the substantive part). |
+| `.jpg` | "And the file is a JPEG." | Anchored to the pattern's tail in regex form (`.*\\.jpg$`) or as a glob suffix (`*_DM_*.jpg`). Drop this fragment to widen the rule to *any* image / SVG / video with `_DM_` in its name (see §10B.7). |
+
+The user said "don't show" — this is a **subtractive** intent,
+which maps to `negate: true`. Nothing about the rest of the JFK/UX
+hierarchy needs to change: the empty positive set + the §7.0 special
+case still includes every other image, and the single negative item
+simply vetoes the `_DM_` matches.
+
+### 10B.2 Preconditions
+
+* §10A completed. `directories.yaml` has one root —
+  `/Users/<you>/BGit/work/into_Work/StarbuckLabs/JFK/UX` — with
+  `filter: { items: [] }` and a populated `last_walked`.
+* The JFK/UX tree contains at least one file whose name matches
+  `*_DM_*.jpg` (e.g. `screens/login/frame_42_DM_1.jpg`). Verify the
+  file is currently visible in the panel — that is the row that
+  must disappear after this scenario completes.
+* The panel is in **tree** view (per §10A.3); the auto-selected
+  image from §10A.5 is loaded in the viewer.
+
+### 10B.3 Actions, in order
+
+1. From Claude Code:
+
+   ```
+   update_directory_filter(
+     path="~/BGit/work/into_Work/StarbuckLabs/JFK/UX",
+     filter={
+       "match": "any",
+       "items": [
+         {
+           "pattern": ".*_DM_.*\\.jpg$",
+           "kind":    "regex",
+           "negate":  true
+         }
+       ]
+     }
+   )
+   ```
+
+   The MCP server (a) canonicalizes the path, (b) validates the
+   filter (one item, regex syntactically valid, `negate` is a
+   boolean), (c) replaces the JFK/UX root's `filter` block in
+   `directories.yaml`, (d) writes atomically (temp-file + rename),
+   and (e) returns `ok=true` within ~5 ms. **No filesystem walk is
+   triggered** — this is the §3A.7 in-memory re-evaluation
+   contract.
+
+### 10B.4 Expected `directories.yaml` after the call
+
+```yaml
+schema_version: 1
+root_directories:
+  - path: /Users/<you>/BGit/work/into_Work/StarbuckLabs/JFK/UX
+    filter:
+      match: any
+      items:
+        - pattern: ".*_DM_.*\\.jpg$"
+          kind: regex
+          negate: true
+    last_walked: 2026-06-02T10:23:41Z
+```
+
+Four things to notice:
+
+* The stored pattern is **the regex**, not the user-typed
+  `.../*_DM_*.jpg`. The `.../` and `.jpg` decomposition from
+  §10B.1 was done at the MCP boundary; what lands in YAML is the
+  canonical regex form the engine actually evaluates.
+* There is **no positive item**. The §7.0 special case applies:
+  empty positive set ⇒ everything that passed the built-in
+  file-kind filter is in scope, and the single negative item carves
+  out the `_DM_` JPEGs.
+* `last_walked` is **not** updated. The walker did not re-walk;
+  only the in-memory tree's `passesFilter` flags changed.
+* The YAML diff is exactly one block (`filter:` swapped from
+  `items: []` to the four-field form). A `git diff` of
+  `directories.yaml` after this call is one logical change — easy
+  to review, easy to revert.
+
+### 10B.5 Expected result on the panel
+
+* Every `.file` node under the JFK/UX root whose name matches
+  `.*_DM_.*\.jpg$` flips its `passesFilter` to `false`. Every
+  other file (PNG, HEIC, SVG, MP4, JPEGs *without* `_DM_`, etc.)
+  stays visible.
+* The panel re-renders within ~50 ms. On a JFK/UX tree of ~5 000
+  files with ~80 `_DM_` JPEGs, the rendered file count drops by
+  exactly those 80 rows; the count delta is recorded in the
+  `directory.refilter` log line (§10B.6).
+* The viewer canvas is **unaffected** unless the auto-selected
+  file from §10A was one of the carved-out `_DM_` files. In that
+  case the selection is invalidated and the panel auto-selects
+  the next-lexicographic image (per §10.2 step 3); the viewer
+  reloads to show that image.
+* The other JFK/UX root state (`last_walked`, the `FSEventStream`
+  watcher, the in-memory directory skeleton) is untouched — only
+  per-`.file`-node `passesFilter` booleans changed.
+
+### 10B.6 Verify
+
+* On disk:
+
+  ```sh
+  cat ~/Library/Application\ Support/ImageGlass_Mac/directories.yaml
+  ```
+
+  matches §10B.4 byte-for-byte (modulo the `last_walked` timestamp
+  inherited from §10A).
+* On screen: no row whose filename matches `*_DM_*.jpg` is visible
+  in the JFK/UX subtree. Switching the panel to **details** mode
+  (§2.3) and sorting by Name confirms the absence: `frame_42.jpg`
+  and `frame_42_alt.jpg` are present, `frame_42_DM_1.jpg` is gone.
+* On disk:
+
+  ```sh
+  grep -E "mcp.update_directory_filter|directory.refilter" \
+      ~/Library/Application\ Support/ImageGlass_Mac/logs/log.log \
+      | tail -n 2
+  ```
+
+  prints exactly two lines, in this order, sharing one `corr=` id:
+
+  ```
+  ts=… tool=mcp.update_directory_filter path=…/JFK/UX items=1 negate_items=1 corr=… ok=true
+  ts=… app=directory.refilter           roots=1 visible_delta=-80 elapsed_ms=… corr=…
+  ```
+
+  Note `app=directory.refilter`, **not** `directory.walk` — the
+  filesystem was never touched. The `negate_items=1` field is the
+  explicit audit that a negative filter item was applied; an
+  external auditor can grep on `negate_items` to find every
+  "carve out" event across the log.
+* MCP: a follow-up call
+
+  ```
+  get_directory(path="~/BGit/work/into_Work/StarbuckLabs/JFK/UX")
+  ```
+
+  returns the same `filter` object the user sent, including the
+  `negate: true` flag and the `kind: regex` field.
+
+### 10B.7 Equivalents and variants
+
+The §10B.3 regex is the canonical stored form. Three useful
+variants to know about:
+
+* **Glob form** (easier to read, identical behavior for the JPEG
+  case):
+
+  ```
+  { "pattern": "*_DM_*.jpg", "kind": "glob", "negate": true }
+  ```
+
+  Use this when the pattern fits a glob without ambiguity. The
+  YAML stores `kind: glob` and the regex engine is never invoked.
+  The MCP server accepts either form on input.
+
+* **Widen to any kind** (drop the `.jpg` constraint — carve out
+  `_DM_` from PNG, HEIC, SVG, MP4 too):
+
+  ```
+  { "pattern": "*_DM_*", "kind": "glob", "negate": true }
+  ```
+
+  This is the right form when the user says "don't show *any*
+  files with `_DM_` in their name."
+
+* **Stack a second negative** (e.g. also carve out `_WIP_`):
+
+  ```
+  filter={
+    "match": "any",
+    "items": [
+      { "pattern": "*_DM_*",  "kind": "glob", "negate": true },
+      { "pattern": "*_WIP_*", "kind": "glob", "negate": true }
+    ]
+  }
+  ```
+
+  Both vetoes apply independently; a file matching either is
+  carved out. This is the canonical **multi-veto** shape — and it
+  is why the engine (§7.0) treats negative items as standalone
+  vetoes rather than as terms in the combiner.
+
+### 10B.8 Filename vs. path matching — what the engine compares
+
+Every item in `filter.items[]` matches against the **filename**
+(the last path component), not the full path. See
+[list_of_files.mdx §3A.2](../list_of_files.mdx#3a2-schema).
+
+This is sufficient for the canonical `_DM_` case because the
+marker lives in the filename: a file at
+`screens/login/frame_42_DM_1.jpg` is recognized by the `_DM_` in
+`frame_42_DM_1.jpg`, regardless of its parent directories. The
+user-shorthand `.../*_DM_*.jpg` is normalized at the MCP boundary:
+the `.../` prefix is stripped (it conveys "anywhere under the
+root," which is already implicit), and what remains —
+`*_DM_*.jpg` — is what the filename matcher sees.
+
+A first-class `target: filename | path` field on each filter item
+is a **planned v1.1 enhancement** for intents that genuinely need
+directory-name matching ("carve out every file under any
+`_archive/` directory"). Until v1.1 ships, two workarounds:
+
+* If the parent-directory marker also appears in filenames
+  (sometimes a build prepends parent names), match on that.
+* Otherwise, add the offending subdirectory as its own root and
+  immediately `remove_directory` it — except that this is
+  exactly the inverse of what is wanted. The honest answer is
+  that today the engine cannot express "carve out by parent
+  directory." Don't pretend it can; emit
+  `ok=false err=path_separator_in_pattern` (§10B.9) so the caller
+  can rephrase.
+
+### 10B.9 Failure modes the scenario must surface
+
+* **Invalid regex.** If the pattern is `.*_DM_(.*\.jpg$`
+  (unbalanced paren), the MCP call returns
+  `ok=false err=invalid_regex`; `directories.yaml` is unchanged;
+  the panel state is unchanged; one `error.err` record carries
+  the offending pattern and the `corr=` id.
+* **Unknown root path.** If `path` does not match any entry in
+  `root_directories[]`, the call returns
+  `ok=false err=path_not_found`.
+* **Permission denied on YAML write.** If the application support
+  directory is read-only (rare but possible), the call returns
+  `ok=false err=storage_write_failed`; the in-memory filter is
+  **not** updated (we never let memory and disk diverge on a
+  write failure); the panel state stays as it was.
+* **Pattern contains a path separator.** If a future MCP client
+  sends a pattern like `*/foo/*_DM_*.jpg` (with `/` separators
+  that are *not* the `.../` prefix shorthand), the call returns
+  `ok=false err=path_separator_in_pattern` — v1 only supports
+  filename matching (§10B.8). `directories.yaml` is unchanged.
+
 ---
 
 ## 11. End-to-End Acceptance
@@ -987,6 +1330,22 @@ A run of this tour passes when **all of**:
   (`path_not_found`, no media, `permission_denied`) surface
   cleanly without mutating `directories.yaml` and prompt the user
   for authorization when applicable.
+* §10B — continuing from §10A, a single `update_directory_filter`
+  call with one `negate: true` regex item carves `*_DM_*.jpg`
+  files out of the JFK/UX subtree. The user-shorthand
+  `.../*_DM_*.jpg` is normalized at the MCP boundary: the `.../`
+  prefix is dropped (implicit recursion), the `_DM_` substring
+  becomes the pattern body, and `.jpg` is anchored in the regex
+  tail. `directories.yaml` stores the canonical regex form
+  (`.*_DM_.*\.jpg$`) with `kind: regex` and `negate: true`.
+  `last_walked` is unchanged (in-memory re-eval only). The
+  `directory.refilter` log line records `negate_items=1` and a
+  `visible_delta` equal to the count of carved-out files. The
+  cookbook in §7.0.1 is the contract for which user intents map
+  to which `filter.items[]` shapes; the four failure modes
+  (`invalid_regex`, `path_not_found`, `storage_write_failed`,
+  `path_separator_in_pattern`) surface cleanly without
+  divergence between memory and disk.
 
 If any step fails, the failing line in `log.log` (with its `corr=`
 correlation id) is the first place to look — joining it against the

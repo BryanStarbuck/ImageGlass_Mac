@@ -46,8 +46,12 @@ public final class VideoPlaybackController {
     // MARK: - Private state
 
     private var looper: AVPlayerLooper?
-    private var timeObserver: Any?
-    private var endObserver: NSObjectProtocol?
+    /// Reference-typed box so `deinit` (nonisolated) can reach the
+    /// AVFoundation observer tokens without crossing the @MainActor
+    /// boundary that owns the rest of this class. The box itself is
+    /// `@unchecked Sendable`; only the main actor mutates its fields,
+    /// from `installPlayerObservers` and `unload`.
+    private let observers = ObserverBox()
     private var rateObserver: NSKeyValueObservation?
     private var statusObserver: NSKeyValueObservation?
     private var mutedObserver: NSKeyValueObservation?
@@ -65,23 +69,16 @@ public final class VideoPlaybackController {
 
     deinit {
         // AppKit / AVFoundation will tear down the player when the last
-        // reference drops; we just have to detach the periodic observer.
-        // Swift 6 actor isolation: `timeObserver`, `endObserver`, and
-        // `player` are main-actor-isolated; reach them via a nonisolated
-        // dispatch hop so deinit (which can fire on any thread) does not
-        // touch isolated state directly.
-        let p = unsafelyUnwrappedPlayer
-        let t = unsafelyUnwrappedTimeObserver
-        let e = unsafelyUnwrappedEndObserver
-        if let t { p.removeTimeObserver(t) }
-        if let e { NotificationCenter.default.removeObserver(e) }
+        // reference drops; we just detach the observers we registered.
+        // `player.removeTimeObserver` and `NotificationCenter.removeObserver`
+        // are both documented as thread-safe.
+        if let e = observers.endObserver {
+            NotificationCenter.default.removeObserver(e)
+        }
+        if let t = observers.timeObserver {
+            observers.player?.removeTimeObserver(t)
+        }
     }
-
-    /// Nonisolated mirrors so `deinit` can release the observers without
-    /// crossing the actor boundary. Kept in sync by `installPlayerObservers`.
-    private nonisolated(unsafe) var unsafelyUnwrappedPlayer: AVPlayer { player }
-    private nonisolated(unsafe) var unsafelyUnwrappedTimeObserver: Any? { timeObserver }
-    private nonisolated(unsafe) var unsafelyUnwrappedEndObserver: NSObjectProtocol? { endObserver }
 
     // MARK: - Load
 
@@ -164,13 +161,13 @@ public final class VideoPlaybackController {
     /// criterion 9).
     public func unload() {
         player.pause()
-        if let timeObserver {
-            player.removeTimeObserver(timeObserver)
-            self.timeObserver = nil
+        if let t = observers.timeObserver {
+            player.removeTimeObserver(t)
+            observers.timeObserver = nil
         }
-        if let endObserver {
-            NotificationCenter.default.removeObserver(endObserver)
-            self.endObserver = nil
+        if let e = observers.endObserver {
+            NotificationCenter.default.removeObserver(e)
+            observers.endObserver = nil
         }
         rateObserver?.invalidate()
         statusObserver?.invalidate()
@@ -345,13 +342,13 @@ public final class VideoPlaybackController {
     /// for gapless looping (no end-of-track black flash).
     private func rebuildPlayer(for item: AVPlayerItem) {
         // Detach old observers — they were attached to the previous player.
-        if let timeObserver {
-            player.removeTimeObserver(timeObserver)
-            self.timeObserver = nil
+        if let t = observers.timeObserver {
+            player.removeTimeObserver(t)
+            observers.timeObserver = nil
         }
-        if let endObserver {
-            NotificationCenter.default.removeObserver(endObserver)
-            self.endObserver = nil
+        if let e = observers.endObserver {
+            NotificationCenter.default.removeObserver(e)
+            observers.endObserver = nil
         }
         rateObserver?.invalidate()
         statusObserver?.invalidate()
@@ -376,19 +373,25 @@ public final class VideoPlaybackController {
     }
 
     private func installPlayerObservers() {
+        // Keep the nonisolated mirror in sync so `deinit` can release
+        // the time observer on whatever thread it runs.
+        observers.player = player
         // 10 Hz periodic time observer drives the scrubber / overlay.
-        timeObserver = player.addPeriodicTimeObserver(
+        // The closure is `@Sendable` so the main-actor mutation hops via
+        // Task — same pattern as the rate / mute / volume observers below.
+        observers.timeObserver = player.addPeriodicTimeObserver(
             forInterval: CMTime(value: 1, timescale: 10),
             queue: .main
         ) { [weak self] t in
-            guard let self else { return }
-            self.currentTime = CMTimeGetSeconds(t).isFinite
-                ? CMTimeGetSeconds(t) : 0
+            let seconds = CMTimeGetSeconds(t).isFinite ? CMTimeGetSeconds(t) : 0
+            Task { @MainActor [weak self] in
+                self?.currentTime = seconds
+            }
         }
 
         // End-of-item handler. Only meaningful when loop is off; when loop
         // is on AVPlayerLooper handles the restart.
-        endObserver = NotificationCenter.default.addObserver(
+        observers.endObserver = NotificationCenter.default.addObserver(
             forName: .AVPlayerItemDidPlayToEndTime,
             object: nil,
             queue: .main
@@ -418,4 +421,17 @@ public final class VideoPlaybackController {
             Task { @MainActor [weak self] in self?.volume = v }
         }
     }
+}
+
+/// Holder for AVFoundation observer tokens that the @MainActor-isolated
+/// `VideoPlaybackController` registers but its nonisolated `deinit` must
+/// be able to detach. `@unchecked Sendable` is sound because the fields
+/// are only mutated on the main actor (from `installPlayerObservers` and
+/// `unload`) and the AVFoundation teardown APIs invoked from `deinit`
+/// (`AVPlayer.removeTimeObserver`, `NotificationCenter.removeObserver`)
+/// are documented as thread-safe.
+private final class ObserverBox: @unchecked Sendable {
+    var timeObserver: Any?
+    var endObserver: NSObjectProtocol?
+    var player: AVPlayer?
 }

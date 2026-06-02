@@ -103,17 +103,25 @@ public struct RootFilter: Sendable, Equatable, Codable {
 
     /// Evaluate the filter against a single filename. Returns `true` if
     /// the file passes (would be visible).
+    ///
+    /// Semantics (mcp_file.mdx §7): negate items are exclusion overrides —
+    /// if any `negate: true` item matches the filename, the file is
+    /// excluded regardless of how positive items combine. Otherwise the
+    /// positive items are combined according to `match` (`any` ORs them,
+    /// `all` ANDs them). If only negate items are present, the file
+    /// passes unless one of them matches.
     public func evaluate(filename: String) -> Bool {
         if items.isEmpty { return true }
-        var bools: [Bool] = []
-        for item in items {
-            let raw = Self.itemMatches(item, filename: filename)
-            // `negate` flips the contribution: a match excludes.
-            bools.append(item.negate ? !raw : raw)
+        for item in items where item.negate {
+            if Self.itemMatches(item, filename: filename) { return false }
         }
+        let positives = items.filter { !$0.negate }
+        if positives.isEmpty { return true }
         switch match {
-        case .any: return bools.contains(true)
-        case .all: return !bools.contains(false)
+        case .any:
+            return positives.contains { Self.itemMatches($0, filename: filename) }
+        case .all:
+            return positives.allSatisfy { Self.itemMatches($0, filename: filename) }
         }
     }
 

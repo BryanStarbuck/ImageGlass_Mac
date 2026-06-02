@@ -17,8 +17,8 @@ struct ImageViewer: View {
 
     var body: some View {
         ZStack(alignment: .topLeading) {
-            if state.selectedFile != nil {
-                CanvasHost(state: state, viewer: viewer)
+            if let path = state.selectedFile {
+                MediaCanvasDispatcher(state: state, viewer: viewer, path: path)
                     .onDrop(of: [.fileURL], delegate: FileDropDelegate(state: state))
                     .focusable()
                     .focusEffectDisabled()
@@ -26,7 +26,7 @@ struct ImageViewer: View {
                     .onKeyPress(.rightArrow) { handleArrow(.right) }
                     .onKeyPress(.upArrow)    { handleArrow(.up)    }
                     .onKeyPress(.downArrow)  { handleArrow(.down)  }
-                    .onKeyPress(.space)      { viewer.zoomToActual();  return .handled }
+                    .onKeyPress(.space)      { handleSpace() }
                     .onKeyPress(.escape) {
                         if state.crop.isActive { state.crop.cancel(); return .handled }
                         return .ignored
@@ -75,6 +75,30 @@ struct ImageViewer: View {
         .background(Color(NSColor.windowBackgroundColor))
     }
 
+    /// Spacebar. videos.mdx §11.2 / svg.mdx §10.2 — focus-context rule:
+    /// when the current file is a video, Space toggles play/pause; when
+    /// it is an animated SVG, Space toggles SVG animation; otherwise
+    /// fall back to the existing image-canvas behavior (zoom to actual).
+    private func handleSpace() -> KeyPress.Result {
+        guard let path = state.selectedFile else {
+            viewer.zoomToActual(); return .handled
+        }
+        switch MediaKind.detect(path: path) {
+        case .video:
+            state.video.playPauseToggle()
+            return .handled
+        case .svg:
+            if state.svg.kind == .animated {
+                state.svg.playPauseToggle()
+                return .handled
+            }
+            return .ignored
+        case .image:
+            viewer.zoomToActual()
+            return .handled
+        }
+    }
+
     /// Arrow-key handler. When the crop tool is active, arrows nudge /
     /// grow the selection per docs/crop.mdx §2.4. Otherwise they
     /// navigate to prev / next image.
@@ -113,6 +137,31 @@ struct ImageViewer: View {
         } description: {
             Text("Drag an image into the window or pick a file from the panel on the left.")
                 .foregroundStyle(.secondary)
+        }
+    }
+}
+
+// MARK: - Media kind dispatch
+
+/// Pick the right canvas for the selected file. Static images render
+/// through the existing `CanvasHost`; videos go to `VideoCanvasView`
+/// (AVKit `AVPlayerView`); SVGs go to `SVGCanvasView` (WKWebView or
+/// NSImage). Detection uses UTType + extension via
+/// `MediaKind.detect(path:)`.
+private struct MediaCanvasDispatcher: View {
+    @Bindable var state: AppState
+    @Bindable var viewer: ViewerState
+    let path: String
+
+    var body: some View {
+        let kind = MediaKind.detect(path: path)
+        switch kind {
+        case .image:
+            CanvasHost(state: state, viewer: viewer)
+        case .video:
+            VideoCanvasView(state: state, controller: state.video, path: path)
+        case .svg:
+            SVGCanvasView(state: state, controller: state.svg, path: path)
         }
     }
 }

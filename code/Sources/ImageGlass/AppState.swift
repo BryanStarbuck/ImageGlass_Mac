@@ -12,11 +12,36 @@ public final class AppState {
     public var activeScopeName: String = ""
     public var activeScope: Scope? = nil
     public var resolvedFiles: [String] = []
-    public var selectedFile: String? = nil
+    public var selectedFile: String? = nil {
+        didSet {
+            // mcp_file.mdx §2.3 — every selection change (whether the
+            // user clicked a row, hit ←/→, dropped a file, or an MCP
+            // tool wrote selection.txt) emits a single
+            // `notifications/imageglass/selection_changed` push event
+            // so connected MCP clients see the move.
+            guard oldValue != selectedFile else { return }
+            // mcp_file.mdx §10.1 trigger condition #1 / §10.7 negative
+            // case: the walker only auto-selects when the viewer is
+            // empty. Mirror selectedFile into the walker so a manual
+            // selection (or any incoming MCP `select_file`) suppresses
+            // a future first-image-found auto-advance.
+            DirectoryTreeWalker.shared.viewerIsEmpty = (selectedFile == nil)
+            if let path = selectedFile {
+                MCPNotificationBus.shared.emitSelectionChanged(path: path)
+            }
+        }
+    }
     public var lastEvaluated: Date? = nil
 
     public var showPanelColumn: Bool = true
     public var panelViewMode: PanelViewMode = .list
+
+    /// Live snapshot of `DirectoryTreeWalker.shared.snapshot()`. Refreshed
+    /// from `DirectoryTreeWalker.didChangeNotification` (walk completed,
+    /// refilter ran, root removed) and is the source of truth the file
+    /// tree panel (Stage E) binds to. Empty until the walker starts
+    /// emitting; populated for every root in `directories.yaml`.
+    public var walkerRoots: [RootDirectory] = []
 
     /// Layout of all modular panels (toolbar, file panel, status bar, ...).
     /// Loaded from `layout.json` at bootstrap, persisted on every mutation.
@@ -31,6 +56,16 @@ public final class AppState {
     /// so the menu commands, overlay, and panel all bind to the same
     /// instance.
     public var crop: CropController = CropController()
+
+    /// Video preview transport controller (docs/videos.mdx §3). Owns the
+    /// AVPlayer + AVPlayerLooper for the active viewer window so the
+    /// Video menu, the canvas, and the MCP surface all bind to the same
+    /// observable.
+    public var video: VideoPlaybackController = VideoPlaybackController()
+
+    /// SVG preview controller (docs/svg.mdx §3). Holds the
+    /// WKWebView-backed transport bridge + per-file SVG state.
+    public var svg: SVGPlaybackController = SVGPlaybackController()
 
     /// Merged, effective configuration produced by `ConfigLoader`. Loaded
     /// during `bootstrap()` from the three igconfig.* tiers + CLI overrides.
@@ -123,9 +158,11 @@ public final class AppState {
             // mcp_file.mdx §1.3 — first launch leaves an empty
             // `directories.yaml` so the panel has a defined state.
             var directoryCount = 0
+            var storedRoots: [RootDirectory] = []
             do {
                 let file = try DirectoriesStore.shared.ensureExists()
                 directoryCount = file.roots.count
+                storedRoots = file.roots
             } catch {
                 ErrorLog.log("DirectoriesStore.ensureExists failed",
                              error: error, class: String(describing: Self.self))
@@ -135,6 +172,19 @@ public final class AppState {
             await activate(scopeNamed: bootstrapped)
             startWatching()
             startSelectionWatcher()
+            startViewModeWatcher()
+            startDirectoryTreeWalkerObserver()
+            // mcp_file.mdx §3A.5: the walker is "running even when the
+            // component is turned off" — so every root in
+            // directories.yaml is scheduled at boot. A relaunch with
+            // pre-existing roots repopulates the in-memory tree without
+            // the user re-adding anything.
+            for root in storedRoots {
+                let corr = MCPAuditLogger.newCorrelationId()
+                DirectoryTreeWalker.shared.scheduleWalk(
+                    root: root.path, filter: root.filter, corr: corr
+                )
+            }
         } catch {
             ErrorLog.log("bootstrap failed", error: error, class: String(describing: Self.self))
             NSLog("ImageGlass bootstrap failed: \(error)")
@@ -213,46 +263,87 @@ public final class AppState {
         if let f = selectedFile { cropController.bind(activeImage: nil, path: f) }
     }
 
+    /// Re-walk the active scope on a background `Task`. If a previous
+    /// walk is still in flight when this is called, that earlier task
+    /// is cancelled first so only the latest scope state ever lands in
+    /// the GUI (mcp_file.mdx §10.3).
+    ///
+    /// `isWalking` is observable and drives the spinning refresh icon
+    /// in the panel toolbar (§10.5). Callers can `await` this method;
+    /// it returns when the new walk has finished (or has been
+    /// superseded and abandoned).
     public func reevaluateActive() async {
-        guard var scope = activeScope else { return }
+        guard let scopeIn = activeScope else { return }
+        walkTask?.cancel()
+        let scopeName = scopeIn.name
+        let scopeSnapshot = scopeIn
+        isWalking = true
         let walkStart = Date()
-        scope = ScopeEvaluator.evaluate(scope)
-        let elapsedMs = Int(Date().timeIntervalSince(walkStart) * 1000.0)
-        do {
-            try storage.saveScope(scope)
-        } catch {
-            ErrorLog.log("storage.saveScope failed for '\(scope.name)'",
-                         error: error, class: String(describing: Self.self))
+        let task = Task.detached(priority: .utility) {
+            () -> (Scope, Int) in
+            // Off the main actor: heavy filesystem walk happens here.
+            // `Task.isCancelled` is checked after the walk so the cost
+            // of a cancelled walk is bounded by `ScopeEvaluator.evaluate`.
+            let evaluated = ScopeEvaluator.evaluate(scopeSnapshot)
+            let elapsedMs = Int(Date().timeIntervalSince(walkStart) * 1000.0)
+            return (evaluated, elapsedMs)
         }
-        activeScope = scope
-        resolvedFiles = scope.resolvedFiles
-        lastEvaluated = scope.lastEvaluated
-
-        // mcp_file.mdx §10: when the viewer is empty (`selectedFile == nil`)
-        // and the new resolved list contains at least one image, auto-
-        // select the first one and emit the `panel.auto_select_first`
-        // audit line.
-        let viewerWasEmpty = (selectedFile == nil)
-        if selectedFile == nil || !(resolvedFiles.contains(selectedFile ?? "")) {
-            selectedFile = resolvedFiles.first
-            if viewerWasEmpty, let first = resolvedFiles.first {
-                MCPAuditLogger.shared.logAutoSelectFirst(
-                    path: first,
-                    corr: MCPAuditLogger.newCorrelationId(),
-                    reason: "viewer_empty"
-                )
+        walkTask = Task { [weak self] in
+            let (scope, elapsedMs) = await task.value
+            // If a later reevaluateActive() ran while we were walking,
+            // walkTask is now a different task; drop our results.
+            guard let self else { return }
+            guard !Task.isCancelled else {
+                self.isWalking = false
+                return
             }
-        }
-        rebuildSourceWatchers()
+            do {
+                try self.storage.saveScope(scope)
+            } catch {
+                ErrorLog.log("storage.saveScope failed for '\(scope.name)'",
+                             error: error, class: String(describing: Self.self))
+            }
+            self.activeScope = scope
+            self.resolvedFiles = scope.resolvedFiles
+            self.lastEvaluated = scope.lastEvaluated
 
-        // Audit the walk itself (mcp_file.mdx §8: every walk produces a
-        // matching `app=scope.evaluate` line).
-        MCPAuditLogger.shared.logScopeEvaluate(
-            scope: scope.name,
-            count: resolvedFiles.count,
-            elapsedMs: elapsedMs,
-            corr: MCPAuditLogger.newCorrelationId()
-        )
+            // mcp_file.mdx §10: when the viewer is empty
+            // (`selectedFile == nil`) and the new resolved list contains
+            // at least one image, auto-select the first one and emit
+            // the `panel.auto_select_first` audit line.
+            let viewerWasEmpty = (self.selectedFile == nil)
+            if self.selectedFile == nil
+                || !(self.resolvedFiles.contains(self.selectedFile ?? "")) {
+                self.selectedFile = self.resolvedFiles.first
+                if viewerWasEmpty, let first = self.resolvedFiles.first {
+                    let corr = MCPAuditLogger.newCorrelationId()
+                    MCPAuditLogger.shared.logAutoSelectFirst(
+                        path: first,
+                        corr: corr,
+                        reason: "viewer_empty"
+                    )
+                    // Push a notifications/imageglass/auto_select_first
+                    // event to any connected MCP client (§10).
+                    MCPNotificationBus.shared.emitAutoSelectFirst(
+                        path: first,
+                        corr: corr,
+                        reason: "viewer_empty"
+                    )
+                }
+            }
+            self.rebuildSourceWatchers()
+
+            // Audit the walk itself (mcp_file.mdx §8: every walk produces
+            // a matching `app=scope.evaluate` line).
+            MCPAuditLogger.shared.logScopeEvaluate(
+                scope: scopeName,
+                count: self.resolvedFiles.count,
+                elapsedMs: elapsedMs,
+                corr: MCPAuditLogger.newCorrelationId()
+            )
+            self.isWalking = false
+        }
+        await walkTask?.value
     }
 
     /// (Re)attach FileWatchers to each include-rule directory in the active
@@ -290,6 +381,10 @@ public final class AppState {
     private func startSelectionWatcher() {
         selectionWatcher?.cancel()
         let url = AppPaths.macAppSupportDir.appendingPathComponent("selection.txt")
+        // Touch the file so `open(O_EVTONLY)` succeeds on first launch.
+        if !FileManager.default.fileExists(atPath: url.path) {
+            try? Data().write(to: url, options: .atomic)
+        }
         let w = FileWatcher(url: url) { [weak self] in
             Task { @MainActor in
                 guard let self else { return }
@@ -305,6 +400,106 @@ public final class AppState {
         }
         w.start()
         self.selectionWatcher = w
+    }
+
+    /// React to MCP `panel.set_view_mode` calls. The tool writes the
+    /// chosen mode (`tree`, `list`, `details`, `grid`, `scroller`) to
+    /// `~/Library/Application Support/ImageGlass_Mac/panel_view_mode.txt`;
+    /// we poll the file and reflect its contents into `panelViewMode`.
+    /// Strings outside `{list, tree}` collapse to `.list` for now —
+    /// `grid` / `details` / `scroller` views are not wired in the GUI
+    /// yet (mcp_file.mdx §3).
+    /// React to `DirectoryTreeWalker.firstImageFoundNotification` —
+    /// when an MCP `add_directory` / `refresh_directory` call completes
+    /// its walk and the §10 trigger conditions hold (viewer is empty,
+    /// first matched file's kind is `.image`), the walker posts the URL
+    /// and we move the viewer's selection to it. The walker already
+    /// emits the `app=panel.auto_select_first` audit line; this is the
+    /// missing on-screen half of §10.
+    private var firstImageFoundToken: NSObjectProtocol?
+    /// `DirectoryTreeWalker.didChangeNotification` token. Drives the
+    /// observable `walkerRoots` snapshot the file tree panel renders
+    /// (Stage E). Fires on every walk completion, refilter, and
+    /// `removeRoot` so the panel updates within ~250 ms (mcp_file.mdx
+    /// §4.3 / §6.3 / §7.3).
+    private var directoryDidChangeToken: NSObjectProtocol?
+    private func startDirectoryTreeWalkerObserver() {
+        if let t = firstImageFoundToken {
+            NotificationCenter.default.removeObserver(t)
+        }
+        if let t = directoryDidChangeToken {
+            NotificationCenter.default.removeObserver(t)
+        }
+        // Initial pull so panels that boot before any walk completes
+        // still see whatever roots the walker already has (e.g. when
+        // bootstrap scheduled walks that finish synchronously on a
+        // tiny test fixture).
+        walkerRoots = DirectoryTreeWalker.shared.snapshot()
+
+        directoryDidChangeToken = NotificationCenter.default.addObserver(
+            forName: DirectoryTreeWalker.didChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                self.walkerRoots = DirectoryTreeWalker.shared.snapshot()
+            }
+        }
+
+        firstImageFoundToken = NotificationCenter.default.addObserver(
+            forName: DirectoryTreeWalker.firstImageFoundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            Task { @MainActor in
+                guard let self else { return }
+                guard self.selectedFile == nil else {
+                    // §10.3 — user clicked something during the walk;
+                    // honor that selection and let the walker's callback
+                    // fall on the floor.
+                    return
+                }
+                if let url = note.object as? URL {
+                    let path = url.path
+                    if !self.resolvedFiles.contains(path) {
+                        self.resolvedFiles.insert(path, at: 0)
+                    }
+                    self.selectedFile = path
+                    // §10.5 — "the panel switches to tree view if it
+                    // was not already" and "the panel is visible". Wire
+                    // both here so the on-screen result matches the
+                    // verify step in §10A.4.
+                    self.panelViewMode = .tree
+                    self.showPanelColumn = true
+                    self.panelLayout.showPanel(
+                        BuiltInPanelCatalog.filePanel.id
+                    )
+                }
+            }
+        }
+    }
+
+    private func startViewModeWatcher() {
+        viewModeWatcher?.cancel()
+        let url = AppPaths.macAppSupportDir.appendingPathComponent("panel_view_mode.txt")
+        if !FileManager.default.fileExists(atPath: url.path) {
+            try? Data().write(to: url, options: .atomic)
+        }
+        let w = FileWatcher(url: url) { [weak self] in
+            Task { @MainActor in
+                guard let self else { return }
+                guard let data = try? Data(contentsOf: url),
+                      let raw = String(data: data, encoding: .utf8) else { return }
+                let mode = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                let resolved: PanelViewMode = (mode == "tree") ? .tree : .list
+                if self.panelViewMode != resolved {
+                    self.panelViewMode = resolved
+                }
+            }
+        }
+        w.start()
+        self.viewModeWatcher = w
     }
 
     private func startWatching() {

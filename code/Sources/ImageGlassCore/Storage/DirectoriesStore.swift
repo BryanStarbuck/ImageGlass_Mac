@@ -184,12 +184,37 @@ public enum DirectoriesStoreError: Error, CustomStringConvertible {
     case pathNotFound(String)
     case invalidFilter(String)
     case alreadyExists(String)
+    /// A `kind: regex` filter item carries a regex that `NSRegularExpression`
+    /// refuses to compile (mcp_file.mdx §10B.9). The MCP tool layer maps
+    /// this to `err=invalid_regex` in `log.log`.
+    case invalidRegex(pattern: String, reason: String)
+    /// A filter item's pattern still contains `/` after the boundary
+    /// normalization stripped the `.../` recursive-prefix shorthand
+    /// (mcp_file.mdx §10B.1 / §10B.9). v1 only supports filename
+    /// matching; the MCP tool layer maps this to
+    /// `err=path_separator_in_pattern`.
+    case pathSeparatorInPattern(String)
 
     public var description: String {
         switch self {
         case .pathNotFound(let p): return "Path not found: \(p)"
         case .invalidFilter(let m): return "Invalid filter: \(m)"
         case .alreadyExists(let p): return "Already a root: \(p)"
+        case .invalidRegex(let p, let r): return "Invalid regex \"\(p)\": \(r)"
+        case .pathSeparatorInPattern(let p): return "Pattern \"\(p)\" contains a path separator '/'; v1 filters match against the filename only (mcp_file.mdx §10B.8)."
+        }
+    }
+
+    /// The `err=` value the MCP tools should journal for this error.
+    /// Centralized here so the spec contract (mcp_file.mdx §10B.9) and
+    /// the tool dispatchers stay in sync.
+    public var auditCode: String {
+        switch self {
+        case .pathNotFound:            return "path_not_found"
+        case .invalidFilter:           return "invalid_filter"
+        case .alreadyExists:           return "already_exists"
+        case .invalidRegex:            return "invalid_regex"
+        case .pathSeparatorInPattern:  return "path_separator_in_pattern"
         }
     }
 }
