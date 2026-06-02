@@ -1,0 +1,96 @@
+---
+title: Building a Theme Pack
+description: How to author a .igtheme pack — folder layout, manifest, icons.
+---
+
+# Building a Theme Pack
+
+A theme pack is a `.igtheme` archive that ImageGlass loads to customize
+its visual appearance. Authoring a theme is straightforward — you only
+need a folder, a JSON manifest, a preview image, and a set of SVG icons.
+
+## Directory Layout
+
+```
+THEME_PACK.igtheme
+└─ THEME_FOLDER/
+   ├─ igtheme.json         (manifest — required)
+   ├─ preview.webp         (or .jpg, shown in Settings)
+   └─ *.svg                (toolbar / UI icons)
+```
+
+`THEME_FOLDER` is named using the convention:
+
+```
+<theme-name>.<author-name>
+```
+
+For example: `Kobe.Duong-Dieu-Phap`.
+
+The `.igtheme` file itself is a standard archive containing this folder.
+
+## The Three Required Components
+
+### 1. `igtheme.json` — manifest
+
+The most important file in the pack. Tells ImageGlass which SVG file
+maps to which UI element and declares the theme's metadata and colors.
+
+The manifest has five top-level sections:
+
+| Section | Purpose |
+| --- | --- |
+| `_Metadata` | Config version (currently `"9.0"`) and a free-text description. |
+| `Info` | Theme name, version, description, author name, contact link. |
+| `Settings` | Dark mode flag, navigation button visibility, app logo file, preview image filename. |
+| `Colors` | HEX color codes for the viewer area, toolbar, gallery, menu. Supports the special value `system` to follow the OS accent. |
+| `ToolbarIcons` | Map of UI function → SVG filename. 40+ entries required. |
+
+### 2. Preview image
+
+A WebP or JPG file shown in the Settings dialog when users browse
+available themes. Filename is declared in `Settings.PreviewImage`.
+
+### 3. SVG icons
+
+ImageGlass uses SVG icons so the UI looks crisp at all DPIs. The
+manifest's `ToolbarIcons` section maps each named UI function to a
+filename in the theme folder.
+
+## Required Icons (40+)
+
+The manifest references icons for every interactive element, including:
+
+- **Zoom controls** — zoom in, zoom out, reset zoom, auto zoom, lock zoom,
+  scale to fit, scale to fill, scale to width, scale to height.
+- **Navigation** — previous, next, first, last, frame previous, frame next.
+- **Image manipulation** — rotate left, rotate right, flip horizontal,
+  flip vertical, crop.
+- **View modes** — full screen, frameless, window fit, slideshow.
+- **Utility** — color picker, color channels, gallery toggle, toolbar
+  toggle, settings, about.
+
+The exact, complete list is enumerated in the `ToolbarIcons` section of
+the manifest schema. If a theme is missing an icon, ImageGlass falls back
+to the default icon for that slot.
+
+## Distribution
+
+Once you've packaged your `.igtheme` file, you can:
+
+1. **Submit it for inclusion** on the official site by opening a GitHub
+   issue on the ImageGlass repository, **or** emailing
+   `phap@imageglass.org` with the file attached.
+2. **Self-host** on GitHub or anywhere else; users can install it via the
+   Settings UI or via:
+   ```text
+   igcmd.exe install-themes "path\to\theme.igtheme"
+   ```
+
+## Tips
+
+- Use a vector editor (Inkscape, Illustrator, Figma) to keep icons
+  consistent in line weight and proportions.
+- Test in both light and dark mode if your icons rely on stroke vs. fill.
+- For inspiration, examine an existing official theme — `.igtheme` files
+  are just archives, so you can unzip one and study the manifest.

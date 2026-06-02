@@ -1,0 +1,64 @@
+---
+title: Themes
+description: What ImageGlass themes are, available themes, and how compatibility works.
+---
+
+# Themes
+
+Themes are downloadable visual packages that change the look of ImageGlass
+— color accents, icon styles, panel backgrounds, dark vs. light mode.
+
+## What a Theme Controls
+
+A theme bundles together:
+
+- **Color accents** — toolbar, gallery, viewer, menus.
+- **Toolbar icons** — provided as SVG so they scale crisply at any DPI.
+- **App logo** within the UI.
+- **Navigation arrows**.
+- **Dark/light mode flag**.
+
+## Browsing & Installing
+
+Themes are distributed as `.igtheme` files. Two ways to install:
+
+1. **GUI**: Open ImageGlass, go to Settings → Appearance / Themes,
+   select the `.igtheme` file.
+2. **Command line** — useful for scripted deployment:
+   ```text
+   igcmd.exe install-themes "path\to\theme.igtheme"
+   ```
+   To remove:
+   ```text
+   igcmd.exe uninstall-theme "path\to\theme.igtheme"
+   ```
+
+## Featured Community Themes
+
+A small selection of themes hosted on the official site:
+
+| Theme | Description | Min. Version |
+| --- | --- | --- |
+| **SyncUI-White** / **SyncUI-Dark** | Light and dark theme with Google-style accents and minimalist icons. | 8.3+ |
+| **WinUI3 Dark** / **WinUI3 Light** | Fluent Design color palettes. | 9.0+ |
+| **Line (Gray)** | Minimalist line-based icons. | 9.0+ |
+| **Default Light** | Light color accents and Google-style icons. | 8.2+ |
+| **ko-Z** | "Cozy dark theme." | 8.1+ |
+| **Calibre9 Light** | ImageGlass 9 Calibre icon set. | 9.0+ |
+| **Constellation** | "A nice and sweet theme." | 8.1+ |
+| **Windows 10 Light** / **Windows 10 Navy Blue** | Themes styled after Windows 10. | 8.1+ |
+
+Each theme on the site declares a minimum-supported ImageGlass version.
+Themes for v8.x continue to load in v9.x for the most part, but
+icon-mapping additions in newer versions mean older themes may not
+populate every UI element.
+
+## Community Contributions
+
+Themes are created and contributed by community members — hosted on
+GitHub, shared via the official site. Authors can submit a new theme by:
+
+- Opening an issue on the ImageGlass GitHub repository, **or**
+- Emailing the maintainer at `phap@imageglass.org`.
+
+For details on creating a theme pack, see [`theme-pack.mdx`](./theme-pack.mdx).

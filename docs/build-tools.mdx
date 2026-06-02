@@ -1,0 +1,133 @@
+---
+title: Building Tools for ImageGlass
+description: Authoring third-party tools that integrate with ImageGlass.
+---
+
+# Building Tools for ImageGlass
+
+ImageGlass exposes a small SDK that lets external programs integrate
+tightly with the viewer — receive image-loaded events, respond to user
+actions, and pass the currently displayed image to your tool.
+
+## Prerequisites
+
+- **Visual Studio 2022**
+- **C#**
+- **.NET 6** or later
+
+## Step-by-Step
+
+### 1. Create a project
+
+Start a new C# project in Visual Studio. Console app, WinForms, WPF, or
+WinUI all work — the SDK is UI-framework-agnostic.
+
+### 2. Install the `ImageGlass.Tools` NuGet package
+
+Either:
+
+```text
+Install-Package ImageGlass.Tools
+```
+
+…or add the `ImageGlass.Tools.csproj` directly as a project reference.
+
+### 3. Instantiate the tool class
+
+```csharp
+var igTool = new ImageGlassTool();
+```
+
+### 4. Register event handlers
+
+The two events most tools care about:
+
+- `ToolMessageReceived` — fires when ImageGlass sends your tool a message
+  (e.g., a new image was loaded).
+- `ToolClosingRequest` — fires when ImageGlass is shutting down or has
+  asked the tool to close.
+
+```csharp
+igTool.ToolMessageReceived += OnMessageReceived;
+igTool.ToolClosingRequest  += OnClosing;
+```
+
+### 5. Implement the handlers
+
+Messages are typed by name. The most common one:
+
+- `IMAGE_LOADED` — a new image is now displayed in ImageGlass. Payload
+  includes the full file path.
+
+```csharp
+private static void OnMessageReceived(object? sender, ToolMessageEventArgs e)
+{
+    if (e.MessageName == "IMAGE_LOADED")
+    {
+        var path = e.MessageData?.ToString();
+        // …react to the new image…
+    }
+}
+```
+
+### 6. Connect to ImageGlass
+
+```csharp
+await igTool.ConnectAsync();
+```
+
+This opens an IPC channel back to the viewer. Once connected, events
+start flowing.
+
+## Registering the Tool in ImageGlass
+
+There are two ways to make ImageGlass aware of your tool.
+
+### Option A — UI
+
+1. Open ImageGlass.
+2. Go to **Settings → Tools**.
+3. Click **Add…**.
+4. Provide a unique tool ID, the path to your executable, optional
+   command-line arguments, and an optional hotkey.
+
+### Option B — Edit `igconfig.json`
+
+Add an entry under the `Tools` section with:
+
+- A unique identifier (your tool's name / ID).
+- Path to the executable.
+- Arguments — use the `<file>` placeholder to receive the current image
+  path.
+- Optional hotkey binding.
+- Integration flag (whether the tool runs in-process or as an external
+  child process).
+
+## The `<file>` Placeholder
+
+When you launch a tool from ImageGlass with arguments that include
+`<file>`, ImageGlass substitutes the full path of the currently displayed
+image. Example tool entry:
+
+```json
+{
+  "ToolId": "my-editor",
+  "Executable": "C:\\Tools\\MyEditor\\editor.exe",
+  "Arguments": "--open <file>",
+  "Hotkey": "Ctrl+E"
+}
+```
+
+Pressing `Ctrl+E` while viewing `C:\Photos\sunset.jpg` would launch:
+
+```text
+C:\Tools\MyEditor\editor.exe --open "C:\Photos\sunset.jpg"
+```
+
+## Example Use Cases
+
+- **ExifGlass** — companion EXIF metadata viewer (officially maintained).
+- **External editors** — launch Photoshop, GIMP, or Krita with the current
+  image in one keystroke.
+- **Batch processors** — append the current image to a processing queue.
+- **Cloud sync helpers** — upload the displayed image to a remote service.

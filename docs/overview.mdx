@@ -1,0 +1,157 @@
+---
+title: ImageGlass Starbuck Overview
+description: Bryan Starbuck's fork of ImageGlass — adds MCP support, modular UI panels, scope controls, and a Local Storage feature drivable from Claude Code.
+---
+
+# ImageGlass Starbuck — Overview
+
+> **This repository is Bryan Starbuck's fork of [ImageGlass](https://imageglass.org).**
+> The upstream project is a lightweight, open-source image viewer. This fork
+> exists to add an automation surface (MCP), a panel-based UI, and a
+> scope-driven, AI-editable Local Storage configuration model on top of it.
+
+---
+
+## Most Important Rules and Goals (Fork Charter)
+
+These are the load-bearing goals for the Starbuck fork. Every change in this
+repository should serve one of these five goals. If a change does not, it
+belongs upstream or in a different project.
+
+### 1. MCP Support
+
+Add a Model Context Protocol (MCP) server to ImageGlass so that **Claude Code
+(and other MCP clients) can drive and configure ImageGlass from outside the
+application**. The MCP server is the integration point that lets external AI
+tooling read and modify the Local Storage configuration described in Goal 4.
+
+* MCP is how the AI talks to the viewer.
+* MCP is how the AI edits scopes without the user opening the GUI.
+* MCP is the contract — keep it stable, documented, and ergonomic.
+
+### 2. Modular UI Panels (New Column)
+
+Add a **new column** to the ImageGlass UI that hosts modular UI panels.
+
+* The initial panel is a **directory / filename panel** that lists the images
+  and files that are currently in scope.
+* The same panel can be toggled into a **file-tree view** that shows the same
+  files arranged in their directory hierarchy.
+* The architecture is **panel-based** so additional panels can be added over
+  time without disturbing the core viewer.
+
+### 3. Scope Controls (Include / Exclude)
+
+Give the user explicit controls to define **what is included in the active
+file list and what is excluded**.
+
+* Scopes can be expressed as directories, directory hierarchies,
+  glob/extension criteria, or named rule sets.
+* Scope is the single source of truth for what shows up in the panel.
+
+### 4. Local Storage Feature
+
+A **local-filesystem-backed configuration store**, kept as plain text files
+on disk in a known directory. This is the feature name: **Local Storage**.
+
+Each entry records:
+
+* The **last time** the scope was evaluated / loaded.
+* The list of **images (and other files)** that were resolved into the file
+  list on that run.
+* The list of **source directories or criteria** that drove the scope.
+
+Runtime behavior:
+
+* Local Storage holds a list of directories or criteria.
+* It walks the matching directory hierarchies.
+* It finds the files that satisfy the scope.
+* That resolved list is what gets shown in the directory / filename panel
+  (Goal 2).
+
+Plain text on disk is non-negotiable — it is what makes Goal 5 possible.
+
+### 5. MCP-Driven Editing of Local Storage
+
+Because Local Storage state is plain text files **and** is fronted by the MCP
+server, **Claude Code can**:
+
+* Read the current scope definitions.
+* Modify scope definitions.
+* Swap in new directory lists.
+* Change inclusion / exclusion criteria.
+* Trigger re-evaluation.
+
+…all **without the user having to edit settings inside the GUI**.
+
+---
+
+## What ImageGlass Is (Upstream)
+
+ImageGlass is an open-source, ad-free photo viewer that has been in active
+development since 2010. It is designed as a fast, modern, and highly
+customizable replacement for the default Windows photo viewer, with broad
+support for legacy, modern, and specialized image formats.
+
+- An open-source image previewer / viewer focused on speed and a clean UI.
+- A drop-in alternative for the default Windows Photos app.
+- A platform for power users: themes, icon packs, language packs,
+  command-line utilities, and integrations with third-party tools.
+- Free of advertisements; funded entirely by user donations and sponsorships.
+
+See `starbuck-fork.mdx` for the full description of the fork's additions and
+`about.mdx` for upstream project background.
+
+## Project At-a-Glance
+
+| Attribute | Value |
+| --- | --- |
+| Fork | ImageGlass Starbuck (this repo) |
+| Fork maintainer | Bryan Starbuck |
+| Upstream | [d2phap/ImageGlass](https://github.com/d2phap/ImageGlass) |
+| Upstream creator | Dương Diệu Pháp (Duong Dieu Phap) |
+| Current stable (upstream) | ImageGlass 9.5.0.515 |
+| Next major (upstream) | ImageGlass 10 Beta 1 (March 2026) — cross-platform rewrite |
+| First released | 2010 |
+| Years of development | 16+ |
+| Total downloads | 7,000,000+ |
+| GitHub stars | 13,281 |
+| GitHub forks | 705 |
+| License | GNU GPL v3 |
+| Platform (v9) | Windows |
+| Platform (v10) | Cross-platform via .NET + Avalonia UI |
+| Website | https://imageglass.org |
+
+## Core Selling Points (Upstream)
+
+1. **90+ image formats** — WEBP, GIF, SVG, PNG, JXL, HEIC, RAW, and many more
+   via ImageMagick.
+2. **Fast and lightweight** — minimal resource consumption.
+3. **Highly personalizable** — themes, icon packs, language packs.
+4. **Clean, modern UI** — toolbar and layout are fully configurable.
+5. **Third-party app integration** — launch external editors with the
+   current image passed as an argument.
+6. **No ads, no tracking** — fully open source, community-supported.
+
+## Documentation in This Folder
+
+| File | Topic |
+| --- | --- |
+| `overview.mdx` | This document — fork charter + what ImageGlass is. |
+| `starbuck-fork.mdx` | Full detail on the Starbuck fork: MCP, panels, scopes, Local Storage. |
+| `about.mdx` | About the upstream project, history, philosophy, funding. |
+| `features.mdx` | Full upstream feature list (viewing, zoom, editing, metadata). |
+| `supported-formats.mdx` | All supported image formats and dependencies. |
+| `command-line.mdx` | `ImageGlass.exe` and `igcmd.exe` command-line usage. |
+| `app-configs.mdx` | Configuration files, load order, priority. |
+| `themes.mdx` | What themes are, available themes, install. |
+| `theme-pack.mdx` | How to build a `.igtheme` pack. |
+| `build-tools.mdx` | How to build third-party tools / extensions. |
+| `releases.mdx` | Recent releases, news, and roadmap. |
+
+## Source
+
+Upstream content here is derived from the official site at
+[imageglass.org](https://imageglass.org) — primarily the About page, docs,
+and news sections — as of 2026-06-02. Fork charter content is authored by
+Bryan Starbuck for this fork.

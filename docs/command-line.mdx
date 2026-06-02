@@ -1,0 +1,81 @@
+---
+title: Command-Line Utilities
+description: ImageGlass.exe and igcmd.exe command-line reference.
+---
+
+# Command-Line Utilities
+
+ImageGlass ships two command-line entry points:
+
+- **`ImageGlass.exe`** — the main app; accepts arguments that control the
+  appearance of the window at launch.
+- **`igcmd.exe`** — a separate command utility for system-level actions
+  (wallpaper, default viewer registration, language/theme install, etc.).
+
+## `ImageGlass.exe`
+
+Arguments are prefixed with `/` and use a `name=value` format. Any setting
+exposed in `igconfig.json` can be overridden this way.
+
+### Example
+
+```text
+ImageGlass.exe /ShowToolbar=false /ShowGallery=false /WindowBackdrop="Acrylic" "C:\my photos\sky.jpg"
+```
+
+This launches ImageGlass with the toolbar and gallery hidden, the Acrylic
+backdrop enabled, and opens the file `sky.jpg`.
+
+### Startup Boost
+
+- Version 9.1+ supports `--startup-boost`, which preloads ImageGlass for
+  faster perceived launch time on subsequent runs.
+
+## `igcmd.exe`
+
+A dedicated utility for actions that don't require opening the viewer
+window.
+
+| Command | Description |
+| --- | --- |
+| `set-wallpaper <imgPath> [style]` | Set the desktop background image. `style` controls fill mode (fit, fill, stretch, tile, center). |
+| `set-lock-screen <imgPath>` | Set the Windows lock screen background. |
+| `set-default-viewer [exts] [--per-machine]` | Register ImageGlass as the default viewer for the given extensions. |
+| `remove-default-viewer [exts] [--per-machine]` | Unregister ImageGlass as the default viewer. |
+| `export-frames <filePath>` | Extract every frame from an animated or multi-frame image to separate files. |
+| `quick-setup` | Launch the first-run configuration wizard. |
+| `check-for-update` | Check the update server for a newer release. |
+| `install-languages [filePaths]` | Install one or more `.iglang` language packs. |
+| `install-themes [filePaths]` | Install one or more `.igtheme` theme packs. |
+| `uninstall-theme <filePath>` | Remove an installed theme pack. |
+| `set-startup-boost` | Enable Startup Boost (v9.1+). |
+| `remove-startup-boost` | Disable Startup Boost (v9.1+). |
+
+### The `--per-machine` Flag
+
+By default, default-viewer registration is per-user (writes to
+`HKEY_CURRENT_USER`). Passing `--per-machine` writes to the system-wide
+registry (`HKEY_LOCAL_MACHINE`) instead, which is what you usually want
+for IT-managed deployments.
+
+## Common Use Cases
+
+### Bulk-deploy a theme to all workstations
+```text
+igcmd.exe install-themes "\\fileserver\share\Kobe.Duong-Dieu-Phap.igtheme"
+```
+
+### Register ImageGlass as the default viewer for all common types
+```text
+igcmd.exe set-default-viewer ".jpg;.jpeg;.png;.gif;.webp;.heic" --per-machine
+```
+
+### Quick wallpaper change from a script
+```text
+igcmd.exe set-wallpaper "C:\Wallpapers\today.jpg" fill
+```
+
+### Open ImageGlass with a custom UI for a kiosk
+```text
+ImageGlass.exe /ShowToolbar=false /ShowGallery=false /FullScreen=true "D:\slideshow\start.jpg"
+```
