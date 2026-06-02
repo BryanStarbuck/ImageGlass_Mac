@@ -3,12 +3,10 @@ import ImageGlassCore
 
 struct ContentView: View {
     @Bindable var state: AppState
+    @Bindable var layout: LayoutController
 
     var body: some View {
-        NavigationSplitView {
-            DirectoryFilenamePanel(state: state)
-                .frame(minWidth: 220, idealWidth: 280)
-        } detail: {
+        PanelHost(controller: layout) {
             VStack(spacing: 0) {
                 ImageViewer(state: state, viewer: state.viewer)
                 statusBar
@@ -22,6 +20,15 @@ struct ContentView: View {
             ToolbarItem(placement: .navigation) {
                 Button {
                     state.showPanelColumn.toggle()
+                    Task {
+                        if state.showPanelColumn {
+                            await layout.show(id: BuiltinPanels.directoryFilename.id)
+                        } else {
+                            await layout.hide(id: BuiltinPanels.directoryFilename.id)
+                            await layout.hide(id: BuiltinPanels.filePanel.id)
+                            await layout.hide(id: BuiltinPanels.fileTree.id)
+                        }
+                    }
                 } label: {
                     Image(systemName: "sidebar.left")
                 }
