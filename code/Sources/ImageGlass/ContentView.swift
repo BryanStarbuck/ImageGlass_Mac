@@ -1,11 +1,13 @@
 import SwiftUI
+import Combine
 import ImageGlassCore
 
 struct ContentView: View {
     @Bindable var state: AppState
+    @State private var columnVisibility: NavigationSplitViewVisibility = .automatic
 
     var body: some View {
-        NavigationSplitView {
+        NavigationSplitView(columnVisibility: $columnVisibility) {
             DirectoryFilenamePanel(state: state)
                 .frame(minWidth: 220, idealWidth: 280)
         } detail: {
@@ -17,7 +19,21 @@ struct ContentView: View {
         .navigationTitle(windowTitle)
         .tint(state.themeStore.currentTheme.colors.accentColor)
         .preferredColorScheme(state.themeStore.currentTheme.preferredColorScheme)
-        .task { await state.bootstrap() }
+        .task {
+            await state.bootstrap()
+            AboutAppDelegate.registerListenerAndFlush()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .imageGlassOpenURLs)) { note in
+            guard let urls = note.userInfo?["urls"] as? [URL] else { return }
+            for url in urls { state.openExternalFile(url: url) }
+        }
+        .onChange(of: state.showPanelColumn) { _, show in
+            columnVisibility = show ? .all : .detailOnly
+        }
+        .onChange(of: columnVisibility) { _, vis in
+            let shown = (vis != .detailOnly)
+            if state.showPanelColumn != shown { state.showPanelColumn = shown }
+        }
         .toolbar {
             ToolbarItem(placement: .navigation) {
                 Button {

@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import AppKit
 import ImageGlassCore
 
 /// Root reactive model. Holds the active scope, its resolved file list,
@@ -164,12 +165,16 @@ public final class AppState {
 
     /// Add an ad-hoc file (from drag-drop or Open dialog) to the resolved
     /// list and select it. Does not modify the active scope on disk —
-    /// it's a transient browse.
+    /// it's a transient browse. Also records the URL with
+    /// `NSDocumentController` so the system Open Recent menu reflects it.
     public func openExternalFile(url: URL) {
         let path = AppPaths.contractTilde(url.path)
         if !resolvedFiles.contains(path) {
             resolvedFiles.insert(path, at: 0)
         }
         selectedFile = path
+        // The AppKit recent-document list is what backs both
+        // Open Recent menu entries and `NSDocumentController.recentDocumentURLs`.
+        NSDocumentController.shared.noteNewRecentDocumentURL(url)
     }
 }
