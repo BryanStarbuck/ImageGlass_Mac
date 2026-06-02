@@ -33,8 +33,26 @@ public final class AppState {
     }
     public var lastEvaluated: Date? = nil
 
-    public var showPanelColumn: Bool = true
-    public var panelViewMode: PanelViewMode = .list
+    /// Visibility of the left file panel column. Computed off
+    /// `panelLayout` so the title-bar `sidebar.left` toolbar button
+    /// (docs/panels.mdx §5.6.1), the View menu's Show/Hide Panel Column
+    /// item, the ⌘L keybinding, and §10.5's walker hook all read and
+    /// write the *same* truth — the on-disk layout. Eliminates the
+    /// drift bug where a stored boolean disagreed with the layout
+    /// after a relaunch. Mutations route through `hideByUser` /
+    /// `showByUser` so an explicit close also persists to
+    /// `settings.layout.show_file_panel`.
+    public var showPanelColumn: Bool {
+        get { panelLayout.layout.isVisible(BuiltInPanelCatalog.filePanel.id) }
+        set {
+            if newValue {
+                showByUser(panelID: BuiltInPanelCatalog.filePanel.id, asPrimary: true)
+            } else {
+                hideByUser(panelID: BuiltInPanelCatalog.filePanel.id)
+            }
+        }
+    }
+    public var panelViewMode: PanelViewMode = .tree
 
     /// Live snapshot of `DirectoryTreeWalker.shared.snapshot()`. Refreshed
     /// from `DirectoryTreeWalker.didChangeNotification` (walk completed,
@@ -153,6 +171,19 @@ public final class AppState {
             themeStore.bootstrap()
             PanelRegistry.shared.registerBuiltInPanels()
             panelLayout.reloadFromDisk()
+            // docs/panels.mdx §6.5 — bootstrap reconciliation. The
+            // user-facing contract (CLAUDE.md, dir_ui.mdx §2) is that
+            // `settings.layout.show_*` is the single source of truth
+            // for which panels are open: the file panel defaults to
+            // ON, and only an explicit user-close persists as `false`.
+            // The reconciliation below replays those flags against the
+            // freshly-loaded `layout.json` so a layout that has drifted
+            // (file_panel landed in `hidden`, scope_editor stuck on the
+            // left, etc.) is silently corrected. `file_panel` is
+            // restored *as the primary tab* so it lands as the
+            // prominent left-dock surface instead of behind whatever
+            // else happens to share the left column.
+            reconcilePanelsWithSettings()
             panelLayout.startWatching()
             let bootstrapped = try storage.bootstrapIfNeeded()
             // mcp_file.mdx §1.3 — first launch leaves an empty
@@ -371,6 +402,156 @@ public final class AppState {
         }
     }
 
+    // MARK: - Settings-driven panel visibility (docs/panels.mdx §6.5)
+
+    /// Replay each `settings.layout.show_*` flag against the loaded
+    /// `PanelLayout` so the two stores agree. Called once during
+    /// `bootstrap()` after `panelLayout.reloadFromDisk()`. The flags
+    /// are authoritative: a stale layout that hides `file_panel`
+    /// (because the user landed on a pre-fork `layout.json`) is
+    /// silently corrected back to "visible" because the default
+    /// `show_file_panel = true` carries the spec's "on by default"
+    /// guarantee.
+    public func reconcilePanelsWithSettings() {
+        reconcile(panelID: BuiltInPanelCatalog.filePanel.id,
+                  showFlag: settings.layout.show_file_panel,
+                  asPrimary: true)
+        reconcile(panelID: BuiltInPanelCatalog.scopeEditor.id,
+                  showFlag: settings.layout.show_scope)
+        reconcile(panelID: BuiltInPanelCatalog.metadata.id,
+                  showFlag: settings.layout.show_metadata)
+        reconcile(panelID: BuiltInPanelCatalog.mcpActivity.id,
+                  showFlag: settings.layout.show_mcp)
+        reconcile(panelID: BuiltInPanelCatalog.galleryStrip.id,
+                  showFlag: settings.layout.show_thumb_strip)
+        reconcile(panelID: BuiltInPanelCatalog.statusBar.id,
+                  showFlag: settings.layout.show_status_bar)
+        reconcile(panelID: BuiltInPanelCatalog.toolbar.id,
+                  showFlag: settings.layout.show_toolbar)
+    }
+
+    private func reconcile(panelID id: String,
+                           showFlag: Bool,
+                           asPrimary: Bool = false) {
+        let isVisible = panelLayout.layout.isVisible(id)
+        if showFlag && !isVisible {
+            if asPrimary {
+                panelLayout.showPanelAsPrimary(id)
+            } else {
+                panelLayout.showPanel(id)
+            }
+        } else if !showFlag && isVisible {
+            panelLayout.hidePanel(id)
+        } else if showFlag && asPrimary {
+            // Visible but possibly not the primary tab in its group —
+            // promote it so the file_panel is the active surface even
+            // when an existing left group already held something else.
+            panelLayout.showPanelAsPrimary(id)
+        }
+    }
+
+    /// Hide a panel because the user clicked the close button in its
+    /// chrome (or hit ⌘L for the file panel). Persists the explicit
+    /// close to `settings.layout.show_*` so the next launch respects
+    /// the user's choice — the spec's "if the user goes out of their
+    /// way to close it, save that off" contract.
+    public func hideByUser(panelID id: String) {
+        panelLayout.hidePanel(id)
+        if updateLayoutSetting(forPanelID: id, visible: false) {
+            Task { await saveSettings() }
+        }
+    }
+
+    /// Show a panel because the user clicked the title-bar toolbar
+    /// button, the View menu, or a Show toggle in Settings. Persists
+    /// to `settings.layout.show_*` so reconciliation on the next
+    /// launch keeps the panel visible.
+    public func showByUser(panelID id: String, asPrimary: Bool = false) {
+        if asPrimary {
+            panelLayout.showPanelAsPrimary(id)
+        } else {
+            panelLayout.showPanel(id)
+        }
+        if updateLayoutSetting(forPanelID: id, visible: true) {
+            Task { await saveSettings() }
+        }
+    }
+
+    /// Toggle visibility of a panel as a user action (persists to
+    /// `settings.layout.show_*`). Used by the title-bar `sidebar.left`
+    /// button and `⌘L` for the file panel — see docs/panels.mdx §5.6.1.
+    public func toggleByUser(panelID id: String, asPrimary: Bool = false) {
+        if panelLayout.layout.isVisible(id) {
+            hideByUser(panelID: id)
+        } else {
+            showByUser(panelID: id, asPrimary: asPrimary)
+        }
+    }
+
+    /// Called by the SettingsScene toggles. The settings binding has
+    /// already mutated `settings.layout.show_*`; this just reconciles
+    /// the live `panelLayout` to match and persists the settings.
+    /// Distinct from `showByUser` / `hideByUser` because those write
+    /// the settings flag themselves (which would double-write when
+    /// driven from the `@Binding` toggle).
+    public func applyShowFlag(_ id: String, visible: Bool, asPrimary: Bool = false) {
+        let isVisible = panelLayout.layout.isVisible(id)
+        if visible && !isVisible {
+            if asPrimary {
+                panelLayout.showPanelAsPrimary(id)
+            } else {
+                panelLayout.showPanel(id)
+            }
+        } else if !visible && isVisible {
+            panelLayout.hidePanel(id)
+        }
+        Task { await saveSettings() }
+    }
+
+    /// Map a panel id to its `LayoutSettings.show_*` flag and write
+    /// the new value. Returns `true` if a flag was changed (so the
+    /// caller knows whether to persist).
+    @discardableResult
+    private func updateLayoutSetting(forPanelID id: String, visible: Bool) -> Bool {
+        var changed = false
+        switch id {
+        case BuiltInPanelCatalog.filePanel.id:
+            if settings.layout.show_file_panel != visible {
+                settings.layout.show_file_panel = visible; changed = true
+            }
+        case BuiltInPanelCatalog.scopeEditor.id:
+            if settings.layout.show_scope != visible {
+                settings.layout.show_scope = visible; changed = true
+            }
+        case BuiltInPanelCatalog.metadata.id:
+            if settings.layout.show_metadata != visible {
+                settings.layout.show_metadata = visible; changed = true
+            }
+        case BuiltInPanelCatalog.mcpActivity.id:
+            if settings.layout.show_mcp != visible {
+                settings.layout.show_mcp = visible; changed = true
+            }
+        case BuiltInPanelCatalog.galleryStrip.id:
+            if settings.layout.show_thumb_strip != visible {
+                settings.layout.show_thumb_strip = visible; changed = true
+            }
+        case BuiltInPanelCatalog.statusBar.id:
+            if settings.layout.show_status_bar != visible {
+                settings.layout.show_status_bar = visible; changed = true
+            }
+        case BuiltInPanelCatalog.toolbar.id:
+            if settings.layout.show_toolbar != visible {
+                settings.layout.show_toolbar = visible; changed = true
+            }
+        default:
+            // Panels not mirrored in `LayoutSettings` (histogram,
+            // color_picker, frame_nav, etc.) leave the JSON layout as
+            // the only persistence — same as before this hook existed.
+            break
+        }
+        return changed
+    }
+
     // MARK: - Watching
 
     /// React to MCP `select_file` calls. The tool writes the path to
@@ -469,9 +650,10 @@ public final class AppState {
                     // §10.5 — "the panel switches to tree view if it
                     // was not already" and "the panel is visible". Wire
                     // both here so the on-screen result matches the
-                    // verify step in §10A.4.
+                    // verify step in §10A.4. `showPanelColumn` is a
+                    // computed alias for `panelLayout.isVisible(...)`
+                    // so we go through `showPanel` directly.
                     self.panelViewMode = .tree
-                    self.showPanelColumn = true
                     self.panelLayout.showPanel(
                         BuiltInPanelCatalog.filePanel.id
                     )
@@ -484,7 +666,7 @@ public final class AppState {
         viewModeWatcher?.cancel()
         let url = AppPaths.macAppSupportDir.appendingPathComponent("panel_view_mode.txt")
         if !FileManager.default.fileExists(atPath: url.path) {
-            try? Data().write(to: url, options: .atomic)
+            try? Data("tree".utf8).write(to: url, options: .atomic)
         }
         let w = FileWatcher(url: url) { [weak self] in
             Task { @MainActor in
@@ -492,8 +674,13 @@ public final class AppState {
                 guard let data = try? Data(contentsOf: url),
                       let raw = String(data: data, encoding: .utf8) else { return }
                 let mode = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-                let resolved: PanelViewMode = (mode == "tree") ? .tree : .list
-                if self.panelViewMode != resolved {
+                let resolved: PanelViewMode?
+                switch mode {
+                case "tree": resolved = .tree
+                case "list": resolved = .list
+                default:     resolved = nil  // empty / unknown — keep current default
+                }
+                if let resolved, self.panelViewMode != resolved {
                     self.panelViewMode = resolved
                 }
             }

@@ -350,6 +350,45 @@ Distinct from "hidden", a panel can also be **collapsed** to a thin
 strip (just the header) that the user can click to expand. Collapse
 is per-position: collapse-from-left pins the strip to the left edge.
 
+### 5.6.1 Title-bar toggle for the left file panel
+
+The main window's title-bar toolbar carries a single sidebar-toggle
+button (SF Symbol `sidebar.left`, placed in the leading navigation
+slot). It is the keyboard-and-mouse twin of `⌘L` (§10) and exists
+because the file panel is the primary navigation surface in the fork.
+
+Behavior — pinned so the title-bar button is never ambiguous:
+
+* **Single source of truth.** The button's selected/unselected state
+  is derived from `layout.isVisible("file_panel")`. There is no
+  separate "show panel column" boolean; the layout *is* the truth.
+* **One click toggles the file panel.** Clicking the button calls
+  `togglePanel("file_panel")`. If the panel is currently visible
+  anywhere (left, right, top, bottom, or floating), it is hidden into
+  the `hidden` map at its current position. If it is currently hidden,
+  it is restored at its `last_position` — or, on the very first show
+  (no `hidden` entry yet), at its `defaultPosition = .left` with
+  preferred size `280 × 600`.
+* **Sticky to the left.** `file_panel.defaultPosition = .left`, so a
+  fresh install always brings the panel back on the left. A user who
+  has explicitly moved the panel (e.g. to `right` or `floating`) keeps
+  that placement across hide → show cycles; the button does not
+  silently re-dock it.
+* **Default state on first launch.** The default `Browser` preset
+  docks `file_panel` on the left at size 280 (§7.2 / §6.2). The button
+  starts in its selected state and `⌘L` toggles it off.
+* **Tree vs. list is independent.** The button only controls
+  visibility — it never changes `panel_view_mode`. The view-mode
+  toggle lives inside the panel's own header (`Tree` / `List`
+  segmented control). See [list_of_files.mdx](./list_of_files.mdx) §2.4.
+* **No drift across relaunches.** Because the button reads from
+  `layout.json` directly, a stale layout that hides `file_panel`
+  cannot leave the user in a state where the button reports "shown"
+  while the column is empty. The button always matches the canvas.
+
+The button is also published as a `panel.toggle_file_panel` MCP tool
+(see §9) so Claude Code can drive it for headless verification.
+
 Collapsed strips support hover-to-peek: hovering for `hoverDelay =
 600 ms` triggers a transient expanded preview that auto-collapses
 when the pointer leaves. This is the macOS-Finder sidebar-toggle
@@ -495,6 +534,31 @@ the difference (panels move, groups re-form, sizes change) over 200
 ms. Bindings the user is actively dragging are not overwritten until
 the drag ends.
 
+### 6.5 Bootstrap reconciliation — guarantee the file panel is visible
+
+After `LayoutStore.load()` materializes the in-memory layout, the
+framework runs a **one-shot reconciliation pass** on the bootstrap
+path. The only rule today:
+
+* If `file_panel` is *not visible anywhere* (no group contains it and
+  it is not floating), restore it via `showPanel("file_panel")`. The
+  restore lands at `last_position` if a `hidden` entry exists, or at
+  `defaultPosition = .left` (size 280 × 600) otherwise.
+
+The pass exists because the file panel is the fork's primary
+navigation surface (see §5.6.1). A user who hides every panel in a
+previous session — or who lands on a `layout.json` that predates
+`file_panel` — must still see the file tree on next launch, without
+having to remember `⌘L`. The reconciliation is silent (no audit log
+entry), runs exactly once per launch, and persists the resulting
+layout the same way any other mutation does.
+
+The pass does **not** force a view-mode change (the panel keeps the
+user's last `panel_view_mode`), does **not** override an explicit
+user move (a panel docked on the right stays on the right), and is
+intentionally limited to `file_panel` so it does not surprise users
+who hid other panels on purpose.
+
 ---
 
 ## 7. Built-in Presets
@@ -539,6 +603,13 @@ viewing.
 Toolbar top, left-dock file panel (tabbed with scope editor), bottom
 gallery strip. T1/T2 default — matches "open a folder and browse it"
 intuition.
+
+The left-dock file panel is **visible by default** on first launch
+and stays visible across relaunches unless the user explicitly hides
+it via `⌘L`, the title-bar `sidebar.left` button (§5.6.1), or an MCP
+`hide_panel("file_panel")` call. The panel opens in **tree view** by
+default; see [list_of_files.mdx](./list_of_files.mdx) §2.4 for the
+list ↔ tree toggle inside the panel.
 
 ### 7.3 Photographer (⌃⌘3)
 
@@ -719,7 +790,7 @@ display.
 | Action | Default | Notes |
 | --- | --- | --- |
 | Layout preset 1–5 | ⌃⌘1 .. ⌃⌘5 | Switch among built-in presets. |
-| Toggle file panel | ⌘L | Show or hide the file panel. |
+| Toggle file panel | ⌘L | Show or hide the file panel. Same action as the title-bar `sidebar.left` toolbar button (§5.6.1) — both call `togglePanel("file_panel")` and read their selected state from `layout.isVisible("file_panel")`. |
 | Toggle toolbar | ⌥⌘T | |
 | Toggle status bar | ⌥⌘S | |
 | Toggle metadata | ⌥⌘I | |

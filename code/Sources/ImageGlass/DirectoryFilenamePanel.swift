@@ -31,7 +31,13 @@ struct DirectoryFilenamePanel: View {
             header
             Divider()
             Group {
-                if state.walkerRoots.isEmpty && state.resolvedFiles.isEmpty {
+                // mcp_file.mdx §1.3 / §9.2 — the empty state is only
+                // shown when *no* root is registered. If
+                // `directories.yaml` has roots but the walker has not
+                // finished its first pass, render the root rows up
+                // front with a "walking…" indicator so the column is
+                // never blank between launch and walk-completion.
+                if storedRootCount == 0 && state.resolvedFiles.isEmpty {
                     emptyState
                 } else {
                     switch state.panelViewMode {
@@ -40,7 +46,23 @@ struct DirectoryFilenamePanel: View {
                     }
                 }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+        // The chrome already gives the panel a background, but the
+        // SwiftUI HStack will hide the column if every child returns
+        // an "ideal width = 0" view. Force a visible background so
+        // the bar is *always* drawn, even when the list is empty.
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(NSColor.windowBackgroundColor))
+    }
+
+    /// `directories.yaml` root count. Used by the body switch so the
+    /// column renders a tree skeleton between launch and walk-complete
+    /// instead of the §9.2 empty state. Cheap read because
+    /// `DirectoriesStore.shared.load()` is just a small YAML file.
+    private var storedRootCount: Int {
+        if !state.walkerRoots.isEmpty { return state.walkerRoots.count }
+        return (try? DirectoriesStore.shared.load().roots.count) ?? 0
     }
 
     // MARK: - Header (toolbar)

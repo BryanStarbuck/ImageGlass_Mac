@@ -67,6 +67,16 @@ The user can run with:
 * Neither (the new column hidden entirely — the viewer falls back to
   upstream behavior).
 
+**Default-visible guarantee.** On first launch, and on every relaunch
+where a `layout.json` does not explicitly place the Directory Panel
+elsewhere, the panel is rendered on the left of the main window in
+tree mode. The window's title-bar `sidebar.left` toolbar button (and
+its `⌘L` keyboard twin) is the single control that hides or restores
+it; see [panels.mdx §5.6.1](./panels.mdx#561-title-bar-toggle-for-the-left-file-panel)
+for the title-bar button contract and [panels.mdx §6.5](./panels.mdx#65-bootstrap-reconciliation--guarantee-the-file-panel-is-visible)
+for the bootstrap reconciliation pass that keeps a stale layout from
+swallowing the panel.
+
 ---
 
 ## 3. View Mode: Hierarchical Tree

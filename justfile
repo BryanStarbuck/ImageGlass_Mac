@@ -103,8 +103,7 @@ run:
     @echo "==> building"
     cd {{pkg}} && swift build --product ImageGlass
     @echo "==> launching"
-    @nohup "{{pkg}}/.build/debug/ImageGlass" >/dev/null 2>&1 &
-    @echo "==> launched (pid $!)"
+    @nohup "{{pkg}}/.build/debug/ImageGlass" >/dev/null 2>&1 & echo "==> launched (pid $!)"
 
 # Launch the MCP server on stdio (debug).
 mcp:

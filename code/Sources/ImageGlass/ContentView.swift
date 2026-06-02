@@ -59,18 +59,20 @@ struct ContentView: View {
             FloatingPanelController.shared.reconcile(model: state.panelLayout, appState: state)
         }
         .toolbar {
+            // docs/panels.mdx §5.6.1 — the title-bar sidebar toggle.
+            // Drives `togglePanel("file_panel")` directly and reads its
+            // selected state from `layout.isVisible(...)` so the button
+            // can never drift from what is actually on the canvas.
             ToolbarItem(placement: .navigation) {
+                let filePanelID = BuiltInPanelCatalog.filePanel.id
+                let isShown = state.panelLayout.layout.isVisible(filePanelID)
                 Button {
-                    state.showPanelColumn.toggle()
-                    if state.showPanelColumn {
-                        state.panelLayout.showPanel(BuiltInPanelCatalog.filePanel.id)
-                    } else {
-                        state.panelLayout.hidePanel(BuiltInPanelCatalog.filePanel.id)
-                    }
+                    state.toggleByUser(panelID: filePanelID, asPrimary: true)
                 } label: {
                     Image(systemName: "sidebar.left")
+                        .symbolVariant(isShown ? .none : .fill)
                 }
-                .help("Toggle panel column")
+                .help(isShown ? "Hide file panel" : "Show file panel")
             }
         }
     }

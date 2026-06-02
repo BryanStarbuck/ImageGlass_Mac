@@ -62,6 +62,20 @@ public final class PanelLayoutModel {
         apply(new)
     }
 
+    /// Restore a panel and place it as the first (active) tab in its
+    /// destination group. See `PanelLayoutMutations.showPanelAsPrimary`
+    /// and docs/panels.mdx §6.5 (bootstrap reconciliation).
+    public func showPanelAsPrimary(_ id: String) {
+        let descriptor = BuiltInPanelCatalog.descriptor(for: id)
+        let new = PanelLayoutMutations.showPanelAsPrimary(
+            layout,
+            id: id,
+            defaultPosition: descriptor?.defaultPosition ?? .left,
+            defaultSize: descriptor?.preferredSize ?? .init(width: 280, height: 600)
+        )
+        apply(new)
+    }
+
     public func hidePanel(_ id: String) {
         do {
             let new = try PanelLayoutMutations.hidePanel(layout, id: id)
@@ -177,6 +191,19 @@ public final class PanelLayoutModel {
                          error: error,
                          class: String(describing: Self.self))
             NSLog("ImageGlass: failed to persist layout: \(error)")
+        }
+        // Human-readable YAML mirror at
+        // `~/Library/Application Support/ImageGlass_Mac/panels.yaml`.
+        // The contract from project CLAUDE.md is that the user-visible
+        // settings file remembers "which panels are open and where" —
+        // this is that file. Failure is non-fatal: the JSON store above
+        // already has the authoritative copy.
+        do {
+            try PanelStateYAMLStore.shared.save(new)
+        } catch {
+            ErrorLog.log("PanelStateYAMLStore.save failed — panels.yaml mirror",
+                         error: error,
+                         class: String(describing: Self.self))
         }
     }
 }

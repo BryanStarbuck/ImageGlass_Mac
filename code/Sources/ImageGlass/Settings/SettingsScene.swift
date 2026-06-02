@@ -235,13 +235,41 @@ private struct LayoutSettingsView: View {
                 TextField("Active preset", text: $state.settings.layout.active_preset)
             }
             Section("Default panels") {
+                // Each toggle drives the on-disk `settings.layout.show_*`
+                // boolean *and* the live `panelLayout`, so flipping a
+                // toggle in Settings actually moves the panel on the
+                // canvas instead of just saving a flag the runtime
+                // ignores. The `.onChange` handlers route through
+                // `reconcile` so the same code path as bootstrap
+                // reconciliation is exercised. See docs/panels.mdx §6.5.
                 Toggle("Show toolbar", isOn: $state.settings.layout.show_toolbar)
+                    .onChange(of: state.settings.layout.show_toolbar) { _, v in
+                        state.applyShowFlag(BuiltInPanelCatalog.toolbar.id, visible: v)
+                    }
                 Toggle("Show status bar", isOn: $state.settings.layout.show_status_bar)
+                    .onChange(of: state.settings.layout.show_status_bar) { _, v in
+                        state.applyShowFlag(BuiltInPanelCatalog.statusBar.id, visible: v)
+                    }
                 Toggle("Show file panel", isOn: $state.settings.layout.show_file_panel)
+                    .onChange(of: state.settings.layout.show_file_panel) { _, v in
+                        state.applyShowFlag(BuiltInPanelCatalog.filePanel.id, visible: v, asPrimary: true)
+                    }
                 Toggle("Show thumbnail strip", isOn: $state.settings.layout.show_thumb_strip)
+                    .onChange(of: state.settings.layout.show_thumb_strip) { _, v in
+                        state.applyShowFlag(BuiltInPanelCatalog.galleryStrip.id, visible: v)
+                    }
                 Toggle("Show metadata panel", isOn: $state.settings.layout.show_metadata)
+                    .onChange(of: state.settings.layout.show_metadata) { _, v in
+                        state.applyShowFlag(BuiltInPanelCatalog.metadata.id, visible: v)
+                    }
                 Toggle("Show scope panel", isOn: $state.settings.layout.show_scope)
+                    .onChange(of: state.settings.layout.show_scope) { _, v in
+                        state.applyShowFlag(BuiltInPanelCatalog.scopeEditor.id, visible: v)
+                    }
                 Toggle("Show MCP panel", isOn: $state.settings.layout.show_mcp)
+                    .onChange(of: state.settings.layout.show_mcp) { _, v in
+                        state.applyShowFlag(BuiltInPanelCatalog.mcpActivity.id, visible: v)
+                    }
             }
             Section("Full-screen / slideshow") {
                 Toggle("Hide toolbar in full screen", isOn: $state.settings.layout.hide_toolbar_fullscreen)

@@ -120,6 +120,125 @@ final class PanelLayoutTests: XCTestCase {
 
     // MARK: - Store
 
+    // MARK: - showPanelAsPrimary (docs/panels.mdx §6.5)
+
+    /// `file_panel` was hidden but the left dock already holds another
+    /// panel (the user's drift case). `showPanelAsPrimary` must
+    /// prepend `file_panel` and make it the active tab, never append
+    /// it behind the existing occupant.
+    func testShowPanelAsPrimaryPrependsToExistingGroup() {
+        var layout = PanelLayout(
+            groups: [
+                TabGroup(position: .left,
+                         panelIDs: ["scope_editor"],
+                         activeIndex: 0,
+                         size: 280),
+            ],
+            floating: [],
+            hidden: [
+                "file_panel": HiddenPanelState(
+                    lastPosition: .left,
+                    lastSize: .init(width: 280, height: 600)
+                )
+            ],
+            activePreset: ""
+        )
+        layout = PanelLayoutMutations.showPanelAsPrimary(layout, id: "file_panel")
+        let left = layout.groups.first { $0.position == .left }!
+        XCTAssertEqual(left.panelIDs, ["file_panel", "scope_editor"],
+                       "file_panel should be inserted at index 0")
+        XCTAssertEqual(left.activeIndex, 0,
+                       "file_panel should be the active tab in its group")
+        XCTAssertNil(layout.hidden["file_panel"],
+                     "hidden entry should be cleared on restore")
+    }
+
+    /// When `file_panel` is already visible but it's the second tab
+    /// (not the primary), `showPanelAsPrimary` must promote it to the
+    /// front of its group rather than be a no-op.
+    func testShowPanelAsPrimaryPromotesExistingTab() {
+        var layout = PanelLayout(
+            groups: [
+                TabGroup(position: .left,
+                         panelIDs: ["scope_editor", "file_panel"],
+                         activeIndex: 0,
+                         size: 280),
+            ],
+            floating: [],
+            hidden: [:],
+            activePreset: ""
+        )
+        layout = PanelLayoutMutations.showPanelAsPrimary(layout, id: "file_panel")
+        let left = layout.groups.first { $0.position == .left }!
+        XCTAssertEqual(left.panelIDs, ["file_panel", "scope_editor"])
+        XCTAssertEqual(left.activeIndex, 0)
+    }
+
+    /// When no left group exists at all, the panel must create one at
+    /// its default position.
+    func testShowPanelAsPrimaryCreatesGroupWhenAbsent() {
+        var layout = PanelLayout(
+            groups: [TabGroup(position: .top, panelIDs: ["toolbar"], activeIndex: 0)],
+            floating: [],
+            hidden: [:],
+            activePreset: ""
+        )
+        layout = PanelLayoutMutations.showPanelAsPrimary(layout, id: "file_panel",
+                                                          defaultPosition: .left,
+                                                          defaultSize: .init(width: 280, height: 600))
+        let left = layout.groups.first { $0.position == .left }!
+        XCTAssertEqual(left.panelIDs, ["file_panel"])
+        XCTAssertEqual(left.activeIndex, 0)
+        XCTAssertEqual(left.size, 280)
+    }
+
+    // MARK: - PanelStateYAML mirror
+
+    func testPanelStateYAMLEncodesVisibleAndHidden() {
+        let layout = PanelLayout(
+            groups: [
+                TabGroup(position: .left,
+                         panelIDs: ["file_panel"],
+                         activeIndex: 0,
+                         size: 280),
+            ],
+            floating: [],
+            hidden: [
+                "scope_editor": HiddenPanelState(
+                    lastPosition: .left,
+                    lastSize: .init(width: 280, height: 400)
+                )
+            ],
+            activePreset: "Browser"
+        )
+        let yaml = PanelStateYAML.encode(layout)
+        XCTAssertTrue(yaml.contains("schema_version: 1"))
+        XCTAssertTrue(yaml.contains("active_preset: Browser"))
+        XCTAssertTrue(yaml.contains("- id: file_panel"))
+        XCTAssertTrue(yaml.contains("visible: true"))
+        XCTAssertTrue(yaml.contains("position: left"))
+        XCTAssertTrue(yaml.contains("size: 280"))
+        XCTAssertTrue(yaml.contains("- id: scope_editor"))
+        XCTAssertTrue(yaml.contains("visible: false"))
+        XCTAssertTrue(yaml.contains("last_position: left"))
+        XCTAssertTrue(yaml.contains("last_size: [280, 400]"))
+    }
+
+    func testPanelStateYAMLStoreWritesAtomic() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ig_panels_yaml_test_\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = PanelStateYAMLStore()
+        store.fileOverride = dir.appendingPathComponent("panels.yaml")
+        try store.save(BuiltInPreset.browser.layout())
+        let written = try String(contentsOf: store.fileOverride!, encoding: .utf8)
+        XCTAssertTrue(written.contains("- id: file_panel"))
+        XCTAssertTrue(written.contains("visible: true"))
+    }
+
+    // MARK: - Store
+
     func testLayoutStoreRoundTrip() throws {
         // Redirect HOME to a temp dir so we don't touch the user's real
         // Application Support during the test.

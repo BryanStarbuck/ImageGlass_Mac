@@ -233,4 +233,18 @@ ImageGlass is intended for anyone seeking a fast, customizable, ad-free image vi
 
 With 7 million+ downloads and strong GitHub metrics, it serves a global user base. Its scope is deliberately focused on high-performance **viewing** with lightweight editing and extensive customization, rather than comprehensive photo management or professional retouching. It integrates well into broader workflows via third-party tools and is suitable for both personal and commercial environments.
 
+---
+
+# Directory Index: docs/use_cases
+
+Recursive listing of every directory and file under `~/BGit/tools_various/ImageGlass_Mac/docs/use_cases`. Each entry describes its purpose in 15 words or less.
+
+## Directories
+
+* `/Users/bryan/BGit/tools_various/ImageGlass_Mac/docs/use_cases/` — User-scenario tour docs for MCP-driven file panel features, with verifiable on-screen and on-disk outcomes.
+
+## Files
+
+* `/Users/bryan/BGit/tools_various/ImageGlass_Mac/docs/use_cases/mcp_file.mdx` — Step-by-step tour of MCP calls driving the directory/filename panel: first launch, tree view, filter mutations.
+
 The official website is [imageglass.org](https://imageglass.org), with full documentation, downloads, news, and support options.

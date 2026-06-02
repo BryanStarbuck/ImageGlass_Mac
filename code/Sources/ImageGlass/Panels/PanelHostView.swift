@@ -4,25 +4,39 @@ import ImageGlassCore
 
 /// Renders a `PanelLayoutModel` as a multi-dock window layout. Spec §8.1
 /// recommends an `NSSplitViewController` for the production fork; this
-/// SwiftUI implementation is the same composition expressed with
-/// `HSplitView`/`VSplitView`/`HStack`/`VStack` so the framework is fully
-/// usable now while the AppKit bridge for snap-and-drag is built out.
+/// SwiftUI implementation gives the same shape via explicit widths +
+/// `ResizableDivider` so the user gets a real draggable gripper bar
+/// between the left file panel and the image viewer (the spec's
+/// "gripper gap" from CLAUDE.md / dir_ui.mdx). Every drag persists the
+/// new size to `layout.json` via `model.setSize`.
 ///
 /// Structure:
 /// ```
 /// VStack
-///   top group          (if present)
-///   HSplitView
-///     left group       (if present)
-///     viewer + centerOverlay
-///     right group      (if present)
-///   bottom group       (if present)
+///   top group              (if present)
+///   HStack
+///     left group           (if present)  fixed width = g.size
+///     ResizableDivider     (if present)  draggable; persists g.size
+///     center + overlay     fills remainder
+///     ResizableDivider     (if right present)
+///     right group          (if present)  fixed width = g.size
+///   bottom group           (if present)
 /// ```
+///
+/// The full window + per-panel + viewer geometry is appended to
+/// `log.log` on every layout pass via `WindowGeometryReporter` so the
+/// "the bar does not show" bug can be diagnosed from outside the app.
 @MainActor
 struct PanelHostView<Center: View>: View {
     @Bindable var state: AppState
     @Bindable var model: PanelLayoutModel
     let center: () -> Center
+
+    /// Minimum draggable width for the left and right panels. Below
+    /// this, the divider snaps and hides the panel via `hideByUser`.
+    private let dragSnapMin: CGFloat = 160
+    /// Maximum draggable width.
+    private let dragMaxFraction: CGFloat = 0.6
 
     var body: some View {
         VStack(spacing: 0) {
@@ -35,7 +49,20 @@ struct PanelHostView<Center: View>: View {
                 if let g = group(at: .left) {
                     groupView(g)
                         .frame(width: g.size ?? 280)
-                    Divider()
+                    ResizableDivider(
+                        orientation: .vertical,
+                        onDrag: { delta in
+                            let current = g.size ?? 280
+                            let proposed = current + delta
+                            if proposed < dragSnapMin {
+                                // Snap closed; persist explicit hide.
+                                state.hideByUser(panelID: g.panelIDs[g.activeIndex])
+                            } else {
+                                model.setSize(panelID: g.panelIDs[g.activeIndex],
+                                              size: proposed)
+                            }
+                        }
+                    )
                 }
                 ZStack {
                     center()
@@ -47,7 +74,19 @@ struct PanelHostView<Center: View>: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 if let g = group(at: .right) {
-                    Divider()
+                    ResizableDivider(
+                        orientation: .vertical,
+                        onDrag: { delta in
+                            let current = g.size ?? 320
+                            let proposed = current - delta
+                            if proposed < dragSnapMin {
+                                state.hideByUser(panelID: g.panelIDs[g.activeIndex])
+                            } else {
+                                model.setSize(panelID: g.panelIDs[g.activeIndex],
+                                              size: proposed)
+                            }
+                        }
+                    )
                     groupView(g)
                         .frame(width: g.size ?? 320)
                 }
@@ -58,6 +97,84 @@ struct PanelHostView<Center: View>: View {
                 groupView(g)
                     .frame(height: g.size ?? 120)
             }
+        }
+        .background(
+            // Attaches the geometry reporter to the hosting NSWindow
+            // once it is mounted. A zero-sized view that never draws.
+            WindowGeometryAttach(state: state)
+                .allowsHitTesting(false)
+                .frame(width: 0, height: 0)
+        )
+        .onChange(of: model.layout.groups.first { $0.position == .left }?.size) { _, _ in
+            WindowGeometryReporter.shared.logCurrent(reason: "panel.resize")
+        }
+        .onChange(of: model.layout.isVisible(BuiltInPanelCatalog.filePanel.id)) { _, _ in
+            WindowGeometryReporter.shared.logCurrent(reason: "panel.visibility")
+        }
+    }
+
+    // MARK: - Resizable splitter
+
+    /// A draggable divider that exposes a visible 6-point gripper
+    /// strip with a slim center bar. Reports drag delta to the caller
+    /// so the caller can update the layout's `size` for the adjacent
+    /// panel and persist it. Per CLAUDE.md: "Make sure there's a
+    /// resizer bar on the right when there's the FileTree and that
+    /// window and that panel. Make sure it's grippable on the right
+    /// edge, with a little gripper gap…"
+    struct ResizableDivider: View {
+        enum Orientation { case vertical, horizontal }
+        let orientation: Orientation
+        /// Called with the *incremental* drag distance in points since
+        /// the last update. Positive vertical delta = drag right /
+        /// down; negative = left / up.
+        let onDrag: (CGFloat) -> Void
+
+        @State private var lastTranslation: CGSize = .zero
+        @State private var hovered: Bool = false
+
+        var body: some View {
+            ZStack {
+                // Wide invisible hit area so the user can grab the
+                // divider without aiming pixel-perfect.
+                Color.clear
+                    .frame(
+                        width: orientation == .vertical ? 8 : nil,
+                        height: orientation == .horizontal ? 8 : nil
+                    )
+                    .contentShape(Rectangle())
+                // Visible 1pt center bar.
+                Rectangle()
+                    .fill(hovered ? Color.accentColor.opacity(0.6)
+                                  : Color(NSColor.separatorColor))
+                    .frame(
+                        width: orientation == .vertical ? (hovered ? 3 : 1) : nil,
+                        height: orientation == .horizontal ? (hovered ? 3 : 1) : nil
+                    )
+            }
+            .onHover { isOver in
+                hovered = isOver
+                if isOver {
+                    let cursor: NSCursor = orientation == .vertical
+                        ? .resizeLeftRight : .resizeUpDown
+                    cursor.push()
+                } else {
+                    NSCursor.pop()
+                }
+            }
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { g in
+                        let delta = orientation == .vertical
+                            ? g.translation.width  - lastTranslation.width
+                            : g.translation.height - lastTranslation.height
+                        lastTranslation = g.translation
+                        onDrag(delta)
+                    }
+                    .onEnded { _ in
+                        lastTranslation = .zero
+                    }
+            )
         }
     }
 
@@ -80,7 +197,10 @@ struct PanelHostView<Center: View>: View {
             supportsFloating: PanelRegistry.shared.panel(for: activeID)?.descriptor.supportsFloating ?? true,
             isFloating: false,
             tabGroup: group,
-            onClose:        { model.hidePanel(activeID) },
+            // Close routes through `state.hideByUser` so an explicit
+            // user-close also persists to `settings.layout.show_*`
+            // (docs/panels.mdx §5.6.1, CLAUDE.md fork contract).
+            onClose:        { state.hideByUser(panelID: activeID) },
             onToggleFloat:  { model.toggleFloat(activeID) },
             onMove:         { newPos in model.movePanel(activeID, to: newPos) },
             onActivateTab:  { pid in model.activateTab(in: group.id, panel: pid) }
@@ -151,7 +271,7 @@ final class FloatingPanelController {
                 supportsFloating: panel.descriptor.supportsFloating,
                 isFloating: true,
                 tabGroup: nil,
-                onClose:        { [weak model] in model?.hidePanel(floating.id) },
+                onClose:        { [weak appState] in appState?.hideByUser(panelID: floating.id) },
                 onToggleFloat:  { [weak model] in model?.toggleFloat(floating.id) },
                 onMove:         { [weak model] pos in model?.movePanel(floating.id, to: pos) },
                 onActivateTab:  { _ in }

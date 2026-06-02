@@ -18,8 +18,51 @@ public enum PanelLayoutMutations {
         defaultPosition: DockPosition = .right,
         defaultSize: CGSize = .init(width: 280, height: 600)
     ) -> PanelLayout {
+        showPanel(layout, id: id,
+                  defaultPosition: defaultPosition,
+                  defaultSize: defaultSize,
+                  asPrimary: false)
+    }
+
+    /// Same as `showPanel` but the restored panel is inserted at the front
+    /// of its destination tab group (or floating list) and becomes the
+    /// active tab. Used by the bootstrap reconciliation (panels.mdx §6.5)
+    /// to put `file_panel` back as the prominent left-dock tab rather than
+    /// the last tab behind whatever else happens to share the left.
+    public static func showPanelAsPrimary(
+        _ layout: PanelLayout,
+        id: String,
+        defaultPosition: DockPosition = .left,
+        defaultSize: CGSize = .init(width: 280, height: 600)
+    ) -> PanelLayout {
+        showPanel(layout, id: id,
+                  defaultPosition: defaultPosition,
+                  defaultSize: defaultSize,
+                  asPrimary: true)
+    }
+
+    private static func showPanel(
+        _ layout: PanelLayout,
+        id: String,
+        defaultPosition: DockPosition,
+        defaultSize: CGSize,
+        asPrimary: Bool
+    ) -> PanelLayout {
         var l = layout
-        if l.isVisible(id) { return l }
+        if l.isVisible(id) {
+            if asPrimary,
+               let gIdx = l.groups.firstIndex(where: { $0.panelIDs.contains(id) }),
+               let pIdx = l.groups[gIdx].panelIDs.firstIndex(of: id),
+               pIdx != 0 {
+                // Already visible but not primary — promote to first tab
+                // so the title-bar toggle / bootstrap reconciliation can
+                // hand the user the prominent file panel they expect.
+                l.groups[gIdx].panelIDs.remove(at: pIdx)
+                l.groups[gIdx].panelIDs.insert(id, at: 0)
+                l.groups[gIdx].activeIndex = 0
+            }
+            return l
+        }
 
         let position: DockPosition
         let size: CGFloat
@@ -35,11 +78,25 @@ public enum PanelLayoutMutations {
         }
 
         if position == .floating {
-            let frame = CGRect(x: 200, y: 200, width: defaultSize.width, height: defaultSize.height)
-            l.floating.append(FloatingPanel(id: id, frame: frame))
+            let f = FloatingPanel(
+                id: id,
+                frame: CGRect(x: 200, y: 200,
+                              width: defaultSize.width,
+                              height: defaultSize.height)
+            )
+            if asPrimary {
+                l.floating.insert(f, at: 0)
+            } else {
+                l.floating.append(f)
+            }
         } else if let idx = l.groups.firstIndex(where: { $0.position == position }) {
-            l.groups[idx].panelIDs.append(id)
-            l.groups[idx].activeIndex = l.groups[idx].panelIDs.count - 1
+            if asPrimary {
+                l.groups[idx].panelIDs.insert(id, at: 0)
+                l.groups[idx].activeIndex = 0
+            } else {
+                l.groups[idx].panelIDs.append(id)
+                l.groups[idx].activeIndex = l.groups[idx].panelIDs.count - 1
+            }
         } else {
             l.groups.append(TabGroup(position: position, panelIDs: [id], activeIndex: 0, size: size))
         }
