@@ -119,12 +119,17 @@ public struct MCPTools {
                     "additionalProperties": false,
                 ])
             ),
-        ]
+        ] + charterDescriptors()
     }
 
     // MARK: - Dispatch
 
     public func call(name: String, arguments: [String: Any?]) throws -> MCP.CallToolResult {
+        // Charter tools (rule sets, chaining, audit, diff, import/export)
+        // get first chance to handle the call.
+        if let charterResult = try callCharter(name: name, arguments: arguments) {
+            return charterResult
+        }
         switch name {
         case "list_scopes":
             let scopes = try storage.listScopes()
@@ -198,18 +203,27 @@ public struct MCPTools {
         case "evaluate_scope":
             let scopeName = try requireString(arguments, "name")
             let scope = try storage.loadScope(scopeName)
-            let evaluated = ScopeEvaluator.evaluate(scope)
+            // Use the charter-flavored evaluator so rule-set composition,
+            // inheritsFrom chaining, diffing, and audit logging all run.
+            let evaluated = ScopeEvaluator.evaluateWithProvenance(scope)
             try storage.saveScope(evaluated)
-            return .text(prettyJSON([
+            var payload: [String: Any] = [
                 "name": evaluated.name,
                 "lastEvaluated": ISO8601DateFormatter().string(from: evaluated.lastEvaluated ?? Date()),
                 "fileCount": evaluated.resolvedFiles.count,
                 "files": evaluated.resolvedFiles,
-            ] as [String: Any]))
+            ]
+            if let d = evaluated.lastDiff {
+                payload["added"] = d.added
+                payload["removed"] = d.removed
+            }
+            return .text(prettyJSON(payload))
 
         case "delete_scope":
             let scopeName = try requireString(arguments, "name")
             try storage.deleteScope(scopeName)
+            // Best-effort: prune the per-scope audit log so deletion is total.
+            try? ScopeAuditLog.shared.clear(scopeName: scopeName)
             return .text("Deleted scope '\(scopeName)'.")
 
         default:

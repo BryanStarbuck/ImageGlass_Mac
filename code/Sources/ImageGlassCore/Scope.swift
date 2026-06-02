@@ -10,13 +10,30 @@ public struct Scope: Codable, Equatable, Sendable {
     public var lastEvaluated: Date?
     public var resolvedFiles: [String]
 
+    // -- Charter additions (all optional so legacy JSON decodes unchanged) --
+
+    /// Names of other scopes whose include / exclude rules are merged into
+    /// this scope at evaluation time. See `Charter/ScopeChain.swift`.
+    public var inheritsFrom: [String]?
+
+    /// Names of `RuleSet` records (spec §3 "Named rule sets that can be
+    /// referenced and reused"). Stored under `rulesets/<name>.json`.
+    public var ruleSets: [String]?
+
+    /// The (added, removed) delta between the previous resolved file list and
+    /// the current one, captured on every evaluation for provenance.
+    public var lastDiff: ScopeDiff?
+
     public init(
         name: String,
         description: String? = nil,
         include: IncludeRules = .init(),
         exclude: ExcludeRules = .init(),
         lastEvaluated: Date? = nil,
-        resolvedFiles: [String] = []
+        resolvedFiles: [String] = [],
+        inheritsFrom: [String]? = nil,
+        ruleSets: [String]? = nil,
+        lastDiff: ScopeDiff? = nil
     ) {
         self.name = name
         self.description = description
@@ -24,6 +41,9 @@ public struct Scope: Codable, Equatable, Sendable {
         self.exclude = exclude
         self.lastEvaluated = lastEvaluated
         self.resolvedFiles = resolvedFiles
+        self.inheritsFrom = inheritsFrom
+        self.ruleSets = ruleSets
+        self.lastDiff = lastDiff
     }
 
     public struct IncludeRules: Codable, Equatable, Sendable {
