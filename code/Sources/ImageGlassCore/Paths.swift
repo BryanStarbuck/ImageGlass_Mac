@@ -111,24 +111,19 @@ public enum AppPaths {
         macAppSupportDir.appendingPathComponent("scopes", isDirectory: true)
     }
 
-    public static var macLogsDir: URL {
-        macAppSupportDir.appendingPathComponent("logs", isDirectory: true)
-    }
-
     public static var macLogFile: URL {
-        macLogsDir.appendingPathComponent("log.log")
+        macAppSupportDir.appendingPathComponent("log.log")
     }
 
     /// The directory tree panel's own store (use_cases/mcp_file.mdx §0,
-    /// list_of_files.mdx §3A.1). A single YAML file alongside `scopes/`
-    /// and `logs/`.
+    /// list_of_files.mdx §3A.1). A single YAML file alongside `scopes/`.
     public static var macDirectoriesFile: URL {
         macAppSupportDir.appendingPathComponent("directories.yaml")
     }
 
     public static func ensureMacDirectories() throws {
         let fm = FileManager.default
-        for dir in [macAppSupportDir, macScopesDir, macLogsDir] {
+        for dir in [macAppSupportDir, macScopesDir] {
             if !fm.fileExists(atPath: dir.path) {
                 try fm.createDirectory(at: dir, withIntermediateDirectories: true)
             }

@@ -16,11 +16,14 @@ public struct MCPTools {
     public let themeTools: ThemeMCPTools
     public let cropTools: CropMCPTools
     public let panelTools: PanelMCPTools
-    /// File-panel scenario tools from `docs/use_cases/mcp_file.mdx` —
-    /// `update_scope`, `list_files_in_scope`, `select_file`,
-    /// `panel.set_view_mode`. Writes YAML scope files at the spec path
-    /// and structured records to `logs/log.log`.
-    public let filePanelTools: FilePanelMCPTools
+    /// File-tree panel tools from `docs/use_cases/mcp_file.mdx` —
+    /// `add_directory`, `remove_directory`, `set_global_filter`,
+    /// `update_directory_filter`, `clear_directories`, etc. Writes
+    /// `directories.yaml` and structured records to `log.log`.
+    public let directoriesTools: DirectoriesMCPTools
+    /// GUI-bridge tools (`select_file`, `panel.set_view_mode`) that
+    /// route a hint file + a notifications/imageglass/* push event.
+    public let bridgeTools: FilePanelBridgeMCPTools
 
     public init(
         storage: LocalStorage = .shared,
@@ -29,7 +32,8 @@ public struct MCPTools {
         themeTools: ThemeMCPTools = ThemeMCPTools(),
         cropTools: CropMCPTools = CropMCPTools(),
         panelTools: PanelMCPTools = PanelMCPTools(),
-        filePanelTools: FilePanelMCPTools = FilePanelMCPTools()
+        directoriesTools: DirectoriesMCPTools = DirectoriesMCPTools(),
+        bridgeTools: FilePanelBridgeMCPTools = FilePanelBridgeMCPTools()
     ) {
         self.storage = storage
         self.toolStorage = toolStorage
@@ -37,7 +41,8 @@ public struct MCPTools {
         self.themeTools = themeTools
         self.cropTools = cropTools
         self.panelTools = panelTools
-        self.filePanelTools = filePanelTools
+        self.directoriesTools = directoriesTools
+        self.bridgeTools = bridgeTools
     }
 
     // MARK: - Descriptors
@@ -397,7 +402,9 @@ public struct MCPTools {
         // Panel framework (list_panels, show/hide/move/tab, apply_layout_preset, ...).
         base.append(contentsOf: panelTools.descriptors())
         // File-panel walkthrough tools (mcp_file.mdx §4–§10).
-        base.append(contentsOf: filePanelTools.descriptors())
+        base.append(contentsOf: directoriesTools.descriptors())
+        // GUI-bridge tools (select_file, panel.set_view_mode) — §2 / §3.
+        base.append(contentsOf: bridgeTools.descriptors())
         return base
     }
 
@@ -479,10 +486,14 @@ public struct MCPTools {
                     return try panelTools.call(name: name, arguments: arguments)
                 }
                 // Route the file-panel walkthrough tools (mcp_file.mdx).
-                if FilePanelMCPTools.toolNames.contains(name) {
+                if DirectoriesMCPTools.toolNames.contains(name) {
                     return try lock.withLock {
-                        try filePanelTools.call(name: name, arguments: arguments)
+                        try directoriesTools.call(name: name, arguments: arguments)
                     }
+                }
+                // Route the GUI-bridge tools (select_file, set_view_mode).
+                if FilePanelBridgeMCPTools.toolNames.contains(name) {
+                    return try bridgeTools.call(name: name, arguments: arguments)
                 }
                 return .text("Unknown tool: \(name)", isError: true)
             }

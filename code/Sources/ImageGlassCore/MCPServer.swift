@@ -20,19 +20,27 @@ public final class MCPServer {
     private let output: FileHandle
     private let serverName: String
     private let serverVersion: String
+    /// Serializes writes to `output` so an asynchronous notification from
+    /// `MCPNotificationBus` cannot interleave with a response frame from
+    /// `handleLine`.
+    private let writeLock = NSLock()
+    private let notificationBus: MCPNotificationBus
+    private var notificationSubscription: UUID?
 
     public init(
         input: FileHandle = .standardInput,
         output: FileHandle = .standardOutput,
         tools: MCPTools = MCPTools(),
         serverName: String = "imageglass-mcp",
-        serverVersion: String = AppVersion.semverString
+        serverVersion: String = AppVersion.semverString,
+        notificationBus: MCPNotificationBus = .shared
     ) {
         self.input = input
         self.output = output
         self.tools = tools
         self.serverName = serverName
         self.serverVersion = serverVersion
+        self.notificationBus = notificationBus
     }
 
     public func run() {
@@ -41,6 +49,20 @@ public final class MCPServer {
         encoder.dateEncodingStrategy = .iso8601
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
+
+        // Forward every event posted to the notification bus as a
+        // newline-delimited JSON-RPC notification on `output`. Subscribed
+        // before the read loop starts so events emitted by tools mid-call
+        // are not lost.
+        notificationSubscription = notificationBus.addSubscriber { [weak self] note in
+            self?.writeNotification(note, encoder: encoder)
+        }
+        defer {
+            if let sub = notificationSubscription {
+                notificationBus.removeSubscriber(sub)
+                notificationSubscription = nil
+            }
+        }
 
         var buffer = Data()
         while true {
@@ -195,12 +217,44 @@ public final class MCPServer {
         do {
             var data = try encoder.encode(value)
             data.append(0x0A) // newline-delimited framing
+            writeLock.lock()
+            defer { writeLock.unlock() }
             try output.write(contentsOf: data)
         } catch {
             ErrorLog.log("MCP response write failed",
                          error: error,
                          class: "MCPServer")
             FileHandle.standardError.write(Data("MCP write error: \(error)\n".utf8))
+        }
+    }
+
+    /// Serialize one push event as a JSON-RPC notification (no `id`).
+    /// Called from `MCPNotificationBus` subscribers — may run on any
+    /// thread. Serialised against tool responses via `writeLock`.
+    private func writeNotification(
+        _ note: MCPNotificationBus.Notification,
+        encoder: JSONEncoder
+    ) {
+        var envelope: [String: Any] = [
+            "jsonrpc": "2.0",
+            "method":  note.method,
+        ]
+        if !note.params.isEmpty {
+            envelope["params"] = note.params
+        }
+        do {
+            var data = try JSONSerialization.data(
+                withJSONObject: envelope,
+                options: [.sortedKeys, .withoutEscapingSlashes]
+            )
+            data.append(0x0A)
+            writeLock.lock()
+            defer { writeLock.unlock() }
+            try output.write(contentsOf: data)
+        } catch {
+            ErrorLog.log("MCP notification write failed",
+                         error: error,
+                         class: "MCPServer")
         }
     }
 

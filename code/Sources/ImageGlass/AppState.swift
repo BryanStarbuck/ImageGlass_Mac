@@ -224,13 +224,6 @@ public final class AppState {
             ErrorLog.log("storage.saveScope failed for '\(scope.name)'",
                          error: error, class: String(describing: Self.self))
         }
-        // Keep the spec-mandated YAML mirror in sync (mcp_file.mdx §0).
-        do {
-            try MacScopeStore.shared.saveScope(scope)
-        } catch {
-            ErrorLog.log("MacScopeStore.saveScope failed for '\(scope.name)'",
-                         error: error, class: String(describing: Self.self))
-        }
         activeScope = scope
         resolvedFiles = scope.resolvedFiles
         lastEvaluated = scope.lastEvaluated
@@ -244,7 +237,6 @@ public final class AppState {
             selectedFile = resolvedFiles.first
             if viewerWasEmpty, let first = resolvedFiles.first {
                 MCPAuditLogger.shared.logAutoSelectFirst(
-                    scope: scope.name,
                     path: first,
                     corr: MCPAuditLogger.newCorrelationId(),
                     reason: "viewer_empty"

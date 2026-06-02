@@ -1,7 +1,7 @@
 import Foundation
 
 /// Append-only writer for the spec-mandated activity log at
-/// `~/Library/Application Support/ImageGlass_Mac/logs/log.log`. Every MCP
+/// `~/Library/Application Support/ImageGlass_Mac/log.log`. Every MCP
 /// call and every scope re-evaluation lands here as a single key=value
 /// line. See `docs/use_cases/mcp_file.mdx` §0 / §4 / §8 / §10 and
 /// `docs/error_handling.mdx` §4.2 for the line grammar this implements.

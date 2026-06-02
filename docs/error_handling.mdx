@@ -592,7 +592,7 @@ The user can see and tune the logging subsystem from the Settings
 window (see [Settings](./settings.mdx) for the parent spec):
 
 * **Logs → Open Logs Folder** — reveals `~/Library/Application
-  Support/ImageGlass_Mac/logs/` in Finder.
+  Support/ImageGlass_Mac/` in Finder.
 * **Logs → Open `error.err`** — opens the current error file in the
   user's default text editor.
 * **Logs → Open `log.log`** — opens the current event file.
@@ -624,7 +624,7 @@ igcmd log grep [--file error|log|both] <pattern>
 
 Both subcommands are thin wrappers over `tail(1)` / `grep(1)` that
 resolve the right path inside `~/Library/Application Support/
-ImageGlass_Mac/logs/` so the user does not have to remember it.
+ImageGlass_Mac/` so the user does not have to remember it.
 
 `igcmd` itself logs through `ImageGlassLog`: every CLI invocation
 writes an `app.startup` / `app.shutdown` pair to `log.log` with the

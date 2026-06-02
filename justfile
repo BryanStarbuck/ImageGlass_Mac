@@ -95,9 +95,16 @@ build-release:
 build-universal:
     cd {{pkg}} && swift build -c release --arch arm64 --arch x86_64
 
-# Launch the SwiftUI app (debug).
+# Launch the SwiftUI app (debug). Kills any prior instance, builds, then
+# launches detached so the terminal returns immediately.
 run:
-    cd {{pkg}} && swift run ImageGlass
+    @echo "==> killing any existing ImageGlass process"
+    @pkill -x ImageGlass || true
+    @echo "==> building"
+    cd {{pkg}} && swift build --product ImageGlass
+    @echo "==> launching"
+    @nohup "{{pkg}}/.build/debug/ImageGlass" >/dev/null 2>&1 &
+    @echo "==> launched (pid $!)"
 
 # Launch the MCP server on stdio (debug).
 mcp:

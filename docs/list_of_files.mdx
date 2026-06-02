@@ -831,8 +831,27 @@ Visual elements:
 
 ### 4.3 Selection model
 
-* **Single-select** drives the viewer canvas: selecting a file loads
-  it. This is the canonical "click a thumbnail" behavior.
+* **Single-select** drives the viewer canvas: selecting any file
+  whose `kind` is `.image`, `.svg`, or `.video` loads it into the
+  viewer immediately. This is the canonical "click a thumbnail"
+  behavior, and it applies to every selection mechanism — mouse
+  click, keyboard arrow, MCP `select_file`, and the auto-select
+  triggered by the walker (see
+  [use_cases/mcp_file.mdx](../docs/use_cases/mcp_file.mdx) §2 and §10).
+  Per-kind behavior on load:
+  * `.image` — decoded via ImageIO and rendered fit-to-window on the
+    `MTKView` canvas.
+  * `.svg` — handed to the SVG preview surface ([svg.mdx](./svg.mdx))
+    — `WKWebView` for animated content, Core Graphics static for the
+    rest. The canvas swaps in the SVG view.
+  * `.video` — handed to the video preview surface
+    ([videos.mdx](./videos.mdx)) — AVKit `AVPlayerView` in the
+    canvas. Playback does **not** start automatically on selection;
+    the user presses Space (or the play button) to begin. Auto-play
+    on selection would surprise the user with sound.
+  Selection never silently fails: if the file is unreadable, the
+  viewer renders its standard error placeholder and writes an
+  `error.err` record with the file URL.
 * **Multi-select** (Shift / Cmd-click) enables batch operations:
   * Delete (⌫) — moves to Trash via `FileManager.trashItem(at:resultingItemURL:)`.
   * Copy paths (⌘C in plain selection mode) — writes paths to the

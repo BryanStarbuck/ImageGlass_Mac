@@ -7,7 +7,7 @@
 // instead of writing ad-hoc `print` statements or silently swallowing errors.
 //
 // Output sink:
-//   ~/Library/Application Support/ImageGlass_Mac/logs/error.err
+//   ~/Library/Application Support/ImageGlass_Mac/error.err
 //
 // Each entry is appended on its own line and contains:
 //   [ISO-8601 timestamp] [source file path:line] [function] [class] message error=<err>
@@ -78,7 +78,6 @@ public enum ErrorLog {
 
         return base
             .appendingPathComponent("ImageGlass_Mac", isDirectory: true)
-            .appendingPathComponent("logs", isDirectory: true)
             .appendingPathComponent("error.err")
     }()
 

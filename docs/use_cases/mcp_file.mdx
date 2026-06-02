@@ -118,7 +118,7 @@ them.
   root_directories: []
   ```
 
-* On disk: `logs/log.log` has a single startup line of the form
+* On disk: `log.log` has a single startup line of the form
 
   ```
   ts=2026-06-02T10:00:00.123Z app=startup msg="layout=Browser directories=0"
@@ -126,7 +126,28 @@ them.
 
 ---
 
-## 2. Click an Image — It Loads in the Main Viewer
+## 2. Select a File — Image / SVG / Video All Load in the Viewer
+
+**Rule, stated once:** any time a row is selected in the file panel
+— by mouse click, keyboard arrow, MCP `select_file`, or the §10
+auto-select — and the file's `kind` is `.image`, `.svg`, or
+`.video`, the viewer canvas loads that file. This is the canonical
+selection-drives-viewer contract from
+[list_of_files.mdx §4.3](../list_of_files.mdx#43-selection-model).
+The three kinds load through their dedicated preview surfaces:
+
+* `.image` → decoded by ImageIO, rendered fit-to-window on the
+  Metal canvas.
+* `.svg` → SVG preview surface ([../svg.mdx](../svg.mdx)) — the
+  canvas swaps to `WKWebView` for animated SVG, Core Graphics for
+  the static fallback.
+* `.video` → video preview surface ([../videos.mdx](../videos.mdx))
+  — the canvas swaps to AVKit `AVPlayerView`. Playback does **not**
+  start automatically on selection; the user presses Space to
+  start. This avoids surprise audio.
+
+The rule fires unconditionally for the three kinds. The auto-play
+exclusion above is the only per-kind difference.
 
 ### 2.1 Preconditions
 
@@ -144,32 +165,44 @@ them.
 ### 2.2 Actions, in order
 
 1. Click the row labeled `001.jpg` in the file panel.
+2. Click `notes_old.png` — another `.image` file with a different
+   UTI; the canvas re-loads, replacing (not overlaying) the prior
+   image.
+3. (Optional, if the fixture is extended with `beach/clip.mp4`)
+   click `clip.mp4`. The canvas swaps to AVKit and shows the first
+   frame with the play button enabled; pressing Space starts
+   playback.
+4. (Optional, if the fixture is extended with `beach/logo.svg`)
+   click `logo.svg`. The canvas swaps to the SVG preview surface
+   and renders the SVG fit-to-window.
 
 ### 2.3 Expected result
 
-* The file panel highlights the clicked row with the system accent
+* The file panel highlights each clicked row with the system accent
   color.
-* The viewer canvas loads `~/Pictures/tour/beach/001.jpg` and renders
-  it fit-to-window.
-* The status bar reads the file name, pixel dimensions, and file
-  size of `001.jpg`.
-* The MCP server emits a `selection_changed` push event
+* The viewer canvas loads the newly-selected file every time, never
+  the previous one.
+* The status bar reads the file name, pixel dimensions (or video
+  duration / SVG `viewBox`), and file size of the active selection.
+* The MCP server emits one `selection_changed` push event per
+  selection
   ([list_of_files.mdx §8.1](../list_of_files.mdx#81-push-events))
-  with payload `["/Users/.../beach/001.jpg"]`.
+  with payload `[<absolute path>]`.
 
 ### 2.4 Verify
 
-* On screen: the image is visible in the viewer; the status bar
-  matches the file.
+* On screen: after each click the viewer shows that file, never the
+  previous one; the status bar matches.
 * On disk:
 
   ```sh
-  tail -n 1 ~/Library/Application\ Support/ImageGlass_Mac/logs/log.log
+  tail -n 4 ~/Library/Application\ Support/ImageGlass_Mac/logs/log.log
   ```
 
-  contains a `tool=panel.select_file path=…/beach/001.jpg` audit
-  record (the GUI selection runs through the same audit path as
-  MCP-driven `select_file`).
+  contains one `tool=panel.select_file path=<absolute path>` audit
+  record per click. The GUI selection runs through the same audit
+  path as MCP-driven `select_file`, so an external observer sees
+  the same line shape regardless of which surface drove the change.
 
 ---
 
@@ -531,7 +564,7 @@ on its own so it is testable as one acceptance criterion.
 
   ```sh
   grep -E "tool=mcp\\.(add|remove|set_global|update_directory)" \
-      ~/Library/Application\ Support/ImageGlass_Mac/logs/log.log \
+      ~/Library/Application\ Support/ImageGlass_Mac/log.log \
       | wc -l
   ```
 
@@ -539,8 +572,8 @@ on its own so it is testable as one acceptance criterion.
 * On disk:
 
   ```sh
-  grep "app=directory.walk"    ~/Library/Application\ Support/ImageGlass_Mac/logs/log.log | wc -l   # 1 (just §4)
-  grep "app=directory.refilter" ~/Library/Application\ Support/ImageGlass_Mac/logs/log.log | wc -l   # 2 (§6, §7)
+  grep "app=directory.walk"    ~/Library/Application\ Support/ImageGlass_Mac/log.log | wc -l   # 1 (just §4)
+  grep "app=directory.refilter" ~/Library/Application\ Support/ImageGlass_Mac/log.log | wc -l   # 2 (§6, §7)
   ```
 * Every successful `tool=mcp.add_directory` line is followed (within
   ~500 ms by wall clock) by a matching `app=directory.walk` line
@@ -624,9 +657,20 @@ at a real image without a second prompt.
      root and now finds at least one file (e.g. the user just
      plugged in an external drive).
 3. After the walk + filter eval, at least one file has
-   `passesFilter: true` AND its `kind` is `.image` (the auto-select
-   rule fires for images only — video/SVG do not auto-load in the
-   viewer in v1).
+   `passesFilter: true` AND its `kind` is `.image`.
+
+The auto-select rule deliberately fires for **images only**. The
+reason is asymmetry with manual selection: §2's
+selection-drives-viewer rule loads any of `.image / .svg / .video`,
+but it does so because the user explicitly clicked the row.
+Auto-select happens *without* the user clicking, so it must avoid
+surprising side effects — an auto-loaded video could start playing
+audio after Space is pressed for an unrelated reason, and an
+auto-loaded animated SVG could begin a long animation the user did
+not ask for. Restricting auto-select to still images keeps the
+"add a directory, see an image" promise without any side effects
+the user has not authorized. Manual selection of a video or SVG
+remains fully supported (§2.2 steps 3–4).
 
 If any condition fails the panel does **not** auto-advance — the
 viewer stays empty and waits for an explicit `select_file`. In
@@ -635,8 +679,9 @@ particular:
 * If the viewer already shows an image, the user is mid-task and
   auto-selection would yank their focus. Do nothing.
 * If the new root contains only `.svg` or `.mp4` files, the viewer
-  stays empty (those kinds populate the panel but do not
-  auto-preview in v1).
+  stays empty after the add. Those kinds populate the panel and the
+  user can click any of them to load it (§2's manual selection rule);
+  they are simply not auto-previewed by §10.
 * If every file is filtered out (`passesFilter: false`), the viewer
   stays empty.
 
@@ -730,7 +775,7 @@ skipped because its UTI does not conform to `public.image`,
 
   ```sh
   grep -E "mcp.add_directory|directory.walk|panel.auto_select_first" \
-      ~/Library/Application\ Support/ImageGlass_Mac/logs/log.log \
+      ~/Library/Application\ Support/ImageGlass_Mac/log.log \
       | tail -n 3
   ```
 
@@ -775,13 +820,137 @@ only when it should.
 
 ---
 
+## 10A. Real-World Rehearsal — Adding `~/BGit/work/into_Work/StarbuckLabs/JFK/UX`
+
+This scenario re-runs the §10 auto-select-first-image flow against a
+real working directory rather than the synthetic `~/Pictures/tour`
+fixture. It is the exact interaction a user types into Claude Code,
+the one §0 calls out as the "I'm going to enter this into Claude
+Code" canonical example. Anything that passes §10 with the synthetic
+fixture and fails here is a packaging / sandbox / canonicalization
+bug, not a logic bug.
+
+### 10A.1 Preconditions
+
+* App is running and the file panel is visible (per §1).
+* The viewer is in the **empty** state from §9 — i.e.
+  `directories.yaml` either has `root_directories: []` or has roots
+  whose every file is currently filtered out. Confirm the status bar
+  reads `0 files` and the viewer shows `No image previewed`.
+* The directory `~/BGit/work/into_Work/StarbuckLabs/JFK/UX` exists
+  and is readable. It contains a deep mixed-content tree (image
+  files, SVG, optional video, plus non-media files that the built-in
+  file-kind filter must drop).
+* If the build is sandboxed: the user has previously granted
+  Folder Access to `~/BGit/work/` (or a parent) so the saved
+  security-scoped bookmark resolves. If no bookmark exists yet, the
+  MCP call will surface `err=permission_denied` and the panel
+  prompts the user with `NSOpenPanel` to grant access; on grant, the
+  call is replayed.
+
+### 10A.2 Actions, in order
+
+1. From Claude Code:
+
+   ```
+   add_directory(path="~/BGit/work/into_Work/StarbuckLabs/JFK/UX")
+   ```
+
+   No `filter` argument is supplied; the new root inherits the
+   empty filter so every image / SVG / video file under the
+   hierarchy is in scope at the built-in-filter gate.
+
+### 10A.3 Expected result
+
+* The MCP server canonicalizes the path
+  (`/Users/<you>/BGit/work/into_Work/StarbuckLabs/JFK/UX`),
+  validates it exists, appends it to `root_directories[]`, and
+  writes `directories.yaml` atomically. The call returns within
+  ~5 ms with `ok=true`; it does **not** block on the walk.
+* The
+  [background walker](../list_of_files.mdx#3a5-background-walker-thread)
+  wakes, walks the hierarchy depth-first in lexicographic order, and
+  registers a recursive `FSEventStream` on the root.
+* The file panel switches to **tree** view if it was not already
+  (per §10.2), expands the outline from the JFK/UX root down to the
+  first directory that contains a `.image` file with
+  `passesFilter == true`, and highlights that file. The viewer
+  loads that image fit-to-window. Status bar updates to show the
+  file name, dimensions, and size.
+* No video starts playing; no SVG animation begins. Per §10.1, the
+  first auto-selected file is `.image`. If the user then clicks a
+  `.svg` or `.mp4` row in the panel, §2's manual rule loads it into
+  the viewer (with the playback / animation rules from
+  [../videos.mdx](../videos.mdx) and [../svg.mdx](../svg.mdx)).
+* Background walk continues; later rows surface in the tree as the
+  walker emits batches. `last_walked` fills in on completion.
+
+### 10A.4 Verify
+
+* On disk:
+
+  ```sh
+  cat ~/Library/Application\ Support/ImageGlass_Mac/directories.yaml
+  ```
+
+  contains an entry for the canonicalized JFK/UX path with an empty
+  filter and a populated `last_walked` once the walk finishes.
+* On screen: the panel's tree shows the JFK/UX root expanded down to
+  the auto-selected file; that row is highlighted; the viewer shows
+  the image.
+* On disk:
+
+  ```sh
+  grep -E "mcp.add_directory|directory.walk|panel.auto_select_first" \
+      ~/Library/Application\ Support/ImageGlass_Mac/logs/log.log \
+      | tail -n 3
+  ```
+
+  shows three lines, in this order:
+
+  ```
+  ts=… tool=mcp.add_directory      path=…/JFK/UX             corr=… ok=true
+  ts=… app=panel.auto_select_first path=…/JFK/UX/<first>.<ext> corr=… reason=viewer_empty
+  ts=… app=directory.walk          path=…/JFK/UX count=<N>   elapsed_ms=… corr=…
+  ```
+
+  All three share the same `corr=` id.
+* Manual selection sanity check: with the panel populated, click any
+  `.svg`, `.heic`, `.png`, or `.mp4` row in the JFK/UX tree.
+  Confirm: the viewer canvas swaps to the matching preview surface
+  per §2.3; one new `tool=panel.select_file` line lands in
+  `logs/log.log` per click; no auto-play occurs for video; the
+  previous viewer contents are replaced (not overlaid).
+
+### 10A.5 Failure modes the scenario must surface
+
+* **Path does not exist.** If the user mistypes the path (e.g.
+  `JFK/UI` instead of `JFK/UX`), the MCP call returns
+  `ok=false err=path_not_found`; `directories.yaml` is **not**
+  modified; one `error.err` record carries the offending path. The
+  viewer stays empty.
+* **Path exists but contains no media.** The walk completes; the
+  panel renders the empty root row; the viewer stays in the
+  `No image previewed` state. No `panel.auto_select_first` line is
+  written. This is the same outcome as §10.7's "every file filtered
+  out" sub-case.
+* **Permission denied.** Sandboxed build without a security-scoped
+  bookmark covering the JFK/UX hierarchy: the MCP call returns
+  `ok=false err=permission_denied`; the panel surfaces an inline
+  banner with an `[Authorize…]` button that opens `NSOpenPanel`. On
+  grant, the call is replayed and the §10A.3 flow proceeds.
+
+---
+
 ## 11. End-to-End Acceptance
 
 A run of this tour passes when **all of**:
 
 * §1 — file panel is on the left by default after a clean launch;
   `directories.yaml` exists with `root_directories: []`.
-* §2 — clicking a row in the panel loads the image in the viewer;
+* §2 — selecting any row in the panel whose kind is `.image`,
+  `.svg`, or `.video` loads it into the viewer through the matching
+  preview surface; video does not auto-play on selection;
   `README.txt` never appears (built-in file-kind filter).
 * §3 — tree-view toggle re-lays the same files into an outline that
   mirrors the source directory tree — the one-to-one mapping with
@@ -808,6 +977,16 @@ A run of this tour passes when **all of**:
   highlights the row, and loads it in the viewer — and only fires
   when the trigger conditions of §10.1 hold (negative cases in
   §10.7 stay empty).
+* §10A — the same flow runs end-to-end against the real path
+  `~/BGit/work/into_Work/StarbuckLabs/JFK/UX`. The MCP `add_directory`
+  call returns within ~5 ms; the panel auto-selects the first
+  image; the three log lines (`mcp.add_directory`,
+  `panel.auto_select_first`, `directory.walk`) share one `corr=`
+  id; manual clicks on `.svg` / `.heic` / `.png` / `.mp4` rows load
+  through the matching preview surface; the three failure modes
+  (`path_not_found`, no media, `permission_denied`) surface
+  cleanly without mutating `directories.yaml` and prompt the user
+  for authorization when applicable.
 
 If any step fails, the failing line in `log.log` (with its `corr=`
 correlation id) is the first place to look — joining it against the
