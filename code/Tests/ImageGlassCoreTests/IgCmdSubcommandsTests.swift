@@ -121,7 +121,7 @@ final class IgCmdSubcommandsTests: XCTestCase {
     }
 }
 
-final class CLIArgumentsTests: XCTestCase {
+final class CLIArgumentsCatalogTests: XCTestCase {
 
     func testEverySwitchMatchesAConfigField() {
         // The /Name=Value switches the spec promises must each map to a

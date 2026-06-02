@@ -141,4 +141,38 @@ final class CLIArgumentsTests: XCTestCase {
         XCTAssertFalse(ImageGlassLaunchArguments.isValidSettingName("Users/me"))
         XCTAssertFalse(ImageGlassLaunchArguments.isValidSettingName("with space"))
     }
+
+    // MARK: spec-anchored switch / help coverage
+
+    func testEverySwitchMatchesAConfigField() {
+        for s in CLIArguments.switches {
+            let pair = "/\(s.name)=fake"
+            let parsed = CLIOverrides.parse([pair])
+            XCTAssertEqual(parsed.rawPairs.first?.name, s.name,
+                           "parser dropped the documented switch /\(s.name)")
+        }
+    }
+
+    func testWantsHelpDetectsAllForms() {
+        XCTAssertTrue(CLIArguments.wantsHelp(["--help"]))
+        XCTAssertTrue(CLIArguments.wantsHelp(["-h"]))
+        XCTAssertTrue(CLIArguments.wantsHelp(["/?"]))
+        XCTAssertTrue(CLIArguments.wantsHelp(["/ShowToolbar=false", "--help"]))
+        XCTAssertFalse(CLIArguments.wantsHelp([]))
+        XCTAssertFalse(CLIArguments.wantsHelp(["/ShowToolbar=false"]))
+    }
+
+    func testHelpTextLooksLikeAUsageScreen() {
+        let text = CLIArguments.helpText()
+        XCTAssertTrue(text.contains("ImageGlass"))
+        XCTAssertTrue(text.contains("Usage:"))
+        XCTAssertTrue(text.contains("/ShowToolbar"))
+        XCTAssertTrue(text.contains("--startup-boost"))
+    }
+
+    func testStartupBoostLongFormSwitchIsParsed() {
+        let parsed = CLIOverrides.parse(["--startup-boost"])
+        XCTAssertEqual(parsed.partial.startupBoost, true)
+        XCTAssertEqual(parsed.positionalArguments, [])
+    }
 }
