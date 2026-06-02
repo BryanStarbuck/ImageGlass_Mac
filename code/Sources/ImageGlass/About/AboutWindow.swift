@@ -62,4 +62,68 @@ final class AboutAppDelegate: NSObject, NSApplicationDelegate {
     @objc func orderFrontStandardAboutPanel(_ sender: Any?) {
         AboutWindowController.show()
     }
+
+    @MainActor
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // When launched via `swift run` (no .app bundle), the process can
+        // come up as an accessory and never bring its window to the front.
+        // Force a regular activation policy so the SwiftUI window is reachable.
+        NSApp.setActivationPolicy(.regular)
+
+        // SwiftUI creates the WindowGroup window lazily — it doesn't exist
+        // when `applicationDidFinishLaunching` fires. Wait for the first
+        // titled window to be created, then recenter it onto the screen
+        // that contains the mouse cursor if SwiftUI restored a frame to a
+        // monitor the user isn't looking at.
+        Self.installFirstWindowRelocator()
+    }
+
+    private static nonisolated(unsafe) var mainWindowObserver: NSObjectProtocol?
+
+    @MainActor
+    private static func installFirstWindowRelocator() {
+        mainWindowObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didBecomeKeyNotification,
+            object: nil,
+            queue: .main
+        ) { note in
+            guard let window = note.object as? NSWindow,
+                  window.styleMask.contains(.titled),
+                  window.canBecomeMain
+            else { return }
+            MainActor.assumeIsolated {
+                Self.relocateIfOffCursorScreen(window)
+                NSApp.activate(ignoringOtherApps: true)
+            }
+            if let token = mainWindowObserver {
+                NotificationCenter.default.removeObserver(token)
+                mainWindowObserver = nil
+            }
+        }
+    }
+
+    /// SwiftUI's `WindowGroup` restores the previous frame from
+    /// `NSUserDefaults` ("NSWindow Frame …"). If that frame is on a
+    /// monitor the user isn't looking at — or on a monitor that's been
+    /// disconnected — the window is technically visible but practically
+    /// invisible. If the restored frame is on a screen that doesn't contain
+    /// the mouse cursor, recenter on the cursor's screen.
+    @MainActor
+    private static func relocateIfOffCursorScreen(_ window: NSWindow) {
+        let mouse = NSEvent.mouseLocation
+        guard let cursorScreen = NSScreen.screens.first(where: { $0.frame.contains(mouse) }) ?? NSScreen.main else {
+            return
+        }
+        if let windowScreen = window.screen, windowScreen == cursorScreen {
+            return
+        }
+        let visible = cursorScreen.visibleFrame
+        var newFrame = window.frame
+        if newFrame.width < 300 { newFrame.size.width = 900 }
+        if newFrame.height < 300 { newFrame.size.height = 600 }
+        newFrame.origin.x = visible.midX - newFrame.width / 2
+        newFrame.origin.y = visible.midY - newFrame.height / 2
+        window.setFrame(newFrame, display: true)
+        window.makeKeyAndOrderFront(nil)
+    }
 }
