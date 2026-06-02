@@ -4,6 +4,8 @@ import ImageGlassCore
 // Standalone MCP server — talks JSON-RPC over stdio.
 // Launch with:  swift run imageglass-mcp
 // or after build: ./.build/debug/imageglass-mcp
+//
+// Spec §5: transport is stdio. Diagnostics go to stderr only.
 
 do {
     try AppPaths.ensureDirectories()

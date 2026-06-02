@@ -235,10 +235,11 @@ final class ExternalToolsTests: XCTestCase {
         XCTAssertEqual(reloaded.executablePath, "/usr/bin/true")
     }
 
-    func testMCPFireUnknownToolReturnsError() {
+    func testMCPFireUnknownToolReturnsError() throws {
+        // Spec §9: tool-side errors are returned as isError: true CallToolResults,
+        // not thrown — the dispatcher catches and converts them.
         let tools = MCPTools()
-        XCTAssertThrowsError(
-            try tools.call(name: "fire_external_tool", arguments: ["id": "ghost"])
-        )
+        let result = try tools.call(name: "fire_external_tool", arguments: ["id": "ghost"])
+        XCTAssertTrue(result.isError ?? false, "expected isError result for unknown tool id")
     }
 }
