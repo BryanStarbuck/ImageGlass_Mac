@@ -7,6 +7,18 @@ import ImageGlassCore
 struct ImageGlassApp: App {
     @State private var state = AppState()
 
+    // Intercept `--help` / `-h` / `/?` at process start so the user gets
+    // a real CLI help message instead of a window opening. Done as an init
+    // because by the time SwiftUI sets up the scene the AppKit window
+    // would already be on screen.
+    init() {
+        let raw = Array(CommandLine.arguments.dropFirst())
+        if CLIArguments.wantsHelp(raw) {
+            print(CLIArguments.helpText())
+            exit(0)
+        }
+    }
+
     // Owns the AppDelegate that overrides `orderFrontStandardAboutPanel`
     // so the default Apple About panel is replaced by `AboutView`.
     @NSApplicationDelegateAdaptor(AboutAppDelegate.self) private var aboutDelegate

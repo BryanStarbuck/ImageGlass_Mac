@@ -7,6 +7,7 @@ let package = Package(
     products: [
         .executable(name: "ImageGlass", targets: ["ImageGlass"]),
         .executable(name: "imageglass-mcp", targets: ["ImageGlassMCPServer"]),
+        .executable(name: "igcmd", targets: ["igcmd"]),
         .library(name: "ImageGlassCore", targets: ["ImageGlassCore"]),
     ],
     targets: [
@@ -23,6 +24,11 @@ let package = Package(
             name: "ImageGlassMCPServer",
             dependencies: ["ImageGlassCore"],
             path: "Sources/ImageGlassMCPServer"
+        ),
+        .executableTarget(
+            name: "igcmd",
+            dependencies: ["ImageGlassCore"],
+            path: "Sources/igcmd"
         ),
         .testTarget(
             name: "ImageGlassCoreTests",

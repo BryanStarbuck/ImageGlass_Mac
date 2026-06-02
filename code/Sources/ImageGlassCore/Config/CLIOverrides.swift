@@ -55,6 +55,15 @@ public struct CLIOverrides: Equatable, Sendable {
         var rawPairs: [(name: String, value: String)] = []
 
         for arg in args {
+            // Special-case the long-form switch the spec calls out by name:
+            //   `ImageGlass.exe --startup-boost`  (no `=value`).
+            // Treat it as `StartupBoost=true` so the rest of the pipeline
+            // doesn't need to special-case it.
+            if arg == "--startup-boost" {
+                partial.startupBoost = true
+                rawPairs.append((name: "StartupBoost", value: "true"))
+                continue
+            }
             guard arg.hasPrefix("/"), let eq = arg.firstIndex(of: "=") else {
                 positional.append(arg)
                 continue
