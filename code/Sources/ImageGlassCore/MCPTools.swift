@@ -270,6 +270,46 @@ public struct MCPTools {
                     "additionalProperties": false,
                 ])
             ),
+
+            // MARK: - Releases & version metadata (see docs/releases.mdx)
+
+            .init(
+                name: "app_version",
+                description: "Return this Mac fork's version metadata: marketing version, build number, release channel, and the upstream Windows version we currently track as stable.",
+                inputSchema: AnyCodable([
+                    "type": "object",
+                    "properties": [:] as [String: Any],
+                    "additionalProperties": false,
+                ])
+            ),
+            .init(
+                name: "list_releases",
+                description: "Return all release notes (both this Mac fork and upstream Windows) in reverse-chronological order, with version, date, kind (stable|beta), origin (mac_fork|upstream), and highlights. Sourced from docs/releases.mdx.",
+                inputSchema: AnyCodable([
+                    "type": "object",
+                    "properties": [
+                        "origin": [
+                            "type": "string",
+                            "description": "Filter: 'mac_fork', 'upstream', or 'all' (default).",
+                        ],
+                    ],
+                    "additionalProperties": false,
+                ])
+            ),
+            .init(
+                name: "check_for_update",
+                description: "Query GitHub Releases for a newer Mac fork build. Disabled by default — pass force=true to run the network call when the user explicitly asks (e.g. menu item 'Check for Updates…'). Returns currentVersion, latestVersion, isUpdateAvailable, and the release URL.",
+                inputSchema: AnyCodable([
+                    "type": "object",
+                    "properties": [
+                        "force": [
+                            "type": "boolean",
+                            "description": "Override the disabled-by-default policy and issue the network call. Default: false.",
+                        ],
+                    ],
+                    "additionalProperties": false,
+                ])
+            ),
         ]
         // Theme subsystem descriptors (list_themes, get/set_current_theme).
         // See Themes/ThemeMCPTools.swift.
@@ -320,6 +360,14 @@ public struct MCPTools {
             // Charter (see overview.mdx)
             case "charter_status":
                 return .text(prettyJSON(CharterStatus.report()))
+
+            // Releases & version metadata (see releases.mdx)
+            case "app_version":
+                return appVersion()
+            case "list_releases":
+                return listReleases(arguments)
+            case "check_for_update":
+                return try checkForUpdate(arguments)
 
             default:
                 // Route theme tools (list_themes, get/set_current_theme) through
@@ -529,6 +577,95 @@ public struct MCPTools {
             "argv": argv,
             "launched": true,
         ] as [String: Any]))
+    }
+
+    // MARK: - Releases & version metadata
+
+    private func appVersion() -> MCP.CallToolResult {
+        let payload: [String: Any] = [
+            "marketing_version": AppVersion.marketingVersion,
+            "build_number": AppVersion.buildNumber,
+            "channel": AppVersion.channel.rawValue,
+            "display_version": AppVersion.displayVersion,
+            "semver": AppVersion.semverString,
+            "user_agent": AppVersion.userAgent,
+            "current_stable_upstream": ReleasesCatalog.currentStableUpstreamVersion,
+        ]
+        return .text(prettyJSON(payload))
+    }
+
+    private func listReleases(_ args: [String: Any?]) -> MCP.CallToolResult {
+        let originFilter = (args["origin"] as? String) ?? "all"
+        let entries: [Changelog.Entry]
+        switch originFilter.lowercased() {
+        case "mac_fork", "macfork", "mac":
+            entries = Changelog.macForkEntries
+        case "upstream":
+            entries = Changelog.upstreamEntries
+        default:
+            entries = Changelog.entries
+        }
+        let iso = ISO8601DateFormatter()
+        let releases: [[String: Any]] = entries.map { e in
+            [
+                "version": e.version,
+                "title": e.title,
+                "date": iso.string(from: e.date),
+                "kind": e.kind.rawValue,
+                "origin": e.origin == .macFork ? "mac_fork" : "upstream",
+                "highlights": e.bullets,
+            ] as [String: Any]
+        }
+        return .text(prettyJSON(["releases": releases] as [String: Any]))
+    }
+
+    private func checkForUpdate(_ args: [String: Any?]) throws -> MCP.CallToolResult {
+        let force = (args["force"] as? Bool) ?? false
+        let checker = UpdateChecker()
+        // Synchronously dispatch the async check from a non-async tool call.
+        // Tools may be invoked from a synchronous JSON-RPC dispatch loop, so
+        // we hop onto a dedicated semaphore-gated Task to wait for the result.
+        var captured: Result<UpdateCheckResult, Error>!
+        let sem = DispatchSemaphore(value: 0)
+        Task {
+            do {
+                let r = try await checker.check(force: force)
+                captured = .success(r)
+            } catch {
+                captured = .failure(error)
+            }
+            sem.signal()
+        }
+        sem.wait()
+        switch captured! {
+        case .success(let r):
+            let payload: [String: Any] = [
+                "current_version": r.currentVersion,
+                "latest_version": r.latestVersion as Any,
+                "is_update_available": r.isUpdateAvailable,
+                "release_url": r.latestReleaseURL?.absoluteString as Any,
+                "channel": r.channel.rawValue,
+                "checked_at": ISO8601DateFormatter().string(from: r.checkedAt),
+            ]
+            return .text(prettyJSON(payload))
+        case .failure(let err):
+            if let uc = err as? UpdateCheckError {
+                switch uc {
+                case .disabledByPolicy:
+                    return .text(
+                        "Update check is disabled by default. Pass force=true to run it.",
+                        isError: true
+                    )
+                case .networkUnavailable:
+                    return .text("Network unavailable.", isError: true)
+                case .malformedResponse:
+                    return .text("Malformed response from GitHub Releases.", isError: true)
+                case .httpStatus(let code):
+                    return .text("GitHub Releases returned HTTP \(code).", isError: true)
+                }
+            }
+            return .text("Update check failed: \(err.localizedDescription)", isError: true)
+        }
     }
 
     // MARK: - Helpers
