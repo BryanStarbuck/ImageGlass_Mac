@@ -3,8 +3,8 @@ import Foundation
 public enum AppPaths {
     public static let appName = "ImageGlass"
 
-    /// Reads HOME from the live environment so tests can rebind it.
-    /// Falls back to NSHomeDirectory() if HOME is unset.
+    /// Reads HOME from the live environment so tests can rebind it via
+    /// `setenv("HOME", ...)`. Falls back to `NSHomeDirectory()` if HOME is unset.
     public static var homeDirectory: String {
         if let h = ProcessInfo.processInfo.environment["HOME"], !h.isEmpty {
             return h
@@ -35,6 +35,11 @@ public enum AppPaths {
 
     public static var configFile: URL {
         appSupportDir.appendingPathComponent("igconfig.json")
+    }
+
+    /// User-extensible format registry overlay (see `docs/supported-formats.mdx`).
+    public static var formatsFile: URL {
+        appSupportDir.appendingPathComponent("formats.json")
     }
 
     public static func ensureDirectories() throws {

@@ -1,0 +1,917 @@
+---
+title: File List Panel
+description: Product and engineering specification for the file list panel of ImageGlass_Mac — the multi-mode browser (strip / grid / details / tree / column), the Local Storage scope engine that feeds it, thumbnail caching, FSEventStream-backed live updates, and the MCP tools that let Claude Code drive the panel.
+---
+
+# File List Panel
+
+This page is the **complete product + engineering specification** for
+the **file list panel** — the new column the fork adds, plus the
+scope engine that feeds it.
+
+This is improvement #2 from [Starbuck Fork](./starbuck-fork.mdx)
+(modular UI panels) combined with #3 (scope controls) and #4 (Local
+Storage). It is also the largest single panel built on top of the
+[panels framework](./panels.mdx).
+
+It cross-references:
+
+* [Starbuck Fork](./starbuck-fork.mdx) §2–§5 — the charter for
+  panels, scopes, and Local Storage.
+* [Panels](./panels.mdx) — the host framework the file panel lives
+  in (movable / dockable / floating).
+* [Settings → Gallery](./settings.mdx#410-gallery) — the small set of
+  Settings that govern defaults.
+* [Crop](./crop.mdx) — when batch cropping, the file panel drives
+  the iteration.
+
+The Mac stack used throughout: **Swift 6 + SwiftUI** (`Table`,
+`List`, `OutlineGroup` for tree mode, `LazyVGrid` for the grid /
+strip), **AppKit** (`NSCollectionView` for very large grids only;
+`NSImageView` thumbnails) where SwiftUI hits performance limits,
+**ImageIO** (`CGImageSourceCreateThumbnailAtIndex`) for fast
+thumbnails, `FileManager.enumerator(at:includingPropertiesForKeys:options:)`
+for the scope walker, **FSEventStream** for live file-change
+notifications, and **`actor`** isolation for the caches and stores.
+
+---
+
+## 1. Audience and Goals
+
+### 1.1 Audiences
+
+| Tier | Audience | What they want from the file panel |
+| --- | --- | --- |
+| T1 | Casual viewer | A thumbnail strip at the bottom, like Preview.app. Click a thumbnail; the image loads. Nothing else. |
+| T2a | Photographer | A grid of large thumbnails, sort by EXIF DateTimeOriginal, filter by extension, fast keyboard navigation. |
+| T2b | Designer cataloging assets | A details list with Name / Size / Dimensions / Modified columns; resizable, sortable, reorderable. |
+| T3 | Power user | Tree mode showing the directory hierarchy of a multi-directory scope; explicit scope editor next to it. |
+| T4 | Claude Code / MCP | The panel binds to a scope. Claude Code edits the scope's JSON via MCP and the panel updates live; selecting an image in the panel loads it in the viewer. |
+
+### 1.2 Goals
+
+* **One panel, five rendering modes.** Strip, grid, details, tree,
+  column — switchable from the panel toolbar. The data underneath is
+  always the same resolved file list.
+* **Scopes, not folders.** The panel never just "shows the contents
+  of one folder." It always binds to a scope. A scope can be
+  implicitly created from a single folder (the casual case) or
+  explicitly defined as a multi-directory rule set.
+* **Live.** When the underlying filesystem changes (files added,
+  removed, renamed, modified), the panel reflects it within a
+  debounced 250 ms.
+* **Fast.** Thumbnails are generated on demand, cached on disk,
+  paged for very large scopes (>50 000 files). The panel is usable
+  on a NAS-backed scope of 250 000 RAW files.
+* **Programmable.** Scopes are plain-text JSON on disk. The MCP
+  server reads and writes them so Claude Code can swap, narrow, or
+  rotate the active set without GUI input.
+* **Native.** Drag from the panel to Finder via file promises. Drag
+  from Finder into the panel to extend the scope. Space-bar Quick
+  Look. SF Symbol badges. NSWorkspace icons for non-image files.
+
+### 1.3 Non-goals
+
+* No image editing in the panel. The panel is selection and
+  navigation only; edits happen on the viewer canvas.
+* No content-based search ("find me photos that look like this") in
+  v1. The filter is filename + extension + date + dimensions only.
+  Vision-backed search is a v2 candidate but is out of scope for
+  this spec.
+* No metadata editing in the panel (rotations, ratings, captions);
+  those live in the dedicated Metadata panel.
+* No two-way sync with Finder's sort order; macOS does not expose a
+  general API for it. The panel has its own sort model.
+
+---
+
+## 2. The Five View Modes
+
+Each mode renders the same `[FileEntry]` data with a different
+visual density.
+
+### 2.1 Strip
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ ⌕filter   sort:Date ▾    view: ▣ ░ ⊟ ┣ ⫯   refresh   edit scope    │ panel toolbar
+├─────────────────────────────────────────────────────────────────────┤
+│  ┌──┐  ┌──┐  ┌──┐  ┌██┐  ┌──┐  ┌──┐  ┌──┐  ┌──┐  ┌──┐  ┌──┐         │
+│  │  │  │  │  │  │  │██│  │  │  │  │  │  │  │  │  │  │  │  │         │  thumbs
+│  └──┘  └──┘  └──┘  └██┘  └──┘  └──┘  └──┘  └──┘  └──┘  └──┘         │
+│  001   002   003  ▶004   005   006   007   008   009   010         │  filenames (optional)
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+A single horizontal row of thumbnails. Default at the bottom of the
+window (Preview.app-like). Active thumbnail is outlined with the
+system accent color. Filenames below thumbnails are toggleable.
+Scrolls horizontally via swipe / arrow keys.
+
+### 2.2 Grid
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ ⌕filter   sort:Date ▾    view: ▣ ░ ⊟ ┣ ⫯   refresh   edit scope    │
+├─────────────────────────────────────────────────────────────────────┤
+│  ┌────┐  ┌────┐  ┌────┐  ┌████┐  ┌────┐  ┌────┐                    │
+│  │    │  │    │  │    │  │████│  │    │  │    │                    │
+│  │    │  │    │  │    │  │████│  │    │  │    │                    │
+│  └────┘  └────┘  └────┘  └████┘  └────┘  └────┘                    │
+│  001     002     003     ▶004    005     006                       │
+│                                                                     │
+│  ┌────┐  ┌────┐  ┌────┐  ┌────┐  ┌────┐  ┌────┐                    │
+│  │    │  │    │  │    │  │    │  │    │  │    │                    │
+│  │    │  │    │  │    │  │    │  │    │  │    │                    │
+│  └────┘  └────┘  └────┘  └────┘  └────┘  └────┘                    │
+│  007     008     009     010     011     012                       │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+Multi-row grid with configurable thumbnail size (XS / S / M / L /
+XL → 32 / 64 / 96 / 128 / 192 / 256 / 384 / 512 px). Filename
+underneath; badges in the upper right. Number of columns adapts to
+the panel width by default but can be locked to a specific count via
+`gallery.grid_columns`.
+
+### 2.3 Details
+
+```
+┌───────────────────────────────────────────────────────────────────────────┐
+│ ⌕filter   sort: ▾    view: ▣ ░ ⊟ ┣ ⫯   refresh   edit scope              │
+├───────────────────────────────────────────────────────────────────────────┤
+│ Name           ▴   │ Size     │ Dimensions │ Modified           │ Type   │
+├────────────────────┼──────────┼────────────┼────────────────────┼────────┤
+│ ▣ 001.jpg          │  3.4 MB  │ 6000×4000  │ 2026-05-12 14:22   │ JPEG   │
+│ ▣ 002.jpg          │  3.1 MB  │ 6000×4000  │ 2026-05-12 14:23   │ JPEG   │
+│ ▣ 003.dng          │ 48.2 MB  │ 8688×5792  │ 2026-05-12 14:23   │ DNG    │
+│▶▣ 004.heic         │  2.0 MB  │ 4032×3024  │ 2026-05-12 14:24   │ HEIC   │
+│ ▣ 005.png          │  1.1 MB  │ 1920×1080  │ 2026-05-13 09:01   │ PNG    │
+└───────────────────────────────────────────────────────────────────────────┘
+```
+
+SwiftUI `Table` with sortable, resizable, reorderable columns.
+Default columns: Name, Size, Dimensions, Modified, Type. Optional
+columns (toggle via column header context menu): EXIF Date Taken,
+Rating, Camera, Lens, ISO, Shutter, Aperture, Focal length, Color
+space, Bit depth, Folder.
+
+A thumbnail "swatch" preview is shown in the Name cell at a small
+fixed size (24 pt) so the user can still identify rows by visual.
+
+### 2.4 Tree
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ ⌕filter   sort: ▾    view: ▣ ░ ⊟ ┣ ⫯   refresh   edit scope        │
+├─────────────────────────────────────────────────────────────────────┤
+│ ▼ ~/Pictures/2026-shoots                                           │
+│   ▼ Wedding                                                        │
+│     ▼ ceremony                                                     │
+│         ▣ 001.dng                                                  │
+│         ▣ 002.dng                                                  │
+│        ▶▣ 003.dng                                                  │
+│     ▶ reception                                                    │
+│   ▼ Portraits                                                      │
+│     ▶ Anna                                                         │
+│     ▶ Ben                                                          │
+│ ▼ /Volumes/PhotoArchive/2026                                       │
+│   ▶ exports                                                        │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+`OutlineGroup`-backed. Shows directories as nodes and matching files
+as leaves. Expand/collapse with arrow keys. When the scope has
+multiple source directories, each appears as a top-level node so the
+user can see which source a file came from.
+
+### 2.5 Column (Finder-style)
+
+Optional v1.1; not part of the launch v1 set. Renders the directory
+hierarchy as horizontally-cascading columns à la Finder's Column
+view. Documented here for completeness; the framework supports it
+but the implementation is deferred.
+
+### 2.6 View-mode comparison
+
+| Mode | Best for | Density (items per 1024 × 768 panel) | Switch cost | Notes |
+| --- | --- | --- | --- | --- |
+| Strip | Quick scrubbing | ~12 | None | Default bottom-dock mode. |
+| Grid M | Photo browsing | ~36 | None | Sweet spot for most users. |
+| Grid XL | RAW review | ~6 | None | One-image-at-a-time analog of the contact sheet. |
+| Details | Asset cataloging | ~24 | None | Sortable, filterable, scriptable. |
+| Tree | Multi-dir scope hygiene | varies | None | The only mode that *shows* the scope's directory structure. |
+| Column | (v1.1) | varies | (deferred) | |
+
+The mode toggle is in the panel's toolbar; switching is instant
+because the underlying `[FileEntry]` is shared.
+
+---
+
+## 3. The Scope
+
+A **scope** is the source of truth for "what files are in this
+panel." Scopes are described in [starbuck-fork.mdx](./starbuck-fork.mdx) §3–§4;
+this section pins down the schema, semantics, and lifecycle.
+
+### 3.1 Scope JSON
+
+A scope is one JSON file under
+`~/Library/Application Support/ImageGlass_Mac/scopes/<name>.json`.
+
+Schema:
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ImageGlass_Mac scope",
+  "type": "object",
+  "required": ["name", "schema_version", "criteria"],
+  "properties": {
+    "name":           { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" },
+    "schema_version": { "type": "integer", "const": 1 },
+    "description":    { "type": "string" },
+    "criteria": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["root"],
+        "properties": {
+          "root":           { "type": "string", "description": "Absolute path. Sandboxed builds require a saved security-scoped bookmark." },
+          "bookmark":       { "type": "string", "description": "Base64-encoded NSURL bookmark data. Required in sandboxed builds." },
+          "recursive":      { "type": "boolean", "default": true },
+          "max_depth":      { "type": ["integer", "null"], "default": null },
+          "include_globs":  { "type": "array", "items": { "type": "string" } },
+          "exclude_globs":  { "type": "array", "items": { "type": "string" } },
+          "include_exts":   { "type": "array", "items": { "type": "string" } },
+          "exclude_exts":   { "type": "array", "items": { "type": "string" } },
+          "include_hidden": { "type": "boolean", "default": false },
+          "follow_symlinks":{ "type": "boolean", "default": false }
+        }
+      }
+    },
+    "sort": {
+      "type": "object",
+      "properties": {
+        "by":        { "enum": ["name", "size", "modified", "created", "exif_date_taken", "extension", "random", "dimensions"] },
+        "direction": { "enum": ["asc", "desc"] }
+      }
+    },
+    "filter": {
+      "type": "object",
+      "properties": {
+        "text":      { "type": "string" },
+        "date_from": { "type": "string", "format": "date-time" },
+        "date_to":   { "type": "string", "format": "date-time" },
+        "min_width": { "type": "integer" },
+        "min_height":{ "type": "integer" },
+        "max_size":  { "type": "integer" }
+      }
+    },
+    "last_evaluated": { "type": "string", "format": "date-time" },
+    "resolved": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "size", "modified"],
+        "properties": {
+          "path":     { "type": "string" },
+          "size":     { "type": "integer" },
+          "modified": { "type": "string", "format": "date-time" },
+          "dim":      { "type": "array", "items": { "type": "integer" }, "minItems": 2, "maxItems": 2 }
+        }
+      }
+    }
+  }
+}
+```
+
+The schema is the contract between the GUI, the MCP server, and any
+external tool. Every required field above has a meaning; the
+optional fields are progressive enhancements.
+
+### 3.2 Worked example — "2026-shoots"
+
+```json
+{
+  "name": "2026-shoots",
+  "schema_version": 1,
+  "description": "Active photo shoots from 2026, across local and external drives.",
+  "criteria": [
+    {
+      "root": "/Users/bryan/Pictures/2026-shoots",
+      "recursive": true,
+      "include_exts": ["nef", "cr3", "dng", "jpg", "jpeg", "heic"],
+      "exclude_globs": ["**/_archive/**", "**/.imageglass/**"]
+    },
+    {
+      "root": "/Volumes/PhotoArchive/2026/exports",
+      "recursive": false,
+      "include_exts": ["jpg", "jpeg"]
+    }
+  ],
+  "sort": { "by": "exif_date_taken", "direction": "desc" },
+  "filter": { "min_width": 3000 },
+  "last_evaluated": "2026-06-02T10:18:42Z",
+  "resolved": [
+    { "path": "/Users/bryan/Pictures/2026-shoots/Wedding/ceremony/001.dng",
+      "size": 50331648, "modified": "2026-05-12T14:22:01Z", "dim": [8688, 5792] }
+    // … 824 more entries
+  ]
+}
+```
+
+### 3.3 Staleness and re-evaluation
+
+A scope is **stale** when any of:
+
+* `last_evaluated` is older than the most-recent mtime of any
+  source directory.
+* An `FSEventStream` watching a source directory has signaled a
+  change since `last_evaluated`.
+* The user clicked **Refresh** in the panel toolbar.
+* The user explicitly invoked `evaluate_scope` via MCP.
+
+A stale scope is re-walked by `ScopeWalker` on a background task; the
+panel shows a progress indicator on its toolbar refresh icon and
+updates the file list as the walk completes. Subsequent reads use
+the freshly-resolved list.
+
+### 3.4 Sandbox + security-scoped bookmarks
+
+When the app is sandboxed (App Sandbox enabled at build time), the
+walker cannot enumerate a directory unless the app holds a
+security-scoped bookmark for it. The scope JSON stores the bookmark
+data as a base64 blob (`criteria[].bookmark`). The walker calls
+`URL.startAccessingSecurityScopedResource()` before enumerating and
+`stopAccessingSecurityScopedResource()` after.
+
+The user grants the bookmark by picking the directory in an
+`NSOpenPanel`, which produces a resolvable bookmark. If the user
+later moves the source directory, the bookmark survives (it tracks
+the directory by inode/volumeUUID, not by path).
+
+### 3.5 Implicit scope (Cmd-O)
+
+When the user opens a single file or folder with Cmd-O (or the
+"Open With" Finder action), the panel creates an **implicit scope**
+without writing it to disk:
+
+* Single file → scope = "all images in the containing folder",
+  active = the opened file.
+* Single folder → scope = "all images in this folder, recursive=true,
+  no extension filter".
+
+The implicit scope lives only in memory and is replaced as soon as
+the user opens another file. The user can promote an implicit scope
+to a named scope with the panel toolbar's `[Save scope as…]` action.
+
+---
+
+## 4. UI Mechanics
+
+### 4.1 Panel chrome
+
+The panel toolbar (top of the panel, ~36 pt high):
+
+```
+[Scope name ▾]  [⌕ filter]  [sort: Date ▾]  [▣ ░ ⊟ ┣ ⫯ view]  [↻ refresh]  [✎ edit scope]
+```
+
+* **Scope name** — popover with the list of saved scopes and an
+  `[+ New scope…]` entry; clicking a name swaps the active scope.
+* **Filter** — `TextField`; matches against filename and (in v1.1)
+  date / size tokens.
+* **Sort** — `Menu`; reuses `viewer.image_order` choices plus
+  `dimensions`.
+* **View toggle** — five buttons (or a `Picker`) for the five modes.
+* **Refresh** — manual re-evaluation. Visually animated (spinning)
+  while a re-walk is in progress.
+* **Edit scope** — opens the `scope_editor` panel (which can be
+  tabbed with this panel).
+
+### 4.2 Item rendering
+
+A `FileEntry` is rendered with:
+
+```swift
+struct FileEntry: Hashable, Sendable {
+    var path: URL
+    var size: Int64
+    var modified: Date
+    var created: Date
+    var dimensions: CGSize?      // nil until resolved
+    var exifDateTaken: Date?     // nil if not present or not yet resolved
+    var typeIdentifier: UTType
+    var isAnimated: Bool
+    var isMultiFrame: Bool
+    var isRAW: Bool
+    var isHDR: Bool
+    var isFavorite: Bool         // user-tagged via the panel
+}
+```
+
+Visual elements:
+
+* **Thumbnail**: 64 / 96 / 128 / 192 / 256 / 384 / 512 px square
+  depending on `gallery.thumb_size` and the mode (strip uses one of
+  the smaller; grid uses the configured size; details uses 24 pt;
+  tree uses 18 pt).
+  Generated via `CGImageSourceCreateThumbnailAtIndex` with
+  `kCGImageSourceCreateThumbnailFromImageAlways = true` and
+  `kCGImageSourceThumbnailMaxPixelSize = <target>`. Cached on disk
+  under `~/Library/Caches/com.starbuck.imageglass/thumbnails/`
+  keyed by source path + mtime + target size.
+
+  ```swift
+  func makeThumbnail(for url: URL, maxPixelSize: Int) throws -> CGImage? {
+      let opts: [CFString: Any] = [
+          kCGImageSourceCreateThumbnailFromImageAlways: true,
+          kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
+          kCGImageSourceCreateThumbnailWithTransform: true
+      ]
+      guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+      return CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary)
+  }
+  ```
+
+* **Filename label** — truncated middle, system caption font.
+* **Badges** — small SF Symbol indicators in the corners. Verified
+  against upstream `ImageGlass.Gallery/Item/ImageGalleryItem.cs`:
+
+  | Badge | SF Symbol | Meaning |
+  | --- | --- | --- |
+  | Animated | `play.circle.fill` | Multi-frame animation (GIF / WebP / APNG) |
+  | RAW | `camera.aperture` | Camera RAW |
+  | HDR | `sun.max.circle.fill` | HDR JPEG / HEIC / AVIF |
+  | Multi-frame | `square.stack.3d.up.fill` | Multi-page TIFF / multi-page PDF |
+  | Favorite | `star.fill` | User-tagged |
+  | Unread | `circle.fill` | New since last view (v1.1) |
+
+  Badges are SF Symbols, not emoji, so they respect monochrome
+  rendering, accessibility colors, and the user's "Increase contrast"
+  setting.
+
+* **Non-image files** — when the scope includes non-image files
+  (PDF, text, video), the thumbnail is replaced by the file-type
+  icon from `NSWorkspace.shared.icon(forFile:)`. The panel does not
+  attempt to thumbnail unsupported formats; that prevents long
+  stalls on huge files.
+
+### 4.3 Selection model
+
+* **Single-select** drives the viewer canvas: selecting a file loads
+  it. This is the canonical "click a thumbnail" behavior.
+* **Multi-select** (Shift / Cmd-click) enables batch operations:
+  * Delete (⌫) — moves to Trash via `FileManager.trashItem(at:resultingItemURL:)`.
+  * Copy paths (⌘C in plain selection mode) — writes paths to the
+    pasteboard.
+  * Copy image data (⌥⌘C) — copies the first selection's image
+    bytes.
+  * Move / Copy to folder — opens a chooser.
+  * Export… — passes to the export flow.
+  * Batch crop — opens the crop tool with `tools.crop.persistent_selection = true` ([crop](./crop.mdx) §6.2).
+
+### 4.4 Drag and drop
+
+* **Drag out** — `NSItemProvider` file-promise items. The user can
+  drag a selection into Finder, into another app, or into a
+  multi-file-accepting upload field. Promises mean the file is not
+  copied until the destination accepts.
+* **Drag in** — accepts file URLs from Finder / other apps. Drop on
+  the panel adds the URL(s) as a new source criterion to the active
+  scope (with the user's confirmation if the scope is a saved
+  named scope). Drop on an empty panel creates a new implicit
+  scope.
+
+### 4.5 Keyboard
+
+| Key | Action |
+| --- | --- |
+| ↑ / ↓ / ← / → | Move selection. In Grid and Tree, full 2-D navigation. |
+| Home / End | First / last item. |
+| Page Up / Page Down | Page-scroll. |
+| Cmd-A | Select all. |
+| Cmd-Shift-A | Deselect all. |
+| Space | Quick Look preview (full-window translucent overlay; not the main canvas). |
+| Return | Load selection in viewer (default behavior also fires on single click). |
+| Cmd-F | Focus the filter field. |
+| Cmd-R | Refresh (re-evaluate scope). |
+| Cmd-D | Duplicate the selection into the same folder with `_copy` suffix. |
+| ⌫ | Move to Trash. |
+| Cmd-⇧-⌫ | Permanent delete (with confirmation). |
+| Cmd-O | Reveal in Finder. |
+| Cmd-I | Show info popover (size, dimensions, exif). |
+
+---
+
+## 5. Sort and Filter
+
+### 5.1 Sort modes
+
+The sort modes match `viewer.image_order` plus `dimensions`:
+
+| Sort | Implementation |
+| --- | --- |
+| `name` | Natural sort (locale-aware, numeric-aware). Falls back to ASCII when filenames are not text. |
+| `size` | `URLResourceKey.fileSize`. |
+| `modified` | `URLResourceKey.contentModificationDate`. |
+| `created` | `URLResourceKey.creationDate`. |
+| `exif_date_taken` | EXIF `DateTimeOriginal` from `CGImageSourceCopyPropertiesAtIndex`. Files without EXIF sort after files with EXIF (configurable). |
+| `extension` | UTI's preferred extension. |
+| `random` | Stable random with the scope name as the seed (so the order is reproducible across launches until the scope is re-evaluated). |
+| `dimensions` | Composite of width × height. Files without resolved dimensions are loaded asynchronously and re-inserted when ready. |
+
+Direction is `asc` or `desc`. Headers in Details mode show the
+direction with a `↑ / ↓` indicator.
+
+### 5.2 Filter
+
+The filter field is a free-form text input plus, in v1.1, a small
+token language:
+
+| Token | Effect |
+| --- | --- |
+| `*.jpg` | Filename glob. |
+| `>5mb` | File size greater than 5 MB. |
+| `wider:3000` | Dimensions width ≥ 3000 px. |
+| `taller:2000` | Dimensions height ≥ 2000 px. |
+| `after:2026-05-01` | Modified after this date. |
+| `before:2026-06-01` | Modified before this date. |
+| `kind:raw` | UTI conforms to `public.camera-raw-image`. |
+| `kind:hdr` | EXIF / metadata flags HDR. |
+| `fav:` | Favorite-tagged. |
+
+Bare text (no `:` or `>`) is treated as a substring match against
+the filename. Tokens compose with implicit AND.
+
+---
+
+## 6. Performance
+
+### 6.1 Lazy decode
+
+Only visible items have thumbnails decoded. Off-screen items use a
+placeholder (a faint gray rectangle plus the file-type icon).
+Visibility is tracked via the SwiftUI `onAppear` / `onDisappear`
+hooks for grid/strip and via `NSCollectionView`'s prefetch APIs
+for the rare cases where `LazyVGrid` is replaced by
+`NSCollectionViewRepresentable`.
+
+### 6.2 Bounded concurrency
+
+Thumbnail decoding runs in a `ThumbnailCache` actor with a
+`AsyncSemaphore` bounded by `ProcessInfo.processInfo.activeProcessorCount`:
+
+```swift
+actor ThumbnailCache {
+    private let semaphore = AsyncSemaphore(value: ProcessInfo.processInfo.activeProcessorCount)
+    private var memoryLRU: LRUCache<ThumbKey, CGImage> = .init(maxBytes: 256 * 1024 * 1024)
+    private let diskRoot: URL
+
+    func thumbnail(for entry: FileEntry, size: Int) async -> CGImage? {
+        let key = ThumbKey(path: entry.path, mtime: entry.modified, size: size)
+        if let hit = memoryLRU[key] { return hit }
+        if let disk = await readDisk(key: key) {
+            memoryLRU[key] = disk
+            return disk
+        }
+        await semaphore.acquire()
+        defer { Task { await semaphore.release() } }
+        guard let img = try? makeThumbnail(for: entry.path, maxPixelSize: size) else { return nil }
+        memoryLRU[key] = img
+        Task.detached(priority: .utility) { await self.writeDisk(key: key, image: img) }
+        return img
+    }
+}
+```
+
+### 6.3 LIFO queue
+
+When the user scrolls fast, the queue of pending thumbnails
+prioritizes the **most recently requested** items so the visible
+viewport always wins. Scrolled-past items are dropped from the
+queue without being decoded.
+
+### 6.4 LRU eviction
+
+* **Memory LRU** — capped by total bytes (256 MB default).
+* **Disk LRU** — capped by total bytes (`gallery.disk_cache_mb`,
+  default 400 MB; absolute cap `advanced.thumb_cache_mb`, default
+  1024 MB). Eviction runs on a background `NSBackgroundActivityScheduler`
+  job every 6 hours.
+
+### 6.5 Paged scope walking
+
+Scopes with > 50 000 files:
+
+1. The walker yields the first 5 000 entries as soon as they are
+   enumerated; the panel renders them while the walker continues.
+2. Subsequent batches of 5 000 are appended; the panel uses a
+   diff-friendly `IdentifiedArray` so SwiftUI does not re-render the
+   whole list.
+3. The resolved file list is streamed to disk in chunks, not held
+   entirely in memory.
+4. The panel toolbar shows a thin progress bar across the bottom
+   of the toolbar until the walk completes.
+
+### 6.6 FSEvent debounce
+
+`FSEventStream` events are debounced 250 ms before being dispatched
+to the panel. Bulk file operations (e.g., a `cp -R` of 500 files)
+collapse to a single re-evaluation rather than 500.
+
+### 6.7 Memory budget
+
+Targets, measured on an M3 Pro:
+
+| Scope size | Idle memory | Active-scroll memory |
+| --- | --- | --- |
+| 100 files | ~40 MB | ~80 MB |
+| 5 000 files | ~80 MB | ~200 MB |
+| 50 000 files | ~150 MB | ~400 MB |
+| 250 000 files | ~300 MB | ~600 MB |
+
+Above 250 000 files the panel shifts to `NSCollectionView` for the
+grid mode automatically.
+
+---
+
+## 7. Wiring
+
+### 7.1 ScopeStore
+
+```swift
+actor ScopeStore {
+    private let root: URL  // ~/Library/Application Support/ImageGlass_Mac/scopes
+    private var loaded: [String: Scope] = [:]
+
+    func list() -> [String] { /* read root, return filenames */ }
+    func load(_ name: String) async throws -> Scope { /* read JSON */ }
+    func save(_ scope: Scope) async throws { /* atomic-rename write */ }
+    func delete(_ name: String) async throws { /* remove file */ }
+}
+```
+
+### 7.2 ScopeWalker
+
+```swift
+actor ScopeWalker {
+    func walk(_ scope: Scope) -> AsyncThrowingStream<FileEntry, Error> {
+        AsyncThrowingStream { continuation in
+            Task.detached(priority: .utility) {
+                let keys: [URLResourceKey] = [.isDirectoryKey, .fileSizeKey,
+                                              .contentModificationDateKey,
+                                              .creationDateKey,
+                                              .typeIdentifierKey]
+                for criterion in scope.criteria {
+                    guard let enumerator = FileManager.default.enumerator(
+                        at: criterion.root,
+                        includingPropertiesForKeys: keys,
+                        options: criterion.includeHidden ? [] : [.skipsHiddenFiles]
+                    ) else { continue }
+
+                    for case let url as URL in enumerator {
+                        if Task.isCancelled { continuation.finish(); return }
+                        if matches(url, criterion: criterion) {
+                            continuation.yield(makeEntry(url, keys: keys))
+                        }
+                    }
+                }
+                continuation.finish()
+            }
+        }
+    }
+}
+```
+
+### 7.3 FileWatcher
+
+```swift
+actor FileWatcher {
+    private var stream: FSEventStreamRef?
+    private let queue = DispatchQueue(label: "imageglass.fsevents")
+    private let debounce: Duration = .milliseconds(250)
+
+    func watch(_ roots: [URL], onChange: @escaping @Sendable () async -> Void) { /* … */ }
+    func stop() { /* … */ }
+}
+```
+
+### 7.4 ThumbnailCache
+
+See §6.2.
+
+### 7.5 FileListViewModel
+
+```swift
+@MainActor @Observable
+final class FileListViewModel {
+    var activeScope: Scope?
+    var entries: IdentifiedArray<URL, FileEntry> = []
+    var selection: Set<URL> = []
+    var viewMode: ViewMode = .strip
+    var sort: SortDescriptor = .init(by: .modified, direction: .desc)
+    var filterText: String = ""
+    var isWalking: Bool = false
+    var walkProgress: Double = 0
+
+    func setActiveScope(_ name: String) async { /* … */ }
+    func selectFile(_ url: URL) { selection = [url] }
+    func selectFiles(_ urls: [URL]) { selection = Set(urls) }
+    func refresh() async { /* trigger re-walk */ }
+    func setViewMode(_ mode: ViewMode) { viewMode = mode }
+}
+```
+
+The panel's SwiftUI view binds to this `@Observable` view model.
+External clients (the MCP server, the viewer canvas selection
+synchronizer) call methods on it; all mutations are main-actor
+isolated.
+
+---
+
+## 8. MCP Integration
+
+The MCP server exposes these tools. All read tools are R-only; all
+write tools mutate scope JSON via atomic-rename writes and
+notify the panel via `FSEventStream`.
+
+| Tool | What it does |
+| --- | --- |
+| `list_scopes` | Return every scope name + summary. |
+| `get_active_scope` | Return the name of the currently active scope (or `null` for implicit). |
+| `set_active_scope(name)` | Set the active scope. |
+| `get_scope(name)` | Return the full scope JSON. |
+| `create_scope(name, criteria, sort?, filter?, description?)` | Create a new scope file. |
+| `update_scope(name, patch)` | Patch fields of an existing scope. |
+| `delete_scope(name)` | Delete a scope. Refuses to delete the active scope; caller must `set_active_scope` first. |
+| `evaluate_scope(name)` | Force re-walk. Returns the resolved count and the wall-clock duration. |
+| `list_files_in_scope(name, offset?, limit?)` | Return the resolved file list, paginated. |
+| `select_file(path)` | Set the panel's selection to this single file (also loads it in the viewer). |
+| `select_files(paths)` | Set the panel's selection to a list. |
+| `set_view_mode(mode)` | Switch the panel between strip / grid / details / tree / column. |
+| `set_sort(by, direction)` | Set the sort. |
+| `set_filter(text)` | Set the filter text. |
+
+Each tool's full JSON-RPC schema lives in
+`Source/MCPSchemas/file_list/*.json` and is registered with the
+MCP server at panel registration time.
+
+### 8.1 Push events
+
+The MCP server also pushes events that clients can subscribe to:
+
+* `scope_evaluated` — payload: scope name, file count, elapsed_ms.
+* `scope_changed` — payload: scope name; emitted on any field change.
+* `selection_changed` — payload: list of paths.
+* `view_mode_changed` — payload: new mode.
+
+Clients use these to keep their own UI / state in sync without
+polling.
+
+### 8.2 Example — Claude Code narrowing a scope
+
+```
+User to Claude Code:
+  "From this scope, just show me the HEIC files smaller than 5 MB."
+
+Claude Code calls:
+  get_active_scope() -> "2026-shoots"
+  update_scope("2026-shoots", {
+    "criteria": [
+      { "root": "/Users/bryan/Pictures/2026-shoots",
+        "recursive": true,
+        "include_exts": ["heic"] }
+    ],
+    "filter": { "max_size": 5242880 }
+  })
+  // ScopeStore writes the file; FSEventStream fires; the panel
+  // detects, re-walks, and renders the narrowed list within ~300 ms.
+```
+
+---
+
+## 9. Workflow Scenarios
+
+### 9.1 Preview.app refugee (T1)
+
+User installs the app, opens `~/Desktop/photo.heic` with Cmd-O.
+* Implicit scope created from `~/Desktop`.
+* Panel docks at the bottom in `strip` mode (Settings default).
+* User scrolls horizontally; arrow keys advance through photos.
+* No file panel work required from the user.
+
+### 9.2 Photographer with multi-source scope (T2a)
+
+* Photographer creates scope `2026-shoots` via Settings (`[+ New
+  scope…]` from the scope picker), pointing at one local and one
+  external-drive directory.
+* Sets extension filter to `nef, cr3, dng`.
+* Picks sort = EXIF Date Taken (descending).
+* Switches the panel to `grid` mode, size L.
+* When the external drive is unplugged, the panel shows the local
+  files only; reconnecting the drive triggers a 250 ms-debounced
+  re-walk that re-includes them.
+
+### 9.3 Claude Code rotates scopes (T4)
+
+* User says "use my review queue."
+* Claude Code calls `set_active_scope("review-queue")`.
+* Panel switches; viewer loads the first file.
+* User finishes review; tells Claude Code "now switch to last
+  week's exports."
+* Claude Code: `set_active_scope("exports-2026-w22")`.
+* Zero GUI clicks.
+
+### 9.4 Designer drag-out to Sketch (T2b)
+
+* Designer in Details mode, sorted by Modified descending.
+* Multi-selects three icon PNGs (Cmd-click).
+* Drags the selection out of the panel onto a Sketch artboard.
+* Sketch accepts the file promises; the files are not duplicated
+  until Sketch reads them.
+
+### 9.5 Tree-mode disambiguation (T3)
+
+* User has two folders named `IMG_0001.jpg` in different source
+  directories.
+* In `details` mode the rows look identical.
+* User switches to `tree` mode; each file is visibly under its
+  source directory.
+* User right-clicks the wrong one → Move to Trash.
+
+---
+
+## 10. Divergence from Upstream
+
+| Upstream | Mac fork |
+| --- | --- |
+| `ImageGlass.Gallery` — single horizontal/vertical thumbnail strip on one edge of the window. | Multi-mode panel (strip / grid / details / tree / column) hosted in the new panel framework. |
+| File list = contents of the currently-open file's containing folder, optionally recursive. | File list = the resolved set of the active scope, which can span multiple directories with per-directory inclusion/exclusion rules. |
+| WinForms + GDI+ rendering. | SwiftUI + AppKit + ImageIO + Metal-backed thumbnails when needed. |
+| Thumbnails generated by upstream `GDIThumbnailExtractor`. | Thumbnails generated by `CGImageSourceCreateThumbnailAtIndex`. |
+| Thumbnail cache in `ImageGlass.Gallery/Cache/ThumbnailCacheManager.cs`. | Two-tier cache: `actor ThumbnailCache` with in-memory LRU + on-disk LRU. Same semantics; native Swift. |
+| File-Explorer-sort-order syncing (`Config.ShouldUseExplorerSortOrder`). | Dropped. Finder does not expose a general API for it. The panel has its own sort model. |
+| `FrmMain.FileWatcher.cs` uses `FileSystemWatcher`. | `actor FileWatcher` wraps `FSEventStream`. Debounced 250 ms. |
+| Per-image rating / tags via Windows shell tags. | Not in v1. Favorites are stored in a small side-file. Full ratings via the Metadata panel in v1.1. |
+| Single thumbnail-size knob (`Config.ThumbnailSize`). | Same knob plus a per-panel-mode override. |
+
+### 10.1 File mapping (upstream → fork)
+
+| Upstream | Fork analog |
+| --- | --- |
+| `Source/Components/ImageGlass.Gallery/ImageGallery.cs` | `Sources/Panels/FileList/FileListView.swift` |
+| `Source/Components/ImageGlass.Gallery/Enums.cs:368` (`View`) | `ViewMode` enum (strip / grid / details / tree / column) |
+| `Source/Components/ImageGlass.Gallery/Enums.cs:114` (`ColumnType`) | The optional-column toggles in Details mode |
+| `Source/Components/ImageGlass.Gallery/Enums.cs:346` (`UseEmbeddedThumbnails`) | `image.embedded_thumb_*` Settings |
+| `Source/Components/ImageGlass.Gallery/Item/ImageGalleryItem.cs` | `FileEntry` struct + the panel's badge logic |
+| `Source/Components/ImageGlass.Gallery/Cache/ThumbnailCacheManager.cs` | `actor ThumbnailCache` |
+| `Source/Components/ImageGlass.Gallery/Extractor/GDIThumbnailExtractor.cs` | `makeThumbnail(for:maxPixelSize:)` using ImageIO |
+| `Source/Components/ImageGlass.Base/FileSystem/FileFinder.cs` | `actor ScopeWalker` |
+| `Source/ImageGlass/FrmMain.cs::Gallery_ItemClick:256` | `FileListViewModel.selectFile(_:)` |
+| `Source/ImageGlass/FrmMain.cs::LoadGallery:693` | `ScopeWalker.walk(_:)` + `FileListViewModel.setActiveScope(_:)` |
+| `Source/ImageGlass/FrmMain.FileWatcher.cs` | `actor FileWatcher` |
+
+---
+
+## 11. Open Questions
+
+* **Vision-backed search (v2).** "Find photos that look like this"
+  via on-device Vision embeddings is a natural addition once the
+  thumbnail cache is in place. Out of scope for v1.
+* **Per-file rating UI.** Should ratings live in the file panel or
+  in the metadata panel? Tentative: metadata. The file panel renders
+  the rating as a small badge but does not allow editing.
+* **Auto-discovered scopes.** Should the app surface a "Recents"
+  scope or a "Photos library" scope automatically? Tentative: no
+  automatic scopes in v1 — but the Quick Setup flow ([Settings §2.7](./settings.mdx#27-quick-setup-first-run))
+  could offer to create them.
+* **NAS / S3 / cloud scopes.** Scopes today assume local filesystem
+  (or mounted volumes). A future "Cloud" scope kind would walk
+  remote storage. Out of scope for v1; spec'd here for awareness.
+
+---
+
+## 12. Acceptance Criteria
+
+The file panel ships when all of the following pass:
+
+* **Five modes load correctly** for a 5 000-file scope with mixed
+  formats (JPEG, HEIC, PNG, DNG, MP4, PDF, TXT).
+* **Live updates**: copying 500 files into a watched directory
+  triggers exactly one re-walk within 500 ms.
+* **Thumbnail throughput**: ≥ 200 thumbnails / second on M3 Pro for
+  cached items, ≥ 50 / second for first-time generation.
+* **Memory cap**: a 250 000-file scope holds idle at ≤ 350 MB.
+* **MCP round-trip**: `create_scope` → `evaluate_scope` →
+  `set_active_scope` → `list_files_in_scope` returns the expected
+  list and the GUI reflects every change within 500 ms.
+* **Sandbox**: a sandboxed build with a security-scoped bookmark
+  correctly enumerates a user-granted directory across an app
+  relaunch.
+* **Crash safety**: kill the process mid-scope-write 100 times; on
+  relaunch every scope is either the prior valid state or its
+  `.bak` and we recover.
+* **Accessibility**: VoiceOver announces each item by filename, size,
+  and modified date; the view-mode toggle is keyboard-traversable.

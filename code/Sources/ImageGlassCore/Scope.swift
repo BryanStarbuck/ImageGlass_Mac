@@ -59,13 +59,16 @@ public struct Scope: Codable, Equatable, Sendable {
 /// Default scope that ships with first launch.
 public extension Scope {
     static var starter: Scope {
+        // Pull the default extension list from the central format registry so
+        // the on-disk story stays in sync with what the loader can actually
+        // decode (see `docs/supported-formats.mdx`).
         Scope(
             name: "default",
             description: "Default scope — your Pictures folder.",
             include: .init(
                 directories: ["~/Pictures"],
                 recursive: true,
-                extensions: ["jpg", "jpeg", "png", "gif", "heic", "tiff", "webp", "bmp", "svg"]
+                extensions: FormatRegistry.shared.defaultScopeExtensions()
             ),
             exclude: .init(hiddenFiles: true)
         )
