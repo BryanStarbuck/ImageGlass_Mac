@@ -1004,6 +1004,8 @@ public struct Settings: Codable, Equatable, Sendable {
     public var tools: ToolsSettings
     public var plugins: PluginsSettings
     public var advanced: AdvancedSettings
+    /// Multi-monitor window state. See `docs/multi_monitor.mdx`.
+    public var window: WindowSettings
 
     public init(
         version: Int = Settings.currentSchemaVersion,
@@ -1022,7 +1024,8 @@ public struct Settings: Codable, Equatable, Sendable {
         language: LanguageSettings = .init(),
         tools: ToolsSettings = .init(),
         plugins: PluginsSettings = .init(),
-        advanced: AdvancedSettings = .init()
+        advanced: AdvancedSettings = .init(),
+        window: WindowSettings = .init()
     ) {
         self.version = version
         self.general = general
@@ -1041,6 +1044,7 @@ public struct Settings: Codable, Equatable, Sendable {
         self.tools = tools
         self.plugins = plugins
         self.advanced = advanced
+        self.window = window
     }
 
     /// Built-in defaults; equivalent to `Settings()` but kept for symmetry
@@ -1070,13 +1074,14 @@ public struct Settings: Codable, Equatable, Sendable {
         self.tools = try c.decodeIfPresent(ToolsSettings.self, forKey: .tools) ?? d.tools
         self.plugins = try c.decodeIfPresent(PluginsSettings.self, forKey: .plugins) ?? d.plugins
         self.advanced = try c.decodeIfPresent(AdvancedSettings.self, forKey: .advanced) ?? d.advanced
+        self.window = try c.decodeIfPresent(WindowSettings.self, forKey: .window) ?? d.window
     }
 
     private enum CodingKeys: String, CodingKey {
         case version, general, image, viewer, appearance, layout, slideshow
         case edit, mouse, keyboard, gallery, toolbar
         case fileAssoc = "file_assoc"
-        case language, tools, plugins, advanced
+        case language, tools, plugins, advanced, window
     }
 }
 

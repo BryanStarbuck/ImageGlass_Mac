@@ -1,0 +1,648 @@
+---
+title: Multi-Monitor Window State
+description: Product and engineering specification for monitor-aware window persistence in ImageGlass_Mac — track which display the window lives on, its frame within that display, and the last-selected file in the file panel, then restore all three on the next launch.
+---
+
+# Multi-Monitor Window State
+
+This page is the **complete product + engineering specification** for the
+multi-monitor window-state subsystem of the ImageGlass Starbuck fork
+(ImageGlass_Mac). It is the contract that the SwiftUI window scene, the
+`NSWindowDelegate` bridge, the on-disk `settings.json` `window` section,
+and the launch-time restoration path all must satisfy.
+
+It cross-references the sibling specs and does not duplicate them:
+
+* [Settings](./settings.mdx) §2 — the canonical `settings.json` store. The
+  `window` section defined here is one more `Codable` section of that
+  root struct; persistence pipeline, atomic writes, and `FSEventStream`
+  hot-reload semantics are owned by the Settings spec.
+* [Panels and Window Layout](./panels.mdx) — panel docking, floating
+  panels, layout presets. Panel layout is **not** owned by this spec; it
+  lives in `layout.json`. This spec only owns the *outer* window's screen,
+  frame, and selected file.
+* [File List Panel](./list_of_files.mdx) — owns the file-panel selection
+  semantics. This spec writes the selected path back to `settings.json`
+  but the rules for what is selectable, what "the file tree" is, and how
+  selection navigates live there.
+* [Automation](./automation.mdx) — overall fork charter. Read first.
+
+The Mac stack used throughout this spec is the one declared in
+`CLAUDE.md`: **Swift 6 + SwiftUI + AppKit interop** (`NSWindow`,
+`NSWindowDelegate`, `NSScreen`, `CGDirectDisplayID`), persisted via
+`Codable` JSON to `settings.json`.
+
+---
+
+## 1. Why the Fork Adds Monitor-Aware State
+
+Upstream Windows ImageGlass persists window position and size as a single
+`(x, y, width, height)` tuple in absolute screen coordinates. That works
+on a single-monitor PC. On a Mac with three displays — say a 6K Pro
+Display XDR on the left, a built-in MacBook screen in the middle, and a
+4K Samsung M8 on the right (see `CLAUDE.md`) — the absolute coordinate
+of the upper-left of "the right monitor" depends on how the user has
+arranged displays in System Settings. Two failure modes follow:
+
+1. **The user undocks the laptop.** The right monitor disappears.
+   ImageGlass relaunches and tries to position the window at
+   `(5760, 0, 1600, 1200)` — coordinates that no longer correspond to
+   any attached display. The window opens off-screen and the user has
+   to drag it back via the *Window* menu.
+2. **The user moves a display in System Settings.** What was at
+   `x = 5760` is now at `x = -1920`. The window lands somewhere other
+   than where the user left it, even though the same monitor is
+   attached.
+
+The Mac-native solution is to remember **which display** the window was
+on (by a stable identifier) and the frame **within that display's local
+coordinate space**, then on launch resolve the identifier back to a
+currently-attached `NSScreen` before computing the absolute frame. If
+the display is gone, fall back deterministically.
+
+The fork's product brief also adds two things upstream does not:
+
+* **Last-selected file in the file panel.** Upstream's "open last seen
+  image" (`general.open_last_image`) re-opens *the last viewed image
+  file*. The fork's panel column (see `panels.mdx`, `list_of_files.mdx`)
+  has an explicit selection in the directory/filename panel — including
+  in tree mode — that needs to survive a restart even when the resolved
+  scope changes between runs.
+* **Atomic round-trip with the MCP server.** Window state lives in
+  `settings.json`, the same file MCP clients (Claude Code) read and
+  write. A Claude Code session can set the window to a specific
+  monitor + frame before the user even launches the app.
+
+---
+
+## 2. Goals and Non-goals
+
+### 2.1 Goals
+
+* **Monitor identity, not absolute coordinates.** The persisted record
+  identifies the display by a stable token, never by world-space x/y.
+* **Round-trip exactness.** A user who quits with the window on screen
+  B at `(120, 80, 1400, 900)` and relaunches with the same display
+  configuration gets the window back at exactly `(120, 80, 1400, 900)`
+  on screen B — pixel-identical, no jitter, no "centered" fudge.
+* **Deterministic fallback.** When the saved display is no longer
+  attached, the fallback rule is documented (see §6.3) so behavior is
+  predictable across restarts.
+* **One round-trip for selection.** The path the user had selected in
+  the file panel at quit time is re-selected on launch, after the scope
+  evaluates, with explicit semantics for "file no longer exists" and
+  "file no longer in scope".
+* **Discoverable in settings.json.** Like every other persisted state
+  in the fork, the window state is a named section in `settings.json`,
+  inspectable by the user, version-controllable, and editable by MCP.
+* **Crash-safe.** The save path is the same atomic-rename pipeline used
+  by the rest of `settings.json` (`settings.mdx` §2.4). A crash mid-save
+  never corrupts the file.
+
+### 2.2 Non-goals
+
+* **Per-window state for multiple windows.** v1 persists exactly one
+  outer window's state: the main viewer window. Additional windows
+  (Settings, About, Releases, floating panels) are out of scope; they
+  follow AppKit defaults or the panel framework's own persistence.
+* **Window state in iCloud / cross-machine sync.** Window state is
+  intrinsically per-machine (display configurations differ). Saving it
+  in `settings.json` is fine because the rest of `settings.json` is
+  per-machine too; but no sync layer is added.
+* **Full-screen restoration of the macOS *Spaces* the window was on.**
+  AppKit does not give us a stable Space identifier. We persist the
+  full-screen flag and rely on the OS to put the window on a Space.
+* **Per-file selection memory across scopes.** The selected path is
+  recorded once. If the user switches scopes between runs, the
+  selection is reset to the new scope's first file. See §7.4.
+
+---
+
+## 3. The Persisted Model
+
+### 3.1 Where it lives
+
+The window-state record lives in `settings.json` under the key
+`window`. This is one more `Codable` section of the root `Settings`
+struct (`settings.mdx` §2.3), peer to `general`, `viewer`, `appearance`,
+etc.
+
+It does **not** live in `UserDefaults`. Three reasons:
+
+1. **MCP must be able to edit it.** `UserDefaults` is binary plist
+   inside `~/Library/Preferences/`; it is not inspectable, not
+   diff-friendly, and not part of the MCP surface.
+2. **Settings spec §2.1 reserved `UserDefaults` for trivial UI prefs
+   that change on every interaction.** Multi-monitor window state has
+   meaningful structure and is read by external tooling — it is not
+   trivial.
+3. **The `settings.json` atomic-write + `FSEventStream` pipeline
+   already exists.** Reusing it gets crash-safety and hot-reload for
+   free.
+
+### 3.2 The Codable schema
+
+```swift
+public struct WindowSettings: Codable, Equatable, Sendable {
+    /// Stable identifier of the display the window was on at save time.
+    /// See §4 for how it is computed and resolved.
+    public var display_id: String?
+
+    /// Human-readable name of that display (e.g. "Built-in Retina Display",
+    /// "Samsung M8"). Stored for log readability and for the Settings
+    /// "Currently saved on: ___" indicator. Not used to match a display.
+    public var display_name: String?
+
+    /// Window frame in *display-local* coordinates: x and y are offsets
+    /// from the display's lower-left corner (AppKit convention), in
+    /// points. Width and height are in points.
+    /// If `display_id` resolves on launch, the absolute frame is computed
+    /// as `display.frame.origin + (x, y)` clamped to the visible frame.
+    public var frame: WindowFrame?
+
+    /// True if the window was in native macOS full-screen at the moment
+    /// of save. On restore the window is placed on the saved display
+    /// first, then full-screened.
+    public var fullscreen: Bool
+
+    /// True if the window was zoomed (green-button maximised) at save.
+    /// Distinct from `fullscreen` — zoomed is a windowed state.
+    public var zoomed: Bool
+
+    /// True if the window was minimized to the Dock. We do NOT restore
+    /// minimized — see §7.3 — but we record it so MCP clients can read
+    /// the prior state.
+    public var minimized: Bool
+
+    /// Path of the file that was selected in the directory/filename
+    /// panel (list or tree mode) at save time. Tilde-contracted, same
+    /// convention as `resolvedFiles`. See §7.4 for restoration semantics.
+    public var last_selected_file: String?
+
+    /// ISO-8601 timestamp of the most recent save. Diagnostic only.
+    public var saved_at: String?
+}
+
+public struct WindowFrame: Codable, Equatable, Sendable {
+    public var x: Double         // points from display origin
+    public var y: Double         // points from display origin
+    public var width: Double     // points
+    public var height: Double    // points
+}
+```
+
+Default values: every field is `nil`/`false`. A brand-new install
+therefore writes nothing into `window` until the first quit. The
+first launch uses the SwiftUI/AppKit default frame.
+
+### 3.3 JSON shape
+
+The on-disk representation, after a session on the built-in display:
+
+```json
+"window": {
+  "display_id": "37D8832A-2D66-02CA-B9F7-8F30A301B230",
+  "display_name": "Built-in Retina Display",
+  "frame": { "x": 240, "y": 180, "width": 1440, "height": 960 },
+  "fullscreen": false,
+  "zoomed": false,
+  "minimized": false,
+  "last_selected_file": "~/Pictures/2026/IMG_4137.HEIC",
+  "saved_at": "2026-06-02T18:42:11Z"
+}
+```
+
+The whole file is encoded with `[.prettyPrinted, .sortedKeys]` (see
+`settings.mdx` §2.3), so `window` always appears in alphabetic position
+and produces stable MCP diffs.
+
+---
+
+## 4. Identifying a Display Across Launches
+
+### 4.1 The identifier we use
+
+`NSScreen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")]`
+returns a `CGDirectDisplayID` — a `UInt32` assigned by the window
+server. It is **not** stable across reboots, sleep/wake on Apple
+Silicon, or display reconfiguration; we cannot persist it.
+
+The correct stable token is the **display's UUID**, obtained from the
+display ID at runtime:
+
+```swift
+import CoreGraphics
+import IOKit
+
+let dispID: CGDirectDisplayID = /* from NSScreen */
+guard let cfUUID = CGDisplayCreateUUIDFromDisplayID(dispID)?.takeRetainedValue()
+else { return nil }
+let uuid = CFUUIDCreateString(nil, cfUUID) as String? // "37D8832A-2D66-…"
+```
+
+`CGDisplayCreateUUIDFromDisplayID` returns a UUID that is **stable** for
+a given physical panel:
+* Survives reboots.
+* Survives unplug/replug.
+* Survives display arrangement changes in System Settings.
+* Changes only if the panel itself is replaced (e.g. swap an
+  external monitor for a different one of the same model).
+
+This is the token persisted in `display_id`.
+
+### 4.2 Computing display-local coordinates
+
+The visible frame for any `NSScreen` is in global AppKit space (origin
+of the main display is at `(0, 0)`; secondary displays can be at
+negative or large positive offsets). To make the saved frame portable
+across system-arrangement changes, we store **display-local** offsets:
+
+```swift
+let s = window.screen ?? NSScreen.main!
+let global = window.frame                            // global space
+let origin = s.frame.origin                          // display's global origin
+let local  = NSRect(x: global.minX - origin.x,
+                    y: global.minY - origin.y,
+                    width:  global.width,
+                    height: global.height)
+```
+
+On restore, the inverse:
+
+```swift
+let s = resolveScreen(uuid: saved.display_id) ?? NSScreen.main!
+let target = NSRect(x: s.frame.origin.x + saved.frame.x,
+                    y: s.frame.origin.y + saved.frame.y,
+                    width:  saved.frame.width,
+                    height: saved.frame.height)
+window.setFrame(clamp(target, to: s.visibleFrame), display: true)
+```
+
+The clamp step (§4.4) guarantees the window cannot be placed even one
+point under the menu bar or off the right edge.
+
+### 4.3 Resolving the saved UUID
+
+On launch, we walk the currently-attached `NSScreen.screens` array and
+match by UUID:
+
+```swift
+for screen in NSScreen.screens {
+    if let n = screen.deviceDescription[
+        NSDeviceDescriptionKey("NSScreenNumber")
+    ] as? CGDirectDisplayID,
+       let cf = CGDisplayCreateUUIDFromDisplayID(n)?.takeRetainedValue() {
+        let u = CFUUIDCreateString(nil, cf) as String
+        if u == saved.display_id { return screen }
+    }
+}
+return nil
+```
+
+If the match returns `nil` we apply the fallback rule (§6.3).
+
+### 4.4 Clamping to visible frame
+
+After computing the absolute target frame we clamp:
+
+* `width`  = `min(saved.width,  visibleFrame.width)`
+* `height` = `min(saved.height, visibleFrame.height)`
+* `x` = `min(max(target.x, visibleFrame.minX), visibleFrame.maxX - width)`
+* `y` = `min(max(target.y, visibleFrame.minY), visibleFrame.maxY - height)`
+
+This handles the edge case where the user reduced the resolution of the
+saved display between runs.
+
+---
+
+## 5. The Lifecycle
+
+### 5.1 Launch sequence
+
+```
+ImageGlassApp.init()
+    └─ parses CLI, builds AppState
+        AppState.bootstrap() (async, on first .task)
+            ├─ loadSettings()       reads settings.json → state.settings.window
+            ├─ themeStore.bootstrap()
+            ├─ scope bootstrap, refreshScopeList, activate(scope)
+            └─ startWatching()
+
+WindowGroup body shown ────────────────────────────────────────────────┐
+                                                                       ▼
+                                                AppDelegate.applicationDidFinishLaunching
+                                                    └─ WindowStateController.attach(mainWindow)
+                                                        ├─ subscribes to NSWindowDelegate events
+                                                        ├─ reads state.settings.window
+                                                        ├─ applies frame (§5.2)
+                                                        └─ schedules selection restore (§7.4)
+```
+
+The window-state restore runs **after** `bootstrap()` so the scope is
+already resolved and we know whether the saved `last_selected_file` is
+in the current `resolvedFiles`.
+
+### 5.2 Apply algorithm (restore)
+
+```swift
+func restore(saved: WindowSettings, to window: NSWindow) {
+    // 1. Resolve the display.
+    let screen = resolveScreen(uuid: saved.display_id) ?? fallbackScreen()
+
+    // 2. Compute and clamp the absolute frame.
+    if let f = saved.frame {
+        let target = absoluteFrame(local: f, on: screen)
+        window.setFrame(clamp(target, to: screen.visibleFrame), display: true)
+    } else {
+        // No saved frame: center on the chosen screen with the default size.
+        let size = NSSize(width: 1100, height: 760)
+        let v = screen.visibleFrame
+        let f = NSRect(x: v.midX - size.width/2,
+                       y: v.midY - size.height/2,
+                       width: size.width, height: size.height)
+        window.setFrame(f, display: true)
+    }
+
+    // 3. Restore the windowed-state flags. Order matters:
+    //    - zoom before full-screen, so unzooming during a later toggle
+    //      returns to the saved frame, not to the OS default.
+    if saved.zoomed && !window.isZoomed { window.zoom(nil) }
+    if saved.fullscreen && !window.styleMask.contains(.fullScreen) {
+        window.toggleFullScreen(nil)
+    }
+    // We do NOT restore `minimized` — opening into the Dock would
+    // hide the app immediately, which is hostile.
+}
+```
+
+### 5.3 Save sequence
+
+The save path runs in two places:
+
+1. **On any window event that changes persistent state.** A debounced
+   (500 ms) capture writes the current frame + screen UUID to
+   `state.settings.window` and triggers `state.saveSettings()`. The
+   events: `windowDidResize`, `windowDidMove`, `windowDidChangeScreen`,
+   `windowDidEnterFullScreen`, `windowDidExitFullScreen`,
+   `windowDidMiniaturize`, `windowDidDeminiaturize`,
+   `windowDidBecomeKey` (for an initial baseline).
+2. **On `applicationWillTerminate`.** A final, synchronous capture is
+   forced regardless of debounce. This guarantees the last known
+   position is on disk even if the user quits within 500 ms of the
+   last move. Selection is captured here too.
+
+The mid-session writes are what enables a *crash recovery*: the user
+who force-kills the app gets approximately the last position back
+(within debounce window), not whatever was on disk at startup.
+
+---
+
+## 6. Edge Cases and Fallbacks
+
+### 6.1 First launch (no saved state)
+
+`settings.json` either does not exist or has no `window` key. We use
+the SwiftUI default: a window sized 1100×760 centered on
+`NSScreen.main`. The first quit writes the resulting frame.
+
+### 6.2 Saved display is currently attached
+
+The happy path. Restore as in §5.2.
+
+### 6.3 Saved display is *not* attached (fallback)
+
+Apply in order, taking the first that succeeds:
+
+1. If `NSScreen.main` exists, place the window there at the saved
+   *local* offset, clamped to its visible frame.
+2. If `NSScreen.main` is `nil` (shouldn't happen on macOS but is
+   `nil`-able), place on `NSScreen.screens.first`.
+3. If no screens at all (theoretical), defer until `screensDidChange`
+   fires.
+
+In cases (1) and (2) we **do not overwrite** `display_id` on disk on
+the next save. The user may simply have unplugged a monitor
+temporarily; the next reconnect should put the window back where it
+belongs. Instead we write the *new* display's UUID only when the user
+actively moves the window onto another screen (the
+`windowDidChangeScreen` event), or when 60 seconds elapse with the
+window stable on the fallback display.
+
+This rule is the user-visible difference between "you docked again,
+welcome back to your Pro Display" and "you really did move to the
+laptop".
+
+### 6.4 Display resolution changed
+
+The display is matched by UUID (still the same physical panel), but
+its `visibleFrame` is smaller than the saved frame. §4.4 clamps the
+restored frame to fit. We do not "shrink-to-fit" beyond the clamp; the
+user's preferred size is preserved as far as the new resolution
+allows.
+
+### 6.5 Saved frame is entirely off-screen
+
+A previously-attached external display had a very high `x` origin; the
+saved local frame is fine but combined with `NSScreen.main`'s origin
+the absolute frame falls outside any current screen. The clamp in §4.4
+catches this — both axes are independently clamped — and the window
+lands inside the visible frame of the chosen screen.
+
+### 6.6 Full-screen at save time, no display at restore
+
+If `fullscreen == true` but the saved display is gone, we still apply
+the fallback in §6.3, then full-screen on that display. The user is
+not left looking at a hidden window.
+
+### 6.7 Multiple windows of the main scene
+
+SwiftUI's `WindowGroup` allows the user to open additional windows via
+*File → New Window*. v1 of this spec only tracks the **first key
+window** to enter `applicationDidFinishLaunching` and only restores to
+that one window on next launch. Additional windows open at AppKit
+defaults and are not persisted.
+
+### 6.8 Frameless / borderless window
+
+The `viewer.isFrameless` setting (see `viewer.mdx`) drops the title
+bar. Frame computation and persistence are identical to a normal
+window; the restore path applies the saved frame *after*
+`WindowModes.toggleFrameless` is reconciled to the saved
+`general.frameless` flag.
+
+### 6.9 Two displays with identical UUIDs
+
+Some virtual-display tools (e.g. Sidecar, AirPlay receivers) can
+report the same UUID for a transient display. We pick the first match
+in `NSScreen.screens` order and proceed. This is benign: the user's
+intent is "the iPad-as-display screen" and we honor it.
+
+---
+
+## 7. Selection Restoration
+
+### 7.1 What is "the selected file"
+
+The directory / filename panel (see `list_of_files.mdx`) maintains
+exactly one selected path in both list mode and tree mode. The path is
+the same value `AppState.selectedFile` holds — tilde-contracted,
+absolute on disk.
+
+### 7.2 When is it captured
+
+Every time `AppState.selectedFile` changes, the
+`WindowStateController` debounces (300 ms) and writes the new value to
+`state.settings.window.last_selected_file`. The same value is also
+written synchronously in the `applicationWillTerminate` save.
+
+We **do not** capture the selected scope here — scope selection has
+its own persistence (`LocalStorage`, see `list_of_files.mdx`). The
+window section only holds the file path.
+
+### 7.3 What is *not* captured
+
+* The viewer's zoom / pan / rotation state. Those belong to
+  `ViewerState` and have their own session story (currently
+  non-persistent; see `viewer.mdx`).
+* The window minimized state (we record it but do not restore — see
+  §5.2).
+* Which Space the window was on. AppKit gives us no stable Space
+  identifier.
+
+### 7.4 Restore algorithm
+
+After `AppState.bootstrap()` has finished and the scope is resolved,
+the controller runs:
+
+```swift
+guard let path = state.settings.window.last_selected_file else { return }
+if state.resolvedFiles.contains(path) {
+    state.selectedFile = path
+} else if FileManager.default.fileExists(atPath: AppPaths.expandTilde(path)) {
+    // File still exists but is no longer in scope. We treat the saved
+    // path as an "external open" so the user can still see it; this is
+    // the same code path the Open dialog uses.
+    state.openExternalFile(url: URL(fileURLWithPath: AppPaths.expandTilde(path)))
+} else {
+    // File is gone. Fall back to the scope's first file (already done
+    // by `activate(scopeNamed:)`); leave `last_selected_file` on disk
+    // so a re-mount of the volume can recover it on a later launch.
+}
+```
+
+The "leave the stale path on disk" rule is important: the user who
+plugs in an external SSD half a minute after launch should get back
+their selection the *next* time they quit-and-relaunch with the SSD
+already mounted. Aggressively zeroing the field would prevent that.
+
+### 7.5 Interaction with `general.open_last_image`
+
+`general.open_last_image` (from upstream) is independent and takes
+precedence if both are set. Concretely:
+
+* If `general.open_last_image == true` and `general.last_seen_image`
+  is set, that file is selected/opened first.
+* Otherwise, the `window.last_selected_file` restore in §7.4 runs.
+
+The Settings UI exposes `open_last_image` as a checkbox; the
+`window.last_selected_file` field is internal and not user-visible
+unless they go look at `settings.json`.
+
+---
+
+## 8. MCP Surface
+
+The window section is fully integrated with the existing settings MCP
+tools described in `settings.mdx` §2.5.
+
+| Tool call | Effect |
+| --- | --- |
+| `get_settings("window")` | Return the entire `window` section. |
+| `get_setting("window.frame.width")` | Read one value. |
+| `set_setting("window.frame.width", 1600)` | Set one value; validated. |
+| `set_settings({"window": {…}})` | Replace the entire section atomically. |
+| `reset_section("window")` | Clear all fields → next launch behaves like a fresh install. |
+
+There is **no new MCP tool** added by this spec — the goal is that
+window state is "just another settings section" to the MCP client.
+
+Two notes specific to writes:
+
+1. Setting `window.display_id` to a UUID that does not correspond to a
+   currently-attached display is accepted at write time and applied at
+   next launch via §6.3 fallback.
+2. Setting `window.frame` to coordinates that fall outside the visible
+   frame is accepted at write time; the launch-time clamp in §4.4
+   keeps the window on-screen.
+
+This permissiveness lets a Claude Code session pre-stage a layout for
+the next launch even when the target display is not currently active
+(e.g. "set up for my external monitor; I'll launch ImageGlass after I
+dock").
+
+---
+
+## 9. Implementation Plan (Swift)
+
+### 9.1 New files
+
+* `code/Sources/ImageGlassCore/Config/WindowSettings.swift` — the
+  `WindowSettings` and `WindowFrame` structs above, plus a small
+  helper `WindowDisplayResolver` that wraps
+  `CGDisplayCreateUUIDFromDisplayID`. Lives in `Core` so the MCP layer
+  can read/write window state without depending on `AppKit`.
+* `code/Sources/ImageGlass/Window/WindowStateController.swift` — the
+  `@MainActor` controller that observes an `NSWindow`, debounces
+  writes, applies the restore on attach, and is the sole writer of
+  `state.settings.window`.
+
+### 9.2 Modified files
+
+* `code/Sources/ImageGlassCore/Config/Settings.swift` — add `var window:
+  WindowSettings` to the root `Settings` struct, default `.init()`,
+  with the corresponding `CodingKeys` entry.
+* `code/Sources/ImageGlass/ImageGlassApp.swift` — instantiate the
+  controller; the easiest hook is to store it on the
+  `NSApplicationDelegateAdaptor` (currently `AboutAppDelegate`) and
+  call `controller.attach(_:)` in `applicationDidFinishLaunching` after
+  walking `NSApp.windows` to find the main window. The terminate hook
+  goes in `applicationWillTerminate`.
+* `code/Sources/ImageGlass/AppState.swift` — no field changes; the
+  controller reads `state.settings.window` and `state.selectedFile`
+  through the existing public API.
+
+### 9.3 Persistence wiring
+
+The controller never writes `settings.json` itself. It mutates
+`state.settings.window`, then calls `state.saveSettings()`. The
+existing `SettingsStore` actor's debounce + atomic-rename already
+guarantees crash-safety and serialization with other writers (see
+`settings.mdx` §2.4).
+
+### 9.4 Testing
+
+Unit tests live in
+`code/Tests/ImageGlassCoreTests/WindowSettingsTests.swift` and cover:
+
+* Round-trip encode/decode for every field of `WindowSettings`.
+* Local-to-absolute frame math (`displayLocalFrame(_:on:)`,
+  `absoluteFrame(local:on:)`).
+* `clamp(_:to:)` for all eight off-axis cases.
+* Fallback selection rule §6.3, fed a fake `NSScreen.screens` array.
+
+UI behavior (the AppKit attach/restore) is verified manually for v1
+because `XCUITest` against `NSWindowDelegate` is overkill for the
+contract.
+
+---
+
+## 10. Cross-references
+
+* §3.1 routes everything through the canonical `settings.json` defined in
+  [`settings.mdx`](./settings.mdx) §2.
+* §7.1 builds on the selection model defined in
+  [`list_of_files.mdx`](./list_of_files.mdx).
+* §8 is consumed by the generic settings MCP tools described in
+  [`settings.mdx`](./settings.mdx) §2.5.
+* The frameless interaction in §6.8 is owned by the viewer spec; this
+  page only describes the integration point, not the chrome rules.

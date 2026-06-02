@@ -1,29 +1,29 @@
 ---
-title: ImageGlass Starbuck Overview
-description: Bryan Starbuck's fork of ImageGlass — adds MCP support, modular UI panels, scope controls, and a Local Storage feature drivable from Claude Code.
+title: ImageGlass_Mac Overview
+description: ImageGlass_Mac — a Mac-native image viewer with MCP support, modular UI panels, scope controls, and a Local Storage feature drivable from Claude Code.
 ---
 
-# ImageGlass Starbuck — Overview
+# ImageGlass_Mac — Overview
 
-> **This repository is Bryan Starbuck's fork of [ImageGlass](https://imageglass.org).**
-> The upstream project is a lightweight, open-source image viewer. This fork
-> exists to add an automation surface (MCP), a panel-based UI, and a
-> scope-driven, AI-editable Local Storage configuration model on top of it.
+> **ImageGlass_Mac is a Mac-native image viewer.**
+> It pairs a fast, ad-free viewing experience with an automation surface
+> (MCP), a panel-based UI, and a scope-driven, AI-editable Local Storage
+> configuration model.
 
 ---
 
-## Most Important Rules and Goals (Fork Charter)
+## Most Important Rules and Goals
 
-These are the load-bearing goals for the Starbuck fork. Every change in this
-repository should serve one of these five goals. If a change does not, it
-belongs upstream or in a different project.
+These are the load-bearing goals for ImageGlass_Mac. Every change in this
+repository should serve one of these five goals.
 
 ### 1. MCP Support
 
-Add a Model Context Protocol (MCP) server to ImageGlass so that **Claude Code
-(and other MCP clients) can drive and configure ImageGlass from outside the
-application**. The MCP server is the integration point that lets external AI
-tooling read and modify the Local Storage configuration described in Goal 4.
+Add a Model Context Protocol (MCP) server to ImageGlass_Mac so that
+**Claude Code (and other MCP clients) can drive and configure
+ImageGlass_Mac from outside the application**. The MCP server is the
+integration point that lets external AI tooling read and modify the Local
+Storage configuration described in Goal 4.
 
 * MCP is how the AI talks to the viewer.
 * MCP is how the AI edits scopes without the user opening the GUI.
@@ -31,7 +31,7 @@ tooling read and modify the Local Storage configuration described in Goal 4.
 
 ### 2. Modular UI Panels (New Column)
 
-Add a **new column** to the ImageGlass UI that hosts modular UI panels.
+Add a **new column** to the ImageGlass_Mac UI that hosts modular UI panels.
 
 * The initial panel is a **directory / filename panel** that lists the images
   and files that are currently in scope.
@@ -86,47 +86,41 @@ server, **Claude Code can**:
 
 ---
 
-## What ImageGlass Is (Upstream)
+## What ImageGlass_Mac Is
 
-ImageGlass is an open-source, ad-free photo viewer that has been in active
-development since 2010. It is designed as a fast, modern, and highly
-customizable replacement for the default Windows photo viewer, with broad
+ImageGlass_Mac is an open-source, ad-free photo viewer for macOS. It is
+designed as a fast, modern, and highly customizable image viewer with broad
 support for legacy, modern, and specialized image formats.
 
 - An open-source image previewer / viewer focused on speed and a clean UI.
-- A drop-in alternative for the default Windows Photos app.
+- A first-class macOS app: native window chrome, gestures, dark/light
+  system theme, Apple Silicon performance.
 - A platform for power users: themes, icon packs, language packs,
   command-line utilities, and integrations with third-party tools.
-- Free of advertisements; funded entirely by user donations and sponsorships.
+- Free of advertisements; funded entirely by user donations and
+  sponsorships.
 
-See `starbuck-fork.mdx` for the full description of the fork's additions and
-`about.mdx` for upstream project background.
+See `automation.mdx` for the full description of the MCP automation,
+panels, scopes, and Local Storage subsystems.
 
 ## Project At-a-Glance
 
 | Attribute | Value |
 | --- | --- |
-| Fork | ImageGlass Starbuck (this repo) |
-| Fork maintainer | Bryan Starbuck |
-| Upstream | [d2phap/ImageGlass](https://github.com/d2phap/ImageGlass) |
-| Upstream creator | Dương Diệu Pháp (Duong Dieu Phap) |
-| Current stable (upstream) | ImageGlass 9.5.0.515 |
-| Next major (upstream) | ImageGlass 10 Beta 1 (March 2026) — cross-platform rewrite |
-| First released | 2010 |
-| Years of development | 16+ |
-| Total downloads | 7,000,000+ |
-| GitHub stars | 13,281 |
-| GitHub forks | 705 |
+| Project | ImageGlass_Mac |
+| Maintainer | Bryan Starbuck |
 | License | GNU GPL v3 |
-| Platform (v9) | Windows |
-| Platform (v10) | Cross-platform via .NET + Avalonia UI |
-| Website | https://imageglass.org |
+| Platform | macOS (Apple Silicon primary; Intel supported) |
+| Minimum OS | macOS 14 (Sonoma); target macOS 15 (Sequoia) |
+| Language | Swift 6 |
+| UI framework | SwiftUI + AppKit interop |
 
-## Core Selling Points (Upstream)
+## Core Selling Points
 
-1. **90+ image formats** — WEBP, GIF, SVG, PNG, JXL, HEIC, RAW, and many more
-   via ImageMagick.
-2. **Fast and lightweight** — minimal resource consumption.
+1. **90+ image formats** — WEBP, GIF, SVG, PNG, JXL, HEIC, RAW, and many
+   more via the macOS ImageIO pipeline.
+2. **Fast and lightweight** — minimal resource consumption; native Apple
+   Silicon performance.
 3. **Highly personalizable** — themes, icon packs, language packs.
 4. **Clean, modern UI** — toolbar and layout are fully configurable.
 5. **Third-party app integration** — launch external editors with the
@@ -137,21 +131,13 @@ See `starbuck-fork.mdx` for the full description of the fork's additions and
 
 | File | Topic |
 | --- | --- |
-| `overview.mdx` | This document — fork charter + what ImageGlass is. |
-| `starbuck-fork.mdx` | Full detail on the Starbuck fork: MCP, panels, scopes, Local Storage. |
-| `about.mdx` | About the upstream project, history, philosophy, funding. |
-| `features.mdx` | Full upstream feature list (viewing, zoom, editing, metadata). |
+| `overview.mdx` | This document — charter + what ImageGlass_Mac is. |
+| `automation.mdx` | Full detail on MCP, panels, scopes, Local Storage. |
+| `features.mdx` | Full feature list (viewing, zoom, editing, metadata). |
 | `supported-formats.mdx` | All supported image formats and dependencies. |
-| `command-line.mdx` | `ImageGlass.exe` and `igcmd.exe` command-line usage. |
+| `command-line.mdx` | Command-line usage. |
 | `app-configs.mdx` | Configuration files, load order, priority. |
 | `themes.mdx` | What themes are, available themes, install. |
-| `theme-pack.mdx` | How to build a `.igtheme` pack. |
+| `theme-pack.mdx` | How to build a theme pack. |
 | `build-tools.mdx` | How to build third-party tools / extensions. |
 | `releases.mdx` | Recent releases, news, and roadmap. |
-
-## Source
-
-Upstream content here is derived from the official site at
-[imageglass.org](https://imageglass.org) — primarily the About page, docs,
-and news sections — as of 2026-06-02. Fork charter content is authored by
-Bryan Starbuck for this fork.

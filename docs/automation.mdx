@@ -1,24 +1,21 @@
 ---
-title: ImageGlass Starbuck Fork
-description: Detailed description of Bryan Starbuck's fork of ImageGlass — MCP support, modular UI panels, scope controls, Local Storage, and Claude Code integration.
+title: Automation, Panels, and Local Storage
+description: Detailed description of ImageGlass_Mac's MCP support, modular UI panels, scope controls, Local Storage, and Claude Code integration.
 ---
 
-# ImageGlass Starbuck Fork
+# Automation, Panels, and Local Storage
 
-This page describes, in detail, what makes the **ImageGlass Starbuck** fork
-different from the upstream ImageGlass project. The high-level charter lives
-in `overview.mdx`; this page is the deep dive.
-
-The fork is maintained by **Bryan Starbuck**. The upstream project remains
-[d2phap/ImageGlass](https://github.com/d2phap/ImageGlass), licensed under
-GNU GPL v3.
+This page describes, in detail, the architectural features that define
+ImageGlass_Mac as a programmable image viewer: MCP integration, modular UI
+panels, scope controls, and Local Storage. The high-level charter lives in
+`overview.mdx`; this page is the deep dive.
 
 ---
 
-## Why a Fork?
+## Why These Features?
 
-Upstream ImageGlass is excellent for **human-driven** image viewing. The
-Starbuck fork extends it for **AI-driven and workflow-driven** use:
+ImageGlass_Mac extends the standard image-viewer experience for
+**AI-driven and workflow-driven** use:
 
 * The user defines *scopes* (which directories / files matter right now).
 * The viewer reads those scopes from disk-backed Local Storage.
@@ -26,8 +23,8 @@ Starbuck fork extends it for **AI-driven and workflow-driven** use:
 * Claude Code (or any MCP client) edits scopes, swaps directory sets, and
   re-triggers evaluation without the user opening the GUI.
 
-The result: ImageGlass becomes a viewer **and** a programmable file-list
-surface that an AI assistant can drive.
+The result: ImageGlass_Mac is both a viewer **and** a programmable
+file-list surface that an AI assistant can drive.
 
 ---
 
@@ -35,7 +32,7 @@ surface that an AI assistant can drive.
 
 ### Goal
 
-Embed (or front) ImageGlass with a **Model Context Protocol** server so that
+Embed ImageGlass_Mac with a **Model Context Protocol** server so that
 external MCP clients — Claude Code in particular — can read and modify the
 viewer's configuration over a well-defined protocol.
 
@@ -43,7 +40,7 @@ viewer's configuration over a well-defined protocol.
 
 * MCP exposes the Local Storage data model (see §4) as the primary surface.
 * MCP is the **only sanctioned automation contract**. Ad-hoc IPC, file
-  scraping, or COM hooks are not part of this fork's design.
+  scraping, or other hooks are not part of the design.
 * MCP must be stable enough that a Claude Code workflow can rely on it
   across releases.
 
@@ -59,7 +56,7 @@ viewer's configuration over a well-defined protocol.
 
 ### Goal
 
-Add a **new column** to the ImageGlass main window that hosts modular UI
+The main window includes a dedicated **column** that hosts modular UI
 panels.
 
 ### Initial Panel: Directory / Filename Panel
@@ -79,7 +76,7 @@ source is always the resolved file list from Local Storage (§4).
 
 ### Panel Architecture
 
-* The new column is **panel-based**. Additional panels can be added later
+* The column is **panel-based**. Additional panels can be added later
   (e.g., a scope-editor panel, a metadata panel, a recent-runs panel).
 * Adding a new panel must not require modifying the core viewer.
 * Panels can be shown, hidden, or reordered by the user.
@@ -131,7 +128,7 @@ Each Local Storage entry records:
 ### Runtime Behavior
 
 1. Local Storage holds a list of **directories or criteria**.
-2. ImageGlass walks the matching **directory hierarchies**.
+2. ImageGlass_Mac walks the matching **directory hierarchies**.
 3. It finds the files that satisfy the scope.
 4. That resolved list is what shows up in the Directory / Filename panel
    (§2).
@@ -172,22 +169,5 @@ All of this happens **without the user editing settings inside the GUI**.
    directory, but exclude anything with `_old` in the name."*
 2. Claude Code calls the MCP server.
 3. The MCP server updates the Local Storage scope file.
-4. ImageGlass re-evaluates the scope.
+4. ImageGlass_Mac re-evaluates the scope.
 5. The Directory / Filename panel updates to show the resolved file list.
-
----
-
-## Relationship to Upstream ImageGlass
-
-The fork is **additive**:
-
-* The core viewer, format support, themes, configs, and command-line
-  utilities described in the rest of these docs all remain valid.
-* Upstream features such as 90+ image formats, customizable UI, EXIF
-  viewing, slideshow, etc. are untouched conceptually — see `features.mdx`
-  and `supported-formats.mdx`.
-* The fork's additions (MCP, panels, scopes, Local Storage) sit **next to**
-  the upstream viewer, not on top of it.
-
-The fork preserves upstream's GPL v3 license and credits the upstream
-project and its creator, Duong Dieu Phap.

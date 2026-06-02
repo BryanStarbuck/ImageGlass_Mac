@@ -72,9 +72,35 @@ public enum AppPaths {
         appSupportDir.appendingPathComponent("formats.json")
     }
 
+    /// Directory holding the panel-framework layout files (see `docs/panels.mdx` §6).
+    public static var layoutDir: URL {
+        appSupportDir.appendingPathComponent("layout", isDirectory: true)
+    }
+
+    public static var layoutFile: URL {
+        layoutDir.appendingPathComponent("layout.json")
+    }
+
+    public static var layoutBackupFile: URL {
+        layoutDir.appendingPathComponent("layout.json.bak")
+    }
+
+    public static var layoutPresetsDir: URL {
+        layoutDir.appendingPathComponent("presets", isDirectory: true)
+    }
+
     public static func ensureDirectories() throws {
         let fm = FileManager.default
         for dir in [appSupportDir, scopesDir, toolsDir, runtimeDir, ruleSetsDir, auditDir, languagesDir, themesDir] {
+            if !fm.fileExists(atPath: dir.path) {
+                try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            }
+        }
+    }
+
+    public static func ensureLayoutDirectories() throws {
+        let fm = FileManager.default
+        for dir in [layoutDir, layoutPresetsDir] {
             if !fm.fileExists(atPath: dir.path) {
                 try fm.createDirectory(at: dir, withIntermediateDirectories: true)
             }

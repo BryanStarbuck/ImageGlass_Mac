@@ -14,9 +14,9 @@ here. No subsystem writes its own log or error file.
 
 It cross-references:
 
-* [Starbuck Fork](./starbuck-fork.mdx) §1 — *MCP Support*. Every MCP
+* [Automation](./automation.mdx) §1 — *MCP Support*. Every MCP
   tool invocation is logged through this subsystem.
-* [Starbuck Fork](./starbuck-fork.mdx) §3–§5 — *Scope Controls* and
+* [Automation](./automation.mdx) §3–§5 — *Scope Controls* and
   *MCP-Driven Editing of Local Storage*. Every change to a scope's
   included directories or file filters is logged through this
   subsystem.
@@ -48,7 +48,7 @@ The fork has three properties that make a thoughtful logging layer
 non-optional:
 
 1. **MCP is the automation contract.** Claude Code drives
-   ImageGlass_Mac via MCP (see [Starbuck Fork §1](./starbuck-fork.mdx)).
+   ImageGlass_Mac via MCP (see [Automation §1](./automation.mdx)).
    When something goes wrong inside an MCP tool call, the user is
    often not at the keyboard — Claude is. A persistent, structured
    error trail is the only way to debug after the fact.

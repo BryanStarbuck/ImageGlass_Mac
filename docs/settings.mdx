@@ -23,7 +23,7 @@ It cross-references the sibling specs and does not duplicate them:
   Scope JSON files are not "settings" in the strict sense; the **Gallery**
   page below covers gallery-style file panel defaults, and scope persistence
   is fully spec'd in `list_of_files.mdx`.
-* [Starbuck Fork](./starbuck-fork.mdx) — overall fork charter. Read this
+* [Automation](./automation.mdx) — overall fork charter. Read this
   first if you have not already.
 
 The Mac stack used throughout this spec is the one declared in
@@ -97,7 +97,7 @@ Justification:
   per-install state that should not survive a config export. Putting these
   in `settings.json` would pollute MCP diffs every time a window moved.
 * **`settings.json` is plain text and inspectable.** It is the same
-  philosophy as the Local Storage scope files (see `starbuck-fork.mdx` §4):
+  philosophy as the Local Storage scope files (see `automation.mdx` §4):
   a binary blob would close off the MCP, hand-editing, and
   version-control workflows the fork explicitly wants to enable.
 

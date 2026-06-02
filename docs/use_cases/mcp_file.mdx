@@ -13,7 +13,7 @@ human (or a test) can verify the step actually worked.
 
 It is the user-facing companion to:
 
-* [Starbuck Fork](../starbuck-fork.mdx) §2 (panels) and §4–§5 (Local
+* [Automation](../automation.mdx) §2 (panels) and §4–§5 (Local
   Storage + MCP) — the charter being implemented.
 * [Panels](../panels.mdx) — the framework the file panel lives in.
 * [File List Panel](../list_of_files.mdx) — the panel itself, its
@@ -530,9 +530,170 @@ state instead of holding a stale image.
 
   returns `{ "files": [], "total": 0 }`.
 
+This empty state is also the precondition for §10: if the next MCP
+call introduces a new directory, the panel auto-selects the first
+image it finds.
+
 ---
 
-## 10. End-to-End Acceptance
+## 10. Auto-Select First Image When Viewer Is Empty
+
+When an MCP call introduces a new directory **and** the viewer is in
+the empty `No image previewed` state from §9, the panel walks the
+new directory hierarchy in the background and auto-selects the first
+image it finds. The selection lands in the file-tree UI without the
+user touching the keyboard or mouse.
+
+The rule exists so a Claude Code interaction like *"set up a scope
+for my screenshots and show me one"* lands the user looking at a
+real image without a second prompt.
+
+### 10.1 Trigger conditions — all must hold
+
+1. The viewer is in the empty state from §9 (no image loaded; either
+   `0 files` or the prior selection is no longer in scope).
+2. An incoming MCP call introduces at least one new source
+   directory. Specifically any of:
+   * `create_scope` with non-empty `criteria`,
+   * `update_scope` patch that adds a `criteria` entry with a `root`,
+   * `set_active_scope` to a scope whose `criteria` is non-empty.
+3. The new criteria, after applying `include_exts` / `exclude_globs`,
+   resolve to at least one file whose UTI conforms to `public.image`.
+
+If any condition fails the panel does **not** auto-advance — the
+viewer stays empty and waits for an explicit `select_file`. In
+particular:
+
+* If the viewer already shows an image, the user is mid-task and
+  auto-selection would yank their focus. Do nothing.
+* If the new criteria resolve to zero images (only `.txt`, for
+  example), the viewer stays empty.
+
+### 10.2 Walk + selection algorithm
+
+1. The MCP call writes the scope YAML and returns immediately. It
+   does **not** block on the walk.
+2. `ScopeWalker` enumerates the new directory hierarchies on a
+   background `Task` (off the main actor). The walk uses
+   `FileManager.enumerator(at:includingPropertiesForKeys:options:)`
+   with `.skipsHiddenFiles` and the scope's `exclude_globs`.
+3. **Order**: depth-first, children visited in lexicographic order by
+   filename. This makes "first image" deterministic and reproducible.
+4. As soon as the walker hits a path whose UTI conforms to
+   `public.image` and which passes the scope's
+   `include_exts` / `exclude_globs`, it posts a `firstImageFound(URL)`
+   message to the main actor and **continues the walk in the
+   background** for the rest of the resolved list.
+5. On the main actor, the panel:
+   * Re-checks the trigger conditions. If the viewer is no longer
+     empty (the user clicked something while the walk ran), the
+     auto-selection is abandoned and the walk continues silently.
+   * Otherwise: switches the file panel to **tree** view if it is
+     not already, expands the outline rows from each scope root down
+     to the file's parent directory, sets `selection = [URL]`,
+     scrolls the row into view, and loads the image in the viewer.
+6. The background walk continues until the full resolved list is
+   materialized and written to the scope YAML. The panel updates as
+   later batches arrive; the auto-selected file remains selected
+   unless the user moves the selection.
+
+### 10.3 Race and cancellation rules
+
+* If two MCP calls arrive in quick succession (e.g. `create_scope`
+  immediately followed by `update_scope`), only the most recent
+  walk's `firstImageFound` is honored. Earlier walks are canceled
+  via `Task.cancel()` and their pending callbacks are discarded.
+* If the user clicks any row in the panel between the MCP call and
+  `firstImageFound`, the auto-selection is canceled — the user is
+  now driving.
+* If the viewer is loaded via any other path (drag-from-Finder,
+  Cmd-O, MCP `select_file`) before `firstImageFound` arrives, the
+  auto-selection is canceled.
+
+### 10.4 Actions, in order
+
+This scenario starts from §9's empty state.
+
+1. Confirm the viewer is empty: status bar reads `0 files`; viewer
+   reads `No image previewed`.
+2. From Claude Code:
+
+   ```
+   update_scope(name="default", patch={
+       "add_criteria": [
+           { "root": "~/Pictures/tour", "recursive": true }
+       ]
+   })
+   ```
+
+### 10.5 Expected result
+
+* The MCP call returns within ~5 ms with `ok=true`. It does **not**
+  wait for the walk.
+* The file panel toolbar's refresh icon animates (spinning) while
+  the walk runs.
+* Within ~150 ms on the small `~/Pictures/tour` fixture (or ~1 s on
+  a 10 000-file fixture), the panel:
+  * Switches to tree view if it was not already.
+  * Expands `tour → beach`.
+  * Highlights row `001.jpg`.
+  * Scrolls the row into view.
+* The viewer loads `001.jpg` and renders it fit-to-window.
+* `default.yaml` `resolved:` continues filling in as the background
+  walk completes.
+
+The choice of `001.jpg` (not `peak.heic` or `notes_old.png`) follows
+from the depth-first lexicographic walk: `beach < mountains`, then
+within `beach`, `001.jpg < 002.jpg < notes_old.png`. `README.txt` is
+skipped because its UTI does not conform to `public.image`.
+
+### 10.6 Verify
+
+* On screen: the file panel's tree shows `▾ tour ▾ beach` and the
+  row `001.jpg` is highlighted; the viewer shows the image.
+* On disk:
+
+  ```sh
+  grep -E "mcp.update_scope|scope.evaluate|panel.auto_select_first" \
+      ~/Library/Application\ Support/ImageGlass_Mac/logs/log.log \
+      | tail -n 3
+  ```
+
+  shows three lines, in this order:
+
+  ```
+  ts=… tool=mcp.update_scope name=default corr=… ok=true
+  ts=… app=panel.auto_select_first scope=default path=…/beach/001.jpg corr=… reason=viewer_empty
+  ts=… app=scope.evaluate name=default count=5 elapsed_ms=… corr=…
+  ```
+
+  The `panel.auto_select_first` line is the proof that the
+  auto-selection fired. It carries the same `corr=` id as the
+  triggering MCP call so an auditor can join them.
+
+### 10.7 Negative cases that must NOT auto-select
+
+Each is a quick sub-scenario; together they prove the rule fires
+only when it should.
+
+* **Viewer already has an image.** Re-run the §4 add-directory call
+  while `001.jpg` is loaded. Verify: no `panel.auto_select_first`
+  line; the viewer continues to show `001.jpg`; the panel adds the
+  new files but the selection does not move.
+* **New criteria resolve to no images.** From the empty viewer, add
+  a directory that contains only `.txt` files. Verify: no
+  `panel.auto_select_first` line; the viewer stays empty;
+  `log.log` records `app=scope.evaluate count=0`.
+* **User clicks during the walk.** From the empty viewer, add a very
+  large directory. While the walk is still running, click any row
+  that has already appeared. Verify: `panel.auto_select_first` is
+  **not** written (the walker's first-image callback is discarded on
+  the main actor because `selection != []`), and the row the user
+  clicked remains selected.
+
+---
+
+## 11. End-to-End Acceptance
 
 A run of this tour passes when **all of**:
 
@@ -551,6 +712,12 @@ A run of this tour passes when **all of**:
   malformed call wrote `ok=false err=…` without mutating the scope.
 * §9 — clearing all criteria leaves the viewer in the explicit
   `No image previewed` empty state with `0 files` in the status bar.
+* §10 — from §9's empty state, an MCP call that introduces a
+  directory triggers a background walk, auto-selects the first
+  image (depth-first lexicographic), expands the tree to it,
+  highlights the row, and loads it in the viewer — and only fires
+  when the trigger conditions of §10.1 hold (negative cases in
+  §10.7 stay empty).
 
 If any step fails, the failing line in `log.log` (with its `corr=`
 correlation id) is the first place to look — joining it against the

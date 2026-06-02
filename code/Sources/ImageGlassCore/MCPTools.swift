@@ -15,19 +15,22 @@ public struct MCPTools {
     public let lock: MCPLock
     public let themeTools: ThemeMCPTools
     public let cropTools: CropMCPTools
+    public let panelTools: PanelMCPTools
 
     public init(
         storage: LocalStorage = .shared,
         toolStorage: ExternalToolStorage = .shared,
         lock: MCPLock = .shared,
         themeTools: ThemeMCPTools = ThemeMCPTools(),
-        cropTools: CropMCPTools = CropMCPTools()
+        cropTools: CropMCPTools = CropMCPTools(),
+        panelTools: PanelMCPTools = PanelMCPTools()
     ) {
         self.storage = storage
         self.toolStorage = toolStorage
         self.lock = lock
         self.themeTools = themeTools
         self.cropTools = cropTools
+        self.panelTools = panelTools
     }
 
     // MARK: - Descriptors
@@ -381,11 +384,11 @@ public struct MCPTools {
         // See Themes/ThemeMCPTools.swift.
         base.append(contentsOf: themeTools.descriptors())
         // Charter additions: rule sets, scope chains, audit, diff, import/export.
-        // See Charter/MCPTools+Charter.swift.
         base.append(contentsOf: charterDescriptors())
-        // Crop subsystem descriptors (crop_image, get/set_crop_selection).
-        // See Crop/CropMCPTools.swift.
+        // Crop subsystem (crop_image, get/set_crop_selection).
         base.append(contentsOf: cropTools.descriptors())
+        // Panel framework (list_panels, show/hide/move/tab, apply_layout_preset, ...).
+        base.append(contentsOf: panelTools.descriptors())
         return base
     }
 
@@ -458,10 +461,13 @@ public struct MCPTools {
                 if ThemeMCPTools.toolNames.contains(name) {
                     return try themeTools.call(name: name, arguments: arguments)
                 }
-                // Route crop tools (crop_image, get/set_crop_selection)
-                // through CropMCPTools. See Crop/CropMCPTools.swift.
+                // Route crop tools through CropMCPTools.
                 if CropMCPTools.toolNames.contains(name) {
                     return try cropTools.call(name: name, arguments: arguments)
+                }
+                // Route panel-framework tools through PanelMCPTools.
+                if PanelMCPTools.toolNames.contains(name) {
+                    return try panelTools.call(name: name, arguments: arguments)
                 }
                 return .text("Unknown tool: \(name)", isError: true)
             }

@@ -17,6 +17,11 @@ public final class AppState {
     public var showPanelColumn: Bool = true
     public var panelViewMode: PanelViewMode = .list
 
+    /// Layout of all modular panels (toolbar, file panel, status bar, ...).
+    /// Loaded from `layout.json` at bootstrap, persisted on every mutation.
+    /// See docs/panels.mdx.
+    public let panelLayout = PanelLayoutModel()
+
     /// Per-window viewer state (zoom mode, pan, rotation, overlays, ...).
     /// Lives here so menu commands and the SwiftUI viewer can share it.
     public var viewer: ViewerState = ViewerState()
@@ -89,9 +94,13 @@ public final class AppState {
     public func bootstrap() async {
         do {
             try AppPaths.ensureDirectories()
+            try AppPaths.ensureLayoutDirectories()
             await loadConfig()
             await loadSettings()
             themeStore.bootstrap()
+            PanelRegistry.shared.registerBuiltInPanels()
+            panelLayout.reloadFromDisk()
+            panelLayout.startWatching()
             let bootstrapped = try storage.bootstrapIfNeeded()
             await refreshScopeList()
             await activate(scopeNamed: bootstrapped)

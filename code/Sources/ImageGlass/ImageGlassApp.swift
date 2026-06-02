@@ -6,7 +6,6 @@ import ImageGlassCore
 @main
 struct ImageGlassApp: App {
     @State private var state: AppState
-    @State private var layout = LayoutController()
 
     // Owns the AppDelegate that overrides `orderFrontStandardAboutPanel`
     // so the default Apple About panel is replaced by `AboutView`.
@@ -30,15 +29,10 @@ struct ImageGlassApp: App {
 
     var body: some Scene {
         WindowGroup("ImageGlass") {
-            ContentView(state: state, layout: layout)
+            ContentView(state: state)
                 .frame(minWidth: 900, minHeight: 600)
                 .task {
-                    // Wire built-in view factories before bootstrapping the
-                    // controller — the controller's bootstrap registers the
-                    // descriptors and applies the active preset, which will
-                    // immediately query the view registry for factories.
                     registerBuiltinViewFactories(state: state)
-                    await layout.bootstrap(builtinDescriptors: BuiltinPanels.all)
                 }
         }
         .commands {
@@ -218,9 +212,9 @@ struct ImageGlassApp: App {
     @CommandsBuilder
     private var layoutMenuCommands: some Commands {
         CommandMenu("Layout") {
-            ForEach(Array(layout.document.allPresetsInDisplayOrder.prefix(9).enumerated()), id: \.element.id) { idx, preset in
-                Button(preset.name) {
-                    Task { await layout.applyPreset(named: preset.id) }
+            ForEach(Array(BuiltInPreset.allCases.enumerated()), id: \.element.rawValue) { idx, preset in
+                Button(preset.rawValue) {
+                    state.panelLayout.applyPreset(preset.rawValue)
                 }
                 .keyboardShortcut(KeyEquivalent(Character("\(idx + 1)")), modifiers: [.command, .option])
             }
@@ -305,7 +299,5 @@ private func registerBuiltinViewFactories(state: AppState) {
     let registry = PanelViewRegistry.shared
 
     let dirFn: () -> AnyView = { AnyView(DirectoryFilenamePanel(state: state)) }
-    registry.register(id: BuiltinPanels.directoryFilename.id, dirFn)
-    registry.register(id: BuiltinPanels.filePanel.id, dirFn)
-    registry.register(id: BuiltinPanels.fileTree.id, dirFn)
+    registry.register(id: BuiltInPanelCatalog.filePanel.id, dirFn)
 }

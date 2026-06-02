@@ -1,0 +1,147 @@
+import Foundation
+import Observation
+import SwiftUI
+import ImageGlassCore
+
+/// Observable wrapper around `PanelLayout`. The view tree observes this so
+/// changes (from the GUI or from `FSEventStream` after an MCP edit) re-render.
+/// Spec §8.3.
+@MainActor
+@Observable
+public final class PanelLayoutModel {
+    public private(set) var layout: PanelLayout
+
+    /// File watcher for `layout.json`. When an MCP-driven edit lands, this
+    /// reloads the file and republishes. Spec §6.4.
+    private var watcher: FileWatcher?
+
+    public init(layout: PanelLayout = LayoutStore.shared.load()) {
+        self.layout = layout
+    }
+
+    /// Start watching `layout.json` and the presets dir for external edits
+    /// (typically from MCP).
+    public func startWatching() {
+        stopWatching()
+        try? AppPaths.ensureLayoutDirectories()
+        let w = FileWatcher(url: AppPaths.layoutDir) { [weak self] in
+            Task { @MainActor in self?.reloadFromDisk() }
+        }
+        w.start()
+        self.watcher = w
+    }
+
+    public func stopWatching() {
+        watcher?.cancel()
+        watcher = nil
+    }
+
+    public func reloadFromDisk() {
+        let new = LayoutStore.shared.load()
+        if new != self.layout {
+            self.layout = new
+        }
+    }
+
+    // MARK: - Mutators (mirror the MCP surface)
+
+    public func showPanel(_ id: String) {
+        let descriptor = BuiltInPanelCatalog.descriptor(for: id)
+        let new = PanelLayoutMutations.showPanel(
+            layout,
+            id: id,
+            defaultPosition: descriptor?.defaultPosition ?? .right,
+            defaultSize: descriptor?.preferredSize ?? .init(width: 280, height: 600)
+        )
+        apply(new)
+    }
+
+    public func hidePanel(_ id: String) {
+        if let new = try? PanelLayoutMutations.hidePanel(layout, id: id) {
+            apply(new)
+        }
+    }
+
+    public func togglePanel(_ id: String) {
+        if layout.isVisible(id) {
+            hidePanel(id)
+        } else {
+            showPanel(id)
+        }
+    }
+
+    public func movePanel(_ id: String, to position: DockPosition) {
+        let descriptor = BuiltInPanelCatalog.descriptor(for: id)
+        if position == .floating, descriptor?.supportsFloating == false { return }
+        if let new = try? PanelLayoutMutations.movePanel(
+            layout,
+            id: id,
+            to: position,
+            preferredSize: descriptor?.preferredSize ?? .init(width: 320, height: 600)
+        ) {
+            apply(new)
+        }
+    }
+
+    public func setSize(panelID: String, size: CGFloat) {
+        if let new = try? PanelLayoutMutations.setPanelSize(layout, id: panelID, size: size) {
+            apply(new)
+        }
+    }
+
+    public func activateTab(in groupID: UUID, panel id: String) {
+        var new = layout
+        if let gIdx = new.groups.firstIndex(where: { $0.id == groupID }),
+           let pIdx = new.groups[gIdx].panelIDs.firstIndex(of: id) {
+            new.groups[gIdx].activeIndex = pIdx
+            apply(new)
+        }
+    }
+
+    public func applyPreset(_ name: String) {
+        if let builtIn = PresetCatalog.builtIn(named: name) {
+            apply(builtIn.layout())
+            return
+        }
+        if let user = try? LayoutStore.shared.loadUserPreset(name: name) {
+            apply(user)
+        }
+    }
+
+    public func saveCurrentLayout(name: String) {
+        try? LayoutStore.shared.saveUserPreset(name: name, layout: layout)
+    }
+
+    /// Toggle the active preset's "Reset" — reload the active preset from disk
+    /// (or from built-ins) discarding any unsaved user moves. Spec §10 ⌃⌘0.
+    public func resetToActivePreset() {
+        applyPreset(layout.activePreset.isEmpty ? BuiltInPreset.browser.rawValue : layout.activePreset)
+    }
+
+    /// Float-or-dock the active panel — toggles between floating and the
+    /// last docked position. Spec §10 ⌃⌘F.
+    public func toggleFloat(_ id: String) {
+        guard let descriptor = BuiltInPanelCatalog.descriptor(for: id),
+              descriptor.supportsFloating else { return }
+        if layout.position(of: id) == .floating {
+            // Move back to its built-in default docked position.
+            movePanel(id, to: descriptor.defaultPosition == .floating ? .right : descriptor.defaultPosition)
+        } else {
+            movePanel(id, to: .floating)
+        }
+    }
+
+    // MARK: - Apply (persists to disk)
+
+    private func apply(_ new: PanelLayout) {
+        guard new != layout else { return }
+        self.layout = new
+        // Persist; if persistence fails (e.g., schema violation), we still
+        // publish the new in-memory state so the user can recover.
+        do {
+            try LayoutStore.shared.save(new)
+        } catch {
+            NSLog("ImageGlass: failed to persist layout: \(error)")
+        }
+    }
+}

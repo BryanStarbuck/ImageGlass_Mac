@@ -15,7 +15,7 @@ and the panel-related MCP tools all must satisfy.
 
 It cross-references:
 
-* [Starbuck Fork](./starbuck-fork.mdx) §2 — *Modular UI Panels*. The
+* [Automation](./automation.mdx) §2 — *Modular UI Panels*. The
   charter that this spec implements.
 * [Settings → Layout](./settings.mdx) §4.5 — the discoverable
   visibility / preset index. Settings binds to and from the layout
@@ -267,7 +267,7 @@ as `layout/presets/<name>.json`.
 | `metadata` | Metadata | right | EXIF, IPTC, XMP, GPS, ICC profile. Reads via `CGImageSourceCopyPropertiesAtIndex`. |
 | `histogram` | Histogram | right (tabbed with `metadata`) | RGBA histogram via Core Image. |
 | `mcp_activity` | MCP activity | right | Live log of MCP tool calls, with client identity and latency. Toggled via `advanced.mcp.audit_log`. |
-| `local_storage` | Local storage | floating | Browse saved scope evaluations, last-run timestamps, file counts. See [Starbuck Fork](./starbuck-fork.mdx) §4. |
+| `local_storage` | Local storage | floating | Browse saved scope evaluations, last-run timestamps, file counts. See [Automation](./automation.mdx) §4. |
 | `plugins_log` | Plugins log | floating | Diagnostic panel for plugin authors. Hidden by default. |
 
 For each, the data source, contents, and interaction model are
