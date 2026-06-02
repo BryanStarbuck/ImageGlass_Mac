@@ -53,6 +53,20 @@ public final class ConfigLoader {
                 self.cli = cli
                 self.adminFile = adminFile
             }
+
+            /// Keys explicitly present in the admin file. Per spec, the UI
+            /// must not let the user mutate these — they are "locked" by
+            /// the highest-priority tier.
+            public var lockedKeys: Set<Config.Key> {
+                guard let admin = adminFile else { return [] }
+                return admin.presentKeys
+            }
+
+            /// `true` when `key` is overridden by the admin tier and thus
+            /// not editable by the user. Convenience for UI bindings.
+            public func isLocked(_ key: Config.Key) -> Bool {
+                lockedKeys.contains(key)
+            }
         }
     }
 
@@ -60,9 +74,9 @@ public final class ConfigLoader {
 
     /// Resolves the effective config without writing anything back.
     public func resolve(cli: CLIOverrides = CLIOverrides()) throws -> Resolution {
-        let defaultLayer = try readPartial(at: paths.defaultFileURL)
+        let defaultLayer = try readPartial(at: paths.effectiveDefaultFileURL)
         let userLayer    = try readPartial(at: paths.userFileURL)
-        let adminLayer   = try readPartial(at: paths.adminFileURL)
+        let adminLayer   = try readPartial(at: paths.effectiveAdminFileURL)
 
         var merged = Config.builtIn
         if let d = defaultLayer { merged = merged.applying(d) }
@@ -82,10 +96,28 @@ public final class ConfigLoader {
 
     /// Resolves the effective config and writes the result to
     /// `igconfig.json` in the Config Dir.
+    ///
+    /// When the Config Dir is read-only (portable mode on a write-protected
+    /// volume, locked-down install), the resolution is returned but the
+    /// write is silently skipped — the app must remain usable even when
+    /// it cannot persist. Callers can detect this by checking
+    /// `FileManager.fileExists(atPath:)` on the user file URL afterward,
+    /// or by observing the error thrown when `throwOnWriteFailure` is set.
     @discardableResult
-    public func resolveAndPersist(cli: CLIOverrides = CLIOverrides()) throws -> Resolution {
+    public func resolveAndPersist(
+        cli: CLIOverrides = CLIOverrides(),
+        throwOnWriteFailure: Bool = false
+    ) throws -> Resolution {
         let r = try resolve(cli: cli)
-        try save(r.config)
+        do {
+            try save(r.config)
+        } catch {
+            if throwOnWriteFailure { throw error }
+            // Read-only config dir is a recoverable condition — the app
+            // can still run with the in-memory config. Surface to the log
+            // so it's not silent.
+            NSLog("ImageGlass: could not persist igconfig.json (\(error.localizedDescription)) — continuing in read-only mode")
+        }
         return r
     }
 

@@ -229,4 +229,73 @@ final class ConfigLoaderTests: XCTestCase {
         XCTAssertFalse(r.config.showToolbar)
         XCTAssertFalse(r.config.showGallery)
     }
+
+    // MARK: - Locked keys (admin tier)
+
+    func testLockedKeysEmptyWhenNoAdminFile() throws {
+        let p = paths()
+        let r = try ConfigLoader(paths: p).resolve()
+        XCTAssertTrue(r.layers.lockedKeys.isEmpty)
+        XCTAssertFalse(r.layers.isLocked(.showToolbar))
+    }
+
+    func testLockedKeysReflectAdminFile() throws {
+        let p = paths()
+        try writeJSON(#"{"ShowToolbar": true, "WindowBackdrop": "Acrylic"}"#, to: p.adminFileURL)
+        let r = try ConfigLoader(paths: p).resolve()
+        XCTAssertEqual(r.layers.lockedKeys, [.showToolbar, .windowBackdrop])
+        XCTAssertTrue(r.layers.isLocked(.showToolbar))
+        XCTAssertTrue(r.layers.isLocked(.windowBackdrop))
+        XCTAssertFalse(r.layers.isLocked(.showGallery))
+    }
+
+    // MARK: - Bundle Resources fallback
+
+    func testBundleResourcesFallbackForDefaultFile() throws {
+        // Simulate an installer that ships `igconfig.default.json` inside
+        // the bundle's Resources directory. The Startup Dir has no copy —
+        // the loader must pick up the bundle copy.
+        let bundleRes = rootDir.appendingPathComponent("Resources", isDirectory: true)
+        try FileManager.default.createDirectory(at: bundleRes, withIntermediateDirectories: true)
+        try writeJSON(#"{"ShowToolbar": false}"#,
+                      to: bundleRes.appendingPathComponent(ConfigPaths.defaultFileName))
+        let p = ConfigPaths.resolve(
+            startupDir: startupDir,
+            userConfigDir: userDir,
+            bundleResourcesDir: bundleRes
+        )
+        let r = try ConfigLoader(paths: p).resolve()
+        XCTAssertFalse(r.config.showToolbar, "default file from Bundle.Resources should apply")
+    }
+
+    func testStartupDirWinsOverBundleResources() throws {
+        // When BOTH locations have the file, the Startup Dir (analog of the
+        // Windows install dir) takes precedence so a sysadmin override
+        // placed there is preferred over the installer-shipped copy.
+        let bundleRes = rootDir.appendingPathComponent("Resources", isDirectory: true)
+        try FileManager.default.createDirectory(at: bundleRes, withIntermediateDirectories: true)
+        try writeJSON(#"{"Language": "from-bundle"}"#,
+                      to: bundleRes.appendingPathComponent(ConfigPaths.defaultFileName))
+        let p = ConfigPaths.resolve(
+            startupDir: startupDir,
+            userConfigDir: userDir,
+            bundleResourcesDir: bundleRes
+        )
+        try writeJSON(#"{"Language": "from-startup"}"#, to: p.defaultFileURL)
+        let r = try ConfigLoader(paths: p).resolve()
+        XCTAssertEqual(r.config.language, "from-startup")
+    }
+
+    func testPortableFlagInBundleResourcesActivatesPortableMode() throws {
+        let bundleRes = rootDir.appendingPathComponent("Resources", isDirectory: true)
+        try FileManager.default.createDirectory(at: bundleRes, withIntermediateDirectories: true)
+        try Data().write(to: bundleRes.appendingPathComponent(ConfigPaths.portableFlagName))
+        let p = ConfigPaths.resolve(
+            startupDir: startupDir,
+            userConfigDir: userDir,
+            bundleResourcesDir: bundleRes
+        )
+        XCTAssertTrue(p.isPortable)
+        XCTAssertEqual(p.configDir, p.startupDir)
+    }
 }
