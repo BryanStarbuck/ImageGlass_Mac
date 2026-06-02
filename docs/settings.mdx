@@ -1324,7 +1324,7 @@ Five sections:
 
 | Setting | JSON key | Type | Default | MCP | Notes |
 | --- | --- | --- | --- | --- | --- |
-| Enable debug logging | `advanced.debug_logging` | `Bool` | `false` | R/W | Upstream `EnableDebug`. |
+| Enable debug logging | `advanced.debug_logging` | `Bool` | `false` | R/W | |
 | Allow unsigned plugins | `advanced.allow_unsigned_plugins` | `Bool` | `false` | R/W | |
 | MCP enabled | `advanced.mcp.enabled` | `Bool` | `true` | R/W | When `false`, the in-process server does not start. |
 | MCP transport | `advanced.mcp.transport` | `enum { stdio, unixSocket, httpSse }` | `stdio` | R/W | `stdio` is the default for Claude Code; `unixSocket` for long-running daemon use; `httpSse` for browser clients. |
@@ -1410,9 +1410,6 @@ The Settings subsystem ships when all of the following pass:
 * **Crash safety**: kill the process mid-write 100 times; on relaunch,
   either `settings.json` is the prior valid state or
   `settings.json.bak` is and we recover from it.
-* **Migration**: load 10 representative upstream `igconfig.json` files
-  from real users; every field that has a mapping must produce the
-  documented Mac value.
 * **Schema documentation**: every field in this spec has an entry in
   `Settings.schema.json` and `list_setting_paths()` returns it.
 * **Localization**: every label in the spec is keyed in `en.iglang` and

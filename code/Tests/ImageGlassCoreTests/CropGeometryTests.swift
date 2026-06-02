@@ -64,7 +64,7 @@ final class CropGeometryTests: XCTestCase {
 
     func testLockRatioKeepsLargerAxis() {
         // 400×400, target 16:9 → should grow whichever axis is closer.
-        let r = CropMath.lockRatio(width: 400, height: 400, ratioW: 16, ratioH: 9)
+        let r = LegacyCropMath.lockRatio(width: 400, height: 400, ratioW: 16, ratioH: 9)
         // 16:9 means h = w * 9/16 = 225. We're locking to a side that
         // keeps the larger relative dimension. Default axis (.either)
         // picks whichever requires less change.
@@ -74,22 +74,22 @@ final class CropGeometryTests: XCTestCase {
 
     func testLockRatioFreeRatioReturnsInputs() {
         // Invalid ratio → returns inputs unchanged (clamped non-negative).
-        let r = CropMath.lockRatio(width: 123, height: 456, ratioW: 0, ratioH: 0)
+        let r = LegacyCropMath.lockRatio(width: 123, height: 456, ratioW: 0, ratioH: 0)
         XCTAssertEqual(r.w, 123)
         XCTAssertEqual(r.h, 456)
     }
 
     func testSnapToStep() {
-        XCTAssertEqual(CropMath.snap(7, to: 8), 8)
-        XCTAssertEqual(CropMath.snap(4, to: 8), 8)
-        XCTAssertEqual(CropMath.snap(3, to: 8), 0)
-        XCTAssertEqual(CropMath.snap(16, to: 8), 16)
+        XCTAssertEqual(LegacyCropMath.snap(7, to: 8), 8)
+        XCTAssertEqual(LegacyCropMath.snap(4, to: 8), 8)
+        XCTAssertEqual(LegacyCropMath.snap(3, to: 8), 0)
+        XCTAssertEqual(LegacyCropMath.snap(16, to: 8), 16)
     }
 
     func testSnapToEdge() {
-        XCTAssertEqual(CropMath.snapToEdge(3, bound: 800, gravity: 8), 0)
-        XCTAssertEqual(CropMath.snapToEdge(795, bound: 800, gravity: 8), 800)
-        XCTAssertEqual(CropMath.snapToEdge(400, bound: 800, gravity: 8), 400)
+        XCTAssertEqual(LegacyCropMath.snapToEdge(3, bound: 800, gravity: 8), 0)
+        XCTAssertEqual(LegacyCropMath.snapToEdge(795, bound: 800, gravity: 8), 800)
+        XCTAssertEqual(LegacyCropMath.snapToEdge(400, bound: 800, gravity: 8), 400)
     }
 
     // MARK: - SelectionResizer
