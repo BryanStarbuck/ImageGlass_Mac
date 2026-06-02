@@ -29,6 +29,33 @@ public enum AboutInfo {
     /// current spec year 2026).
     public static let copyright = "© 2010–2026 Dương Diệu Pháp"
 
+    /// One-paragraph history blurb (spec: "over 16 years (since 2010)…
+    /// single maintainer who continues to work on the project in his
+    /// spare time").
+    public static let historyBlurb = """
+        ImageGlass is an open-source, ad-free photo viewer for Windows. \
+        It has been actively developed and maintained for over 16 years \
+        (since 2010) by a single maintainer who continues to work on \
+        the project in his spare time.
+        """
+
+    // MARK: - Version
+
+    /// Marketing version of this Mac fork. Sourced from the in-code
+    /// Releases catalog so the About surface and the Releases & News
+    /// window can never drift.
+    public static var appVersion: String {
+        if let mac = ReleasesCatalog.releases.first(where: { $0.origin == .macFork }) {
+            return mac.version
+        }
+        return "ImageGlass_Mac"
+    }
+
+    /// Short text shown next to the title — e.g. "Version ImageGlass_Mac 0.1".
+    public static var versionLine: String {
+        "Version \(appVersion)"
+    }
+
     // MARK: - Credits
 
     public struct Person: Sendable, Equatable {
@@ -110,6 +137,46 @@ public enum AboutInfo {
         GNU General Public License for more details.
         """
 
+    // MARK: - Recognition
+
+    /// A single recognition / milestone entry shown in the About surface.
+    /// Distinct from `ReleaseNote` because these are project-level events,
+    /// not software releases.
+    public struct Recognition: Sendable, Equatable, Identifiable {
+        public let title: String
+        public let detail: String
+        public var id: String { title }
+        public init(title: String, detail: String) {
+            self.title = title
+            self.detail = detail
+        }
+    }
+
+    /// Recognition entries pulled verbatim from the spec.
+    public static let recognition: [Recognition] = [
+        Recognition(
+            title: "WeAreDevelopers World Congress 2025 (Berlin)",
+            detail: "ImageGlass was selected for the Open Source Spotlight."
+        ),
+        Recognition(
+            title: "15-year anniversary",
+            detail: "Celebrated with the 9.3 release, which added enhanced Windows Explorer compatibility."
+        ),
+    ]
+
+    // MARK: - Distribution Channels
+
+    /// Items hosted by the official upstream website (spec: Distribution
+    /// Channels). Plain strings — these describe what `imageglass.org`
+    /// hosts and are not individually linkable.
+    public static let distributionChannels: [String] = [
+        "All software releases (stable and beta)",
+        "Theme packs (.igtheme)",
+        "Extension icon packs",
+        "Language packs",
+        "Developer tools / SDK for building third-party integrations",
+    ]
+
     // MARK: - Links
 
     public struct Link: Sendable, Equatable, Identifiable {
@@ -136,6 +203,20 @@ public enum AboutInfo {
             subtitle: "Source code, issues, and releases for the original Windows app",
             url: URL(string: "https://github.com/d2phap/ImageGlass")!
         )
+    ]
+
+    /// Legal documents published on the upstream website (spec).
+    public static let legalLinks: [Link] = [
+        Link(
+            title: "End-User License Agreement",
+            subtitle: "Published on the upstream website",
+            url: URL(string: "https://imageglass.org/license")!
+        ),
+        Link(
+            title: "Privacy Policy",
+            subtitle: "Published on the upstream website",
+            url: URL(string: "https://imageglass.org/privacy")!
+        ),
     ]
 
     /// Donation channels offered by upstream (per spec).

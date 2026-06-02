@@ -9,10 +9,14 @@ import ImageGlassCore
 /// vertical stack so the window stays usable at smaller heights.
 struct AboutView: View {
 
+    @State private var versionCopiedAt: Date?
+
     var body: some View {
         ScrollView(.vertical, showsIndicators: true) {
             VStack(alignment: .leading, spacing: 18) {
                 header
+                Divider()
+                historySection
                 Divider()
                 forkCreditSection
                 Divider()
@@ -20,9 +24,15 @@ struct AboutView: View {
                 Divider()
                 philosophySection
                 Divider()
+                recognitionSection
+                Divider()
                 donationsSection
                 Divider()
                 projectLinksSection
+                Divider()
+                distributionSection
+                Divider()
+                legalSection
                 Divider()
                 licenseSection
                 Divider()
@@ -32,21 +42,112 @@ struct AboutView: View {
             .padding(24)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .frame(minWidth: 520, idealWidth: 560, minHeight: 520, idealHeight: 640)
+        .frame(minWidth: 520, idealWidth: 560, minHeight: 520, idealHeight: 700)
     }
 
     // MARK: - Sections
 
     private var header: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(AboutInfo.projectName)
-                .font(.system(size: 26, weight: .semibold))
-            Text(AboutInfo.tagline)
-                .font(.title3)
-                .foregroundStyle(.secondary)
-            Text(AboutInfo.copyright)
+        HStack(alignment: .top, spacing: 16) {
+            appIcon
+                .frame(width: 96, height: 96)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 6) {
+                Text(AboutInfo.projectName)
+                    .font(.system(size: 26, weight: .semibold))
+                Text(AboutInfo.tagline)
+                    .font(.title3)
+                    .foregroundStyle(.secondary)
+                versionButton
+                Text(AboutInfo.copyright)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    /// Live `NSApp.applicationIconImage` so the icon stays in sync with
+    /// whatever the bundle ships (or what the user assigns at runtime).
+    private var appIcon: some View {
+        Image(nsImage: NSApp.applicationIconImage ?? NSImage(named: NSImage.applicationIconName) ?? NSImage())
+            .resizable()
+            .interpolation(.high)
+            .aspectRatio(contentMode: .fit)
+    }
+
+    /// Version line is a button — clicking it copies the version string
+    /// to the clipboard, which is the standard small affordance Apple
+    /// uses in their own About panels.
+    private var versionButton: some View {
+        let label: String = {
+            if let copiedAt = versionCopiedAt, Date().timeIntervalSince(copiedAt) < 1.5 {
+                return "Copied — \(AboutInfo.versionLine)"
+            }
+            return AboutInfo.versionLine
+        }()
+        return Button(action: copyVersionToClipboard) {
+            Text(label)
                 .font(.callout)
                 .foregroundStyle(.secondary)
+        }
+        .buttonStyle(.plain)
+        .help("Click to copy version to clipboard")
+        .accessibilityLabel(Text("Version \(AboutInfo.appVersion). Click to copy."))
+    }
+
+    private func copyVersionToClipboard() {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(AboutInfo.appVersion, forType: .string)
+        versionCopiedAt = Date()
+    }
+
+    private var historySection: some View {
+        Text(AboutInfo.historyBlurb)
+            .font(.callout)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var recognitionSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            sectionTitle("Recognition")
+            ForEach(AboutInfo.recognition) { r in
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(r.title).fontWeight(.semibold)
+                    Text(r.detail)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
+
+    private var distributionSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            sectionTitle("Distribution Channels")
+            Text("The official upstream site hosts:")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            ForEach(AboutInfo.distributionChannels, id: \.self) { item in
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text("•").foregroundStyle(.secondary)
+                    Text(item)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
+
+    private var legalSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            sectionTitle("Legal")
+            ForEach(AboutInfo.legalLinks) { link in
+                linkRow(link)
+            }
         }
     }
 
