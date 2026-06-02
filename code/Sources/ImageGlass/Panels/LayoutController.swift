@@ -158,6 +158,43 @@ public final class LayoutController {
         }
     }
 
+    /// Persists a divider-drag size change into the active preset's
+    /// `windows[0]` zone and schedules a save. Floating/hidden positions
+    /// are no-ops.
+    public func setZoneSize(at position: PanelPosition, to size: Double) {
+        let active = activePresetId
+        if let idx = document.presets.firstIndex(where: { $0.id == active }) {
+            applyZoneSize(at: position, to: size, presetIndex: idx, isUser: false)
+        } else if let idx = document.userPresets.firstIndex(where: { $0.id == active }) {
+            applyZoneSize(at: position, to: size, presetIndex: idx, isUser: true)
+        }
+        scheduleSave()
+    }
+
+    private func applyZoneSize(
+        at position: PanelPosition,
+        to size: Double,
+        presetIndex: Int,
+        isUser: Bool
+    ) {
+        var preset = isUser ? document.userPresets[presetIndex] : document.presets[presetIndex]
+        guard !preset.windows.isEmpty else { return }
+        var window = preset.windows[0]
+        switch position {
+        case .left:   window.zones.left.size   = size
+        case .right:  window.zones.right.size  = size
+        case .top:    window.zones.top.size    = size
+        case .bottom: window.zones.bottom.size = size
+        case .floating, .hidden: return
+        }
+        preset.windows[0] = window
+        if isUser {
+            document.userPresets[presetIndex] = preset
+        } else {
+            document.presets[presetIndex] = preset
+        }
+    }
+
     // MARK: - Persistence (debounced)
 
     /// Schedules a write to `layout.json`. Coalesces rapid mutations.

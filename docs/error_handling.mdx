@@ -1,0 +1,678 @@
+---
+title: Error Handling and Logging
+description: Product and engineering specification for the error-handling and logging subsystem of ImageGlass_Mac — the two on-disk files (error.err and log.log) under ~/Library/Application Support/ImageGlass_Mac/, the structured record schemas, the reusable Swift logging library that every other subsystem calls, the MCP-call audit trail, and the scope-edit audit trail.
+---
+
+# Error Handling and Logging
+
+This page is the **complete product + engineering specification** for
+how ImageGlass_Mac surfaces errors and logs significant events to
+disk. Every subsystem in the fork — the viewer canvas, the panels
+framework, the scope walker, Local Storage, the MCP server, the crop
+pipeline, the CLI — calls into the small reusable library defined
+here. No subsystem writes its own log or error file.
+
+It cross-references:
+
+* [Starbuck Fork](./starbuck-fork.mdx) §1 — *MCP Support*. Every MCP
+  tool invocation is logged through this subsystem.
+* [Starbuck Fork](./starbuck-fork.mdx) §3–§5 — *Scope Controls* and
+  *MCP-Driven Editing of Local Storage*. Every change to a scope's
+  included directories or file filters is logged through this
+  subsystem.
+* [File List Panel](./list_of_files.mdx) — the scope engine that
+  drives the file list is one of the heaviest producers of log
+  entries (scope re-evaluations, FSEvents debounce decisions,
+  thumbnail decode failures).
+* [App Configuration Files](./app-configs.mdx) — the on-disk
+  configuration store; this subsystem sits next to it under
+  `~/Library/Application Support/ImageGlass_Mac/`.
+* [Command-Line Utilities](./command-line.mdx) — the `igcmd` binary
+  links against the same library so CLI errors and CLI-triggered
+  scope changes land in the same files as GUI ones.
+
+The Mac stack used throughout: **Swift 6** (`actor` for the writer
+isolation, `Codable` for the on-disk record schemas, structured
+concurrency for non-blocking writes), **`os.Logger`** (Apple's
+unified logging system, `OSLog`) as the secondary sink so entries
+also appear in Console.app, **`FileHandle`** + `DispatchIO` for the
+append-only file writers, **`FileManager`** + security-scoped
+bookmarks for the Application Support directory, and **`Foundation`**
+`ISO8601DateFormatter` for timestamps.
+
+---
+
+## 1. Why a Dedicated Logging Subsystem
+
+The fork has three properties that make a thoughtful logging layer
+non-optional:
+
+1. **MCP is the automation contract.** Claude Code drives
+   ImageGlass_Mac via MCP (see [Starbuck Fork §1](./starbuck-fork.mdx)).
+   When something goes wrong inside an MCP tool call, the user is
+   often not at the keyboard — Claude is. A persistent, structured
+   error trail is the only way to debug after the fact.
+2. **Scopes are programmable.** Scopes change frequently and
+   silently, often from MCP, sometimes from the GUI. Without an
+   append-only audit of every scope edit, *"why is this file not
+   showing up?"* becomes unanswerable.
+3. **Reusable encapsulation cuts noise.** Without a shared library,
+   every subsystem writes ad-hoc `print` and `NSLog` calls. The
+   resulting log soup is unreadable. A single `ErrorReporter.report(...)`
+   / `EventLog.log(...)` API forces every site to produce the same
+   structured record.
+
+The user's product requirement is direct: *"Anything that can and
+could have an error, when it does have an error, we need to make sure
+the information gets out to the error file."* That requirement is
+this spec.
+
+---
+
+## 2. Goals and Non-goals
+
+### 2.1 Goals
+
+* **Two files, on disk, in plain text.** `error.err` and `log.log` in
+  `~/Library/Application Support/ImageGlass_Mac/`. Append-only.
+  Readable in any text editor; greppable from the terminal.
+* **One library, every subsystem calls it.** A single Swift module
+  (`ImageGlassLog`) exposes the only sanctioned error-reporting and
+  event-logging APIs. No `print`, no raw `NSLog`, no per-subsystem
+  log files anywhere else in the codebase.
+* **Rich error records.** Every error entry carries the five fields
+  the product brief calls out: timestamp, full source file path,
+  class + method, summary of what went wrong, and a free-form
+  details section.
+* **Auditable MCP activity.** Every MCP request and response is
+  recorded in `log.log` with enough context to replay the call and
+  understand what state it touched.
+* **Auditable scope changes.** Every change to a scope's included
+  directories, excluded directories, or file filters is recorded in
+  `log.log` with the before/after delta.
+* **Non-blocking writers.** Logging from the UI thread does not
+  stutter the viewer. Writes go through a serial actor and a
+  background `DispatchIO` channel.
+* **Rotation, not unbounded growth.** Both files rotate at a
+  configurable size; old generations are kept for a configurable
+  number of days.
+* **Console.app visibility.** Every entry that lands in `error.err`
+  or `log.log` is also emitted to `os.Logger`, so it shows up in
+  Console.app under the `org.imageglass.mac` subsystem.
+
+### 2.2 Non-goals
+
+* **No remote log shipping in v1.** No Sentry, no Datadog, no
+  network-attached log sink. The user can opt in to copying their
+  files manually; the fork does not phone home.
+* **No structured query engine in v1.** Greppable plain text is the
+  query interface. A future `igcmd log` subcommand may add `--since`,
+  `--level`, `--mcp-tool` filters; not required for v1.
+* **No PII redaction layer.** The user owns their machine; file
+  paths and scope criteria are recorded verbatim. Documented in the
+  Settings UI so the user knows.
+* **No log-driven crash reporting.** Apple's `CrashReporter` and the
+  signed app's notarized crash reports handle crashes. The error
+  file captures recoverable errors, not unrecoverable ones.
+
+---
+
+## 3. On-Disk Layout
+
+### 3.1 Directory
+
+All log artifacts live in a single directory:
+
+```text
+~/Library/Application Support/ImageGlass_Mac/
+├── igconfig.json                     # main app config (see app-configs.mdx)
+├── scopes/                           # Local Storage scope definitions
+│   └── *.json
+└── logs/
+    ├── error.err                     # current error file
+    ├── error.err.1.gz                # rotated generations, oldest with the highest index
+    ├── error.err.2.gz
+    ├── log.log                       # current event/audit file
+    ├── log.log.1.gz
+    └── log.log.2.gz
+```
+
+The product brief uses the unqualified names `error.err` and
+`log.log`. Both names are exactly as the user specified — there is
+**no** `imageglass-error.log` or `imageglass.audit.log`. The two file
+names are normative.
+
+### 3.2 File Roles
+
+| File | What it holds | Severity range |
+| --- | --- | --- |
+| `error.err` | Recoverable errors and worse. Every catch block, every failed I/O operation, every decode failure, every MCP tool that returned an error. | `ERROR`, `WARN` |
+| `log.log` | Significant non-error events. MCP requests/responses, scope edits, scope re-evaluations, panel layout saves, startup/shutdown, configuration loads. | `INFO`, `AUDIT`, `DEBUG` (opt-in) |
+
+A single event never lands in both files. An MCP tool that returned
+an error writes the request line to `log.log` (because it was a real
+MCP call worth auditing) **and** writes the error line to `error.err`
+(because the call failed). The two records share a correlation ID so
+they can be joined by grep.
+
+### 3.3 Permissions
+
+Both files are written with mode `0600` (user-only). The directory is
+`0700`. macOS sandboxing places the directory inside the app's
+container when the App Sandbox entitlement is enabled. When the app
+ships outside the sandbox (the GPL v3 / Developer ID build), the
+files live in the user's real `~/Library/Application Support/`.
+
+---
+
+## 4. Record Schemas
+
+Both files are **line-oriented**. Each line is a self-contained
+record. The records are human-readable first, machine-parseable
+second — they are not JSON Lines, but every field is keyed and
+unambiguous.
+
+### 4.1 `error.err` Record
+
+The required fields from the product brief are all present and
+named explicitly:
+
+```text
+2026-06-02T14:33:51.487-07:00  ERROR  [corr=8f3a2c1d]
+  file=/Users/bryan/BGit/tools_various/ImageGlass_Mac/Sources/ImageGlassMac/Scopes/ScopeWalker.swift:142
+  class=ScopeWalker
+  method=enumerate(scope:into:)
+  summary=Failed to enumerate directory inside scope "screenshots-2026-06"
+  details={
+    scope_id: "screenshots-2026-06"
+    failing_url: "/Users/bryan/screenshots/2026-06/raw/"
+    underlying_error: "NSFileReadNoPermissionError (Cocoa 257) — The operation couldn't be completed. (Cocoa error 257.)"
+    errno: 13
+    swift_error_type: "ScopeWalker.WalkError.permissionDenied"
+    stack: [
+      "ScopeWalker.enumerate(scope:into:) @ ScopeWalker.swift:142",
+      "ScopeWalker.evaluate(_:) @ ScopeWalker.swift:78",
+      "ScopeStore.reevaluate(_:reason:) @ ScopeStore.swift:233",
+      "MCPServer.handle(scope_reevaluate:) @ MCPServer+Scope.swift:91"
+    ]
+  }
+```
+
+Field rules:
+
+| Field | Required | Definition |
+| --- | --- | --- |
+| Timestamp | yes | ISO 8601 with millisecond precision and timezone offset. From `ISO8601DateFormatter` with `.withFractionalSeconds`. |
+| Level | yes | `ERROR` or `WARN`. `WARN` is reserved for degraded but successful operations (e.g., a thumbnail fell back to a generic icon). |
+| `corr` | yes | 8-hex-char correlation ID. Shared with any matching `log.log` lines (especially MCP requests). |
+| `file` | yes | **Absolute** path to the source file, followed by `:line`. Captured at the call site via `#file` and `#line`. The product brief explicitly requires the *full* path. |
+| `class` | yes | The enclosing type's name. Resolved at the call site by passing `String(describing: Self.self)` from inside the type, or set to `"<free function>"`. |
+| `method` | yes | The Swift method signature including argument labels, captured via `#function`. |
+| `summary` | yes | One-line human description, ≤120 chars. The "what went wrong." |
+| `details` | yes | A free-form block of `key: value` lines. Includes the underlying `Error` description, any relevant URLs, errno when applicable, the Swift error type name, and a captured call stack from `Thread.callStackSymbols` (top 16 frames, symbolicated). |
+
+The `details` block is delimited by `{` ... `}` and is allowed to
+span multiple lines so a stack trace remains readable. Every line
+that belongs to a record (continuation lines included) is indented
+two spaces; the next record starts at column 0 with a timestamp.
+This is the parser contract.
+
+### 4.2 `log.log` Record
+
+`log.log` is line-oriented with a tighter record shape — most lines
+fit on one line for `grep` and `tail -f` to be useful in a terminal.
+
+```text
+2026-06-02T14:33:50.991-07:00  INFO   [corr=8f3a2c1d]  mcp.request   tool=scope_reevaluate  client=claude-code/0.40.0  args={scope_id:"screenshots-2026-06"}
+2026-06-02T14:33:51.488-07:00  ERROR  [corr=8f3a2c1d]  mcp.response  tool=scope_reevaluate  status=failed  duration_ms=497  see=error.err
+2026-06-02T14:34:02.114-07:00  AUDIT  [corr=2a91be40]  scope.edit    scope_id="screenshots-2026-06"  actor=mcp  client=claude-code/0.40.0  delta={added_dirs:["~/Pictures/Figma_exports/"], removed_filters:["*_old.png"]}
+2026-06-02T14:34:02.130-07:00  INFO   [corr=2a91be40]  scope.eval    scope_id="screenshots-2026-06"  resolved=1842  added=27  removed=3  duration_ms=16
+```
+
+Field rules:
+
+| Field | Required | Definition |
+| --- | --- | --- |
+| Timestamp | yes | Same format as `error.err`. |
+| Level | yes | `INFO`, `AUDIT`, or (opt-in via Settings) `DEBUG`. |
+| `corr` | yes | Correlation ID. MCP request/response pairs share one. Scope edits share one with the eval that they trigger. |
+| Event name | yes | Dotted lowercase, e.g. `mcp.request`, `mcp.response`, `scope.edit`, `scope.eval`, `panel.layout.save`, `config.load`, `app.startup`, `app.shutdown`. The set of event names is closed and documented in §6. |
+| Key/value pairs | yes | Whitespace-separated `key=value`. Values that contain whitespace, equals signs, or quotes are JSON-encoded. Structured payloads (e.g., `delta`, `args`) are JSON object literals. |
+
+When the same correlation ID appears in `error.err` and `log.log`,
+the `log.log` line for that correlation ID carries `see=error.err`.
+That phrase is the join hint — a user (or Claude Code) reading
+`log.log` knows to grep `error.err` for that ID.
+
+### 4.3 Correlation IDs
+
+* 8 hex characters from a cryptographically random source
+  (`SystemRandomNumberGenerator`). Collisions are statistically
+  irrelevant within a single rotation window.
+* Generated at the entry edge: when an MCP request is received, when
+  a CLI command starts, when a GUI action fires, when a startup
+  sequence begins.
+* Propagated through Swift Concurrency via a `@TaskLocal` so any
+  error reported during that work inherits the same ID without
+  threading the value through every function signature.
+
+---
+
+## 5. The Reusable Library — `ImageGlassLog`
+
+The product brief calls out reusable error-handling code as a hard
+requirement. The library lives as a single SwiftPM target,
+`ImageGlassLog`, that every other target depends on.
+
+### 5.1 Public API Surface
+
+The whole public surface is small on purpose. Three types, four
+functions.
+
+```swift
+public enum LogLevel: String, Sendable {
+    case debug = "DEBUG"
+    case info  = "INFO"
+    case audit = "AUDIT"
+    case warn  = "WARN"
+    case error = "ERROR"
+}
+
+public struct ErrorContext: Sendable {
+    public let summary: String
+    public let details: [String: Any]
+    public let underlying: Error?
+    public init(summary: String, details: [String: Any] = [:], underlying: Error? = nil)
+}
+
+public enum CorrelationID {
+    @TaskLocal public static var current: String? = nil
+    public static func generate() -> String   // 8 hex chars
+    public static func with<T>(_ id: String, _ body: () async throws -> T) async rethrows -> T
+}
+
+public enum ErrorReporter {
+    /// Writes to error.err. Captures file/line/function via the default args.
+    public static func report(
+        _ context: ErrorContext,
+        level: LogLevel = .error,
+        file: String = #file,
+        line: Int = #line,
+        function: String = #function,
+        type: Any.Type? = nil           // pass `Self.self` from inside a type
+    )
+
+    /// Same as report(...) but takes a Swift Error and synthesizes the context.
+    public static func reportError(
+        _ error: Error,
+        summary: String? = nil,
+        details: [String: Any] = [:],
+        level: LogLevel = .error,
+        file: String = #file,
+        line: Int = #line,
+        function: String = #function,
+        type: Any.Type? = nil
+    )
+}
+
+public enum EventLog {
+    /// Writes to log.log.
+    public static func log(
+        event: String,                  // e.g. "mcp.request"
+        level: LogLevel = .info,
+        fields: [String: Any] = [:],
+        file: String = #file,
+        line: Int = #line,
+        function: String = #function
+    )
+}
+```
+
+### 5.2 Call Sites — What "Simple Call" Looks Like
+
+The product brief says *"the code makes a simple call and that does
+really great error handling."* That contract is what these examples
+show.
+
+A subsystem that throws:
+
+```swift
+final class ScopeWalker {
+    func enumerate(scope: Scope, into bag: inout FileBag) throws {
+        do {
+            for url in try fileManager.deepEnumerator(at: scope.root) {
+                bag.add(url)
+            }
+        } catch {
+            ErrorReporter.reportError(
+                error,
+                summary: "Failed to enumerate directory inside scope \"\(scope.id)\"",
+                details: [
+                    "scope_id": scope.id,
+                    "failing_url": scope.root.path,
+                    "errno": (error as NSError).code
+                ],
+                type: Self.self
+            )
+            throw ScopeWalker.WalkError.permissionDenied(scope.root)
+        }
+    }
+}
+```
+
+A subsystem that audits an MCP call:
+
+```swift
+EventLog.log(
+    event: "mcp.request",
+    fields: [
+        "tool": tool.name,
+        "client": connection.clientInfo,
+        "args": tool.args
+    ]
+)
+```
+
+A subsystem that warns rather than errors:
+
+```swift
+ErrorReporter.report(
+    ErrorContext(
+        summary: "Thumbnail decode fell back to generic icon",
+        details: ["url": url.path, "format": detectedFormat ?? "<unknown>"]
+    ),
+    level: .warn,
+    type: Self.self
+)
+```
+
+That is the entire pattern. There are no other sanctioned APIs.
+
+### 5.3 Internal Architecture
+
+```
++-----------------------------------+
+|  Call sites in every subsystem    |
+|  (ErrorReporter / EventLog)       |
++-----------------+-----------------+
+                  |
+                  v
++-----------------+-----------------+
+|  LogActor (Swift actor)           |
+|  - serializes formatting          |
+|  - assigns correlation IDs        |
+|  - applies redaction rules        |
++-----------------+-----------------+
+                  |
+        +---------+---------+
+        |                   |
+        v                   v
++---------------+   +----------------------+
+| FileSink      |   | OSLogSink            |
+| - DispatchIO  |   | - subsystem:         |
+|   append-only |   |     org.imageglass   |
+| - rotation    |   |     .mac             |
+|   trigger     |   | - category per file  |
++-------+-------+   +----------------------+
+        |
+        v
++---------------+
+| error.err     |
+| log.log       |
++---------------+
+```
+
+* The actor guarantees record ordering and prevents interleaved
+  half-written lines under concurrent writers.
+* `DispatchIO` provides the non-blocking append; the UI thread never
+  waits on a write.
+* The `OSLogSink` always runs in parallel so Console.app sees the
+  same stream live.
+* Rotation is checked on every Nth write (default N=64) and at
+  startup; it is not a wall-clock task.
+
+### 5.4 Crash Safety
+
+* Records are flushed to the kernel via `O_APPEND` writes; the
+  kernel guarantees atomic append for writes ≤ `PIPE_BUF` (4096
+  bytes on macOS).
+* Records that exceed that size are written via a single
+  `pwrite`-style call after acquiring the actor lock; the file
+  position is the kernel's append offset.
+* On `app.shutdown` the library calls `DispatchIO.close(flags:)`
+  with the synchronous-flush flag and joins before returning.
+* If the process is killed without shutdown, at most the in-flight
+  record is lost. The file is never left in a structurally broken
+  state because there is no header / checksum / footer to corrupt.
+
+---
+
+## 6. Closed Set of `log.log` Event Names
+
+A closed vocabulary keeps the audit file useful. Adding a new event
+name requires a doc-change in this section. The initial set:
+
+| Event | Level | Producer | Required fields |
+| --- | --- | --- | --- |
+| `app.startup` | INFO | App lifecycle | `version`, `build`, `arch`, `os` |
+| `app.shutdown` | INFO | App lifecycle | `uptime_ms`, `reason` |
+| `config.load` | INFO | Config loader | `path`, `source` (`default`/`user`/`admin`) |
+| `config.write` | AUDIT | Config writer | `path`, `keys_changed` |
+| `mcp.server.start` | INFO | MCP server | `transport`, `endpoint` |
+| `mcp.server.stop` | INFO | MCP server | `reason` |
+| `mcp.connection.open` | INFO | MCP server | `client`, `protocol_version` |
+| `mcp.connection.close` | INFO | MCP server | `client`, `reason` |
+| `mcp.request` | INFO | MCP server | `tool`, `client`, `args` |
+| `mcp.response` | INFO | MCP server | `tool`, `status`, `duration_ms` (and `see=error.err` if failed) |
+| `scope.create` | AUDIT | Scope store | `scope_id`, `actor` (`gui`/`mcp`/`cli`), `definition` |
+| `scope.delete` | AUDIT | Scope store | `scope_id`, `actor` |
+| `scope.edit` | AUDIT | Scope store | `scope_id`, `actor`, `delta` (added_dirs, removed_dirs, added_filters, removed_filters, added_excludes, removed_excludes) |
+| `scope.eval` | INFO | Scope walker | `scope_id`, `resolved`, `added`, `removed`, `duration_ms` |
+| `scope.bookmark.refresh` | INFO | Security-scoped bookmark service | `scope_id`, `urls_refreshed` |
+| `panel.layout.save` | INFO | Panels framework | `preset`, `panel_count` |
+| `panel.layout.load` | INFO | Panels framework | `preset` |
+| `crop.batch.start` | INFO | Crop pipeline | `count`, `output_dir` |
+| `crop.batch.end` | INFO | Crop pipeline | `count_ok`, `count_failed`, `duration_ms` |
+
+`scope.edit` and `mcp.request` are the two events the product brief
+explicitly names as worth keeping. They are both `AUDIT`/`INFO` and
+permanent — they are never gated behind a `DEBUG` flag.
+
+---
+
+## 7. Rotation, Retention, Size
+
+| Property | Default | Configurable in `igconfig.json` |
+| --- | --- | --- |
+| Rotate when `error.err` exceeds | 5 MB | `logging.errorFile.maxBytes` |
+| Rotate when `log.log` exceeds | 25 MB | `logging.eventFile.maxBytes` |
+| Keep rotated generations for | 14 days | `logging.retentionDays` |
+| Max number of rotated generations per file | 10 | `logging.maxGenerations` |
+| Compress rotated files with | gzip (`.gz`) | not configurable |
+| Mirror to `os.Logger` | yes | `logging.osLog.enabled` |
+| Include `DEBUG` lines in `log.log` | no | `logging.debugEnabled` |
+
+Rotation is non-destructive: `log.log` becomes `log.log.1`, the
+previous `log.log.1` becomes `log.log.2`, and so on; the oldest
+generation past `maxGenerations` is deleted. After the rename, the
+library reopens a fresh `log.log`. The same sequence applies to
+`error.err`.
+
+---
+
+## 8. MCP Activity Audit Trail (Worked Example)
+
+This is the canonical sequence for any MCP tool call. The reader
+should be able to reconstruct exactly what happened from just the
+two log files.
+
+User asks Claude Code: *"Add `~/Pictures/Figma_exports/` to my
+`screenshots-2026-06` scope and drop the `*_old.png` filter."*
+
+Claude Code issues an MCP `tool/call` to `scope_edit`.
+
+`log.log`:
+
+```text
+2026-06-02T14:34:02.110-07:00  INFO   [corr=2a91be40]  mcp.request   tool=scope_edit  client=claude-code/0.40.0  args={scope_id:"screenshots-2026-06", add_dirs:["~/Pictures/Figma_exports/"], remove_filters:["*_old.png"]}
+2026-06-02T14:34:02.114-07:00  AUDIT  [corr=2a91be40]  scope.edit    scope_id="screenshots-2026-06"  actor=mcp  client=claude-code/0.40.0  delta={added_dirs:["~/Pictures/Figma_exports/"], removed_filters:["*_old.png"]}
+2026-06-02T14:34:02.130-07:00  INFO   [corr=2a91be40]  scope.eval    scope_id="screenshots-2026-06"  resolved=1842  added=27  removed=3  duration_ms=16
+2026-06-02T14:34:02.132-07:00  INFO   [corr=2a91be40]  mcp.response  tool=scope_edit  status=ok  duration_ms=22
+```
+
+`error.err`: (nothing for this correlation ID)
+
+If `~/Pictures/Figma_exports/` were unreadable, the `scope.eval`
+line would be missing, `mcp.response` would carry `status=failed
+see=error.err`, and `error.err` would have a full record per §4.1
+with the same `corr=2a91be40`.
+
+---
+
+## 9. Scope-Edit Audit Trail (User Requirement Coverage)
+
+The product brief says:
+*"If it's about making changes to what directories are included and
+what file filters are passed, then we want to improve that."*
+
+The `scope.edit` event captures exactly that change set. The `delta`
+field is a JSON object with these keys (all optional):
+
+| Key | Meaning |
+| --- | --- |
+| `added_dirs` | Array of directory URLs newly included. |
+| `removed_dirs` | Array of directory URLs no longer included. |
+| `added_filters` | Array of glob/extension filters newly applied. |
+| `removed_filters` | Array of glob/extension filters no longer applied. |
+| `added_excludes` | Array of exclusion patterns newly applied. |
+| `removed_excludes` | Array of exclusion patterns no longer applied. |
+| `renamed_to` | New scope ID when the scope was renamed. |
+
+The `actor` field tells you who made the change:
+
+| `actor` | Meaning |
+| --- | --- |
+| `gui` | A user action in the SwiftUI scope editor panel. |
+| `mcp` | An MCP `scope_edit` / `scope_create` tool call. The `client` field is required and identifies the MCP client. |
+| `cli` | The `igcmd` binary. The `argv` field carries the invocation. |
+| `import` | A scope definition imported from a `.json` file. |
+
+A scope edit always triggers a `scope.eval` with the same `corr` ID
+so the consequence of the edit (how many files were added or
+dropped from the resolved list) is part of the same audit narrative.
+
+---
+
+## 10. Performance Budget
+
+The logging path is on the hot path for two heavy producers: the
+scope walker (millions of file URLs during initial walk of a large
+NAS scope) and the MCP request handler (potentially many calls per
+second from Claude Code). The library must not be the bottleneck.
+
+| Operation | Budget |
+| --- | --- |
+| `EventLog.log(...)` enqueue | < 5 µs on the calling thread (just an `os_unfair_lock` + queue append). |
+| `ErrorReporter.report(...)` enqueue | < 50 µs on the calling thread (slightly higher because the stack is captured). |
+| Background actor format + write | < 200 µs per record, target throughput ≥ 20 000 records/sec. |
+| Rotation latency | < 50 ms; happens on the background queue, not the UI thread. |
+
+The walker is allowed to suppress `scope.eval` debug detail when it
+would emit > 1 line per resolved file; `INFO` summarizes the run.
+Per-file errors during a walk are coalesced into a single
+`error.err` record per failure *category* (permission denied,
+unreadable, decode failed) with a `count=` field and a sample of
+the first three URLs.
+
+---
+
+## 11. Settings Surface
+
+The user can see and tune the logging subsystem from the Settings
+window (see [Settings](./settings.mdx) for the parent spec):
+
+* **Logs → Open Logs Folder** — reveals `~/Library/Application
+  Support/ImageGlass_Mac/logs/` in Finder.
+* **Logs → Open `error.err`** — opens the current error file in the
+  user's default text editor.
+* **Logs → Open `log.log`** — opens the current event file.
+* **Logs → Enable Debug Logging** — flips
+  `logging.debugEnabled` so the more verbose `DEBUG` records appear
+  in `log.log`. Off by default.
+* **Logs → Maximum File Size** — sliders for `error.err` and
+  `log.log` size caps.
+* **Logs → Retention (days)** — slider for `logging.retentionDays`.
+* **Logs → Mirror to Console.app** — toggles `logging.osLog.enabled`.
+
+A "Reveal full path" disclosure under each setting prints the
+absolute filesystem path so the user can copy-paste it into a
+terminal.
+
+---
+
+## 12. CLI Access
+
+The `igcmd` command-line tool (see
+[Command-Line Utilities](./command-line.mdx)) gains two read-only
+subcommands so users and Claude Code can inspect the logs without
+launching the GUI:
+
+```text
+igcmd log tail [--file error|log] [--follow] [--lines N]
+igcmd log grep [--file error|log|both] <pattern>
+```
+
+Both subcommands are thin wrappers over `tail(1)` / `grep(1)` that
+resolve the right path inside `~/Library/Application Support/
+ImageGlass_Mac/logs/` so the user does not have to remember it.
+
+`igcmd` itself logs through `ImageGlassLog`: every CLI invocation
+writes an `app.startup` / `app.shutdown` pair to `log.log` with the
+`argv` of the invocation, and any CLI-driven scope edit writes a
+`scope.edit` with `actor=cli`. CLI errors land in `error.err` with
+the same record shape as GUI errors.
+
+---
+
+## 13. Testing Requirements
+
+A subsystem this central is testable with deterministic XCTest /
+Swift Testing cases. The required test coverage:
+
+* **Record schema golden tests.** A representative
+  `ErrorContext` produces a byte-exact record matching a fixture
+  (modulo the timestamp). Same for every `log.log` event in §6.
+* **Correlation ID propagation.** A `CorrelationID.with(...)` block
+  that calls into a nested `async let` task and reports an error
+  there produces a record with the same `corr` ID.
+* **Concurrent writers.** 10 000 records produced from 32 concurrent
+  tasks land in `log.log` in monotonic-timestamp order with no
+  interleaved lines.
+* **Rotation.** Writing 6 MB into `error.err` with a 5 MB cap
+  produces `error.err` (post-rotation, small) plus `error.err.1.gz`
+  (containing the pre-rotation bytes); a second rotation produces
+  `error.err.2.gz`; exceeding `maxGenerations` deletes the oldest.
+* **OSLog mirror.** A record produced through `EventLog.log(...)`
+  is also queryable via `os_log_create_stream` for the
+  `org.imageglass.mac` subsystem.
+* **MCP audit completeness.** A simulated MCP `scope_edit` request
+  produces exactly the four `log.log` lines from §8 and no others.
+* **Scope walker error coalescing.** A walk over a directory with
+  100 permission-denied URLs produces a single `error.err` record
+  with `count=100` and `sample_urls` of the first three.
+
+---
+
+## 14. Out-of-Scope Items (Tracked for Later)
+
+These are not v1 but are explicitly *not* deferred forever:
+
+* JSON Lines export (`--format=jsonl`) for `igcmd log tail` so
+  log analysis tools can ingest the records.
+* A read-only MCP tool (`logs_tail`) that returns the last N lines
+  to Claude Code. Useful for AI-driven debugging once basic logging
+  works.
+* Per-subsystem `LogLevel` overrides via `igconfig.json` so the user
+  can silence one noisy producer.
+* Symbolicated stack traces for stripped release builds via dSYM
+  lookup at log-write time.

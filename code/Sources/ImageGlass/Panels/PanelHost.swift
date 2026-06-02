@@ -58,32 +58,49 @@ public struct PanelHost<Center: View>: View {
     private var leftZone: some View {
         zoneStack(at: .left)
             .frame(width: leftWidth)
-            .overlay(alignment: .trailing) { verticalDivider }
+            .overlay(alignment: .trailing) {
+                ResizableDivider(
+                    axis: .vertical, invert: false,
+                    size: $leftWidth,
+                    onCommit: { controller.setZoneSize(at: .left, to: Double($0)) }
+                )
+            }
     }
 
     private var rightZone: some View {
         zoneStack(at: .right)
             .frame(width: rightWidth)
-            .overlay(alignment: .leading) { verticalDivider }
+            .overlay(alignment: .leading) {
+                ResizableDivider(
+                    axis: .vertical, invert: true,
+                    size: $rightWidth,
+                    onCommit: { controller.setZoneSize(at: .right, to: Double($0)) }
+                )
+            }
     }
 
     private var topZone: some View {
         zoneStack(at: .top)
             .frame(height: topHeight)
-            .overlay(alignment: .bottom) { horizontalDivider }
+            .overlay(alignment: .bottom) {
+                ResizableDivider(
+                    axis: .horizontal, invert: false,
+                    size: $topHeight,
+                    onCommit: { controller.setZoneSize(at: .top, to: Double($0)) }
+                )
+            }
     }
 
     private var bottomZone: some View {
         zoneStack(at: .bottom)
             .frame(height: bottomHeight)
-            .overlay(alignment: .top) { horizontalDivider }
-    }
-
-    private var verticalDivider: some View {
-        Rectangle().fill(Color(NSColor.separatorColor)).frame(width: 1)
-    }
-    private var horizontalDivider: some View {
-        Rectangle().fill(Color(NSColor.separatorColor)).frame(height: 1)
+            .overlay(alignment: .top) {
+                ResizableDivider(
+                    axis: .horizontal, invert: true,
+                    size: $bottomHeight,
+                    onCommit: { controller.setZoneSize(at: .bottom, to: Double($0)) }
+                )
+            }
     }
 
     @ViewBuilder
@@ -204,5 +221,80 @@ public struct PanelHost<Center: View>: View {
         rightWidth = CGFloat(window.zones.right.isEmpty ? 0 : window.zones.right.size)
         topHeight = CGFloat(window.zones.top.isEmpty ? 0 : window.zones.top.size)
         bottomHeight = CGFloat(window.zones.bottom.isEmpty ? 0 : window.zones.bottom.size)
+    }
+}
+
+/// Tuning constants for the resizable split dividers.
+private enum DividerConst {
+    /// Width (vertical) / height (horizontal) of the invisible hit-zone the
+    /// drag gesture covers. ~5pt matches AppKit `NSSplitView`.
+    static let hitArea: CGFloat = 6
+    /// Smallest a zone can be dragged to before clamping.
+    static let minZone: CGFloat = 60
+    /// Largest a zone can be dragged to before clamping.
+    static let maxZone: CGFloat = 800
+}
+
+/// A draggable split divider that visually renders as a 1pt separator line
+/// but reserves a wider invisible hit-zone for the drag gesture.
+///
+/// `invert` is set on dividers that live on the *leading* edge of their zone
+/// (the right zone and bottom zone), where the drag direction is reversed:
+/// dragging left grows the right zone, dragging up grows the bottom zone.
+@MainActor
+private struct ResizableDivider: View {
+    enum Axis { case vertical, horizontal }
+
+    let axis: Axis
+    let invert: Bool
+    @Binding var size: CGFloat
+    let onCommit: (CGFloat) -> Void
+
+    /// Snapshot of `size` at gesture start so cumulative `translation`
+    /// values from `DragGesture` produce correct deltas across the whole
+    /// drag (translation is reported from the press, not the previous tick).
+    @State private var startSize: CGFloat? = nil
+
+    var body: some View {
+        ZStack {
+            Color.clear
+                .contentShape(Rectangle())
+                .onHover { hovering in
+                    if hovering {
+                        switch axis {
+                        case .vertical:   NSCursor.resizeLeftRight.push()
+                        case .horizontal: NSCursor.resizeUpDown.push()
+                        }
+                    } else {
+                        NSCursor.pop()
+                    }
+                }
+            Rectangle()
+                .fill(Color(NSColor.separatorColor))
+                .frame(
+                    width: axis == .vertical ? 1 : nil,
+                    height: axis == .horizontal ? 1 : nil
+                )
+        }
+        .frame(
+            width: axis == .vertical ? DividerConst.hitArea : nil,
+            height: axis == .horizontal ? DividerConst.hitArea : nil
+        )
+        .gesture(
+            DragGesture(minimumDistance: 1, coordinateSpace: .local)
+                .onChanged { value in
+                    let base = startSize ?? size
+                    if startSize == nil { startSize = base }
+                    let raw = axis == .vertical ? value.translation.width : value.translation.height
+                    let delta = invert ? -raw : raw
+                    size = max(DividerConst.minZone,
+                               min(DividerConst.maxZone, base + delta))
+                }
+                .onEnded { _ in
+                    let final = size
+                    startSize = nil
+                    onCommit(final)
+                }
+        )
     }
 }
