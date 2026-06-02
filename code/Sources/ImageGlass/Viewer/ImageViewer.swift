@@ -22,10 +22,32 @@ struct ImageViewer: View {
                     .onDrop(of: [.fileURL], delegate: FileDropDelegate(state: state))
                     .focusable()
                     .focusEffectDisabled()
-                    .onKeyPress(.leftArrow)  { state.selectPrevious(); return .handled }
-                    .onKeyPress(.rightArrow) { state.selectNext();     return .handled }
+                    .onKeyPress(.leftArrow)  { handleArrow(.left)  }
+                    .onKeyPress(.rightArrow) { handleArrow(.right) }
+                    .onKeyPress(.upArrow)    { handleArrow(.up)    }
+                    .onKeyPress(.downArrow)  { handleArrow(.down)  }
                     .onKeyPress(.space)      { viewer.zoomToActual();  return .handled }
+                    .onKeyPress(.escape) {
+                        if state.crop.isActive { state.crop.cancel(); return .handled }
+                        return .ignored
+                    }
+                    .onKeyPress("g") {
+                        if state.crop.isActive { state.crop.cycleGrid(); return .handled }
+                        return .ignored
+                    }
+                    .onKeyPress("1") { if state.crop.isActive { state.crop.aspectRatio = .freeRatio;  return .handled }; return .ignored }
+                    .onKeyPress("2") { if state.crop.isActive { state.crop.aspectRatio = .ratio1_1;   return .handled }; return .ignored }
+                    .onKeyPress("3") { if state.crop.isActive { state.crop.aspectRatio = .ratio4_3;   return .handled }; return .ignored }
+                    .onKeyPress("4") { if state.crop.isActive { state.crop.aspectRatio = .ratio3_2;   return .handled }; return .ignored }
+                    .onKeyPress("5") { if state.crop.isActive { state.crop.aspectRatio = .ratio16_9;  return .handled }; return .ignored }
+                    .onChange(of: state.selectedFile) { _, path in
+                        // Refresh crop selection on image change (spec §2.7).
+                        state.crop.bind(activeImage: nil, path: path)
+                    }
                 if let cropOverlay { cropOverlay() }
+                if state.crop.isActive {
+                    CropOverlay(controller: state.crop)
+                }
             } else {
                 emptyState
                     .onDrop(of: [.fileURL], delegate: FileDropDelegate(state: state))
@@ -42,6 +64,34 @@ struct ImageViewer: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(NSColor.windowBackgroundColor))
+    }
+
+    /// Arrow-key handler. When the crop tool is active, arrows nudge /
+    /// grow the selection per docs/crop.mdx §2.4. Otherwise they
+    /// navigate to prev / next image.
+    private enum ArrowDir { case left, right, up, down }
+    private func handleArrow(_ dir: ArrowDir) -> KeyPress.Result {
+        if state.crop.isActive {
+            let mods = NSEvent.modifierFlags
+            let shift = mods.contains(.shift)
+            let cmd = mods.contains(.command)
+            let mag: CGFloat = shift ? 10 : 1
+            switch (cmd, dir) {
+            case (false, .left):  state.crop.nudge(dx: -mag, dy: 0); return .handled
+            case (false, .right): state.crop.nudge(dx:  mag, dy: 0); return .handled
+            case (false, .up):    state.crop.nudge(dx: 0, dy: -mag); return .handled
+            case (false, .down):  state.crop.nudge(dx: 0, dy:  mag); return .handled
+            case (true,  .left):  state.crop.grow(dw: -mag, dh: 0); return .handled
+            case (true,  .right): state.crop.grow(dw:  mag, dh: 0); return .handled
+            case (true,  .up):    state.crop.grow(dw: 0, dh: -mag); return .handled
+            case (true,  .down):  state.crop.grow(dw: 0, dh:  mag); return .handled
+            }
+        }
+        switch dir {
+        case .left:  state.selectPrevious(); return .handled
+        case .right: state.selectNext();     return .handled
+        default: return .ignored
+        }
     }
 
     private var emptyState: some View {

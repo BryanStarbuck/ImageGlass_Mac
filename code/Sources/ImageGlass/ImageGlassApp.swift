@@ -40,6 +40,50 @@ struct ImageGlassApp: App {
                 }
             }
             viewerMenuCommands
+            cropMenuCommands
+        }
+    }
+
+    // MARK: - Crop menu
+
+    @CommandsBuilder
+    private var cropMenuCommands: some Commands {
+        CommandMenu("Crop") {
+            Button(state.crop.isActive ? "Close Crop Tool" : "Open Crop Tool") {
+                if state.crop.isActive {
+                    state.crop.cancel()
+                } else {
+                    state.crop.bind(activeImage: nil, path: state.selectedFile)
+                    state.crop.open()
+                }
+            }
+            .keyboardShortcut("k", modifiers: [.command])
+            Divider()
+            Button("Apply Crop (Replace)") {
+                _ = try? state.crop.applyAndReplace()
+            }
+            .keyboardShortcut(.return, modifiers: [])
+            .disabled(!state.crop.isActive || state.crop.rect == nil)
+            Button("Save") {
+                _ = try? state.crop.applySaveInPlace()
+            }
+            .keyboardShortcut("s", modifiers: [.command])
+            .disabled(!state.crop.isActive || state.crop.rect == nil)
+            Button("Save As…") {
+                _ = try? state.crop.applySaveAs()
+            }
+            .keyboardShortcut("s", modifiers: [.command, .shift])
+            .disabled(!state.crop.isActive || state.crop.rect == nil)
+            Button("Copy") {
+                try? state.crop.copyToClipboard()
+            }
+            .keyboardShortcut("c", modifiers: [.command])
+            .disabled(!state.crop.isActive || state.crop.rect == nil)
+            Divider()
+            Button("Reset Selection") { state.crop.resetSelection() }
+                .disabled(!state.crop.isActive)
+            Button("Cycle Grid Overlay") { state.crop.cycleGrid() }
+                .disabled(!state.crop.isActive)
         }
     }
 

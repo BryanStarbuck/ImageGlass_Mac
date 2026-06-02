@@ -9,9 +9,16 @@ struct ContentView: View {
             DirectoryFilenamePanel(state: state)
                 .frame(minWidth: 220, idealWidth: 280)
         } detail: {
-            VStack(spacing: 0) {
-                ImageViewer(state: state, viewer: state.viewer)
-                statusBar
+            HStack(spacing: 0) {
+                VStack(spacing: 0) {
+                    ImageViewer(state: state, viewer: state.viewer)
+                    statusBar
+                }
+                if state.crop.isActive {
+                    Divider()
+                    CropPanelView(controller: state.crop)
+                        .background(.regularMaterial)
+                }
             }
         }
         .navigationTitle(windowTitle)

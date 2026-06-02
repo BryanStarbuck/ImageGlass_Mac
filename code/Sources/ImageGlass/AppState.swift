@@ -21,6 +21,11 @@ public final class AppState {
     /// Lives here so menu commands and the SwiftUI viewer can share it.
     public var viewer: ViewerState = ViewerState()
 
+    /// Crop tool controller (docs/crop.mdx §5.1). Lives at AppState scope
+    /// so the menu commands, overlay, and panel all bind to the same
+    /// instance.
+    public var crop: CropController = CropController()
+
     /// Merged, effective configuration produced by `ConfigLoader`. Loaded
     /// during `bootstrap()` from the three igconfig.* tiers + CLI overrides.
     public var config: Config = .builtIn
