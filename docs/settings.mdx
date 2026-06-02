@@ -1138,7 +1138,7 @@ All tiers.
 
 | Setting | JSON key | Type | Default | MCP | Notes |
 | --- | --- | --- | --- | --- | --- |
-| Language code | `language.code` | `String` (BCP-47, e.g. `en-US`) | system | R/W | Upstream `Language` is an `IgLang` object identified by file name; the Mac fork uses BCP-47 codes mapped to language pack files at load time. |
+| Language code | `language.code` | `String` (BCP-47, e.g. `en-US`) | system | R/W | BCP-47 codes are mapped to language pack files at load time. |
 
 #### Backend wiring
 
@@ -1181,13 +1181,13 @@ defaults live in Settings.
 
 | Setting | JSON key | Type | Default | MCP | Notes |
 | --- | --- | --- | --- | --- | --- |
-| Aspect ratio | `tools.crop.aspect_ratio` | `enum { freeRatio, oneToOne, fourToThree, threeToTwo, sixteenToNine, sixteenToTen, twentyOneToNine, golden, custom }` | `freeRatio` | R/W | Upstream `SelectionAspectRatio`. |
-| Custom aspect values | `tools.crop.aspect_values` | `[Int]` (length 2) | `[0, 0]` | R/W | Used when `aspect_ratio = custom`. Upstream `AspectRatioValues`. |
-| Close tool after saving | `tools.crop.close_after_save` | `Bool` | `false` | R/W | Upstream `CloseToolAfterSaving`. |
-| Initial selection type | `tools.crop.init_selection` | `enum { useLastSelection, customArea, selectAll, selectNone, select10Percent, select20Percent, select25Percent, select30Percent, selectOneThird, select40Percent, select50Percent, select60Percent, selectTwoThirds, select70Percent, select75Percent, select80Percent, select90Percent }` | `select50Percent` | R/W | Upstream `DefaultSelectionType`. |
-| Initial selection rect | `tools.crop.init_rect` | `[Int]` (length 4) | `[0,0,0,0]` | R/W | `[x, y, w, h]`. Used when `init_selection = customArea`. Upstream `InitSelectedArea`. |
-| Center the initial selection | `tools.crop.auto_center` | `Bool` | `true` | R/W | Upstream `AutoCenterSelection`. |
-| Remember selection across images | `tools.crop.persistent_selection` | `Bool` | `false` | R/W | **New for Mac**, useful for batch-cropping a folder. Discussed in `crop.mdx`. |
+| Aspect ratio | `tools.crop.aspect_ratio` | `enum { freeRatio, oneToOne, fourToThree, threeToTwo, sixteenToNine, sixteenToTen, twentyOneToNine, golden, custom }` | `freeRatio` | R/W | |
+| Custom aspect values | `tools.crop.aspect_values` | `[Int]` (length 2) | `[0, 0]` | R/W | Used when `aspect_ratio = custom`. |
+| Close tool after saving | `tools.crop.close_after_save` | `Bool` | `false` | R/W | |
+| Initial selection type | `tools.crop.init_selection` | `enum { useLastSelection, customArea, selectAll, selectNone, select10Percent, select20Percent, select25Percent, select30Percent, selectOneThird, select40Percent, select50Percent, select60Percent, selectTwoThirds, select70Percent, select75Percent, select80Percent, select90Percent }` | `select50Percent` | R/W | |
+| Initial selection rect | `tools.crop.init_rect` | `[Int]` (length 4) | `[0,0,0,0]` | R/W | `[x, y, w, h]`. Used when `init_selection = customArea`. |
+| Center the initial selection | `tools.crop.auto_center` | `Bool` | `true` | R/W | |
+| Remember selection across images | `tools.crop.persistent_selection` | `Bool` | `false` | R/W | Useful for batch-cropping a folder. Discussed in `crop.mdx`. |
 | Default output format | `tools.crop.default_output_format` | `enum { auto, jpeg, png, webp, heic, avif, tiff }` | `auto` | R/W | `auto` means write back in the source format when supported. |
 | Default output quality | `tools.crop.default_output_quality` | `Int` (1–100) | `90` | R/W | |
 | Prefer lossless JPEG | `tools.crop.lossless_jpeg` | `Bool` | `true` | R/W | When true and the crop rectangle is MCU-aligned, write via libjpeg-turbo `tjTransform`. See `crop.mdx`. |
@@ -1196,19 +1196,19 @@ defaults live in Settings.
 
 | Setting | JSON key | Type | Default | MCP | Notes |
 | --- | --- | --- | --- | --- | --- |
-| Show RGB alpha | `tools.color_picker.show_rgb_alpha` | `Bool` | `true` | R/W | Upstream `ShowRgbWithAlpha`. |
-| Show HEX alpha | `tools.color_picker.show_hex_alpha` | `Bool` | `true` | R/W | Upstream `ShowHexWithAlpha`. |
-| Show HSL alpha | `tools.color_picker.show_hsl_alpha` | `Bool` | `true` | R/W | Upstream `ShowHslWithAlpha`. |
-| Show HSV alpha | `tools.color_picker.show_hsv_alpha` | `Bool` | `true` | R/W | Upstream `ShowHsvWithAlpha`. |
-| Show CIELAB alpha | `tools.color_picker.show_cielab_alpha` | `Bool` | `true` | R/W | Upstream `ShowCIELabWithAlpha`. |
-| Default copy format | `tools.color_picker.copy_format` | `enum { rgb, hex, hsl, hsv, cieLab, swift_color, ns_color }` | `hex` | R/W | **New for Mac**: `swift_color` writes `Color(red: r/255, green: g/255, blue: b/255)`; `ns_color` writes `NSColor(deviceRed: …)`. |
+| Show RGB alpha | `tools.color_picker.show_rgb_alpha` | `Bool` | `true` | R/W | |
+| Show HEX alpha | `tools.color_picker.show_hex_alpha` | `Bool` | `true` | R/W | |
+| Show HSL alpha | `tools.color_picker.show_hsl_alpha` | `Bool` | `true` | R/W | |
+| Show HSV alpha | `tools.color_picker.show_hsv_alpha` | `Bool` | `true` | R/W | |
+| Show CIELAB alpha | `tools.color_picker.show_cielab_alpha` | `Bool` | `true` | R/W | |
+| Default copy format | `tools.color_picker.copy_format` | `enum { rgb, hex, hsl, hsv, cieLab, swift_color, ns_color }` | `hex` | R/W | `swift_color` writes `Color(red: r/255, green: g/255, blue: b/255)`; `ns_color` writes `NSColor(deviceRed: …)`. |
 | Show in panel | `tools.color_picker.show_in_panel` | `Bool` | `false` | R/W | When true, the color picker is a docked panel (see `panels.mdx`); when false, it's a floating `NSPanel`. |
 
 #### 4.14.3 Tools → Page Navigation
 
 | Setting | JSON key | Type | Default | MCP | Notes |
 | --- | --- | --- | --- | --- | --- |
-| Show frame nav tool | `tools.frame_nav.show` | `Bool` | `false` | R/W | Mirrors `viewer.show_frame_nav`. Upstream `ShowFrameNavTool`. |
+| Show frame nav tool | `tools.frame_nav.show` | `Bool` | `false` | R/W | Mirrors `viewer.show_frame_nav`. |
 | Auto-play animated frames | `tools.frame_nav.auto_play` | `Bool` | `true` | R/W | |
 | Frame step | `tools.frame_nav.frame_step` | `Int` | `1` | R/W | Default frames advanced per next/prev. |
 
@@ -1222,9 +1222,6 @@ tool automatically adds a sub-tab.
 ---
 
 ### 4.15 Plugins
-
-> **New page in the fork.** Upstream has informal plugin support
-> (ImageMixture) without a dedicated Settings page.
 
 #### Goals
 
@@ -1292,10 +1289,6 @@ panel" badge → user opens the new Histogram panel via the View menu.
 ---
 
 ### 4.16 Advanced
-
-> **New page in the fork.** Consolidates power-user surfaces that
-> upstream scatters across multiple tabs or hides behind config-file
-> editing.
 
 #### Goals
 

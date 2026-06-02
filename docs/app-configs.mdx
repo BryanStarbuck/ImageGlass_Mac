@@ -5,27 +5,27 @@ description: igconfig.default.json, igconfig.json, igconfig.admin.json — load 
 
 # App Configuration Files
 
-ImageGlass is configured entirely through JSON files. There is no
+ImageGlass_Mac is configured entirely through JSON files. There is no
 proprietary database or binary settings store — every setting is plain
 text, version-control-friendly, and easy to script.
 
 ## File Locations
 
-There are two directories ImageGlass uses:
+There are two directories ImageGlass_Mac uses:
 
 | Directory | Path | Notes |
 | --- | --- | --- |
-| **Startup Dir** | Where `ImageGlass.exe` is installed (e.g., `C:\Program Files\ImageGlass\`) | Read-only for ordinary users; controlled by installer / admin. |
-| **Config Dir** | `%LocalAppData%\ImageGlass\` by default; equals the Startup Dir in **portable mode** | Writable by the user; contains the live settings. |
+| **App Bundle Dir** | `/Applications/ImageGlass_Mac.app/Contents/Resources/` | Read-only; controlled by installer / admin. Contains shipped defaults. |
+| **Config Dir** | `~/Library/Application Support/ImageGlass_Mac/` | Writable by the user; contains the live settings. |
 
 ## The Three Configuration Files
 
-ImageGlass recognizes three configuration files, processed in order:
+ImageGlass_Mac recognizes three configuration files, processed in order:
 
-### 1. `igconfig.default.json` (Startup Dir)
+### 1. `igconfig.default.json` (App Bundle Dir)
 
 Specifies **default settings** that apply on first launch when no other
-settings exist. Ships with the installer, edited by app vendors or
+settings exist. Ships with the app, edited by app vendors or
 deployment teams to set sensible defaults for new users.
 
 ### 2. `igconfig.json` (Config Dir)
@@ -34,7 +34,7 @@ The **live user settings**. Written by the app on close. Takes precedence
 over the default file. This is the file you'd back up to preserve a user's
 configuration.
 
-### 3. `igconfig.admin.json` (Startup Dir)
+### 3. `igconfig.admin.json` (App Bundle Dir)
 
 The **admin override**. Settings here override everything — defaults,
 user settings, and even command-line arguments. Used to lock down
@@ -48,40 +48,34 @@ specific options in managed environments.
 4. Command-line arguments (prefixed with `/`).
 5. `igconfig.admin.json` values. **Highest priority — cannot be overridden.**
 
-After applying all sources, ImageGlass writes the resulting merged
+After applying all sources, ImageGlass_Mac writes the resulting merged
 configuration back to `igconfig.json` for the next session.
 
 ## Command-Line Overrides
 
 Any setting can be overridden at launch via `/Setting=Value`:
 
-```text
-ImageGlass.exe /ShowToolbar=false /ShowGallery=false /WindowBackdrop="Acrylic"
+```bash
+ImageGlass_Mac /ShowToolbar=false /ShowGallery=false
 ```
 
 Quotes are required for values that contain spaces.
 
-## Portable Mode
-
-In portable mode, the **Config Dir equals the Startup Dir** — all files
-live next to `ImageGlass.exe`. This is useful for USB-stick installs and
-for keeping a per-machine configuration co-located with the binaries.
-
 ## Deployment Patterns
 
 **Single-machine user customization**
-Edit `igconfig.json` directly in `%LocalAppData%\ImageGlass\`. ImageGlass
-writes any subsequent changes here.
+Edit `igconfig.json` directly in `~/Library/Application Support/ImageGlass_Mac/`.
+ImageGlass_Mac writes any subsequent changes here.
 
 **Locked-down enterprise install**
-1. Install ImageGlass system-wide.
-2. Place `igconfig.admin.json` in the install directory with the locked
-   settings.
+1. Install ImageGlass_Mac system-wide.
+2. Place `igconfig.admin.json` in the app bundle's Resources directory
+   with the locked settings.
 3. Optionally provide `igconfig.default.json` with non-locked defaults.
 
 Because admin-tier values override everything, users physically cannot
-change those settings through the UI without admin access to the install
-folder.
+change those settings through the UI without admin access to the
+install folder.
 
 **Mass deployment with custom defaults but user-editable**
 Ship `igconfig.default.json` only — users will get the defaults on first

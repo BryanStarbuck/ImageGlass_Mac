@@ -1,91 +1,88 @@
 ---
-title: Building Tools for ImageGlass
-description: Authoring third-party tools that integrate with ImageGlass.
+title: Building Tools for ImageGlass_Mac
+description: Authoring third-party tools that integrate with ImageGlass_Mac.
 ---
 
-# Building Tools for ImageGlass
+# Building Tools for ImageGlass_Mac
 
-ImageGlass exposes a small SDK that lets external programs integrate
+ImageGlass_Mac exposes a small SDK that lets external programs integrate
 tightly with the viewer — receive image-loaded events, respond to user
 actions, and pass the currently displayed image to your tool.
 
 ## Prerequisites
 
-- **Visual Studio 2022**
-- **C#**
-- **.NET 6** or later
+- **Xcode 16+**
+- **Swift 6**
+- macOS 14 (Sonoma) or later
 
 ## Step-by-Step
 
 ### 1. Create a project
 
-Start a new C# project in Visual Studio. Console app, WinForms, WPF, or
-WinUI all work — the SDK is UI-framework-agnostic.
+Start a new Swift project in Xcode. A command-line tool, AppKit app, or
+SwiftUI app all work — the SDK is UI-framework-agnostic.
 
-### 2. Install the `ImageGlass.Tools` NuGet package
+### 2. Add the `ImageGlassTools` Swift package
 
-Either:
+In Xcode: **File → Add Packages…** and add the `ImageGlassTools` package,
+or declare it as a dependency in `Package.swift`:
 
-```text
-Install-Package ImageGlass.Tools
+```swift
+.package(url: "https://github.com/.../ImageGlassTools.git", from: "1.0.0")
 ```
-
-…or add the `ImageGlass.Tools.csproj` directly as a project reference.
 
 ### 3. Instantiate the tool class
 
-```csharp
-var igTool = new ImageGlassTool();
+```swift
+let igTool = ImageGlassTool()
 ```
 
 ### 4. Register event handlers
 
 The two events most tools care about:
 
-- `ToolMessageReceived` — fires when ImageGlass sends your tool a message
-  (e.g., a new image was loaded).
-- `ToolClosingRequest` — fires when ImageGlass is shutting down or has
-  asked the tool to close.
+- `toolMessageReceived` — fires when ImageGlass_Mac sends your tool a
+  message (e.g., a new image was loaded).
+- `toolClosingRequest` — fires when ImageGlass_Mac is shutting down or
+  has asked the tool to close.
 
-```csharp
-igTool.ToolMessageReceived += OnMessageReceived;
-igTool.ToolClosingRequest  += OnClosing;
+```swift
+igTool.onMessage = { event in handleMessage(event) }
+igTool.onClosing = { handleClosing() }
 ```
 
 ### 5. Implement the handlers
 
 Messages are typed by name. The most common one:
 
-- `IMAGE_LOADED` — a new image is now displayed in ImageGlass. Payload
-  includes the full file path.
+- `IMAGE_LOADED` — a new image is now displayed in ImageGlass_Mac.
+  Payload includes the full file path.
 
-```csharp
-private static void OnMessageReceived(object? sender, ToolMessageEventArgs e)
-{
-    if (e.MessageName == "IMAGE_LOADED")
-    {
-        var path = e.MessageData?.ToString();
+```swift
+func handleMessage(_ event: ToolMessageEvent) {
+    if event.name == "IMAGE_LOADED" {
+        let path = event.data as? String
         // …react to the new image…
     }
 }
 ```
 
-### 6. Connect to ImageGlass
+### 6. Connect to ImageGlass_Mac
 
-```csharp
-await igTool.ConnectAsync();
+```swift
+try await igTool.connect()
 ```
 
 This opens an IPC channel back to the viewer. Once connected, events
 start flowing.
 
-## Registering the Tool in ImageGlass
+## Registering the Tool in ImageGlass_Mac
 
-There are two ways to make ImageGlass aware of your tool.
+There are two ways to make ImageGlass_Mac aware of your tool.
 
 ### Option A — UI
 
-1. Open ImageGlass.
+1. Open ImageGlass_Mac.
 2. Go to **Settings → Tools**.
 3. Click **Add…**.
 4. Provide a unique tool ID, the path to your executable, optional
@@ -105,29 +102,29 @@ Add an entry under the `Tools` section with:
 
 ## The `<file>` Placeholder
 
-When you launch a tool from ImageGlass with arguments that include
-`<file>`, ImageGlass substitutes the full path of the currently displayed
-image. Example tool entry:
+When you launch a tool from ImageGlass_Mac with arguments that include
+`<file>`, ImageGlass_Mac substitutes the full path of the currently
+displayed image. Example tool entry:
 
 ```json
 {
   "ToolId": "my-editor",
-  "Executable": "C:\\Tools\\MyEditor\\editor.exe",
+  "Executable": "/usr/local/bin/my-editor",
   "Arguments": "--open <file>",
-  "Hotkey": "Ctrl+E"
+  "Hotkey": "⌘E"
 }
 ```
 
-Pressing `Ctrl+E` while viewing `C:\Photos\sunset.jpg` would launch:
+Pressing `⌘E` while viewing `~/Pictures/sunset.jpg` would launch:
 
-```text
-C:\Tools\MyEditor\editor.exe --open "C:\Photos\sunset.jpg"
+```bash
+/usr/local/bin/my-editor --open "~/Pictures/sunset.jpg"
 ```
 
 ## Example Use Cases
 
-- **ExifGlass** — companion EXIF metadata viewer (officially maintained).
-- **External editors** — launch Photoshop, GIMP, or Krita with the current
-  image in one keystroke.
+- **EXIF metadata viewer** — companion metadata inspector.
+- **External editors** — launch Photoshop, GIMP, Acorn, or Pixelmator
+  with the current image in one keystroke.
 - **Batch processors** — append the current image to a processing queue.
 - **Cloud sync helpers** — upload the displayed image to a remote service.

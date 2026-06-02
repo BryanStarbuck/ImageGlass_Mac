@@ -367,6 +367,379 @@ to a named scope with the panel toolbar's `[Save scope as…]` action.
 
 ---
 
+## 3A. The File Tree Panel — `directories.yaml` and Live Walker
+
+This section pins down the **file tree** rendering mode (§2.4) and
+its dedicated storage file. The file tree is the only rendering mode
+that shows the source directory hierarchy directly, so it is also
+the mode that the MCP `add_directory` / `remove_directory` /
+`update_directory_filter` calls drive most visibly.
+
+Walked end-to-end as a user scenario in
+[use_cases/mcp_file.mdx](./use_cases/mcp_file.mdx). That tour is the
+**user-facing acceptance** for this section — every behavior
+specified here must match the tour's verify steps.
+
+### 3A.1 `directories.yaml`
+
+The file tree panel's canonical storage is a single YAML file:
+
+```
+~/Library/Application Support/ImageGlass_Mac/directories.yaml
+```
+
+It maps **one-to-one** with what the file tree UI renders. Each
+top-level row in the tree is one entry in `root_directories:`. Each
+file shown underneath a row is a leaf in the recursive walk of that
+root that passed the built-in file-kind filter *and* the root's
+per-root filter.
+
+The file is the source of truth for the panel. There is **no**
+hidden binary state — the GUI and the MCP server read and write the
+same file. Writes are atomic (temp file + rename); the panel reloads
+via `FSEventStream` on the file itself.
+
+Relationship to §3's `scopes/<name>.json`:
+
+* `directories.yaml` is the file tree panel's **own** store. It is
+  not a scope file. It exists independently of the multi-scope
+  feature.
+* When a multi-scope user is using a named scope, the file tree
+  panel can be bound to it via the scope picker — at that point the
+  panel renders the active scope's `criteria[]` and ignores
+  `directories.yaml`. The default (and the case the MCP file tour
+  covers) is the standalone `directories.yaml`.
+* The data model in `directories.yaml` is a deliberate **subset** of
+  the scope schema — only the fields the file tree panel needs.
+
+### 3A.2 Schema
+
+```yaml
+schema_version: 1
+root_directories:
+  - path: /Users/bryan/Pictures/tour/beach
+    filter:
+      match: any           # 'any' = OR (default), 'all' = AND
+      items:
+        - pattern: "*.jpg"
+          kind: glob       # 'glob' (default), 'substring', 'regex'
+          negate: false    # true = exclude matches (default false = include)
+        - pattern: "*.heic"
+    last_walked: 2026-06-02T10:18:42Z
+  - path: /Users/bryan/Pictures/tour/mountains
+    filter:
+      items: []            # empty = no per-root filter; everything that passes
+                           # the built-in image/SVG/video filter is included
+```
+
+Field rules:
+
+| Field | Required | Notes |
+| --- | --- | --- |
+| `schema_version` | yes | Integer. Currently `1`. |
+| `root_directories` | yes | Array. Empty array is valid — see §3A.10. |
+| `root_directories[].path` | yes | Absolute path. Must be canonicalized (no `~`, no `..`). The MCP server expands and canonicalizes before writing. |
+| `root_directories[].filter` | no | If omitted, equivalent to `{ match: any, items: [] }` — i.e. include everything that passes the built-in file-kind filter. |
+| `filter.match` | no | `any` (OR) is default. `all` (AND) is the alternative. |
+| `filter.items[].pattern` | yes (per item) | The string the matcher tests against the filename (not the full path) by default. |
+| `filter.items[].kind` | no | `glob` (default, uses `fnmatch(3)` semantics with `*`, `?`, `[abc]`), `substring` (case-insensitive substring match against the filename), `regex` (POSIX-extended). |
+| `filter.items[].negate` | no | `false` by default. When `true`, a match means "exclude this file." |
+| `last_walked` | written by walker | ISO-8601 instant. Set by the background walker on every completed walk. |
+
+### 3A.3 Built-in file-kind filter
+
+Independent of any per-root filter, only files of these kinds are
+ever considered:
+
+* **Images** — every UTI conforming to `public.image` (JPEG, PNG,
+  HEIC, HEIF, WebP, AVIF, JXL, TIFF, GIF, BMP, RAW family, etc.).
+* **SVG** — `public.svg-image`.
+* **Video** — every UTI conforming to `public.movie` (MP4, MOV, M4V,
+  HEVC, AVI, MKV — exact set bounded by what AVFoundation can decode
+  on the running OS).
+
+Everything else (`.txt`, `.pdf`, `.zip`, `.sketch`, …) is dropped at
+the walker stage and is never inserted into the in-memory tree, so
+it can never appear in the panel or be re-considered when a filter
+changes. The built-in filter is not configurable from
+`directories.yaml`; it is the panel's hard-wired contract.
+
+### 3A.4 Root directory — in-memory data structure
+
+```swift
+struct RootDirectory: Sendable {
+    let path: URL                       // canonical absolute path
+    var filter: RootFilter              // per-root filter (§3A.2)
+    var tree: DirectoryNode             // the recursive in-memory mirror
+    var lastWalked: Date?
+    var watcher: FileSystemWatcher?     // recursive FSEventStream
+}
+
+indirect enum DirectoryNode: Sendable {
+    case directory(name: String,
+                   children: [DirectoryNode])
+    case file(name: String,
+              uti: UTType,
+              kind: FileKind,           // .image | .svg | .video
+              passesFilter: Bool)       // result of applying RootFilter
+}
+
+struct RootFilter: Sendable {
+    enum Match: Sendable { case any, all }
+    enum ItemKind: Sendable { case glob, substring, regex }
+    struct Item: Sendable {
+        let pattern: String
+        let kind: ItemKind
+        let negate: Bool
+    }
+    var match: Match
+    var items: [Item]
+}
+```
+
+Key invariants:
+
+* **The tree is recursive and complete** — every directory under
+  the root that the walker visited is represented, including
+  directories that contain no matching files. This is what the
+  Outline view renders.
+* **Only `.image`, `.svg`, and `.video` files appear in `.file`
+  nodes.** Other files are dropped at walk time and never enter the
+  tree at all.
+* **`passesFilter`** is the cached result of evaluating `RootFilter`
+  against the file's name. It is updated by `recomputePassesFilter`
+  whenever the filter changes (§3A.7), without re-touching the
+  filesystem.
+* The tree is built once per walk and mutated in place by
+  `FSEventStream` callbacks (§3A.6). It is never rebuilt from
+  scratch unless the root directory itself becomes inaccessible.
+
+### 3A.5 Background walker thread
+
+Each file tree panel owns one background actor — the
+**file-tree walker** — that runs for the lifetime of the panel,
+**even when the panel is hidden or collapsed**. The walker is the
+only thing that touches the filesystem on the panel's behalf.
+
+```swift
+actor DirectoryTreeWalker {
+    private var roots: [URL: RootDirectory] = [:]
+    private var sleeping: Bool = true        // see §3A.5.2
+
+    func addRoot(_ path: URL, filter: RootFilter) async { /* §3A.5.1 */ }
+    func removeRoot(_ path: URL) async { /* tear down watcher, drop from roots */ }
+    func updateFilter(for path: URL, filter: RootFilter) async { /* §3A.7 */ }
+
+    func snapshot() -> [RootDirectory] { Array(roots.values) }
+}
+```
+
+The walker exists per-panel, but its work is `Task.detached(priority:
+.utility)` so it does not contend with the UI. Mutations to the
+in-memory `RootDirectory` graph are actor-isolated. The
+@MainActor view model reads via `snapshot()` and renders the
+SwiftUI `OutlineGroup` from that snapshot.
+
+#### 3A.5.1 Adding a root
+
+When `addRoot(path, filter)` is called (from a menu action, a drag,
+or an MCP `add_directory`):
+
+1. The walker enumerates `path` recursively with
+   `FileManager.enumerator(at:includingPropertiesForKeys:options:)`,
+   filtering at the UTI gate to **image / SVG / video only**.
+2. As entries arrive, the walker builds the `DirectoryNode` tree
+   and computes `passesFilter` for each `.file` node using
+   `RootFilter`.
+3. When the walk completes, the walker registers an
+   **`FSEventStream` recursive watch** on `path` so subsequent
+   add/remove/rename events under the hierarchy call back into the
+   walker (§3A.6).
+4. The walker sets `lastWalked = .now`, writes the new state into
+   `directories.yaml` (atomic), and posts a `rootChanged` event so
+   the panel re-renders.
+
+The MCP call returns as soon as step 1 begins; the walk is async,
+identical to the behavior covered in
+[mcp_file.mdx](./use_cases/mcp_file.mdx) §10.
+
+#### 3A.5.2 Sleep / wake
+
+The walker is mostly idle. To reduce wake-ups on a battery:
+
+* When all FS watchers are quiet for `idleTrigger = 30 s`, the
+  walker marks itself `sleeping = true`. The actor task suspends on
+  its message queue (no work; no CPU).
+* Any of these wake it: an `FSEventStream` callback fires, a panel
+  action arrives (menu / drag / MCP), or a periodic
+  `NSBackgroundActivityScheduler` heartbeat (every 6 h) requests a
+  reconciliation pass.
+* Wake-up cost is < 1 ms; the walker does not re-walk the filesystem
+  on wake — it just resumes processing whatever message woke it.
+
+This sleep/wake behavior is the user-promised contract that the file
+tree panel is "running even when the component is turned off."
+
+### 3A.6 Recursive FS watching per root
+
+Every `RootDirectory` carries one `FileSystemWatcher` wrapping an
+`FSEventStream` started with `kFSEventStreamCreateFlagFileEvents`
+and `kFSEventStreamCreateFlagWatchRoot`. The stream is created with
+the root path and watches the entire hierarchy under it.
+
+On a callback:
+
+* For each changed path, the walker classifies the event:
+  `.created`, `.removed`, `.renamed`, `.modified`.
+* The walker updates the in-memory `DirectoryNode` tree in place:
+  new `.image / .svg / .video` files are inserted with
+  `passesFilter` computed; removed files are dropped; renames are
+  modeled as remove+create.
+* Events are debounced 250 ms (matches §6.6). A bulk `cp -R` of 5000
+  files collapses into a single SwiftUI render pass.
+* Non-image / non-SVG / non-video events are discarded immediately.
+
+The watcher survives the panel being hidden — that is the point of
+§3A.5's "runs even when the component is turned off." Closing the
+panel does **not** tear the watcher down; only `removeRoot` does.
+
+### 3A.7 Filter re-evaluation — no re-walk
+
+When the user (or MCP) changes the filter for a root via
+`updateFilter`, the walker **does not touch the filesystem**. It
+walks the in-memory `DirectoryNode` tree and recomputes
+`passesFilter` on every `.file` node:
+
+```swift
+func recomputePassesFilter(_ node: inout DirectoryNode, with filter: RootFilter) {
+    switch node {
+    case .directory(let name, var children):
+        for i in children.indices { recomputePassesFilter(&children[i], with: filter) }
+        node = .directory(name: name, children: children)
+    case .file(let name, let uti, let kind, _):
+        node = .file(name: name, uti: uti, kind: kind,
+                     passesFilter: filter.evaluate(filename: name))
+    }
+}
+```
+
+This is what makes filter changes feel instant on a 250 000-file
+scope — no I/O, just an in-memory traversal. The panel re-renders
+only the rows whose `passesFilter` flipped.
+
+`RootFilter.evaluate(filename:)`:
+
+* If `items` is empty, returns `true` (no per-root filtering).
+* Otherwise, evaluates each item against the filename: `glob`,
+  `substring`, or `regex` per the item's `kind`.
+* Combines item results by `match`: `any` (default) = logical OR;
+  `all` = logical AND.
+* If an item's `negate` is `true`, a match becomes an exclusion (the
+  item contributes `false` to the combiner instead of `true`).
+
+### 3A.8 Directories menu and hotkeys
+
+A top-level menu item **Directories** appears in the menu bar, in
+the order *File · Edit · Image · View · Directories · Window ·
+Help*. Items:
+
+| Menu item | Default hotkey | Action |
+| --- | --- | --- |
+| Add Directory… | ⌥⌘D | Opens `NSOpenPanel` (folders only, multiple selection allowed). Each picked folder becomes a new entry in `root_directories`. Saves to `directories.yaml`. Triggers a walk. |
+| Remove Directory | ⌥⌘⌫ | Removes the currently-selected root directory entry from `directories.yaml` and tears down its watcher. Disabled if no root is selected. If a non-root row is selected, removes the root that row belongs to (after confirmation). |
+| Edit Filter… | ⌥⌘F | Opens the per-root filter editor sheet for the selected root (or, if a file is selected, for its containing root). |
+| Refresh All | ⌥⌘R | Forces a re-walk of every root. Resets `lastWalked` after completion. |
+| Reveal in Finder | ⌥⌘O | Opens the selected root in Finder. Disabled if no root is selected. |
+| Add Directory from Path… | ⌃⌥⌘D | Prompts for an absolute path; equivalent to `add_directory` via MCP. |
+| Sort Roots By › | (submenu) | Path / Date added / Last walked — chooses how `root_directories[]` is ordered for display. |
+
+Hotkey rules:
+
+* All hotkeys use the **⌥⌘** (Option-Command) prefix so they do not
+  collide with system or viewer-canvas shortcuts (which use ⌘ alone)
+  or with the panels framework shortcuts (which use ⌃⌘, see
+  [panels.mdx](./panels.mdx) §10).
+* Every hotkey is rebindable via [Settings → Keyboard](./settings.mdx)
+  §4.9. The defaults are listed in the keyboard settings page.
+* The menu items are also exposed via the file tree row's
+  right-click context menu; the same hotkeys apply when the panel
+  has focus.
+
+### 3A.9 Walked example
+
+`directories.yaml` after the user adds two roots and applies a
+JPEG-only filter to the first:
+
+```yaml
+schema_version: 1
+root_directories:
+  - path: /Users/bryan/Pictures/tour/beach
+    filter:
+      match: any
+      items:
+        - pattern: "*.jpg"
+        - pattern: "*.jpeg"
+    last_walked: 2026-06-02T10:18:42Z
+  - path: /Users/bryan/Pictures/tour/mountains
+    filter:
+      items: []
+    last_walked: 2026-06-02T10:18:42Z
+```
+
+What the panel renders, in tree mode:
+
+```
+▼ /Users/bryan/Pictures/tour/beach
+    001.jpg
+    002.jpg
+                          (notes_old.png is in memory with passesFilter=false; hidden)
+▼ /Users/bryan/Pictures/tour/mountains
+    peak.heic
+    peak.jpg
+```
+
+If the user (or MCP) flips the first root's filter to
+`items: []`, `notes_old.png` flips its `passesFilter` to `true` via
+the in-memory traversal in §3A.7 and the panel re-renders to
+include it — no disk read.
+
+### 3A.10 MCP tools for the file tree
+
+These tools are dedicated to `directories.yaml`. They are journaled
+to `log.log` the same way the scope-level tools are, and they share
+the verify shape used in [mcp_file.mdx](./use_cases/mcp_file.mdx) §8.
+
+| Tool | What it does |
+| --- | --- |
+| `list_directories()` | Return the `root_directories[]` array with path + filter + last_walked. |
+| `get_directory(path)` | Return a single root directory entry. |
+| `add_directory(path, filter?)` | Append a new root with an optional filter. Triggers a walk + FS watch (§3A.5.1). Idempotent: if the path is already a root, returns `already_exists`. |
+| `remove_directory(path)` | Drop a root directory entry; tear down its watcher; remove its in-memory tree. |
+| `update_directory_filter(path, filter)` | Replace the filter for one root. Triggers in-memory re-evaluation (§3A.7), not a re-walk. |
+| `set_global_filter(filter)` | Apply the same filter to every existing root. Triggers in-memory re-evaluation on each. |
+| `clear_directories()` | Remove every root directory. Used by the negative path of [mcp_file.mdx](./use_cases/mcp_file.mdx) §9. |
+| `reveal_directory(path)` | Equivalent to the Directories menu's "Reveal in Finder" item. |
+| `refresh_directory(path?)` | Force a re-walk of one root, or all roots if `path` is omitted. |
+
+The MCP write tools accept the same `filter` shape as
+`directories.yaml` (§3A.2). The server canonicalizes the path and
+validates the filter before writing.
+
+### 3A.11 Cross-references
+
+* [use_cases/mcp_file.mdx](./use_cases/mcp_file.mdx) — the
+  step-by-step user-scenario tour that exercises every tool in
+  §3A.10 with explicit verify steps.
+* [automation.mdx](./automation.mdx) §4–§5 — Local Storage and
+  MCP-driven editing charter that this section implements for the
+  file tree panel.
+* [panels.mdx](./panels.mdx) §7.2 — the *Browser* layout preset
+  that docks the file tree panel on the left by default.
+* [error_handling.mdx](./error_handling.mdx) §4.2 — the `log.log`
+  record format every MCP call in §3A.10 must produce.
+
+---
+
 ## 4. UI Mechanics
 
 ### 4.1 Panel chrome

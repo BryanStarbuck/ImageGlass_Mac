@@ -209,8 +209,9 @@ public enum CharterStatus {
     }
 
     private static func evaluateScopeControls() -> CharterGoalStatus {
-        // Build a synthetic scope in-memory and confirm the include / exclude
-        // shape is callable. No disk I/O.
+        // Build a synthetic scope in-memory + actually run the evaluator on a
+        // throw-away temporary directory so we catch silent regressions in
+        // include / exclude semantics, not just the shape of the type.
         let probe = Scope(
             name: "__charter_probe__",
             criteria: [
@@ -234,11 +235,17 @@ public enum CharterStatus {
             !probe.include.globs.isEmpty
         let hasExclude =
             !probe.exclude.globs.isEmpty && probe.exclude.hiddenFiles
-        let state: CharterState = (hasInclude && hasExclude) ? .implemented : .partial
+        var gaps: [String] = []
+        let walkerOK = runScopeWalkerSelfCheck(gaps: &gaps)
+        if walkerOK {
+            evidence.append("ScopeEvaluator self-check: walker correctly applies include/exclude rules on a scratch directory.")
+        }
+        let state: CharterState = (hasInclude && hasExclude && walkerOK) ? .implemented : .partial
         return CharterGoalStatus(
             goal: .scopeControls,
             state: state,
-            evidence: evidence
+            evidence: evidence,
+            openGaps: gaps
         )
     }
 
@@ -247,16 +254,90 @@ public enum CharterStatus {
         evidence.append("LocalStorage persists each scope as plain JSON in \(AppPaths.scopesDir.path).")
         evidence.append("Scope records: include rules, exclude rules, lastEvaluated, resolvedFiles, description.")
         evidence.append("bootstrapIfNeeded() seeds a starter scope so the panel column has something to show on first launch.")
-        // Don't touch the user's real Application Support during a status
-        // call — just verify the addressable file location exists as a
-        // constructible URL.
+        var gaps: [String] = []
+        // Path shape check — the on-disk story lives at .../ImageGlass/scopes.
         let pathOK = AppPaths.scopesDir.path.contains("/ImageGlass/scopes")
+        if !pathOK { gaps.append("scopesDir path does not look like '.../ImageGlass/scopes'.") }
+        // Round-trip behaviour check on an in-memory scope through the same
+        // JSONEncoder/JSONDecoder configuration LocalStorage uses. This
+        // protects the plain-text contract from silent codable regressions
+        // without touching the user's real Application Support.
+        let roundTripOK = runScopeRoundTripSelfCheck(gaps: &gaps)
+        if roundTripOK {
+            evidence.append("Codable round-trip preserves all three required fields (source criteria, resolvedFiles, lastEvaluated).")
+        }
+        let state: CharterState = (pathOK && roundTripOK) ? .implemented : .partial
         return CharterGoalStatus(
             goal: .localStorage,
-            state: pathOK ? .implemented : .partial,
+            state: state,
             evidence: evidence,
-            openGaps: pathOK ? [] : ["scopesDir path does not look like '.../ImageGlass/scopes'."]
+            openGaps: gaps
         )
+    }
+
+    // MARK: - Self-check helpers
+
+    /// Drop two files into a scratch directory and confirm ScopeEvaluator
+    /// applies both an include extension and an exclude glob. The scratch
+    /// directory is removed before returning.
+    private static func runScopeWalkerSelfCheck(gaps: inout [String]) -> Bool {
+        let fm = FileManager.default
+        let scratch = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("ig-charter-walker-\(UUID().uuidString)", isDirectory: true)
+        defer { try? fm.removeItem(at: scratch) }
+        do {
+            try fm.createDirectory(at: scratch, withIntermediateDirectories: true)
+            try Data("x".utf8).write(to: scratch.appendingPathComponent("keep.png"))
+            try Data("x".utf8).write(to: scratch.appendingPathComponent("draft_old.png"))
+            try Data("x".utf8).write(to: scratch.appendingPathComponent("notes.txt"))
+            let probe = Scope(
+                name: "__charter_walker_probe__",
+                include: .init(directories: [scratch.path], recursive: false, extensions: ["png"]),
+                exclude: .init(globs: ["*_old*"], hiddenFiles: true)
+            )
+            let files = ScopeEvaluator.resolveFiles(for: probe)
+                .map { ($0 as NSString).lastPathComponent }
+            if files == ["keep.png"] { return true }
+            gaps.append("ScopeEvaluator self-check failed: expected [keep.png], got \(files).")
+            return false
+        } catch {
+            gaps.append("ScopeEvaluator self-check could not create scratch dir: \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    /// Round-trip an in-memory Scope through the same JSON shape that
+    /// LocalStorage writes, and confirm the three load-bearing fields survive.
+    private static func runScopeRoundTripSelfCheck(gaps: inout [String]) -> Bool {
+        let probe = Scope(
+            name: "__charter_codable_probe__",
+            description: "audit probe",
+            include: .init(directories: ["~/Pictures"], recursive: true,
+                           globs: ["IMG_*"], extensions: ["png"]),
+            exclude: .init(globs: ["*_old*"], hiddenFiles: true),
+            lastEvaluated: Date(timeIntervalSince1970: 1_700_000_000),
+            resolvedFiles: ["~/Pictures/a.png", "~/Pictures/b.png"]
+        )
+        let enc = JSONEncoder()
+        enc.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        enc.dateEncodingStrategy = .iso8601
+        let dec = JSONDecoder()
+        dec.dateDecodingStrategy = .iso8601
+        do {
+            let data = try enc.encode(probe)
+            let back = try dec.decode(Scope.self, from: data)
+            guard back.include == probe.include,
+                  back.exclude == probe.exclude,
+                  back.lastEvaluated == probe.lastEvaluated,
+                  back.resolvedFiles == probe.resolvedFiles else {
+                gaps.append("Scope JSON round-trip did not preserve all load-bearing fields.")
+                return false
+            }
+            return true
+        } catch {
+            gaps.append("Scope JSON round-trip threw: \(error.localizedDescription)")
+            return false
+        }
     }
 
     private static func evaluateMCPDrivenEditing() -> CharterGoalStatus {

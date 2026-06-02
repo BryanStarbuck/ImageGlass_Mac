@@ -82,6 +82,35 @@ final class CharterStatusTests: XCTestCase {
         XCTAssertFalse(ImageGlassCore.charterSummary().isEmpty)
     }
 
+    func testScopeControlsSelfCheckActuallyRunsTheWalker() {
+        // The scope-controls evaluator was upgraded from a type-shape check
+        // into an actual evaluator round-trip on a scratch directory. If the
+        // include/exclude semantics ever silently regress, this status should
+        // drop out of `implemented`.
+        let report = CharterStatus.report()
+        let entry = report.status(for: .scopeControls)
+        XCTAssertNotNil(entry)
+        XCTAssertEqual(entry?.state, .implemented,
+                       "scope-controls walker self-check failed: \(entry?.openGaps.joined(separator: "; ") ?? "")")
+        let evidence = entry?.evidence.joined(separator: " | ") ?? ""
+        XCTAssertTrue(evidence.contains("self-check"),
+                      "scope-controls evidence should record that the walker self-check ran.")
+    }
+
+    func testLocalStorageSelfCheckRoundTripsScope() {
+        // The local-storage evaluator now exercises the JSON round-trip for
+        // a synthetic scope so the plain-text contract is protected from
+        // silent Codable regressions.
+        let report = CharterStatus.report()
+        let entry = report.status(for: .localStorage)
+        XCTAssertNotNil(entry)
+        XCTAssertEqual(entry?.state, .implemented,
+                       "local-storage round-trip self-check failed: \(entry?.openGaps.joined(separator: "; ") ?? "")")
+        let evidence = entry?.evidence.joined(separator: " | ") ?? ""
+        XCTAssertTrue(evidence.contains("round-trip"),
+                      "local-storage evidence should record that the codable round-trip self-check ran.")
+    }
+
     func testReportIsRoundTripCodable() throws {
         let report = CharterStatus.report()
         let enc = JSONEncoder()

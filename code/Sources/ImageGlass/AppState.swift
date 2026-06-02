@@ -216,9 +216,23 @@ public final class AppState {
                 if !self.activeScopeName.isEmpty {
                     // Reload the active scope from disk so MCP edits propagate.
                     if let scope = try? self.storage.loadScope(self.activeScopeName) {
+                        // Charter §5 workflow: MCP edits include/exclude rules,
+                        // then ImageGlass "re-evaluates the scope" so the panel
+                        // reflects the new criteria. set_directories /
+                        // set_include_criteria / set_exclude_criteria do not
+                        // touch resolvedFiles on the MCP side, so if the rules
+                        // changed since the last copy we held, walk the new
+                        // criteria here.
+                        let rulesChanged =
+                            self.activeScope?.include != scope.include ||
+                            self.activeScope?.exclude != scope.exclude
                         self.activeScope = scope
-                        self.resolvedFiles = scope.resolvedFiles
-                        self.lastEvaluated = scope.lastEvaluated
+                        if rulesChanged {
+                            await self.reevaluateActive()
+                        } else {
+                            self.resolvedFiles = scope.resolvedFiles
+                            self.lastEvaluated = scope.lastEvaluated
+                        }
                     }
                 }
             }
