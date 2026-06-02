@@ -5,15 +5,20 @@ import Foundation
 public struct MCPTools {
 
     public let storage: LocalStorage
+    public let themeTools: ThemeMCPTools
 
-    public init(storage: LocalStorage = .shared) {
+    public init(
+        storage: LocalStorage = .shared,
+        themeTools: ThemeMCPTools = ThemeMCPTools()
+    ) {
         self.storage = storage
+        self.themeTools = themeTools
     }
 
     // MARK: - Descriptors
 
     public func descriptors() -> [MCP.ToolDescriptor] {
-        [
+        var base: [MCP.ToolDescriptor] = [
             .init(
                 name: "list_scopes",
                 description: "List all scope names currently stored in Local Storage.",
@@ -120,6 +125,10 @@ public struct MCPTools {
                 ])
             ),
         ]
+        // Theme subsystem descriptors (list_themes, get/set_current_theme).
+        // See Themes/ThemeMCPTools.swift.
+        base.append(contentsOf: themeTools.descriptors())
+        return base
     }
 
     // MARK: - Dispatch
@@ -213,6 +222,11 @@ public struct MCPTools {
             return .text("Deleted scope '\(scopeName)'.")
 
         default:
+            // Route theme tools (list_themes, get/set_current_theme) through
+            // ThemeMCPTools. See Themes/ThemeMCPTools.swift.
+            if ThemeMCPTools.toolNames.contains(name) {
+                return try themeTools.call(name: name, arguments: arguments)
+            }
             return .text("Unknown tool: \(name)", isError: true)
         }
     }

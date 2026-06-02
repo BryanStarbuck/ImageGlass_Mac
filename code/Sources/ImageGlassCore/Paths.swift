@@ -3,15 +3,20 @@ import Foundation
 public enum AppPaths {
     public static let appName = "ImageGlass"
 
+    /// Reads HOME from the live environment so tests can rebind it via
+    /// `setenv("HOME", ...)`. Falls back to NSHomeDirectory() if HOME is
+    /// unset. NSHomeDirectory() ignores HOME on macOS, so we read the env
+    /// directly to keep tests hermetic.
+    public static var homeDirectory: String {
+        if let h = ProcessInfo.processInfo.environment["HOME"], !h.isEmpty {
+            return h
+        }
+        return NSHomeDirectory()
+    }
+
     public static var appSupportDir: URL {
-        let fm = FileManager.default
-        let base = try? fm.url(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask,
-            appropriateFor: nil,
-            create: true
-        )
-        return (base ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support"))
+        URL(fileURLWithPath: homeDirectory)
+            .appendingPathComponent("Library/Application Support", isDirectory: true)
             .appendingPathComponent(appName, isDirectory: true)
     }
 
@@ -34,14 +39,14 @@ public enum AppPaths {
 
     public static func expandTilde(_ path: String) -> String {
         guard path.hasPrefix("~") else { return path }
-        let home = NSHomeDirectory()
+        let home = homeDirectory
         if path == "~" { return home }
         if path.hasPrefix("~/") { return home + String(path.dropFirst(1)) }
         return path
     }
 
     public static func contractTilde(_ path: String) -> String {
-        let home = NSHomeDirectory()
+        let home = homeDirectory
         if path == home { return "~" }
         if path.hasPrefix(home + "/") { return "~" + String(path.dropFirst(home.count)) }
         return path

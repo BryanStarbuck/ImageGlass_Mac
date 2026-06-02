@@ -17,6 +17,9 @@ public final class AppState {
     public var showPanelColumn: Bool = true
     public var panelViewMode: PanelViewMode = .list
 
+    /// Theme catalog + current selection (see docs/themes.mdx).
+    public let themeStore = ThemeStore()
+
     public enum PanelViewMode: String, CaseIterable, Identifiable {
         case list, tree
         public var id: String { rawValue }
@@ -33,6 +36,7 @@ public final class AppState {
     public func bootstrap() async {
         do {
             try AppPaths.ensureDirectories()
+            themeStore.bootstrap()
             let bootstrapped = try storage.bootstrapIfNeeded()
             await refreshScopeList()
             await activate(scopeNamed: bootstrapped)
