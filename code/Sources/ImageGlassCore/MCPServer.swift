@@ -84,6 +84,9 @@ public final class MCPServer {
         do {
             request = try decoder.decode(MCP.Request.self, from: data)
         } catch {
+            ErrorLog.log("MCP request JSON-RPC decode failed",
+                         error: error,
+                         class: "MCPServer")
             // Spec §9: protocol-level errors use JSON-RPC reserved codes.
             // -32700 Parse error has no id (id unknown), reply with null id.
             write(MCP.Response.failure(
@@ -174,6 +177,9 @@ public final class MCPServer {
             let callResult = try tools.call(name: toolName, arguments: args)
             return .success(id: request.id, result: AnyCodable(asDict(callResult)))
         } catch {
+            ErrorLog.log("MCP tool call '\(toolName)' threw",
+                         error: error,
+                         class: "MCPServer")
             // Tools.call is defensive — it should not throw — but if it does,
             // surface as an isError tool result per spec §9, not a JSON-RPC
             // error code.
@@ -191,6 +197,9 @@ public final class MCPServer {
             data.append(0x0A) // newline-delimited framing
             try output.write(contentsOf: data)
         } catch {
+            ErrorLog.log("MCP response write failed",
+                         error: error,
+                         class: "MCPServer")
             FileHandle.standardError.write(Data("MCP write error: \(error)\n".utf8))
         }
     }
@@ -198,11 +207,28 @@ public final class MCPServer {
     private func asDict<T: Encodable>(_ value: T) -> [String: Any] {
         let enc = JSONEncoder()
         enc.dateEncodingStrategy = .iso8601
-        guard let data = try? enc.encode(value),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        let data: Data
+        do {
+            data = try enc.encode(value)
+        } catch {
+            ErrorLog.log("asDict JSON encode failed for \(T.self)",
+                         error: error,
+                         class: "MCPServer")
             return [:]
         }
-        return obj
+        do {
+            if let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                return obj
+            }
+            ErrorLog.log("asDict JSON object cast failed for \(T.self)",
+                         class: "MCPServer")
+            return [:]
+        } catch {
+            ErrorLog.log("asDict JSONSerialization failed for \(T.self)",
+                         error: error,
+                         class: "MCPServer")
+            return [:]
+        }
     }
 
     /// Peek at the raw JSON to decide whether the request has an `id` field

@@ -16,6 +16,11 @@ public struct MCPTools {
     public let themeTools: ThemeMCPTools
     public let cropTools: CropMCPTools
     public let panelTools: PanelMCPTools
+    /// File-panel scenario tools from `docs/use_cases/mcp_file.mdx` —
+    /// `update_scope`, `list_files_in_scope`, `select_file`,
+    /// `panel.set_view_mode`. Writes YAML scope files at the spec path
+    /// and structured records to `logs/log.log`.
+    public let filePanelTools: FilePanelMCPTools
 
     public init(
         storage: LocalStorage = .shared,
@@ -23,7 +28,8 @@ public struct MCPTools {
         lock: MCPLock = .shared,
         themeTools: ThemeMCPTools = ThemeMCPTools(),
         cropTools: CropMCPTools = CropMCPTools(),
-        panelTools: PanelMCPTools = PanelMCPTools()
+        panelTools: PanelMCPTools = PanelMCPTools(),
+        filePanelTools: FilePanelMCPTools = FilePanelMCPTools()
     ) {
         self.storage = storage
         self.toolStorage = toolStorage
@@ -31,6 +37,7 @@ public struct MCPTools {
         self.themeTools = themeTools
         self.cropTools = cropTools
         self.panelTools = panelTools
+        self.filePanelTools = filePanelTools
     }
 
     // MARK: - Descriptors
@@ -389,6 +396,8 @@ public struct MCPTools {
         base.append(contentsOf: cropTools.descriptors())
         // Panel framework (list_panels, show/hide/move/tab, apply_layout_preset, ...).
         base.append(contentsOf: panelTools.descriptors())
+        // File-panel walkthrough tools (mcp_file.mdx §4–§10).
+        base.append(contentsOf: filePanelTools.descriptors())
         return base
     }
 
@@ -469,13 +478,25 @@ public struct MCPTools {
                 if PanelMCPTools.toolNames.contains(name) {
                     return try panelTools.call(name: name, arguments: arguments)
                 }
+                // Route the file-panel walkthrough tools (mcp_file.mdx).
+                if FilePanelMCPTools.toolNames.contains(name) {
+                    return try lock.withLock {
+                        try filePanelTools.call(name: name, arguments: arguments)
+                    }
+                }
                 return .text("Unknown tool: \(name)", isError: true)
             }
         } catch let e as MCPToolError {
             return .text(e.description, isError: true)
         } catch let e as CocoaError where e.code == .fileReadNoSuchFile {
+            ErrorLog.log("scope file not found while dispatching MCP tool '\(name)'",
+                         error: e,
+                         class: "MCPTools")
             return .text("Scope not found on disk.", isError: true)
         } catch {
+            ErrorLog.log("MCP tool '\(name)' raised unhandled error",
+                         error: error,
+                         class: "MCPTools")
             return .text("Error: \(error.localizedDescription)", isError: true)
         }
     }
@@ -688,7 +709,13 @@ public struct MCPTools {
         let existed = storage.scopeExists(scopeName)
         try storage.deleteScope(scopeName)
         // Best-effort: prune the per-scope audit log so deletion is total.
-        try? ScopeAuditLog.shared.clear(scopeName: scopeName)
+        do {
+            try ScopeAuditLog.shared.clear(scopeName: scopeName)
+        } catch {
+            ErrorLog.log("failed to clear ScopeAuditLog for '\(scopeName)'",
+                         error: error,
+                         class: "MCPTools")
+        }
         if existed {
             return .text("Deleted scope '\(scopeName)'.")
         } else {
@@ -761,6 +788,9 @@ public struct MCPTools {
         do {
             _ = try ExternalToolLauncher().launch(tool, filePath: file)
         } catch {
+            ErrorLog.log("ExternalToolLauncher.launch failed for tool '\(id)'",
+                         error: error,
+                         class: "MCPTools")
             return .text("Failed to launch '\(id)': \(error)", isError: true)
         }
         return .text(prettyJSON([
@@ -880,18 +910,37 @@ public struct MCPTools {
         let enc = JSONEncoder()
         enc.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         enc.dateEncodingStrategy = .iso8601
-        if let data = try? enc.encode(value), let s = String(data: data, encoding: .utf8) {
-            return s
+        do {
+            let data = try enc.encode(value)
+            if let s = String(data: data, encoding: .utf8) {
+                return s
+            }
+            ErrorLog.log("prettyJSON UTF-8 decode failed for \(T.self)",
+                         class: "MCPTools")
+            return "{}"
+        } catch {
+            ErrorLog.log("prettyJSON encode failed for \(T.self)",
+                         error: error,
+                         class: "MCPTools")
+            return "{}"
         }
-        return "{}"
     }
 
     private func prettyJSON(_ dict: [String: Any]) -> String {
-        if let data = try? JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted, .sortedKeys]),
-           let s = String(data: data, encoding: .utf8) {
-            return s
+        do {
+            let data = try JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted, .sortedKeys])
+            if let s = String(data: data, encoding: .utf8) {
+                return s
+            }
+            ErrorLog.log("prettyJSON(dict) UTF-8 decode failed",
+                         class: "MCPTools")
+            return "{}"
+        } catch {
+            ErrorLog.log("prettyJSON(dict) JSONSerialization failed",
+                         error: error,
+                         class: "MCPTools")
+            return "{}"
         }
-        return "{}"
     }
 }
 

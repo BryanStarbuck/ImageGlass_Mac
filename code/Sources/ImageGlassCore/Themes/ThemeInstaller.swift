@@ -58,7 +58,15 @@ public struct ThemeInstaller: Sendable {
         try ensureInstallRoot()
 
         let stagingDir = try makeStagingDir()
-        defer { try? FileManager.default.removeItem(at: stagingDir) }
+        defer {
+            do {
+                try FileManager.default.removeItem(at: stagingDir)
+            } catch {
+                ErrorLog.log("failed to clean up staging dir \(stagingDir.path)",
+                             error: error,
+                             class: String(describing: Self.self))
+            }
+        }
 
         try unzip(archive: archiveURL, into: stagingDir)
 
@@ -82,7 +90,15 @@ public struct ThemeInstaller: Sendable {
         let destination = installRoot.appendingPathComponent(stagedPack.folderName, isDirectory: true)
 
         let stagingDir = try makeStagingDir()
-        defer { try? FileManager.default.removeItem(at: stagingDir) }
+        defer {
+            do {
+                try FileManager.default.removeItem(at: stagingDir)
+            } catch {
+                ErrorLog.log("failed to clean up staging dir \(stagingDir.path)",
+                             error: error,
+                             class: String(describing: Self.self))
+            }
+        }
 
         let copyDest = stagingDir.appendingPathComponent(stagedPack.folderName, isDirectory: true)
         try FileManager.default.copyItem(at: folderURL, to: copyDest)
@@ -131,7 +147,14 @@ public struct ThemeInstaller: Sendable {
     /// take down the catalog.
     public func loadInstalledThemes() throws -> [ThemePack] {
         try installedThemeFolders().compactMap { folder in
-            try? ThemePack.load(fromFolder: folder)
+            do {
+                return try ThemePack.load(fromFolder: folder)
+            } catch {
+                ErrorLog.log("ThemePack.load failed for \(folder.lastPathComponent)",
+                             error: error,
+                             class: "ThemeInstaller")
+                return nil
+            }
         }
     }
 
@@ -305,10 +328,22 @@ public struct ThemeInstaller: Sendable {
                 try fm.moveItem(at: source, to: destination)
             } catch {
                 // Roll back: put the old one back in place.
-                try? fm.moveItem(at: trash, to: destination)
+                do {
+                    try fm.moveItem(at: trash, to: destination)
+                } catch let rollbackError {
+                    ErrorLog.log("rollback moveItem failed for \(destination.path)",
+                                 error: rollbackError,
+                                 class: "ThemeInstaller")
+                }
                 throw error
             }
-            try? fm.removeItem(at: trash)
+            do {
+                try fm.removeItem(at: trash)
+            } catch {
+                ErrorLog.log("failed to remove old theme dir \(trash.path)",
+                             error: error,
+                             class: "ThemeInstaller")
+            }
         } else {
             try fm.moveItem(at: source, to: destination)
         }

@@ -339,16 +339,33 @@ public extension MCPTools {
         let enc = JSONEncoder()
         enc.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         enc.dateEncodingStrategy = .iso8601
-        if let data = try? enc.encode(value), let s = String(data: data, encoding: .utf8) {
-            return s
+        do {
+            let data = try enc.encode(value)
+            if let s = String(data: data, encoding: .utf8) {
+                return s
+            }
+            ErrorLog.log("charterJSON: UTF-8 decode of encoded JSON failed",
+                         class: "MCPTools+Charter")
+        } catch {
+            ErrorLog.log("charterJSON: JSONEncoder.encode failed for \(type(of: value))",
+                         error: error,
+                         class: "MCPTools+Charter")
         }
         return "{}"
     }
 
     internal func charterJSON(_ dict: [String: Any]) -> String {
-        if let data = try? JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted, .sortedKeys]),
-           let s = String(data: data, encoding: .utf8) {
-            return s
+        do {
+            let data = try JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted, .sortedKeys])
+            if let s = String(data: data, encoding: .utf8) {
+                return s
+            }
+            ErrorLog.log("charterJSON(dict): UTF-8 decode of serialized JSON failed",
+                         class: "MCPTools+Charter")
+        } catch {
+            ErrorLog.log("charterJSON(dict): JSONSerialization.data failed",
+                         error: error,
+                         class: "MCPTools+Charter")
         }
         return "{}"
     }

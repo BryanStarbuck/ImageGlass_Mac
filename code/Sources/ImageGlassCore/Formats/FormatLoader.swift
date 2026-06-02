@@ -109,8 +109,12 @@ public enum FormatLoader {
             // produce a flat composite even though the spec marks them as
             // needing a delegate for advanced features. Try Image I/O and
             // fall back to the error if it can't decode.
-            if let loaded = try? decodeWithImageIO(url: url, format: format) {
-                return loaded
+            do {
+                return try decodeWithImageIO(url: url, format: format)
+            } catch {
+                ErrorLog.log("Image I/O could not decode \(f.id) at \(url.path); needs external delegate",
+                             error: error,
+                             class: "FormatLoader")
             }
             throw FormatLoaderError.requiresExternalDelegate(f)
         }
@@ -132,8 +136,12 @@ public enum FormatLoader {
         let format = sniffedExt.flatMap { FormatRegistry.shared.format(forExtension: $0) }
 
         if let f = format, f.needsExternalDelegate {
-            if let loaded = try? decodeWithImageIO(data: data, format: format, sourceURL: nil) {
-                return loaded
+            do {
+                return try decodeWithImageIO(data: data, format: format, sourceURL: nil)
+            } catch {
+                ErrorLog.log("Image I/O could not decode \(f.id) data blob; needs external delegate",
+                             error: error,
+                             class: "FormatLoader")
             }
             throw FormatLoaderError.requiresExternalDelegate(f)
         }

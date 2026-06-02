@@ -45,15 +45,25 @@ public enum ClipboardLoader {
         // (1) File URLs.
         let urls = readFileURLs(pasteboard)
         if let firstImageURL = urls.first(where: { FormatRegistry.shared.format(forURL: $0) != nil }) {
-            if let loaded = try? FormatLoader.load(url: firstImageURL) {
+            do {
+                let loaded = try FormatLoader.load(url: firstImageURL)
                 return PasteResult(image: loaded, fileURLs: urls, source: .fileURL)
+            } catch {
+                ErrorLog.log("failed to decode clipboard file URL \(firstImageURL.path)",
+                             error: error,
+                             class: "ClipboardLoader")
             }
         }
 
         // (2) Image data blobs in a known wire format.
         if let (data, ext) = readImageDataBlob(pasteboard) {
-            if let loaded = try? FormatLoader.load(data: data, hintedExtension: ext) {
+            do {
+                let loaded = try FormatLoader.load(data: data, hintedExtension: ext)
                 return PasteResult(image: loaded, fileURLs: urls, source: .imageData)
+            } catch {
+                ErrorLog.log("failed to decode clipboard image data (hint=\(ext))",
+                             error: error,
+                             class: "ClipboardLoader")
             }
         }
 
@@ -62,8 +72,13 @@ public enum ClipboardLoader {
            let tiff = bitmap.tiffRepresentation,
            let rep = NSBitmapImageRep(data: tiff),
            let png = rep.representation(using: .png, properties: [:]) {
-            if let loaded = try? FormatLoader.load(data: png, hintedExtension: "png") {
+            do {
+                let loaded = try FormatLoader.load(data: png, hintedExtension: "png")
                 return PasteResult(image: loaded, fileURLs: urls, source: .rawBitmap)
+            } catch {
+                ErrorLog.log("failed to decode raw bitmap from clipboard",
+                             error: error,
+                             class: "ClipboardLoader")
             }
         }
 

@@ -116,6 +116,9 @@ public final class ConfigLoader {
             // Read-only config dir is a recoverable condition — the app
             // can still run with the in-memory config. Surface to the log
             // so it's not silent.
+            ErrorLog.log("could not persist igconfig.json — continuing in read-only mode",
+                         error: error,
+                         class: "ConfigLoader")
             NSLog("ImageGlass: could not persist igconfig.json (\(error.localizedDescription)) — continuing in read-only mode")
         }
         return r

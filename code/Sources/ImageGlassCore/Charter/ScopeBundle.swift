@@ -58,14 +58,24 @@ public enum ScopeBundleService {
         let scope = try scopeStorage.loadScope(scopeName)
         var ruleSets: [RuleSet] = []
         for name in scope.ruleSets ?? [] {
-            if let rs = try? ruleSetStorage.loadRuleSet(name) {
+            do {
+                let rs = try ruleSetStorage.loadRuleSet(name)
                 ruleSets.append(rs)
+            } catch {
+                ErrorLog.log("failed to load rule set '\(name)' for export of scope '\(scopeName)'",
+                             error: error,
+                             class: "ScopeBundleService")
             }
         }
         var parents: [Scope] = []
         for name in scope.inheritsFrom ?? [] {
-            if let p = try? scopeStorage.loadScope(name) {
+            do {
+                let p = try scopeStorage.loadScope(name)
                 parents.append(p)
+            } catch {
+                ErrorLog.log("failed to load parent scope '\(name)' for export of scope '\(scopeName)'",
+                             error: error,
+                             class: "ScopeBundleService")
             }
         }
         return ScopeBundle(scope: scope, ruleSets: ruleSets, parents: parents)
@@ -77,7 +87,12 @@ public enum ScopeBundleService {
         enc.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         enc.dateEncodingStrategy = .iso8601
         let data = try enc.encode(bundle)
-        return String(data: data, encoding: .utf8) ?? "{}"
+        guard let s = String(data: data, encoding: .utf8) else {
+            ErrorLog.log("encoded bundle not valid UTF-8 for scope '\(bundle.scope.name)'",
+                         class: "ScopeBundleService")
+            return "{}"
+        }
+        return s
     }
 
     /// Decode a bundle from JSON text.

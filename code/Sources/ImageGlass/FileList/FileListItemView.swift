@@ -110,6 +110,8 @@ struct FileListItemView: View {
         let side = pixelSide
         let cg = await ThumbnailCache.shared.thumbnail(for: url, maxSide: side)
         guard let cg = cg else {
+            ErrorLog.log("thumbnail decode returned nil for \(url.lastPathComponent) at side=\(side)",
+                         class: "FileListItemView")
             didFailDecode = true
             return
         }

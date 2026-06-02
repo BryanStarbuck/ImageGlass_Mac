@@ -72,7 +72,13 @@ public final class ThemeStore {
     /// Refresh the catalog from disk and apply the persisted selections.
     /// Safe to call multiple times.
     public func bootstrap() {
-        try? AppPaths.ensureThemesDirectory()
+        do {
+            try AppPaths.ensureThemesDirectory()
+        } catch {
+            ErrorLog.log("ensureThemesDirectory failed during bootstrap",
+                         error: error,
+                         class: "ThemeStore")
+        }
         availableThemes = catalog.installedThemes()
 
         // Migrate the legacy single `current-theme.txt` selection on first
@@ -81,18 +87,45 @@ public final class ThemeStore {
         // afterwards the paired files own the selection.
         migrateLegacyCurrentThemeIfNeeded()
 
-        if let mode = (try? readPersistedAppearanceMode()) {
+        let modeResult: ThemeAppearanceMode?
+        do {
+            modeResult = try readPersistedAppearanceMode()
+        } catch {
+            ErrorLog.log("failed to read persisted appearance mode",
+                         error: error,
+                         class: "ThemeStore")
+            modeResult = nil
+        }
+        if let mode = modeResult {
             appearanceMode = mode
         }
 
-        if let name = try? readPersistedThemeName(side: .light),
+        let lightName: String?
+        do {
+            lightName = try readPersistedThemeName(side: .light)
+        } catch {
+            ErrorLog.log("failed to read persisted light theme name",
+                         error: error,
+                         class: "ThemeStore")
+            lightName = nil
+        }
+        if let name = lightName,
            let theme = lookup(name), theme.settings.isDarkMode == false {
             lightTheme = theme
         } else {
             lightTheme = BuiltinThemes.light
         }
 
-        if let name = try? readPersistedThemeName(side: .dark),
+        let darkName: String?
+        do {
+            darkName = try readPersistedThemeName(side: .dark)
+        } catch {
+            ErrorLog.log("failed to read persisted dark theme name",
+                         error: error,
+                         class: "ThemeStore")
+            darkName = nil
+        }
+        if let name = darkName,
            let theme = lookup(name), theme.settings.isDarkMode == true {
             darkTheme = theme
         } else {
@@ -107,11 +140,23 @@ public final class ThemeStore {
         availableThemes = catalog.installedThemes()
         if !availableThemes.contains(where: { $0.name == lightTheme.name }) {
             lightTheme = BuiltinThemes.light
-            try? writePersistedThemeName(lightTheme.name, side: .light)
+            do {
+                try writePersistedThemeName(lightTheme.name, side: .light)
+            } catch {
+                ErrorLog.log("failed to persist fallback light theme name",
+                             error: error,
+                             class: "ThemeStore")
+            }
         }
         if !availableThemes.contains(where: { $0.name == darkTheme.name }) {
             darkTheme = BuiltinThemes.dark
-            try? writePersistedThemeName(darkTheme.name, side: .dark)
+            do {
+                try writePersistedThemeName(darkTheme.name, side: .dark)
+            } catch {
+                ErrorLog.log("failed to persist fallback dark theme name",
+                             error: error,
+                             class: "ThemeStore")
+            }
         }
     }
 
@@ -125,10 +170,22 @@ public final class ThemeStore {
         guard let theme = lookup(name) else { return false }
         if theme.settings.isDarkMode {
             darkTheme = theme
-            try? writePersistedThemeName(theme.name, side: .dark)
+            do {
+                try writePersistedThemeName(theme.name, side: .dark)
+            } catch {
+                ErrorLog.log("failed to persist dark theme selection '\(theme.name)'",
+                             error: error,
+                             class: "ThemeStore")
+            }
         } else {
             lightTheme = theme
-            try? writePersistedThemeName(theme.name, side: .light)
+            do {
+                try writePersistedThemeName(theme.name, side: .light)
+            } catch {
+                ErrorLog.log("failed to persist light theme selection '\(theme.name)'",
+                             error: error,
+                             class: "ThemeStore")
+            }
         }
         if !availableThemes.contains(where: { $0.name == theme.name }) {
             availableThemes.append(theme)
@@ -140,7 +197,13 @@ public final class ThemeStore {
     /// persist it.
     public func setAppearanceMode(_ mode: ThemeAppearanceMode) {
         appearanceMode = mode
-        try? writePersistedAppearanceMode(mode)
+        do {
+            try writePersistedAppearanceMode(mode)
+        } catch {
+            ErrorLog.log("failed to persist appearance mode '\(mode.rawValue)'",
+                         error: error,
+                         class: "ThemeStore")
+        }
     }
 
     /// Update which OS color scheme the app is currently rendering under.
@@ -198,18 +261,44 @@ public final class ThemeStore {
         let legacy = AppPaths.currentThemeFile
         let fm = FileManager.default
         guard fm.fileExists(atPath: legacy.path) else { return }
-        guard let raw = try? String(contentsOf: legacy, encoding: .utf8) else { return }
+        let raw: String
+        do {
+            raw = try String(contentsOf: legacy, encoding: .utf8)
+        } catch {
+            ErrorLog.log("failed to read legacy current-theme.txt at \(legacy.path)",
+                         error: error,
+                         class: "ThemeStore")
+            return
+        }
         let name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty, let theme = lookup(name) else {
-            try? fm.removeItem(at: legacy)
+            do {
+                try fm.removeItem(at: legacy)
+            } catch {
+                ErrorLog.log("failed to remove legacy current-theme.txt at \(legacy.path)",
+                             error: error,
+                             class: "ThemeStore")
+            }
             return
         }
         let side: Side = theme.settings.isDarkMode ? .dark : .light
         let target = side == .light ? AppPaths.currentLightThemeFile : AppPaths.currentDarkThemeFile
         if !fm.fileExists(atPath: target.path) {
-            try? writePersistedThemeName(theme.name, side: side)
+            do {
+                try writePersistedThemeName(theme.name, side: side)
+            } catch {
+                ErrorLog.log("failed to migrate legacy theme name '\(theme.name)' to paired file",
+                             error: error,
+                             class: "ThemeStore")
+            }
         }
-        try? fm.removeItem(at: legacy)
+        do {
+            try fm.removeItem(at: legacy)
+        } catch {
+            ErrorLog.log("failed to remove legacy current-theme.txt after migration",
+                         error: error,
+                         class: "ThemeStore")
+        }
     }
 }
 

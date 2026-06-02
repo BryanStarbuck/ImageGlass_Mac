@@ -227,6 +227,7 @@ struct CropPanelView: View {
     }
 
     private func presentError(_ error: Error) {
+        ErrorLog.log("crop action failed", error: error, class: "CropPanelView")
         let alert = NSAlert(error: error)
         alert.alertStyle = .warning
         alert.runModal()

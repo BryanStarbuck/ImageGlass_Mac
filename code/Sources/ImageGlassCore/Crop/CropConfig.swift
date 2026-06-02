@@ -141,12 +141,27 @@ public enum CropConfigStore {
 
     public static func load() -> CropConfig {
         let url = fileURL
-        guard FileManager.default.fileExists(atPath: url.path),
-              let data = try? Data(contentsOf: url) else {
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            return .default
+        }
+        let data: Data
+        do {
+            data = try Data(contentsOf: url)
+        } catch {
+            ErrorLog.log("read failed: \(url.path)",
+                         error: error,
+                         class: "CropConfigStore")
             return .default
         }
         let dec = JSONDecoder()
-        return (try? dec.decode(CropConfig.self, from: data)) ?? .default
+        do {
+            return try dec.decode(CropConfig.self, from: data)
+        } catch {
+            ErrorLog.log("decode failed: \(url.path)",
+                         error: error,
+                         class: "CropConfigStore")
+            return .default
+        }
     }
 
     public static func save(_ config: CropConfig) throws {

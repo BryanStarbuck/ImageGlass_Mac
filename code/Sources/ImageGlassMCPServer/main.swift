@@ -11,6 +11,9 @@ do {
     try AppPaths.ensureDirectories()
     _ = try LocalStorage.shared.bootstrapIfNeeded()
 } catch {
+    ErrorLog.log("imageglass-mcp bootstrap failed",
+                 error: error,
+                 class: "ImageGlassMCPServer")
     FileHandle.standardError.write(Data("imageglass-mcp bootstrap warning: \(error)\n".utf8))
 }
 

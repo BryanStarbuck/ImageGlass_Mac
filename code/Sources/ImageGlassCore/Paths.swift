@@ -89,6 +89,52 @@ public enum AppPaths {
         layoutDir.appendingPathComponent("presets", isDirectory: true)
     }
 
+    // MARK: - Mac fork directory tree
+    //
+    // The spec (docs/use_cases/mcp_file.mdx §0) names the fork's on-disk
+    // home as `~/Library/Application Support/ImageGlass_Mac/`, distinct
+    // from the upstream-compatible `ImageGlass/` tree used by the rest of
+    // the app. We keep both in parallel: GUI state stays under
+    // `appSupportDir`; new MCP tools (`update_scope`,
+    // `list_files_in_scope`, `select_file`, `panel.set_view_mode`) read
+    // and write the spec-mandated YAML scope files and `log.log` here.
+
+    public static let macAppName = "ImageGlass_Mac"
+
+    public static var macAppSupportDir: URL {
+        URL(fileURLWithPath: homeDirectory)
+            .appendingPathComponent("Library/Application Support", isDirectory: true)
+            .appendingPathComponent(macAppName, isDirectory: true)
+    }
+
+    public static var macScopesDir: URL {
+        macAppSupportDir.appendingPathComponent("scopes", isDirectory: true)
+    }
+
+    public static var macLogsDir: URL {
+        macAppSupportDir.appendingPathComponent("logs", isDirectory: true)
+    }
+
+    public static var macLogFile: URL {
+        macLogsDir.appendingPathComponent("log.log")
+    }
+
+    /// The directory tree panel's own store (use_cases/mcp_file.mdx §0,
+    /// list_of_files.mdx §3A.1). A single YAML file alongside `scopes/`
+    /// and `logs/`.
+    public static var macDirectoriesFile: URL {
+        macAppSupportDir.appendingPathComponent("directories.yaml")
+    }
+
+    public static func ensureMacDirectories() throws {
+        let fm = FileManager.default
+        for dir in [macAppSupportDir, macScopesDir, macLogsDir] {
+            if !fm.fileExists(atPath: dir.path) {
+                try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            }
+        }
+    }
+
     public static func ensureDirectories() throws {
         let fm = FileManager.default
         for dir in [appSupportDir, scopesDir, toolsDir, runtimeDir, ruleSetsDir, auditDir, languagesDir, themesDir] {

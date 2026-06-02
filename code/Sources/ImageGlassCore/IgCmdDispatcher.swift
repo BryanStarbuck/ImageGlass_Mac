@@ -111,6 +111,9 @@ public struct IgCmdDispatcher {
             printLine("Wallpaper set: \(url.path)", to: .stdout)
             return IgCmdExit.success.rawValue
         } catch {
+            ErrorLog.log("setDesktopImageURL failed for \(url.path)",
+                         error: error,
+                         class: "IgCmdDispatcher")
             printLine("igcmd set-wallpaper: \(error.localizedDescription)", to: .stderr)
             return IgCmdExit.softwareError.rawValue
         }
@@ -193,6 +196,8 @@ public struct IgCmdDispatcher {
         var failed: [String] = []
         for ext in exts {
             guard let utType = UTType(filenameExtension: ext) else {
+                ErrorLog.log("UTType(filenameExtension:) returned nil for '\(ext)'",
+                             class: "IgCmdDispatcher")
                 failed.append(ext)
                 continue
             }
@@ -203,6 +208,8 @@ public struct IgCmdDispatcher {
                 targetID
             )
             if status != noErr {
+                ErrorLog.log("LSSetDefaultRoleHandlerForContentType returned \(status) for ext=\(ext)",
+                             class: "IgCmdDispatcher")
                 failed.append(ext)
             }
         }
@@ -251,12 +258,25 @@ public struct IgCmdDispatcher {
 
         var written = 0
         for i in 0..<count {
-            guard let frame = CGImageSourceCreateImageAtIndex(source, i, nil) else { continue }
+            guard let frame = CGImageSourceCreateImageAtIndex(source, i, nil) else {
+                ErrorLog.log("CGImageSourceCreateImageAtIndex(\(i)) returned nil for \(url.path)",
+                             class: "IgCmdDispatcher")
+                continue
+            }
             let idx = String(format: "%0\(digits)d", i + 1)
             let dest = parent.appendingPathComponent("\(stem)-frame-\(idx).png")
-            guard let writer = CGImageDestinationCreateWithURL(dest as CFURL, pngType, 1, nil) else { continue }
+            guard let writer = CGImageDestinationCreateWithURL(dest as CFURL, pngType, 1, nil) else {
+                ErrorLog.log("CGImageDestinationCreateWithURL returned nil for \(dest.path)",
+                             class: "IgCmdDispatcher")
+                continue
+            }
             CGImageDestinationAddImage(writer, frame, nil)
-            if CGImageDestinationFinalize(writer) { written += 1 }
+            if CGImageDestinationFinalize(writer) {
+                written += 1
+            } else {
+                ErrorLog.log("CGImageDestinationFinalize returned false for \(dest.path)",
+                             class: "IgCmdDispatcher")
+            }
         }
 
         if written == 0 {
@@ -285,6 +305,9 @@ public struct IgCmdDispatcher {
             printLine("Quick setup complete. Config: \(paths.userFileURL.path)", to: .stdout)
             return IgCmdExit.success.rawValue
         } catch {
+            ErrorLog.log("quick-setup failed",
+                         error: error,
+                         class: "IgCmdDispatcher")
             printLine("igcmd quick-setup: \(error.localizedDescription)", to: .stderr)
             return IgCmdExit.softwareError.rawValue
         }
@@ -325,6 +348,9 @@ public struct IgCmdDispatcher {
                 try fm.createDirectory(at: langDir, withIntermediateDirectories: true)
             }
         } catch {
+            ErrorLog.log("failed to create languages dir at \(langDir.path)",
+                         error: error,
+                         class: "IgCmdDispatcher")
             printLine("igcmd install-languages: could not create \(langDir.path): \(error.localizedDescription)", to: .stderr)
             return IgCmdExit.softwareError.rawValue
         }
@@ -339,6 +365,9 @@ public struct IgCmdDispatcher {
                 try fm.copyItem(at: src, to: dest)
                 installed += 1
             } catch {
+                ErrorLog.log("install-languages copy failed for \(path) -> \(dest.path)",
+                             error: error,
+                             class: "IgCmdDispatcher")
                 failed.append(path)
             }
         }
@@ -374,6 +403,9 @@ public struct IgCmdDispatcher {
                 let pack = try installer.install(archive: src)
                 installed.append(pack.folderName)
             } catch {
+                ErrorLog.log("ThemeInstaller.install failed for \(src.path)",
+                             error: error,
+                             class: "IgCmdDispatcher")
                 failed.append((path, error.localizedDescription))
             }
         }
@@ -420,6 +452,9 @@ public struct IgCmdDispatcher {
             printLine("Uninstalled theme: \(folderName)", to: .stdout)
             return IgCmdExit.success.rawValue
         } catch {
+            ErrorLog.log("ThemeInstaller.uninstall failed for folder=\(folderName)",
+                         error: error,
+                         class: "IgCmdDispatcher")
             printLine("igcmd uninstall-theme: \(error.localizedDescription)", to: .stderr)
             return IgCmdExit.softwareError.rawValue
         }
@@ -441,6 +476,9 @@ public struct IgCmdDispatcher {
             printLine("Startup Boost \(enable ? "enabled" : "disabled")", to: .stdout)
             return IgCmdExit.success.rawValue
         } catch {
+            ErrorLog.log("startup-boost (\(enable ? "enable" : "disable")) failed",
+                         error: error,
+                         class: "IgCmdDispatcher")
             printLine("igcmd \(verb.rawValue): \(error.localizedDescription)", to: .stderr)
             return IgCmdExit.softwareError.rawValue
         }

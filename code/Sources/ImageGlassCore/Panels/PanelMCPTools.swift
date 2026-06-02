@@ -203,6 +203,9 @@ public struct PanelMCPTools: Sendable {
         } catch let e as PanelToolError {
             return .text(e.description, isError: true)
         } catch {
+            ErrorLog.log("unexpected error in panel MCP tool '\(name)'",
+                         error: error,
+                         class: String(describing: Self.self))
             return .text("Error: \(error.localizedDescription)", isError: true)
         }
     }
@@ -396,16 +399,29 @@ public struct PanelMCPTools: Sendable {
         let enc = JSONEncoder()
         enc.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         enc.dateEncodingStrategy = .iso8601
-        if let data = try? enc.encode(value), let s = String(data: data, encoding: .utf8) {
-            return s
+        do {
+            let data = try enc.encode(value)
+            if let s = String(data: data, encoding: .utf8) { return s }
+            ErrorLog.log("prettyJSON encode produced non-utf8 bytes",
+                         class: String(describing: Self.self))
+        } catch {
+            ErrorLog.log("prettyJSON encode failed",
+                         error: error,
+                         class: String(describing: Self.self))
         }
         return "{}"
     }
 
     private func prettyJSON(_ dict: [String: Any]) -> String {
-        if let data = try? JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted, .sortedKeys]),
-           let s = String(data: data, encoding: .utf8) {
-            return s
+        do {
+            let data = try JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted, .sortedKeys])
+            if let s = String(data: data, encoding: .utf8) { return s }
+            ErrorLog.log("prettyJSON dict serialization produced non-utf8 bytes",
+                         class: String(describing: Self.self))
+        } catch {
+            ErrorLog.log("prettyJSON dict serialization failed",
+                         error: error,
+                         class: String(describing: Self.self))
         }
         return "{}"
     }

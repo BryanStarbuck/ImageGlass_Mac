@@ -47,7 +47,13 @@ public extension ScopeEvaluator {
                 removed: diff.removed,
                 sources: effective.sources
             )
-            try? auditLog.append(entry, scopeName: scope.name)
+            do {
+                try auditLog.append(entry, scopeName: scope.name)
+            } catch {
+                ErrorLog.log("failed to append audit entry for scope '\(scope.name)'",
+                             error: error,
+                             class: "ScopeEvaluator")
+            }
         }
 
         return out

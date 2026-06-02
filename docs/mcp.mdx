@@ -1,0 +1,299 @@
+---
+title: MCP Server Support
+description: Product specification for the Model Context Protocol (MCP) server embedded in ImageGlass_Mac — the contract that lets Claude Code drive the viewer from outside the app by reading and writing Local Storage on the local machine.
+---
+
+# MCP Server Support
+
+> **Document type:** Product specification.
+> **Audience:** Engineering (implementation) and Product (scope and behavior).
+> **Owners:** PM for surface and behavior; CTO for transport, lifecycle, and
+> security posture.
+> **Status:** v1 spec for the Mac-native fork. See `starbuck-fork.mdx` for the
+> umbrella charter and `local_storage.mdx` for the on-disk data model that
+> this server fronts.
+
+---
+
+## 1. Purpose
+
+ImageGlass_Mac ships with an embedded **Model Context Protocol (MCP)** server.
+The server exists so that **Claude Code** (and, by extension, any MCP-capable
+client) can drive and configure ImageGlass_Mac from **outside** the
+application, on the **local computer**, without the user editing settings
+inside the GUI.
+
+In practical terms: a Claude Code user types a request in their terminal,
+Claude Code calls one of this application's MCP tools, the call lands in the
+ImageGlass_Mac process running on the same machine, and the application's
+**Local Storage** (see `local_storage.mdx`) is read or modified accordingly.
+The next time the viewer evaluates a scope, the change is reflected in the
+file list shown in the UI.
+
+MCP is the **only sanctioned automation contract** for the fork. Ad-hoc IPC,
+AppleScript bridges, file-scraping, accessibility-tree hooks, and other
+side-channels are explicitly out of scope for v1.
+
+---
+
+## 2. Goals and Non-Goals
+
+### Goals
+
+* Provide a stable, versioned MCP surface that Claude Code can target across
+  releases.
+* Let an external MCP client declare, in one call, **which directories** and
+  **which filter criteria** define the current set of files the viewer
+  should work with.
+* Make every MCP call observable as a change to a plain-text file in Local
+  Storage, so the system stays inspectable and version-controllable.
+* Keep the contract small enough that a Claude Code workflow can use the
+  whole surface without onboarding overhead.
+
+### Non-Goals (v1)
+
+* The MCP server is **not** a general remote-control surface for arbitrary
+  GUI actions (zoom, pan, slideshow, color picker, etc.). Viewer-state RPCs
+  may be added in a later spec.
+* The MCP server is **not** a network service. v1 is local-only; remote
+  clients are out of scope.
+* The MCP server does **not** maintain its own settings store. All state
+  lives in Local Storage on disk.
+
+---
+
+## 3. How Claude Code Drives ImageGlass_Mac
+
+The intended workflow:
+
+1. The user is in a terminal running Claude Code.
+2. The user asks for something like:
+   *"In ImageGlass, show me all PNGs under `~/screenshots/2026-06/` and my
+   Figma exports directory, but exclude anything with `_old` in the name."*
+3. Claude Code calls the ImageGlass_Mac MCP server's tools.
+4. The server translates the call into edits to `directories.yaml` (and,
+   if relevant, `settings.yaml`) under the application's Local Storage
+   directory.
+5. The application re-evaluates the active scope.
+6. The Directory / Filename panel in the ImageGlass_Mac UI updates to show
+   the resolved file list.
+
+The user did not open Preferences, did not touch the GUI scope editor, and
+did not edit YAML by hand. Claude Code is the orchestrator; the MCP server
+is the integration point on the application side.
+
+---
+
+## 4. What the MCP Caller Specifies
+
+Every MCP call that mutates state must be able to express, at minimum, the
+following pieces of information. These are the data the MCP server expects
+from Claude Code, and they correspond one-to-one with the Local Storage
+data model in `local_storage.mdx`.
+
+### 4.1 Directories to Include
+
+* One or more **absolute directory paths** on the local machine.
+* For each directory, whether the walk is **recursive** (include the entire
+  directory hierarchy beneath it) or **shallow** (this directory only).
+* Multiple directories combine as a union — the resolved file list is the
+  union of all per-directory results, after filtering.
+
+### 4.2 Inclusion Criteria
+
+* **Extensions** (e.g. `png`, `jpg`, `heic`) — the file must match one of
+  the listed extensions to be included.
+* **Glob patterns** (e.g. `*.png`, `IMG_*.heic`, `**/exports/*.jpg`) — the
+  file path or name must match one of the listed globs.
+* If both extensions and globs are present, both must permit the file
+  (logical AND).
+
+### 4.3 Exclusion Criteria
+
+* **Exclude globs** (e.g. `*_old.*`, `**/trash/**`) — any file matching one
+  of these is removed from the result, regardless of inclusion rules.
+* **Hidden files** — boolean: whether dotfiles and macOS-hidden files are
+  included.
+* Exclusions always win over inclusions.
+
+### 4.4 Scope Identity
+
+* A **scope name** — a short, file-system-safe identifier that the caller
+  uses to reference this configuration on subsequent calls. Scopes are
+  stored in Local Storage as named records.
+* An optional human-readable **description**.
+
+---
+
+## 5. Transport and Wire Format
+
+* **Protocol:** Model Context Protocol over **JSON-RPC 2.0**.
+* **Transport:** stdio in v1. The server reads JSON-RPC frames from `stdin`
+  and writes responses to `stdout`. Diagnostics go to `stderr` only.
+* **Process model:** an in-process Swift implementation (no sidecar Node
+  or Python runtime). See `starbuck-fork.mdx` §1 for the architectural
+  rationale and the engineering stack document for the Swift stack.
+* **Lifecycle:** Claude Code launches the MCP server as a child process and
+  manages its lifetime. The server exits cleanly on `stdin` EOF.
+
+HTTP / SSE transport may be added in a future spec but is not required for
+v1. The Claude Code client uses stdio.
+
+---
+
+## 6. Tool Surface (v1)
+
+The MCP server exposes the following tools. Each tool is a thin wrapper
+around an edit to Local Storage; none of them touch the GUI directly.
+
+| Tool | Purpose |
+| --- | --- |
+| `list_scopes` | Return the names of all scopes currently stored. |
+| `get_scope` | Return the full definition of one named scope: include rules, exclude rules, resolved files, last-evaluated timestamp. |
+| `create_scope` | Create a new named scope. Accepts directories, recursive flag, extensions, include globs, exclude globs. |
+| `set_directories` | Replace the include-directories list for a named scope. Does not re-evaluate; the caller calls `evaluate_scope` after. |
+| `set_include_criteria` | Replace include globs and/or extensions for a named scope. |
+| `set_exclude_criteria` | Replace exclude globs and/or the hidden-files flag for a named scope. |
+| `evaluate_scope` | Walk the scope's directories, apply filters, write the resolved file list and timestamp back to Local Storage, return the resolved list. |
+| `delete_scope` | Remove a scope from Local Storage. |
+
+All tools take JSON arguments and return JSON content. Tools that mutate
+state persist the change before returning success; the on-disk
+`directories.yaml` is always the source of truth.
+
+### Standard MCP Methods
+
+In addition to the application-specific tools above, the server implements
+the standard MCP control methods:
+
+* `initialize` — protocol handshake; returns server name, version, and
+  capabilities.
+* `tools/list` — returns the descriptors for every tool above (name,
+  human-readable description, JSON Schema for inputs).
+* `tools/call` — invokes a tool by name with arguments.
+
+---
+
+## 7. Relationship to Local Storage
+
+This MCP server is the **programmatic front door** to Local Storage. The
+specification for Local Storage — what directory it lives in, which files
+it contains, and the schema of those files — is a **separate document**:
+
+* See [`local_storage.mdx`](./local_storage.mdx) for the on-disk data
+  model.
+
+For orientation, the application's Local Storage directory is:
+
+```
+~/T/_imageglass/
+   settings.yaml         # application-level settings (UI, theme, behavior)
+   directories.yaml      # directories + inclusion / exclusion criteria
+```
+
+* `settings.yaml` holds application settings and is occasionally read /
+  written by MCP tools that affect global behavior. The authoritative
+  schema lives in `local_storage.mdx`.
+* `directories.yaml` holds the scope definitions — the list of directories
+  and directory hierarchies to include and the filter criteria that mask
+  certain files off. This is the primary file that MCP tools mutate when
+  Claude Code adjusts what the viewer is looking at.
+
+The MCP server **must not** invent a parallel settings store. Every state
+change goes through Local Storage, so the user can always inspect
+`~/T/_imageglass/` to see exactly what the MCP server has done.
+
+---
+
+## 8. Concurrency, Atomicity, and Re-Evaluation
+
+* Mutations to `directories.yaml` and `settings.yaml` are **atomic** —
+  write to a temp file in the same directory and `rename(2)` over the
+  target.
+* The MCP server holds a process-local lock around each file's
+  read-modify-write cycle to prevent two concurrent tool calls from
+  clobbering each other.
+* `set_directories`, `set_include_criteria`, and `set_exclude_criteria`
+  **do not** automatically re-evaluate the scope. The caller is expected
+  to call `evaluate_scope` once it has finished mutating, so multiple
+  edits coalesce into a single walk.
+* `evaluate_scope` writes the resolved file list and the `lastEvaluated`
+  timestamp back into the scope record in Local Storage and returns the
+  resolved list in the response.
+
+---
+
+## 9. Error Handling
+
+* Tool errors are returned as JSON-RPC `result` payloads with `isError:
+  true` and a human-readable text block, **not** as JSON-RPC protocol-level
+  errors. This matches the MCP convention and lets Claude Code surface the
+  failure as a tool result rather than a transport failure.
+* Protocol-level JSON-RPC errors (`-32700` parse error, `-32600` invalid
+  request, `-32601` method not found, `-32602` invalid params) are reserved
+  for transport / framing problems.
+* Validation failures (missing required argument, unknown scope name,
+  conflicting create) return `isError: true` results with a message that
+  tells the caller what to fix.
+
+---
+
+## 10. Security and Trust Model (v1)
+
+* The MCP server is **local-only** and runs in the user's own session. It
+  has the same file-system authority as the user.
+* There is no authentication, because there is no remote surface. The
+  transport is stdio between Claude Code and the ImageGlass_Mac process.
+* Path arguments are normalized and expanded (`~` → home directory) before
+  use. Symlink escapes and path-traversal patterns (`../`) are followed
+  exactly as the user's shell would follow them — Claude Code is treated
+  as the user.
+* For App Sandbox builds, the application must hold security-scoped
+  bookmarks for any directory the user has previously granted access to;
+  the MCP server may only walk directories that the bookmarks permit.
+  Out-of-sandbox builds have no such restriction.
+
+A future spec may add a network transport, at which point an
+authentication and authorization model will be required. v1 deliberately
+defers that.
+
+---
+
+## 11. Versioning
+
+* The MCP server reports a semver-ish `serverInfo.version` in the
+  `initialize` response (e.g. `0.1.0` for the first ship).
+* Tool names and argument schemas are part of the contract. Breaking
+  changes bump the major component; additive changes (new tools, new
+  optional arguments) bump the minor component.
+* `local_storage.mdx` owns the on-disk schema version. The MCP server
+  reads and writes the schema declared there and is updated when that
+  schema rev's.
+
+---
+
+## 12. Out of Scope for This Document
+
+* The on-disk file format and field-level schema for `settings.yaml` and
+  `directories.yaml` — owned by `local_storage.mdx`.
+* The user-facing UI for the Directory / Filename panel — owned by
+  `starbuck-fork.mdx` §2 and the panel-specific UX docs.
+* The Swift implementation, build, and packaging details — owned by
+  `code/` and `build-tools.mdx`.
+
+---
+
+## 13. Acceptance Criteria for v1
+
+The MCP server is considered v1-complete when:
+
+1. Claude Code can connect to the server over stdio and complete the MCP
+   `initialize` and `tools/list` handshake.
+2. Claude Code can call every tool in §6 and observe the corresponding
+   plain-text changes in `~/T/_imageglass/directories.yaml`.
+3. After an `evaluate_scope` call, the resolved file list returned matches
+   the file list rendered in the Directory / Filename panel for that
+   scope.
+4. Two concurrent tool calls cannot corrupt the YAML files.
+5. The full surface is documented here and in `local_storage.mdx`, and
+   the two documents agree on the data model.

@@ -276,7 +276,10 @@ struct AboutView: View {
     /// Open a URL in the default browser / mail client. Static so the
     /// `AboutWindowController` can reach it too if it needs to.
     static func open(_ url: URL) {
-        NSWorkspace.shared.open(url)
+        if !NSWorkspace.shared.open(url) {
+            ErrorLog.log("NSWorkspace.open failed for \(url.absoluteString)",
+                         class: "AboutView")
+        }
     }
 }
 

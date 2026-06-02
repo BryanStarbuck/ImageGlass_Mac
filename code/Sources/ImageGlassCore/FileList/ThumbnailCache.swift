@@ -48,7 +48,13 @@ public actor ThumbnailCache {
                 .appendingPathComponent("thumbnails", isDirectory: true)
         }
         self.diskDir = dir
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        } catch {
+            ErrorLog.log("failed to create thumbnail cache directory at \(dir.path)",
+                         error: error,
+                         class: "ThumbnailCache")
+        }
     }
 
     /// Fetches a thumbnail for `url` capped to `maxSide` pixels. Reads from
@@ -73,10 +79,16 @@ public actor ThumbnailCache {
         }
         memory.setObject(CGImageBox(cg), forKey: key as NSString)
         // Best-effort write to disk; not fatal if it fails.
-        try? FileManager.default.createDirectory(
-            at: diskPath.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
+        do {
+            try FileManager.default.createDirectory(
+                at: diskPath.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+        } catch {
+            ErrorLog.log("failed to create thumbnail subdir \(diskPath.deletingLastPathComponent().path)",
+                         error: error,
+                         class: "ThumbnailCache")
+        }
         Self.writeDiskHEIC(cg, to: diskPath, byteAccumulator: &pendingDiskBytes)
 
         // Lazy groom — every 10 minutes or when we've added > 50 MB since last.
@@ -179,7 +191,13 @@ public actor ThumbnailCache {
         var freed = 0
         for (url, size, _) in files {
             if total - freed <= byteCap { break }
-            try? fm.removeItem(at: url)
+            do {
+                try fm.removeItem(at: url)
+            } catch {
+                ErrorLog.log("failed to evict thumbnail \(url.path)",
+                             error: error,
+                             class: "ThumbnailCache")
+            }
             freed += size
         }
     }

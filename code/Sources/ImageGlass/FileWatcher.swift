@@ -1,4 +1,5 @@
 import Foundation
+import ImageGlassCore
 
 /// Watches a directory for any change (write/delete/rename within) and
 /// invokes the callback on a debounce. Uses kqueue via DispatchSource.
@@ -17,7 +18,11 @@ final class FileWatcher {
 
     func start() {
         let fd = open(url.path, O_EVTONLY)
-        guard fd >= 0 else { return }
+        guard fd >= 0 else {
+            ErrorLog.log("open(O_EVTONLY) failed for \(url.path) errno=\(errno)",
+                         class: "FileWatcher")
+            return
+        }
         fileDescriptor = fd
 
         let src = DispatchSource.makeFileSystemObjectSource(

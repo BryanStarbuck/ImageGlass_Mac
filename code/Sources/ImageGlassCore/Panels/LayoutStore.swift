@@ -53,16 +53,48 @@ public final class LayoutStore: @unchecked Sendable {
     public func load() -> PanelLayout {
         lock.lock()
         defer { lock.unlock() }
-        try? AppPaths.ensureLayoutDirectories()
-        if let layout = try? readFile(layoutFile), PanelLayoutValidator.validate(layout) == nil {
-            return layout
+        do {
+            try AppPaths.ensureLayoutDirectories()
+        } catch {
+            ErrorLog.log("ensureLayoutDirectories failed during load",
+                         error: error,
+                         class: "LayoutStore")
         }
-        if let layout = try? readFile(backupFile), PanelLayoutValidator.validate(layout) == nil {
-            NSLog("ImageGlass: layout.json invalid — recovered from layout.json.bak")
-            return layout
+        do {
+            let layout = try readFile(layoutFile)
+            if PanelLayoutValidator.validate(layout) == nil {
+                return layout
+            } else if let reason = PanelLayoutValidator.validate(layout) {
+                ErrorLog.log("layout.json failed validation: \(reason)",
+                             class: "LayoutStore")
+            }
+        } catch {
+            ErrorLog.log("could not read layout.json at \(layoutFile.path)",
+                         error: error,
+                         class: "LayoutStore")
+        }
+        do {
+            let layout = try readFile(backupFile)
+            if PanelLayoutValidator.validate(layout) == nil {
+                NSLog("ImageGlass: layout.json invalid — recovered from layout.json.bak")
+                return layout
+            } else if let reason = PanelLayoutValidator.validate(layout) {
+                ErrorLog.log("layout.json.bak failed validation: \(reason)",
+                             class: "LayoutStore")
+            }
+        } catch {
+            ErrorLog.log("could not read layout.json.bak at \(backupFile.path)",
+                         error: error,
+                         class: "LayoutStore")
         }
         let dflt = PresetCatalog.defaultLayout
-        try? writeFile(dflt, to: layoutFile)
+        do {
+            try writeFile(dflt, to: layoutFile)
+        } catch {
+            ErrorLog.log("could not write default layout to \(layoutFile.path)",
+                         error: error,
+                         class: "LayoutStore")
+        }
         return dflt
     }
 
@@ -76,8 +108,23 @@ public final class LayoutStore: @unchecked Sendable {
         }
         try AppPaths.ensureLayoutDirectories()
         if fm.fileExists(atPath: layoutFile.path) {
-            try? fm.removeItem(at: backupFile)
-            try? fm.copyItem(at: layoutFile, to: backupFile)
+            do {
+                try fm.removeItem(at: backupFile)
+            } catch {
+                let ns = error as NSError
+                if !(ns.domain == NSCocoaErrorDomain && ns.code == NSFileNoSuchFileError) {
+                    ErrorLog.log("could not remove old layout backup at \(backupFile.path)",
+                                 error: error,
+                                 class: "LayoutStore")
+                }
+            }
+            do {
+                try fm.copyItem(at: layoutFile, to: backupFile)
+            } catch {
+                ErrorLog.log("could not copy layout.json to layout.json.bak",
+                             error: error,
+                             class: "LayoutStore")
+            }
         }
         try writeFile(layout, to: layoutFile)
     }
@@ -87,8 +134,22 @@ public final class LayoutStore: @unchecked Sendable {
     public func listUserPresets() -> [String] {
         lock.lock()
         defer { lock.unlock() }
-        try? AppPaths.ensureLayoutDirectories()
-        let urls = (try? fm.contentsOfDirectory(at: presetsDir, includingPropertiesForKeys: nil)) ?? []
+        do {
+            try AppPaths.ensureLayoutDirectories()
+        } catch {
+            ErrorLog.log("ensureLayoutDirectories failed during listUserPresets",
+                         error: error,
+                         class: "LayoutStore")
+        }
+        let urls: [URL]
+        do {
+            urls = try fm.contentsOfDirectory(at: presetsDir, includingPropertiesForKeys: nil)
+        } catch {
+            ErrorLog.log("could not list presets dir at \(presetsDir.path)",
+                         error: error,
+                         class: "LayoutStore")
+            urls = []
+        }
         return urls
             .filter { $0.pathExtension == "json" }
             .map { $0.deletingPathExtension().lastPathComponent }

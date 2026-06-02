@@ -64,7 +64,15 @@ public final class ScopeAuditLog {
             return
         }
         let handle = try FileHandle(forWritingTo: url)
-        defer { try? handle.close() }
+        defer {
+            do {
+                try handle.close()
+            } catch {
+                ErrorLog.log("failed to close audit log handle for \(scopeName)",
+                             error: error,
+                             class: "ScopeAuditLog")
+            }
+        }
         try handle.seekToEnd()
         try handle.write(contentsOf: data)
     }
@@ -77,12 +85,23 @@ public final class ScopeAuditLog {
         guard fm.fileExists(atPath: url.path) else { return [] }
 
         let data = try Data(contentsOf: url)
-        guard let s = String(data: data, encoding: .utf8) else { return [] }
+        guard let s = String(data: data, encoding: .utf8) else {
+            ErrorLog.log("audit log for \(scopeName) not valid UTF-8",
+                         class: "ScopeAuditLog")
+            return []
+        }
         let lines = s.split(separator: "\n", omittingEmptySubsequences: true)
         let slice = lines.suffix(max(0, limit))
         return slice.compactMap { line -> ScopeAuditEntry? in
             guard let d = line.data(using: .utf8) else { return nil }
-            return try? decoder.decode(ScopeAuditEntry.self, from: d)
+            do {
+                return try decoder.decode(ScopeAuditEntry.self, from: d)
+            } catch {
+                ErrorLog.log("failed to decode audit entry for \(scopeName)",
+                             error: error,
+                             class: "ScopeAuditLog")
+                return nil
+            }
         }
     }
 

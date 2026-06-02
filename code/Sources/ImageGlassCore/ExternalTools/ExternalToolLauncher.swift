@@ -78,6 +78,9 @@ public final class ExternalToolLauncher {
         do {
             try process.run()
         } catch {
+            ErrorLog.log("process.run() failed for tool '\(tool.id)' exe=\(exe)",
+                         error: error,
+                         class: String(describing: Self.self))
             throw ExternalToolError.launchFailed("\(error)")
         }
         return process

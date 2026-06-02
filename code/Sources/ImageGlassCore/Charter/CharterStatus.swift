@@ -298,9 +298,14 @@ public enum CharterStatus {
             let files = ScopeEvaluator.resolveFiles(for: probe)
                 .map { ($0 as NSString).lastPathComponent }
             if files == ["keep.png"] { return true }
+            ErrorLog.log("ScopeEvaluator self-check produced unexpected files: \(files)",
+                         class: "CharterStatus")
             gaps.append("ScopeEvaluator self-check failed: expected [keep.png], got \(files).")
             return false
         } catch {
+            ErrorLog.log("ScopeEvaluator self-check failed to create scratch dir",
+                         error: error,
+                         class: "CharterStatus")
             gaps.append("ScopeEvaluator self-check could not create scratch dir: \(error.localizedDescription)")
             return false
         }
@@ -330,11 +335,16 @@ public enum CharterStatus {
                   back.exclude == probe.exclude,
                   back.lastEvaluated == probe.lastEvaluated,
                   back.resolvedFiles == probe.resolvedFiles else {
+                ErrorLog.log("Scope JSON round-trip did not preserve all load-bearing fields",
+                             class: "CharterStatus")
                 gaps.append("Scope JSON round-trip did not preserve all load-bearing fields.")
                 return false
             }
             return true
         } catch {
+            ErrorLog.log("Scope JSON round-trip threw",
+                         error: error,
+                         class: "CharterStatus")
             gaps.append("Scope JSON round-trip threw: \(error.localizedDescription)")
             return false
         }

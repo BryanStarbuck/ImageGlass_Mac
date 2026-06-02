@@ -103,11 +103,16 @@ struct ImageViewer: View {
         }
     }
 
+    /// Empty-viewer placeholder per `docs/use_cases/mcp_file.mdx` §9.2:
+    /// "a centered placeholder reading `No image previewed` in the theme's
+    /// secondary-label color. No stale image remains on the canvas."
     private var emptyState: some View {
         ContentUnavailableView {
-            Label("No image selected", systemImage: "photo.on.rectangle.angled")
+            Label("No image previewed", systemImage: "photo.on.rectangle.angled")
+                .foregroundStyle(.secondary)
         } description: {
             Text("Drag an image into the window or pick a file from the panel on the left.")
+                .foregroundStyle(.secondary)
         }
     }
 }
@@ -173,7 +178,12 @@ private struct FileDropDelegate: DropDelegate {
     func performDrop(info: DropInfo) -> Bool {
         let providers = info.itemProviders(for: [.fileURL])
         guard let first = providers.first else { return false }
-        _ = first.loadObject(ofClass: URL.self) { url, _ in
+        _ = first.loadObject(ofClass: URL.self) { url, error in
+            if let error {
+                ErrorLog.log("FileDropDelegate loadObject failed",
+                             error: error,
+                             class: "FileDropDelegate")
+            }
             guard let url else { return }
             Task { @MainActor in
                 state.openExternalFile(url: url)

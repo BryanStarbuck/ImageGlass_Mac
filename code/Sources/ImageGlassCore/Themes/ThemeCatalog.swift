@@ -42,10 +42,18 @@ public struct ThemeCatalog {
         let fm = FileManager.default
         let dir = AppPaths.themesDir
         guard fm.fileExists(atPath: dir.path) else { return [] }
-        guard let entries = try? fm.contentsOfDirectory(
-            at: dir,
-            includingPropertiesForKeys: [.isDirectoryKey]
-        ) else { return [] }
+        let entries: [URL]
+        do {
+            entries = try fm.contentsOfDirectory(
+                at: dir,
+                includingPropertiesForKeys: [.isDirectoryKey]
+            )
+        } catch {
+            ErrorLog.log("contentsOfDirectory failed for \(dir.path)",
+                         error: error,
+                         class: "ThemeCatalog")
+            return []
+        }
 
         var out: [Theme] = []
         for entry in entries.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
@@ -53,8 +61,13 @@ public struct ThemeCatalog {
             guard fm.fileExists(atPath: entry.path, isDirectory: &isDir), isDir.boolValue else {
                 continue
             }
-            if let theme = try? loadTheme(fromFolder: entry) {
+            do {
+                let theme = try loadTheme(fromFolder: entry)
                 out.append(theme)
+            } catch {
+                ErrorLog.log("loadTheme failed for \(entry.lastPathComponent)",
+                             error: error,
+                             class: "ThemeCatalog")
             }
         }
         return out

@@ -62,7 +62,15 @@ struct ImageInfo {
         let fm = FileManager.default
         guard fm.fileExists(atPath: expanded) else { return nil }
 
-        let attrs = try? fm.attributesOfItem(atPath: expanded)
+        let attrs: [FileAttributeKey: Any]?
+        do {
+            attrs = try fm.attributesOfItem(atPath: expanded)
+        } catch {
+            ErrorLog.log("attributesOfItem failed for \(expanded)",
+                         error: error,
+                         class: "ImageInfo")
+            attrs = nil
+        }
         let size = (attrs?[.size] as? NSNumber)?.uint64Value ?? 0
 
         var width = 0, height = 0
@@ -70,6 +78,9 @@ struct ImageInfo {
            let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any] {
             width  = (props[kCGImagePropertyPixelWidth]  as? Int) ?? 0
             height = (props[kCGImagePropertyPixelHeight] as? Int) ?? 0
+        } else {
+            ErrorLog.log("CGImageSourceCreateWithURL / property read failed for \(url.path)",
+                         class: "ImageInfo")
         }
 
         let ext = url.pathExtension.uppercased()

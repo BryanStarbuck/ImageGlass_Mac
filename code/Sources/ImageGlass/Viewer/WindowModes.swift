@@ -38,7 +38,12 @@ enum WindowModes {
     /// image's natural pixel size, clamped to the visible screen rect.
     static func fitWindowToImage(path: String?) {
         guard let path else { return }
-        guard let img = NSImage(contentsOfFile: AppPaths.expandTilde(path)) else { return }
+        let expanded = AppPaths.expandTilde(path)
+        guard let img = NSImage(contentsOfFile: expanded) else {
+            ErrorLog.log("fitWindowToImage: NSImage(contentsOfFile:) failed for \(expanded)",
+                         class: "WindowModes")
+            return
+        }
         guard let win = NSApp.keyWindow ?? NSApp.mainWindow else { return }
 
         let screenFrame = win.screen?.visibleFrame ?? NSScreen.main?.visibleFrame ?? .zero

@@ -68,9 +68,27 @@ public enum CropSideFileStore {
 
     public static func read(for imageURL: URL) -> CropSideFile? {
         let url = sideFileURL(for: imageURL)
-        guard let data = try? Data(contentsOf: url) else { return nil }
+        let data: Data
+        do {
+            data = try Data(contentsOf: url)
+        } catch {
+            let nsErr = error as NSError
+            if !(nsErr.domain == NSCocoaErrorDomain && nsErr.code == NSFileReadNoSuchFileError) {
+                ErrorLog.log("side-file read failed: \(url.path)",
+                             error: error,
+                             class: "CropSideFileStore")
+            }
+            return nil
+        }
         let dec = JSONDecoder()
         dec.dateDecodingStrategy = .iso8601
-        return try? dec.decode(CropSideFile.self, from: data)
+        do {
+            return try dec.decode(CropSideFile.self, from: data)
+        } catch {
+            ErrorLog.log("side-file decode failed: \(url.path)",
+                         error: error,
+                         class: "CropSideFileStore")
+            return nil
+        }
     }
 }

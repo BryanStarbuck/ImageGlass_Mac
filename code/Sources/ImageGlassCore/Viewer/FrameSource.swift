@@ -44,22 +44,30 @@ public final class FrameSource: @unchecked Sendable {
     public static func load(url: URL) -> FrameSource? {
         let opts: [CFString: Any] = [kCGImageSourceShouldCache: false]
         guard let src = CGImageSourceCreateWithURL(url as CFURL, opts as CFDictionary) else {
+            ErrorLog.log("CGImageSourceCreateWithURL returned nil for \(url.path)",
+                         class: "FrameSource")
             return nil
         }
-        return decode(source: src)
+        return decode(source: src, contextLabel: url.lastPathComponent)
     }
 
     public static func load(data: Data) -> FrameSource? {
         let opts: [CFString: Any] = [kCGImageSourceShouldCache: false]
         guard let src = CGImageSourceCreateWithData(data as CFData, opts as CFDictionary) else {
+            ErrorLog.log("CGImageSourceCreateWithData returned nil (data size=\(data.count))",
+                         class: "FrameSource")
             return nil
         }
-        return decode(source: src)
+        return decode(source: src, contextLabel: "<data:\(data.count)b>")
     }
 
-    private static func decode(source: CGImageSource) -> FrameSource? {
+    private static func decode(source: CGImageSource, contextLabel: String = "<unknown>") -> FrameSource? {
         let count = CGImageSourceGetCount(source)
-        guard count > 0 else { return nil }
+        guard count > 0 else {
+            ErrorLog.log("CGImageSourceGetCount returned 0 for \(contextLabel)",
+                         class: "FrameSource")
+            return nil
+        }
 
         let containerProps = CGImageSourceCopyProperties(source, nil) as? [CFString: Any]
         let loopCount = readLoopCount(containerProps)
@@ -69,13 +77,21 @@ public final class FrameSource: @unchecked Sendable {
         var hasDelay = false
 
         for i in 0..<count {
-            guard let cg = CGImageSourceCreateImageAtIndex(source, i, nil) else { continue }
+            guard let cg = CGImageSourceCreateImageAtIndex(source, i, nil) else {
+                ErrorLog.log("CGImageSourceCreateImageAtIndex(\(i)) returned nil for \(contextLabel)",
+                             class: "FrameSource")
+                continue
+            }
             let frameProps = CGImageSourceCopyPropertiesAtIndex(source, i, nil) as? [CFString: Any]
             let delay = readFrameDelay(frameProps)
             if delay > 0 { hasDelay = true }
             frames.append(Frame(cgImage: cg, delay: delay))
         }
-        guard !frames.isEmpty else { return nil }
+        guard !frames.isEmpty else {
+            ErrorLog.log("decoded 0 frames from \(contextLabel) (declared count=\(count))",
+                         class: "FrameSource")
+            return nil
+        }
         return FrameSource(frames: frames, isAnimated: hasDelay, loopCount: loopCount)
     }
 

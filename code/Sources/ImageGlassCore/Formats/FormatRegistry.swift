@@ -150,11 +150,24 @@ public final class FormatRegistry: @unchecked Sendable {
         guard !didLoadUser else { return }
         didLoadUser = true
         let url = AppPaths.formatsFile
-        guard FileManager.default.fileExists(atPath: url.path),
-              let data = try? Data(contentsOf: url),
-              let decoded = try? JSONDecoder().decode(UserFormatsFile.self, from: data)
-        else { return }
-        _userExtras = decoded.extras
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        let data: Data
+        do {
+            data = try Data(contentsOf: url)
+        } catch {
+            ErrorLog.log("failed to read formats.json at \(url.path)",
+                         error: error,
+                         class: "FormatRegistry")
+            return
+        }
+        do {
+            let decoded = try JSONDecoder().decode(UserFormatsFile.self, from: data)
+            _userExtras = decoded.extras
+        } catch {
+            ErrorLog.log("failed to decode formats.json at \(url.path)",
+                         error: error,
+                         class: "FormatRegistry")
+        }
     }
 
     private func persistUserLocked() throws {

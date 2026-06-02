@@ -87,7 +87,11 @@ public enum ScopeEvaluator {
             at: directory,
             includingPropertiesForKeys: keys,
             options: opts
-        ) else { return out }
+        ) else {
+            ErrorLog.log("FileManager.enumerator returned nil for \(directory.path)",
+                         class: "ScopeEvaluator")
+            return out
+        }
 
         let rootDepth = depthComponents(of: directory.path)
         let maxDepth = criterion.maxDepth

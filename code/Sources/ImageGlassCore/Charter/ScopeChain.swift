@@ -91,7 +91,15 @@ public enum ScopeChain {
         // matters for `recursive` / `hiddenFiles` booleans, where ANY-true
         // semantics already merge correctly.
         for parentName in scope.inheritsFrom ?? [] {
-            guard let parent = try? loaders.loadScope(parentName) else { continue }
+            let parent: Scope
+            do {
+                parent = try loaders.loadScope(parentName)
+            } catch {
+                ErrorLog.log("failed to load parent scope '\(parentName)' while composing '\(scope.name)'",
+                             error: error,
+                             class: "ScopeChain")
+                continue
+            }
             absorb(
                 scope: parent,
                 include: &include,
@@ -108,7 +116,15 @@ public enum ScopeChain {
             guard !visited.contains(ruleSetKey) else { continue }
             visited.insert(ruleSetKey)
             sources.append(ruleSetKey)
-            guard let rs = try? loaders.loadRuleSet(ruleSetName) else { continue }
+            let rs: RuleSet
+            do {
+                rs = try loaders.loadRuleSet(ruleSetName)
+            } catch {
+                ErrorLog.log("failed to load rule set '\(ruleSetName)' while composing '\(scope.name)'",
+                             error: error,
+                             class: "ScopeChain")
+                continue
+            }
             merge(into: &include, from: rs.include)
             merge(into: &exclude, from: rs.exclude)
         }

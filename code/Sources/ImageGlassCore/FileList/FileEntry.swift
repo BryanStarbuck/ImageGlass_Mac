@@ -96,7 +96,15 @@ extension FileEntry {
         let keys: Set<URLResourceKey> = [
             .fileSizeKey, .contentModificationDateKey, .typeIdentifierKey,
         ]
-        let vals = try? url.resourceValues(forKeys: keys)
+        let vals: URLResourceValues?
+        do {
+            vals = try url.resourceValues(forKeys: keys)
+        } catch {
+            ErrorLog.log("URL.resourceValues failed for \(url.path)",
+                         error: error,
+                         class: "FileEntry")
+            vals = nil
+        }
         if let s = vals?.fileSize { self.size = Int64(s) }
         if let m = vals?.contentModificationDate { self.mtime = m }
     }

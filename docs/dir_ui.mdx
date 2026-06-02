@@ -1,0 +1,268 @@
+---
+title: Directory Panel UI
+description: Product specification for the hierarchical Directory Panel — the column that renders the file list resolved from directories.yaml, lets the user navigate it, and drives the main image viewer's current selection.
+---
+
+# Directory Panel UI
+
+> **Document type:** Product specification.
+> **Audience:** Engineering (implementation) and Product (behavior, interaction).
+> **Owners:** PM for behavior and interaction; CTO for the
+> SwiftUI / AppKit interop and performance budget.
+> **Status:** v1 spec for the Mac-native fork. See `starbuck-fork.mdx` §2
+> for the umbrella charter (new column, modular panels) and
+> `local_storage.mdx` for the on-disk data model that this panel renders.
+
+---
+
+## 1. Purpose
+
+The **Directory Panel** is the new column the Starbuck fork adds to the
+ImageGlass main window. It renders, in a hierarchical tree view, the set
+of files resolved from the active scope in `directories.yaml`. It is the
+control surface through which the user picks which image the main viewer
+displays.
+
+Conceptually:
+
+* `directories.yaml` declares **one or more root directories** (plus
+  inclusion / exclusion criteria — see `local_storage.mdx`).
+* The application walks the directory hierarchies under those roots,
+  filters the files by the scope's criteria, and produces a **resolved
+  file list**.
+* The Directory Panel renders that resolved file list as a **tree** that
+  mirrors the on-disk directory structure.
+* Clicking an image file in the tree makes the main viewer display that
+  image.
+* Scrolling up and down through the tree (or using arrow keys) advances
+  the main viewer's selection in turn.
+
+The panel is the user-facing twin of the MCP server: the server lets
+Claude Code edit scopes from outside the app, and this panel lets the
+user see and navigate the resulting file list from inside the app.
+
+---
+
+## 2. Where It Fits in the Window
+
+The fork's new column hosts **modular panels** (see `starbuck-fork.mdx`
+§2). v1 ships with two panels in this column:
+
+| Panel | Purpose | Can be toggled off? |
+| --- | --- | --- |
+| **Directory Panel** *(this spec)* | Hierarchical tree of resolved files. Drives the main viewer's current image. | Yes. |
+| **Image Preview Panel** | Thumbnail / preview strip of the same resolved files. Complementary to the tree. | **Yes** — the user can turn this one on or off independently of the Directory Panel. |
+
+Both panels read the **same** resolved file list from Local Storage. They
+are two views of one data model, not two parallel systems. Selection
+state is shared: clicking an entry in either panel updates the other,
+and updates the main viewer.
+
+The user can run with:
+
+* Directory Panel only (default — the tree is the primary navigation).
+* Directory Panel + Preview Panel (tree plus thumbnail strip).
+* Preview Panel only (thumbnails as the primary navigation — for users
+  who prefer image-led browsing).
+* Neither (the new column hidden entirely — the viewer falls back to
+  upstream behavior).
+
+---
+
+## 3. View Mode: Hierarchical Tree
+
+The Directory Panel is **always hierarchical** in v1. It is **not** a
+flat list. A flat list of filenames is offered by the Preview Panel
+(thumbnails) and by upstream ImageGlass's existing gallery; this panel's
+job is to expose the directory structure.
+
+### 3.1 Tree Construction
+
+* The roots of the tree are the **include directories** declared in
+  `directories.yaml` for the active scope. If three root directories are
+  declared, the tree has three top-level nodes.
+* Under each root, the tree contains **only the subdirectories that
+  contain at least one in-scope file**, transitively. Empty branches are
+  pruned so the tree stays scannable.
+* Leaf nodes are **files** that passed the scope's inclusion / exclusion
+  criteria.
+* If a root directory's `recursive` flag is `false`, only that root's
+  direct children are considered; deeper subdirectories are not walked.
+
+### 3.2 Node Display
+
+Each node shows:
+
+| Node kind | Primary text | Secondary text |
+| --- | --- | --- |
+| Root directory | Display name (last path component) | Full absolute path, dimmed, on hover or as a tooltip. |
+| Subdirectory | Folder name | Optional file count of in-scope descendants. |
+| File | Filename | Optional metadata badge (e.g., dimensions, file size) once the metadata pass has run. |
+
+Icons follow the system icon (`NSWorkspace.shared.icon(forFile:)`) so
+the tree feels native and the user gets the same file-type cues they
+see in Finder.
+
+### 3.3 Expand / Collapse
+
+* Initial state: roots are **expanded**, immediate subdirectories are
+  **collapsed**, except when a subdirectory contains the currently
+  selected file (that path is auto-expanded so the selection is
+  visible).
+* Disclosure triangles follow standard `OutlineGroup` /
+  `NSOutlineView` behavior.
+* `⌥`-click on a disclosure triangle expands or collapses the entire
+  subtree, matching Finder.
+
+---
+
+## 4. Data Source and Refresh
+
+* The panel reads the active scope from `directories.yaml` (see
+  `local_storage.mdx`). The "active scope" is the scope named in
+  `settings.yaml` as the currently selected scope.
+* The panel never re-walks the file system on its own. It reads the
+  **resolved file list** that was last written by the scope evaluator
+  (see `mcp.mdx` §6, `evaluate_scope`).
+* When the resolved file list changes — because the user added a
+  directory, because Claude Code mutated the scope via MCP, or because
+  the file-system watcher fired — the panel refreshes incrementally.
+  It must not collapse the tree or lose the user's selection on
+  refresh.
+
+### 4.1 Live File-System Updates
+
+The application's file-system watcher (`FSEventStream`) emits change
+events for the directories named in the active scope. On a change:
+
+1. The scope is re-evaluated in the background.
+2. The new resolved file list is diffed against the displayed tree.
+3. New files appear, removed files disappear, with a brief highlight to
+   draw the user's eye.
+4. The current selection is preserved if the file still exists; if it
+   was removed, selection moves to the nearest surviving sibling.
+
+---
+
+## 5. Selection and Image Preview
+
+### 5.1 Single Selection Drives the Viewer
+
+* Selecting a **file** node makes the main viewer display that image.
+* Selecting a **directory** node does **not** change the viewer — it
+  only highlights the directory. (A future v2 may show a folder
+  thumbnail mosaic; out of scope here.)
+* Selection is **single-row** by default. Multi-select (⌘-click,
+  ⇧-click) is supported for bulk actions (copy, move, exclude — see
+  `menus.mdx`).
+
+### 5.2 Scrolling and Sequential Browsing
+
+The panel is the primary navigation surface for stepping through
+images.
+
+* `↓` and `↑` move to the next / previous **visible** node (skipping
+  collapsed subtrees) and, if that node is a file, load it into the
+  viewer.
+* `→` expands a collapsed directory; on an expanded directory, moves
+  to the first child. `←` collapses; on a collapsed or leaf row, moves
+  to the parent.
+* `Home` / `End` jump to the first / last visible node.
+* `Space` toggles the slideshow on the current scope (same shortcut
+  upstream uses).
+* Scroll-wheel and trackpad scrolling are pass-through — they pan the
+  panel, they do **not** change the selection. This matches Finder and
+  avoids the "I scrolled and now I'm looking at a different image"
+  surprise.
+
+### 5.3 Linked With the Preview Panel
+
+When the Preview Panel is also visible, the selection in the Directory
+Panel and the Preview Panel is **the same selection**. Changing one
+changes the other. Both reflect the viewer's current image at all
+times.
+
+---
+
+## 6. Interaction Surface (Summary)
+
+Interaction details for the menu bar, context menus, and toolbar live
+in `menus.mdx`. The Directory Panel itself exposes:
+
+| Interaction | Effect |
+| --- | --- |
+| Click a file row | Load that image into the viewer. |
+| Double-click a file row | Load + open in the OS default app (optional config). |
+| Click a directory row | Highlight it; no viewer change. |
+| Double-click a directory row | Expand / collapse. |
+| Right-click any row | Open the context menu (see `menus.mdx` §Context Menus). |
+| Drag a row | Initiate a standard Finder-style drag of the file (`NSFilePromiseProvider`). |
+| Drop a folder onto the panel | Offer to add that folder to the active scope as a new include directory. |
+| `↑` / `↓` / `←` / `→` | Navigate as in §5.2. |
+| Type-to-search | Jumps to the first visible row whose filename starts with the typed prefix (1.5 s buffer). |
+
+---
+
+## 7. Performance Budget
+
+The tree must remain responsive on scopes that resolve to **tens of
+thousands of files**.
+
+* The data model is built lazily: subdirectory contents are
+  materialized when the row is expanded, not on initial load.
+* Row rendering uses `NSOutlineView` (via `NSViewRepresentable`) rather
+  than naive SwiftUI `OutlineGroup` for v1, because `NSOutlineView`
+  cell reuse handles 50k-row scopes without dropping frames.
+* Initial paint of a 10,000-file scope must complete in **under 250 ms**
+  on Apple Silicon.
+* Selection change → image visible in the viewer must complete in
+  **under 100 ms** for any format that ImageIO decodes natively.
+
+---
+
+## 8. Visual Style
+
+* Native AppKit / SwiftUI styling. The panel inherits the system
+  light / dark theme via `@Environment(\.colorScheme)`.
+* Row height matches Finder's default list view at the user's current
+  text-size preference.
+* No custom chrome, no skeuomorphic textures. The panel must feel like
+  it shipped with the OS.
+* The active scope's name is shown as a small header above the tree,
+  with a popover trigger to switch scopes (see `menus.mdx`).
+
+---
+
+## 9. Non-Goals (v1)
+
+* No in-panel renaming, deleting, or moving of files. Those happen
+  through Finder integration (Reveal in Finder, drag out) or
+  scope-level menus, not by editing the tree.
+* No tag, rating, or flag editing in the tree. The tree shows
+  structure; metadata edits live in a separate (future) panel.
+* No multi-scope tabs in the tree. The tree always shows exactly one
+  scope at a time; switching scopes is handled by `menus.mdx` and a
+  scope-picker control.
+* No upstream-style "favorites" sidebar inside this panel. Upstream
+  favorites belong to the viewer chrome, not to this column.
+
+---
+
+## 10. Acceptance Criteria for v1
+
+The Directory Panel is considered v1-complete when:
+
+1. Opening the app with a valid `directories.yaml` renders the tree
+   with the include directories as roots, pruned to in-scope files
+   only.
+2. Selecting a file row loads the image in the main viewer within the
+   §7 latency budget.
+3. The Preview Panel can be toggled on and off independently of the
+   Directory Panel without losing the active selection.
+4. Editing the scope through the MCP server (see `mcp.mdx`) and calling
+   `evaluate_scope` causes the tree to refresh incrementally, with
+   selection preserved when possible.
+5. The tree handles a 10,000-file scope without UI stutter (60 fps
+   scrolling on Apple Silicon).
+6. Keyboard navigation (§5.2) matches the spec on a stock US keyboard
+   and respects the user's "Full Keyboard Access" system setting.

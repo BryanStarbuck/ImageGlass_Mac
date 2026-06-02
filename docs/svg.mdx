@@ -1,0 +1,717 @@
+---
+title: SVG Preview
+description: Product and engineering specification for SVG preview in ImageGlass_Mac — WKWebView-backed animated rendering, NSImage / Core Graphics static fallback, zoom, pan, SMIL / CSS animation transport (play, pause, loop, speed), sandboxing, the new SVG menu, and the full hotkey table reconciled against video and image menus so there are no shortcut conflicts.
+---
+
+# SVG Preview
+
+This page is the **complete product + engineering specification** for
+SVG preview in ImageGlass_Mac.
+
+SVG is *not* a raster format and is *not* a video format. It is a
+declarative document with optional animations (SMIL,
+CSS `@keyframes`, or scripted) and resolution-independent geometry
+that we want to zoom into without aliasing. The right primary
+renderer on macOS is **WebKit (WKWebView)** — the same engine Safari
+uses — wrapped inside our canvas and driven by a thin JavaScript
+bridge for transport controls.
+
+It cross-references:
+
+* [Video Preview](./videos.mdx) — sibling preview surface. Shares the
+  Play / Pause / Loop / Speed transport model and the
+  focus-context shortcut rule (`§11` of `videos.mdx`).
+* [Menus](./menus.mdx) — global menu surface. The new SVG menu lands
+  between `Video` and `Scope`.
+* [Features](./features.mdx) — SVG is already listed under "Animation
+  & Multi-Frame Support". This spec is what makes that line true.
+* [Supported Formats](./supported-formats.mdx) — SVG is already in
+  the list. This spec is the renderer.
+* [MCP](./mcp.mdx) — programmatic SVG transport and zoom.
+
+The Mac stack used throughout: **Swift 6 + SwiftUI** for menus and
+chrome, **AppKit `NSViewRepresentable`** to host both renderers,
+**WebKit (`WKWebView`, `WKUserContentController`, `WKContentRuleList`)**
+for the animated path, **ImageIO + Core Graphics** for the static
+fallback path with `CGSVGDocument`-equivalent rendering via the
+`SVGImageRep` route, **MetalKit** for the shared zoom / pan canvas
+state, and **`JavaScriptCore` via the WebKit message-handler bridge**
+for the transport API.
+
+---
+
+## 1. Audience and Goals
+
+### 1.1 Audiences
+
+| Tier | Audience | What they want from SVG preview |
+| --- | --- | --- |
+| T1 | Casual user | Double-click an `.svg`, see it sharp at any size, watch the animation play. |
+| T2 | Designer | Pixel-precise zoom (100 %, 200 %, 400 %), pan, no anti-aliasing surprises, see the artboard frame. |
+| T3 | Web / motion designer | Confirm SMIL and CSS keyframe animations play correctly at the same speed Safari uses. Pause to inspect a frame. |
+| T4 | Power user / MCP | Drive zoom and animation transport from Claude Code: open a path, pause, snapshot a static raster, loop, change speed. |
+
+### 1.2 Goals
+
+* **Native fidelity.** Render SVG with the same engine Safari uses
+  so what the user sees in Safari is what they see in
+  ImageGlass_Mac. We **delegate** to WebKit rather than reinvent SVG.
+* **Animations play.** SMIL (`<animate>`, `<animateTransform>`,
+  `<animateMotion>`, `<set>`), CSS keyframes, and CSS transitions
+  all play out of the box.
+* **Transport is consistent with video.** Spacebar plays / pauses;
+  `M` is reserved (no audio in SVG, see §1.3); `L` loops; speed
+  control is `⌥ 1` … `⌥ 5` exactly like Video.
+* **Zoom is part of the existing zoom model.** `⌘ +`, `⌘ -`, `⌘ 0`,
+  `⌘ 9` work as documented in
+  [`menus.mdx` §4.4](./menus.mdx#44-view). The zoom value is
+  applied to the WKWebView's `pageZoom` for the animated path and to
+  the Metal-backed bitmap for the static path; the user can't tell
+  which is which.
+* **Static rasterization is byte-deterministic.** A snapshot at
+  zoom = 1 produces the same PNG byte-for-byte across runs (subject
+  to font availability).
+* **MCP parity.** Every transport and zoom control is reachable from
+  MCP, matching `videos.mdx §8`.
+* **Sandboxed by default.** The WKWebView for SVG runs with all
+  network loads blocked, no JavaScript by default (toggleable in
+  Settings), no `<foreignObject>` access to AppKit, and a strict
+  Content-Security-Policy.
+
+### 1.3 Non-goals
+
+* **No SVG editing.** We do not modify node attributes, paths, fill
+  colors, or anything else. SVG is read-only.
+* **No audio.** SVG has no audio surface in the W3C spec. The `M`
+  hotkey from Video is **unbound** in SVG context — pressing it does
+  nothing.
+* **No multi-document tab UI.** One SVG per viewer canvas, exactly
+  like images and videos.
+* **No SVG-to-PDF export in v1.** Designers who need PDF can use
+  Preview.app's existing export path.
+* **No HTML rendering.** WKWebView can render HTML — we serve
+  *only* the SVG inside a minimal HTML wrapper and lock down
+  navigation.
+
+---
+
+## 2. macOS Native SVG Support — Survey and Decision
+
+We surveyed every macOS-native path to render SVG in 2026 before
+choosing the architecture below.
+
+### 2.1 Candidate paths
+
+| Approach | Animations? | Zoom? | Quality | Notes |
+| --- | --- | --- | --- | --- |
+| **WKWebView (WebKit)** | Yes — SMIL, CSS keyframes, CSS transitions, scripted. | Yes via `pageZoom` and viewport. | Highest. Same engine as Safari. | First-class macOS API. The macOS-native answer. |
+| **NSImage with SVG support (macOS 13+)** | **No.** Treated as a static "symbol-style" vector. | Yes, scales with view. | Good for static icons. | Apple added `NSImage(named:)` SVG support primarily for SF Symbols-style assets. Animation tags are ignored. |
+| **`CGSVGDocument` (private)** | No. Static-only. | Yes. | Good. | Used by Preview.app and Quick Look internally. Private SPI — **not usable** in a shipping app. |
+| **`SVGImageRep` (NSImageRep subclass)** | No. Static-only. | Yes. | Good. | The public ImageIO route Apple uses to deliver SVG to `NSImage`. Animation tags ignored. |
+| **SVGKit (third-party, Cocoa)** | Limited — partial SMIL via Core Animation. | Yes. | Mixed; rendering bugs vs. WebKit. | Project maturity uneven; last major release predates current SMIL fixes. We do **not** ship it. |
+| **Macaw / SwiftSVG (third-party)** | Limited. | Yes. | Mixed. | Same reasoning as SVGKit. Not shipped. |
+| **PDFKit (convert SVG → PDF first)** | No. | Yes. | Good for static. | Requires a separate converter. Not useful as a primary path. |
+
+### 2.2 Decision
+
+* **Primary renderer: WKWebView.** Every SVG opens in the WKWebView
+  path unless detection (§4.1) determines the document is "definitely
+  static and trivially small" *and* the user has opted into the
+  static fast-path in Settings.
+* **Fallback renderer: `NSImage` via `SVGImageRep`.** Used only for
+  the static fast-path and for thumbnail generation (which never
+  needs to play animation).
+* **No third-party SVG libraries.** They duplicate macOS capability
+  and lag behind WebKit on SMIL / CSS animation correctness.
+
+### 2.3 Why not just NSImage everywhere?
+
+`NSImage(contentsOf:)` succeeds on most SVGs since macOS 13 — but it
+delivers a *static raster* representation at a particular size, with
+all animation elements discarded. Designers ship animated SVGs and
+expect them to animate. The headline feature here is "animations play
+correctly," and that requires WebKit.
+
+### 2.4 Why not Safari Quick Look?
+
+Quick Look uses `CGSVGDocument` (private) under the hood and does
+not animate. WKWebView gives us the animated Safari rendering plus
+programmatic transport control via a JS bridge — which Quick Look
+does not expose.
+
+---
+
+## 3. Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ ViewerCanvasView  (SwiftUI)                                         │
+│                                                                     │
+│  ├─ if file isImage  → ImageCanvasMetalView  (existing)             │
+│  ├─ if file isVideo  → VideoCanvasView       (videos.mdx)           │
+│  └─ if file isSVG    → SVGCanvasView         (new, this doc)        │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ SVGCanvasView  (NSViewRepresentable)                                │
+│                                                                     │
+│   ┌────────── animated path ──────────┐                             │
+│   │ WKWebView (sandboxed)             │                             │
+│   │  - loads minimal HTML shell       │                             │
+│   │  - SVG inlined in <body>          │                             │
+│   │  - no network, no remote JS       │                             │
+│   │  - JS bridge: ig.transport.*      │                             │
+│   └───────────────────────────────────┘                             │
+│                                                                     │
+│   ┌──────────── static path ──────────┐                             │
+│   │ NSImageView                       │                             │
+│   │  + NSImage(SVGImageRep)           │                             │
+│   │  + Metal-backed zoom layer        │                             │
+│   └───────────────────────────────────┘                             │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ SVGPlaybackController  (actor, owned by the window)                 │
+│                                                                     │
+│   - renderer: .animated(WKWebView) | .static(NSImage)               │
+│   - currentURL: URL                                                 │
+│   - isPlaying: Bool                                                 │
+│   - loopOn: Bool                                                    │
+│   - rate: Double                                                    │
+│   - zoom: Double         ← canonical zoom, mirrored into renderer   │
+│   - pan: CGSize          ← canonical pan, mirrored into renderer    │
+│                                                                     │
+│   Methods:                                                          │
+│     load(_ url: URL) async throws                                   │
+│     playPauseToggle()                                               │
+│     setLoop(_ on: Bool)                                             │
+│     setRate(_ rate: Double)                                         │
+│     setZoom(_ z: Double, anchor: CGPoint)                           │
+│     resetZoom()                                                     │
+│     fitZoom()                                                       │
+│     snapshotCurrentFrame() async throws -> CGImage                  │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 3.1 The WKWebView host
+
+We instantiate a single `WKWebView` per `SVGCanvasView`. Its
+configuration is locked down:
+
+```swift
+let config = WKWebViewConfiguration()
+config.suppressesIncrementalRendering = false
+config.allowsAirPlayForMediaPlayback = false
+config.mediaTypesRequiringUserActionForPlayback = .all
+
+// JavaScript: off by default. SMIL and CSS animations do NOT need JS.
+let prefs = WKWebpagePreferences()
+prefs.allowsContentJavaScript = false
+config.defaultWebpagePreferences = prefs
+
+// Block all network loads — we serve the SVG inline.
+config.websiteDataStore = .nonPersistent()
+
+// Bridge for our transport calls (we INJECT this, the SVG cannot call out).
+config.userContentController.add(transportBridge, name: "igTransport")
+```
+
+Why JavaScript is **off** by default:
+
+* SMIL animations (`<animate>`, `<animateTransform>`, etc.) do not
+  require JS.
+* CSS keyframes and CSS transitions do not require JS.
+* Most "animated SVGs in the wild" use SMIL or CSS only.
+* Disabling JS removes the entire SVG-XSS surface.
+
+For the rare case of a scripted SVG (commonly D3-generated charts or
+hand-coded scripted animations), Settings exposes
+**Allow Scripts in SVG** (default off). Enabling it sets
+`prefs.allowsContentJavaScript = true` for the SVG canvas only. The
+sandbox still blocks all network loads.
+
+### 3.2 The HTML shell
+
+We wrap the SVG in a minimal HTML document so we have a viewport, a
+known background, and a known transport API:
+
+```html
+<!doctype html>
+<html><head><meta charset="utf-8">
+<style>
+ html, body { margin: 0; padding: 0; background: transparent;
+              overflow: hidden; width: 100%; height: 100%; }
+ svg { width: 100%; height: 100%; display: block; }
+</style>
+<meta http-equiv="Content-Security-Policy"
+ content="default-src 'none'; img-src data:; style-src 'unsafe-inline';
+          script-src 'none';">
+</head><body>
+{INLINED_SVG}
+<script>/* injected by app; only when JS is enabled */</script>
+</body></html>
+```
+
+The `{INLINED_SVG}` slot is the verbatim file contents — we do not
+parse, normalize, or re-serialize the SVG. We do strip any inline
+`<script>` element when JS is off, before passing to `loadHTMLString`.
+
+The CSP forbids every form of external load. Even if a malicious SVG
+contained an external image reference, it would be blocked.
+
+### 3.3 Transport bridge
+
+For animated SVGs we need three operations:
+
+* `pause()` — stops all animation timers.
+* `play()` — resumes.
+* `setRate(double)` — multiplies the animation timeline rate.
+
+These are implemented in the JS shell that we inject when JS is
+enabled. For the **JS-off** default, we use **SMIL's native control
+API** directly via WebKit's evaluateJavaScript escape hatch — WebKit
+still parses SMIL when JS is off, and the SVG DOM's
+`pauseAnimations()` / `unpauseAnimations()` methods are accessible
+through `WKWebView.evaluateJavaScript`, which is allowed even when
+page-level scripting is disabled:
+
+```swift
+func pause() async {
+    _ = try? await webView.evaluateJavaScript(
+        "document.documentElement.pauseAnimations();"
+    )
+}
+
+func play() async {
+    _ = try? await webView.evaluateJavaScript(
+        "document.documentElement.unpauseAnimations();"
+    )
+}
+
+// Rate is mapped onto SVGSVGElement.setCurrentTime by a small
+// requestAnimationFrame stepper; CSS animation rate via
+// `animation-play-state` + manipulating `currentTime` of CSSAnimation.
+func setRate(_ r: Double) async {
+    _ = try? await webView.evaluateJavaScript(
+        "ig_setRate(\(r));"
+    )
+}
+```
+
+`pauseAnimations()` and `unpauseAnimations()` are W3C SVG 1.1 SMIL
+API methods that exist on `SVGSVGElement` independently of the page
+script context. WebKit honors them.
+
+Looping behaves as follows. SMIL animations with `repeatCount="indefinite"`
+already loop. For SMIL animations that finish, and for CSS animations
+that finish, we attach a one-shot end-event observer (`endEvent` for
+SMIL, `animationend` for CSS) and either let the document idle (loop
+off) or call `setCurrentTime(0)` and `unpauseAnimations()` (loop on).
+
+### 3.4 Zoom
+
+Canonical zoom lives in `SVGPlaybackController.zoom`. It is mirrored
+into the active renderer:
+
+* **Animated path (WKWebView):** apply `pageZoom = zoom` and adjust
+  scroll origin to keep the anchor point stable. `pageZoom` is the
+  same API Safari's `⌘ +` uses; SVG geometry stays vector-crisp at
+  any value.
+* **Static path (NSImage):** the existing Metal canvas already
+  handles zoom — we draw the rasterized `CGImage` from
+  `SVGImageRep.draw(in:)` at the resolved size. At zoom > 1 we
+  re-render the SVG at the higher resolution so the result stays
+  crisp (we do *not* upscale a rasterized bitmap).
+
+Zoom shortcuts (`⌘ +`, `⌘ -`, `⌘ 0`, `⌘ 9`, `⇧ ⌘ 9`) reuse the
+existing View-menu items unchanged. Mouse-wheel zoom and pinch-zoom
+gestures from the existing canvas work identically. Pan uses the
+existing two-finger / drag canvas pan.
+
+### 3.5 Fit, fill, and the SVG `viewBox`
+
+SVGs declare a `viewBox` that defines their intrinsic coordinate
+system. `Zoom to Fit` solves for the largest scale that keeps the
+`viewBox` inside the canvas bounds preserving aspect ratio.
+`Zoom to Fill` solves for the smallest scale that covers the canvas.
+We read the `viewBox` either from the inlined SVG (cheap string
+parse for the root element's attribute) or, when JS is enabled, via
+`document.documentElement.viewBox.baseVal`.
+
+### 3.6 Detecting animated vs. static
+
+```swift
+enum SVGKind { case animated, static }
+
+func detectSVGKind(_ data: Data) -> SVGKind {
+    // Fast string scan, no full XML parse.
+    let s = String(data: data, encoding: .utf8) ?? ""
+    let animatedTags = [
+        "<animate", "<animateTransform", "<animateMotion",
+        "<set ", "<set/>", "@keyframes", "animation:",
+        "transition:", "<script"
+    ]
+    return animatedTags.contains { s.range(of: $0,
+        options: .caseInsensitive) != nil } ? .animated : .static
+}
+```
+
+The static fast path is taken when **all** of these hold:
+
+* `detectSVGKind == .static`.
+* File size < 256 KB.
+* Settings ▸ SVG ▸ *Use Fast Static Path When Safe* is enabled.
+* The user has not explicitly toggled "Always Use WebKit for SVG."
+
+Otherwise, the animated path is used. The static path falls back to
+the animated path on any rendering error.
+
+### 3.7 Snapshot
+
+`snapshotCurrentFrame()` produces a raster CGImage:
+
+* **Animated path:** `WKWebView.takeSnapshot(with:)` with
+  `WKSnapshotConfiguration.snapshotWidth` set so the bitmap matches
+  the current zoom level.
+* **Static path:** draw the `NSImage` into a `CGContext` of the
+  intended size and read back via `CGBitmapContext`.
+
+Either way the result feeds `Save As…` (PNG / JPEG / TIFF / HEIC) and
+the `Copy Image` clipboard path.
+
+### 3.8 Sandbox and security
+
+* WKWebView's process is the standard WebContent helper — isolated
+  from the main app process by the OS.
+* No persistent data store — `WKWebsiteDataStore.nonPersistent()`.
+* No network loads — CSP `default-src 'none'`.
+* No JavaScript by default — `allowsContentJavaScript = false`.
+* No navigation — we intercept `decidePolicyFor navigationAction`
+  and cancel anything that is not the initial `about:blank` load of
+  our HTML shell.
+* No file access — the SVG is inlined as a string into the HTML
+  shell; we never call `loadFileURL`.
+* `<foreignObject>` cannot reach AppKit — WebKit forbids it.
+* The user-facing toggle to enable JS for scripted SVGs is opt-in
+  per-file (remembered in Local Storage) and surfaces a banner the
+  first time it is enabled.
+
+### 3.9 Memory and performance
+
+* Single WKWebView per canvas, reused across SVG file switches
+  (`loadHTMLString` replaces the document; we do not destroy and
+  recreate the view).
+* Maximum inlined SVG size: **8 MB**. Larger files surface a warning
+  and offer the static path.
+* Snapshot cache: the last static snapshot per file is held in
+  memory keyed by `(url, zoom)`. Cap: 64 MB.
+* `WKWebView.startsCommunicatingWithUI` is gated behind
+  visibility — when the ImageGlass_Mac window is occluded, we pause
+  animations via the same `pauseAnimations()` call the user can
+  trigger manually.
+
+---
+
+## 4. Hotkeys (SVG Surface)
+
+When the viewer canvas has key focus **and the current file is an
+SVG**, the following keys are bound. The bindings deliberately mirror
+the Video surface so the user does not have to relearn anything when
+moving between SVG and video.
+
+| Key | Action |
+| --- | --- |
+| ` ` (Space) | Play / Pause animation toggle (no-op if SVG is static; no error) |
+| `L` | Loop on / off |
+| `⌥ 1` | Speed 0.25× |
+| `⌥ 2` | Speed 0.5× |
+| `⌥ 3` | Speed 1.0× |
+| `⌥ 4` | Speed 1.5× |
+| `⌥ 5` | Speed 2.0× |
+| `⌘ +` / `⌘ =` | Zoom in (one step) |
+| `⌘ -` | Zoom out (one step) |
+| `⌘ 0` | Actual size (zoom = 1.0) |
+| `⌘ 9` | Zoom to fit |
+| `⇧ ⌘ 9` | Zoom to fill |
+| `⌥ ⌘ 0` | Zoom to viewBox (the SVG's natural artboard) |
+| `S` | Snapshot current frame → Save panel |
+| `Escape` | Reset zoom to 1.0 and pan to origin |
+| `M` | **Unbound** (no audio surface) |
+| `→` `←` | Reserved — animation step (v2). v1: ignored in canvas focus, so file-list arrows still navigate when focus is on the Directory Panel. |
+
+The intentional alignment with Video means: a user used to Space /
+Loop / Speed in the Video menu can use SVG the same way without
+re-reading the docs.
+
+---
+
+## 5. The SVG Menu (New)
+
+A new **SVG** menu is added to the menu bar between `Video` and
+`Scope`. It is enabled only when the current file is an SVG.
+
+### 5.1 Layout
+
+| Item | Shortcut | Notes |
+| --- | --- | --- |
+| Play / Pause Animation | `␣` | Toggle. Disabled if SVG is detected as static. |
+| Stop and Rewind | `⌘ .` | Pauses and resets timeline to t = 0. Mirrors Video. |
+| — | | |
+| Loop | `L` | Sticky per file (persisted when Settings ▸ SVG ▸ *Remember Loop* is on). |
+| Playback Speed | submenu | `⌥ 1`…`⌥ 5` (0.25× / 0.5× / 1× / 1.5× / 2×). Current speed has a checkmark. |
+| — | | |
+| Zoom In | `⌘ +` | Reuses View ▸ Zoom In (canonical). |
+| Zoom Out | `⌘ -` | |
+| Actual Size | `⌘ 0` | |
+| Zoom to Fit | `⌘ 9` | |
+| Zoom to Fill | `⇧ ⌘ 9` | |
+| Zoom to ViewBox | `⌥ ⌘ 0` | Honors the SVG's intrinsic `viewBox`. |
+| — | | |
+| Snapshot Current Frame… | `S` | PNG / JPEG / TIFF / HEIC. |
+| Copy Current Frame | `⌘ C` | When canvas has focus; goes to pasteboard as a `CGImage`. |
+| Export Raster… | `⇧ ⌘ E` | Sheet: size (px width or scale factor), format, transparent / solid background. |
+| — | | |
+| Show ViewBox Outline | `⌥ V` | Overlay the SVG's `viewBox` as a thin guide. |
+| Show Background | submenu | *Transparent* (default), *White*, *Black*, *Checkerboard*. |
+| Allow Scripts in SVG (this file) | — | Toggle. Off by default. Enabling shows a one-time banner explaining the security trade-off. Persisted per file. |
+| — | | |
+| Reset Pan and Zoom | `Escape` | Same as the canvas Escape binding. |
+
+### 5.2 Items disabled outside SVG context
+
+When the current file is not an SVG, every SVG-menu item is greyed
+out. The shortcuts (`⌥ V`, `⌥ ⌘ 0`, `⇧ ⌘ E`) are still reserved —
+no other command claims them — so a user who memorizes them is never
+surprised.
+
+---
+
+## 6. Context Menu Additions
+
+The viewer canvas context menu defined in
+[`menus.mdx` §5.3](./menus.mdx#53-context-menu-on-the-main-viewer-the-image-canvas)
+gains an SVG-context section that appears only when the current file
+is an SVG:
+
+| Item | Notes |
+| --- | --- |
+| Play / Pause Animation | Disabled if static. |
+| Loop | Toggle. |
+| Playback Speed ▸ | Submenu mirrors SVG ▸ Playback Speed. |
+| Zoom to ViewBox | |
+| Snapshot Current Frame… | |
+| Copy Current Frame | |
+| Export Raster… | |
+| Show Background ▸ | |
+| — | |
+| Allow Scripts in SVG (this file) | One-time-confirm toggle. |
+
+The Directory Panel row context menu
+([`menus.mdx` §5.1](./menus.mdx#51-context-menu-on-a-file-row-in-the-directory-panel))
+gains, for SVG rows:
+
+| Item | Notes |
+| --- | --- |
+| Preview Inline | Hover-preview the SVG (static frame) in the row (off by default). |
+| Open in Safari | Opens the file in the default browser for a "what does Safari show" sanity check. |
+
+---
+
+## 7. Settings (Persisted)
+
+A new **SVG** section is added to [`settings.mdx`](./settings.mdx).
+Settings live in `~/Library/Application Support/ImageGlass_Mac/
+svgSettings.json`.
+
+```json
+{
+  "autoplayOnSelect": true,
+  "rememberLoopPerFile": true,
+  "defaultLoop": false,
+  "defaultRate": 1.0,
+  "useFastStaticPathWhenSafe": true,
+  "alwaysUseWebKit": false,
+  "allowScriptsDefault": false,
+  "background": "transparent",
+  "showViewBoxOutlineByDefault": false,
+  "exportRasterDefaultScale": 2.0,
+  "exportRasterDefaultFormat": "png"
+}
+```
+
+`rememberLoopPerFile = true` writes the loop flag and the "Allow
+Scripts in SVG" flag into `svgState.yaml` keyed by file URL inside
+Local Storage. The security-sensitive Allow-Scripts flag is
+remembered only after the user clicks past the one-time confirmation
+banner.
+
+---
+
+## 8. MCP Integration
+
+The MCP tool surface from [`mcp.mdx`](./mcp.mdx) gains the following
+**svg** tools. Naming and shapes mirror the video tools
+(`videos.mdx §8`) so a Claude Code workflow that knows one knows the
+other.
+
+| Tool | Args | Returns |
+| --- | --- | --- |
+| `svg_play` | — | `{ isPlaying }` |
+| `svg_pause` | — | `{ isPlaying }` |
+| `svg_toggle_play` | — | `{ isPlaying }` |
+| `svg_set_rate` | `{ rate: Double }` (0.25–2.0) | `{ rate }` |
+| `svg_set_loop` | `{ loop: Bool }` | `{ loop }` |
+| `svg_set_zoom` | `{ zoom: Double, anchor?: { x: Double, y: Double } }` | `{ zoom }` |
+| `svg_reset_zoom` | — | `{ zoom: 1.0 }` |
+| `svg_fit_zoom` | — | `{ zoom, mode: "fit" }` |
+| `svg_fill_zoom` | — | `{ zoom, mode: "fill" }` |
+| `svg_viewbox_zoom` | — | `{ zoom, viewBox: { x, y, w, h } }` |
+| `svg_snapshot` | `{ outputPath?: String, scale?: Double, format?: String, background?: String }` | `{ path, width, height }` |
+| `svg_set_background` | `{ kind: "transparent" or "white" or "black" or "checker" }` | `{ background }` |
+| `svg_allow_scripts` | `{ allow: Bool }` | `{ allow }` (no-op if not user-confirmed previously; returns an error code). |
+| `svg_describe` | — | Full state: kind (animated / static), width, height, viewBox, hasSMIL, hasCSSAnimations, hasScripts, isPlaying, zoom, rate, loop. |
+
+Tools are no-ops (returning a clear error) when the current file is
+not an SVG. The MCP server publishes an `svg_state_changed`
+notification on every transport / zoom transition.
+
+---
+
+## 9. Thumbnails
+
+SVG thumbnails for the Directory Panel use the **static path** only.
+We never run a WKWebView for a thumbnail — animation is hidden, and
+the cost would be absurd at scroll speeds.
+
+* Renderer: `NSImage(contentsOf:)` → `SVGImageRep.draw(in:)` into a
+  `CGBitmapContext` sized to the thumbnail cell.
+* Cache: `~/Library/Caches/ImageGlass_Mac/Thumbnails/` keyed by
+  `(fileURL, mtime, size)`.
+* Fallback: if `NSImage` cannot decode (rare; malformed SVG), the
+  thumbnail shows the generic SVG icon and the row still resolves
+  into the file list.
+
+This mirrors the way the image thumbnail pipeline already works
+in [`list_of_files.mdx`](./list_of_files.mdx).
+
+---
+
+## 10. Global Hotkey Reconciliation
+
+This section is **authoritative** for SVG shortcut ownership and
+**continues** the rule structure from
+[`videos.mdx` §11](./videos.mdx#11-global-hotkey-reconciliation).
+
+### 10.1 Resolution rules
+
+1. **Focus wins.** When the SVG canvas has key focus, the canvas's
+   bindings win for `Space`, `L`, `S`, `Escape`, `⌥ 1`–`⌥ 5`, and
+   `⌥ V`.
+2. **Modifier always wins.** Bindings with `⌘` resolve via the menu
+   bar regardless of focus.
+3. **Arrows go to the Directory Panel.** Per §4, SVG canvas does
+   *not* claim un-modified arrows in v1, so file navigation arrows
+   continue to work when focus drifts to the canvas.
+4. `M` is **unbound** in SVG context — it does not steal Video's
+   `M` for any cross-context behavior.
+
+### 10.2 Final shortcut table (SVG-relevant)
+
+| Shortcut | Owner | Notes |
+| --- | --- | --- |
+| `␣` (Space) | **SVG ▸ Play / Pause** when SVG is the current file. (Continues the focus-context rule from `videos.mdx §11.2`.) Falls back to View ▸ Slideshow when an image is current and the file list has focus. |
+| `L` | SVG ▸ Loop | Canvas focus only. |
+| `S` | SVG ▸ Snapshot Current Frame… | Canvas focus only. |
+| `⌘ .` | SVG ▸ Stop and Rewind | Reuses the same binding from `videos.mdx §11.2` (different command in SVG context). |
+| `⌥ 1`–`⌥ 5` | SVG ▸ Playback Speed | Canvas focus only. Same chord-set as Video — different commands because focus is different. |
+| `⌘ +` / `⌘ -` / `⌘ 0` / `⌘ 9` / `⇧ ⌘ 9` | View ▸ Zoom commands | Unchanged from `menus.mdx §4.4`. |
+| `⌥ ⌘ 0` | SVG ▸ Zoom to ViewBox | New. Unbound elsewhere. |
+| `⇧ ⌘ E` | SVG ▸ Export Raster… | New. Unbound elsewhere. |
+| `⌥ V` | SVG ▸ Show ViewBox Outline | New. Unbound elsewhere. |
+| `Escape` | SVG ▸ Reset Pan and Zoom | Canvas focus only. Outside SVG, Escape exits fullscreen / PiP (per `videos.mdx §11.2`) or returns focus to the canvas. |
+| `M` | **Unbound in SVG context** | Pressing `M` while a static SVG is current does nothing; while an animated SVG is current it also does nothing. |
+
+### 10.3 Things this section explicitly changes vs. earlier specs
+
+* No previously-bound shortcut from `menus.mdx` or `videos.mdx` is
+  rebound. Every SVG-introduced shortcut (`⌥ ⌘ 0`, `⇧ ⌘ E`, `⌥ V`)
+  is in unclaimed chord space.
+* The Video menu's `⌘ .`, `⌥ 1`–`⌥ 5`, `L`, `S`, `Space` are
+  **shared** with the SVG menu through the focus-context rule from
+  §10.1 — exactly one command fires at a time (the one matching the
+  current file kind).
+* The Help ▸ Keyboard Shortcuts… sheet must read from the same
+  `KeyBindings.swift` map for SVG context as for Video and Image,
+  so every change here automatically surfaces in the cheat sheet.
+
+---
+
+## 11. Tests and Acceptance Criteria
+
+SVG preview is v1-complete when:
+
+1. A representative test corpus of SVGs (static, SMIL, CSS
+   keyframes, scripted) loads in under 200 ms each on Apple Silicon.
+2. Animations in the SMIL / CSS test set play at the same wall-clock
+   pace as Safari for the same files, verified by frame-stamped test
+   SVGs.
+3. `Space` toggles play / pause; the underlying `pauseAnimations()`
+   / `unpauseAnimations()` SVG DOM calls are observable in the
+   WebKit inspector when attached.
+4. `L` toggles loop; a 2-second `<animate>` test SVG with
+   `repeatCount="1"` restarts within 50 ms of `endEvent` when loop
+   is on.
+5. `⌥ 3` returns rate to 1.0; `⌥ 1` and `⌥ 5` measurably halve and
+   double frame advance over a fixed wall-clock interval.
+6. `⌘ 0` (Actual Size), `⌘ 9` (Fit), `⇧ ⌘ 9` (Fill), `⌥ ⌘ 0`
+   (ViewBox) each leave the SVG visibly crisp — no raster pixelation
+   — at any reasonable zoom value up to 16×.
+7. `S` produces a snapshot whose dimensions match the current zoom
+   and whose alpha channel respects the chosen background.
+8. The static fast-path is selected for trivially-static, small SVGs
+   and produces output indistinguishable from the WKWebView path at
+   zoom = 1.0.
+9. With *Allow Scripts in SVG* off and a deliberately-malicious
+   scripted test SVG, no script executes (verified by an absent
+   sentinel DOM mutation).
+10. With network loads attempted in the test SVG, the CSP blocks
+    them and the Console reports the block.
+11. Every MCP tool in §8 returns within 200 ms and leaves the
+    renderer in the documented state.
+12. Switching from SVG → image / SVG → video disposes the WKWebView
+    (or unloads its content) and tears down the JS bridge cleanly,
+    verified by the absence of a retained `WKWebView` in a memory
+    graph snapshot.
+13. Help ▸ Keyboard Shortcuts… shows the SVG section and matches
+    §10.2 verbatim, pulled from `KeyBindings.swift`.
+
+---
+
+## 12. Out of Scope (v1)
+
+* SVG editing (path manipulation, attribute editing).
+* `.svgz` (gzipped SVG). Deferred to v2 — easy add (`gzip` first,
+  then the existing path).
+* External resource resolution (`<image href="…">` to network URLs
+  is blocked by CSP; `data:` URIs work).
+* SVG-to-PDF export. Use Preview.app.
+* SVG `<foreignObject>` HTML embedding rendering inside ImageGlass
+  AppKit overlays.
+* Scripted SVG transport beyond `pauseAnimations()` / rate — e.g.
+  no UI for invoking user-defined animation functions inside the
+  SVG.
+
+---
+
+## 13. References
+
+* [SVGKit on Swift Package Index](https://swiftpackageindex.com/SVGKit/SVGKit) — the third-party SVG framework we evaluated and chose **not** to ship; included for context.
+* [SVGKit GitHub (MaddTheSane fork)](https://github.com/MaddTheSane/SVGKit) — same project, alternate maintainer.
+* [RenderKit — Native macOS preview app using WKWebView for SVG / HTML](https://github.com/BuildByAnyMeans/RenderKit) — confirms the WKWebView-for-SVG pattern is the standard 2026 approach for native macOS preview apps.
+* [SDWebImageSVGCoder](https://cocoapods.org/pods/SDWebImageSVGCoder) — context for the static SVG-to-CGImage pipeline used by other Cocoa apps.
+* [How to Display SVG Images in Swift — w3tutorials](https://www.w3tutorials.net/blog/how-to-display-svg-image-using-swift/) — background reading on the NSImage / WKWebView trade-off.

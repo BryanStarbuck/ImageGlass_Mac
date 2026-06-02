@@ -24,22 +24,48 @@ On top of the Mac-native viewer baseline, this fork adds:
 
 macOS only. Optimized for Apple Silicon.
 
-## Quick Start
+## Building
+
+### Prerequisites
+
+* macOS 14 (Sonoma) or later
+* Xcode 16+ command-line tools (`xcode-select --install`)
+* [`just`](https://github.com/casey/just) — `brew install just` if missing
+
+### Fresh clone
 
 ```sh
 brew install just              # one-time, if you don't have it
-just bootstrap                 # fetches deps, runs first build
-just run                       # launch the app
+just bootstrap                 # checks tools, resolves SwiftPM deps, debug build
+just run                       # launch the SwiftUI app
 ```
 
-`just bootstrap` is the only command a fresh clone needs. It verifies your
+`just bootstrap` is the only command a fresh clone needs. It verifies
 host tooling, runs SwiftPM dependency resolution, fetches any native
-libraries into `vendor/` (none today — Apple's ImageIO covers the current
-format set), and does a debug build.
+libraries into `vendor/` (none today — Apple's ImageIO covers the
+current format set), and does a debug build.
 
-Run `just` with no arguments to see every recipe. Build settings,
-dependency lists, and the vendor-library policy live in `justfile` and
-`vendor/CLAUDE.md` so they're discoverable from a checkout alone.
+### Recipes
+
+Run `just` with no arguments to print this list. The full source of
+truth is `justfile` in the repo root.
+
+| Recipe                | What it does                                                    |
+|-----------------------|-----------------------------------------------------------------|
+| `just`                | List every recipe.                                              |
+| `just bootstrap`      | Check tools, resolve SwiftPM deps, debug build.                 |
+| `just build`          | Incremental debug build.                                        |
+| `just build-release`  | Optimized release build.                                        |
+| `just build-universal`| Universal binary (arm64 + x86_64).                              |
+| `just run`            | Launch the SwiftUI app.                                         |
+| `just mcp`            | Launch `imageglass-mcp` on stdio.                               |
+| `just test`           | Run XCTest + Swift Testing suites.                              |
+| `just bundle`         | Stage release `ImageGlass.app` under `dist/`.                   |
+| `just dmg`            | Build `dist/ImageGlass.dmg` from the staged bundle.             |
+| `just clean`          | Wipe `.build/`, `.swiftpm/`, `dist/` (keeps `vendor/`).         |
+
+Additional housekeeping recipes (`sign`, `notarize`, `fmt`, `lint`,
+`distclean`) are documented inline in the `justfile`.
 
 ## Repository Layout
 
@@ -68,10 +94,14 @@ and the crop pipeline through this server.
 ```sh
 just build                                # one-time, or after a pull
 just mcp                                  # launch on stdio (foreground)
-# equivalent direct invocation:
-swift run --package-path code imageglass-mcp
-# after a release build:
-./code/.build/release/imageglass-mcp
+```
+
+Equivalent direct invocations (useful when wiring up an external
+launcher):
+
+```sh
+swift run --package-path code imageglass-mcp     # debug
+./code/.build/release/imageglass-mcp             # after `just build-release`
 ```
 
 The binary reads JSON-RPC frames from stdin and writes responses to

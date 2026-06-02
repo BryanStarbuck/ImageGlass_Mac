@@ -235,14 +235,27 @@ struct ImageGlassApp: App {
         }
         guard let loaded = result.image else { return }
         let rep = NSBitmapImageRep(cgImage: loaded.cgImage)
-        guard let data = rep.representation(using: .png, properties: [:]) else { return }
+        guard let data = rep.representation(using: .png, properties: [:]) else {
+            ErrorLog.log("NSBitmapImageRep.representation(using:.png) returned nil for clipboard image",
+                         class: "ImageGlassApp")
+            return
+        }
         let dir = AppPaths.appSupportDir.appendingPathComponent("clipboard", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        } catch {
+            ErrorLog.log("createDirectory failed for \(dir.path)",
+                         error: error,
+                         class: "ImageGlassApp")
+        }
         let url = dir.appendingPathComponent("paste-\(Int(Date().timeIntervalSince1970)).png")
         do {
             try data.write(to: url)
             state.openExternalFile(url: url)
         } catch {
+            ErrorLog.log("paste image write failed for \(url.path)",
+                         error: error,
+                         class: "ImageGlassApp")
             NSLog("Paste image write failed: \(error)")
         }
     }
@@ -262,7 +275,11 @@ struct ImageGlassApp: App {
     private func saveCurrentFrame() {
         guard let path = state.selectedFile else { return }
         let url = URL(fileURLWithPath: AppPaths.expandTilde(path))
-        guard let fs = FrameSource.load(url: url), !fs.frames.isEmpty else { return }
+        guard let fs = FrameSource.load(url: url), !fs.frames.isEmpty else {
+            ErrorLog.log("FrameSource.load returned nil/empty for \(url.path)",
+                         class: "ImageGlassApp")
+            return
+        }
         let idx = max(0, min(state.viewer.currentFrameIndex, fs.frameCount - 1))
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.png, .jpeg, .tiff]
@@ -271,6 +288,9 @@ struct ImageGlassApp: App {
             do {
                 try FrameExporter.saveFrame(fs.frames[idx].cgImage, to: dest)
             } catch {
+                ErrorLog.log("FrameExporter.saveFrame failed for \(dest.path)",
+                             error: error,
+                             class: "ImageGlassApp")
                 NSLog("save frame failed: \(error)")
             }
         }
@@ -279,7 +299,11 @@ struct ImageGlassApp: App {
     private func exportAllFrames() {
         guard let path = state.selectedFile else { return }
         let url = URL(fileURLWithPath: AppPaths.expandTilde(path))
-        guard let fs = FrameSource.load(url: url), fs.frames.count > 1 else { return }
+        guard let fs = FrameSource.load(url: url), fs.frames.count > 1 else {
+            ErrorLog.log("FrameSource.load returned nil or <=1 frame for \(url.path)",
+                         class: "ImageGlassApp")
+            return
+        }
         let panel = NSOpenPanel()
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
@@ -293,6 +317,9 @@ struct ImageGlassApp: App {
                     baseName: url.deletingPathExtension().lastPathComponent
                 )
             } catch {
+                ErrorLog.log("FrameExporter.exportAll failed for \(dir.path)",
+                             error: error,
+                             class: "ImageGlassApp")
                 NSLog("export frames failed: \(error)")
             }
         }

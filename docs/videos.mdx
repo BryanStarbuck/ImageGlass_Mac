@@ -1,0 +1,680 @@
+---
+title: Video Preview
+description: Product and engineering specification for video preview in ImageGlass_Mac — AVFoundation / AVKit playback inside the viewer canvas, spacebar play/pause, mute, loop, picture-in-picture, the new Video menu, and the full hotkey table reconciled against every other menu so there are no shortcut conflicts.
+---
+
+# Video Preview
+
+This page is the **complete product + engineering specification** for
+video preview in ImageGlass_Mac.
+
+ImageGlass_Mac is primarily an image viewer, but it ships with a small
+set of "preview" surfaces for adjacent media types so the user does not
+have to leave the app every time they hit a `.mp4` or `.mov` while
+walking a scope. **Video preview is a first-class feature**: when the
+selected file in the active scope resolves to a supported video, the
+main viewer canvas becomes a video player, and a dedicated **Video**
+menu and matching context menu appear in the menu bar.
+
+It cross-references:
+
+* [Menus](./menus.mdx) — the menu surface and the global shortcut
+  reconciliation. The Video menu specified below is added between
+  `Image` and `Scope`, and the shortcut conflict table in
+  [`menus.mdx` §7](./menus.mdx#7-shortcut-conflict-table-resolved) is
+  superseded by §11 of this document.
+* [Features](./features.mdx) — top-level feature list.
+* [Supported Formats](./supported-formats.mdx) — image formats. Video
+  formats are added in §2 below.
+* [MCP](./mcp.mdx) — programmatic playback controls.
+* [Local Storage](./local_storage.mdx) — videos that resolve into the
+  active scope are listed in the same `files.yaml` as images.
+* [SVG Preview](./svg.mdx) — sibling preview surface; shares the
+  playback transport model (Play / Pause / Loop / Speed).
+
+The Mac stack used throughout: **Swift 6 + SwiftUI** for menus and
+chrome, **AppKit `NSViewRepresentable`** to host the native player,
+**AVFoundation** (`AVAsset`, `AVPlayerItem`, `AVPlayer`) for the
+playback engine, **AVKit** (`AVPlayerView`) for the native transport
+bar and PiP / fullscreen integration, **VideoToolbox** for
+hardware-accelerated decoding, **Core Audio** (`AVAudioSession` on
+iOS-style APIs, `AVAudioEngine` where we need finer-grained mute
+control), and **MetalKit** (`MTKView`) when the video frame has to
+share a canvas with overlays (color picker, frame info).
+
+---
+
+## 1. Audience and Goals
+
+### 1.1 Audiences
+
+| Tier | Audience | What they want from video preview |
+| --- | --- | --- |
+| T1 | Casual user | Hit Space, video plays. Hit Space, video pauses. Done. |
+| T2 | Photographer / videographer | Mute, loop, frame-step, scrub. Hot-key everything so the keyboard never leaves the home row. |
+| T3 | Designer reviewing animations and screen recordings | Play one short `.mov` after another, loop the interesting one, snapshot a frame to PNG. |
+| T4 | Power user / MCP | Drive the player from Claude Code: open a path, seek to a timestamp, capture a frame, mute, change speed, return to the file list. |
+
+### 1.2 Goals
+
+* **Native playback.** Use Apple's `AVPlayer` + `AVKit` chrome. The
+  player feels like Preview.app / QuickTime Player, not like a ported
+  Windows control.
+* **Spacebar = Play / Pause.** Always. When a video is the active
+  media, Space toggles the transport. This shortcut wins against the
+  existing `Slideshow` Space shortcut from
+  [`menus.mdx` §4.4](./menus.mdx#44-view); the Slideshow command moves
+  to `⌥ ⌘ S`. See §11.
+* **Mute is one keystroke.** `M` toggles audio mute. No modifier
+  required when the viewer canvas has key focus.
+* **Loop is a sticky preference, per session and per file.** The
+  user's loop choice is remembered for the current playlist run; the
+  per-file default is configurable in Settings.
+* **Hardware-accelerated decode by default.** H.264, HEVC, ProRes,
+  and AV1 (on M3 and later) decode in `VideoToolbox`. The CPU stays
+  quiet.
+* **Picture-in-Picture (PiP) works.** Standard macOS PiP via
+  `AVPictureInPictureController` integrated with AVPlayerView.
+* **MCP parity.** Every Video menu command has an MCP tool counterpart
+  so an automation script can do the same thing.
+
+### 1.3 Non-goals
+
+* **No video editing.** No trim, no transcode, no filter pipeline in
+  v1. ImageGlass_Mac previews video; it does not edit it.
+* **No multi-track audio mixing.** We pick the primary audio track
+  (or first track, if `Default` is not flagged). Track-switching is
+  v2.
+* **No subtitle styling beyond what AVPlayer renders natively.**
+  Embedded subtitle tracks render via AVKit's built-in renderer; we
+  do not add a separate `.srt` sidecar UI in v1.
+* **No streaming URL playback in v1.** Local files only. HTTP/HLS
+  URLs may be added in v2 via MCP.
+
+---
+
+## 2. Supported Video Formats
+
+ImageGlass_Mac delegates decoding to **AVFoundation / VideoToolbox**.
+The exact list is whatever the current macOS version's AVFoundation
+supports, but the practical matrix for macOS 14 Sonoma / macOS 15
+Sequoia is:
+
+### 2.1 Containers
+
+| Container | Extension | Notes |
+| --- | --- | --- |
+| MPEG-4 | `.mp4`, `.m4v` | Primary container. Full read support. |
+| QuickTime | `.mov`, `.qt` | Apple-native. Full support including ProRes. |
+| 3GPP | `.3gp`, `.3g2` | AVFoundation supports out of the box. |
+| MPEG Transport Stream | `.ts`, `.m2ts` | Read-only via AVFoundation. |
+| AVI | `.avi` | Reads via AVFoundation; some codec combinations may be unsupported. We surface a clear error. |
+| Matroska | `.mkv` | **Not natively supported by AVFoundation.** Bundle an MKV demuxer via `libavformat` (LGPL) behind a feature flag; if disabled, MKVs surface as "preview unavailable". See §9. |
+| WebM | `.webm` | Treated like MKV (libavformat). |
+
+### 2.2 Video codecs
+
+| Codec | Hardware decode? | Notes |
+| --- | --- | --- |
+| H.264 / AVC | Yes (VideoToolbox, all Macs since 2011) | The baseline. |
+| HEVC / H.265 | Yes (Apple Silicon + recent Intel) | Includes HDR10 metadata. |
+| ProRes (422, 4444, RAW) | Yes (Apple Silicon native) | Native to QuickTime. |
+| AV1 | Yes on M3 / M4; software on earlier | We use `VideoToolbox` first and fall back to `libaom` in software if it returns `kVTVideoDecoderUnsupportedDataFormatErr`. |
+| VP9 | Software (`libvpx`) on Intel; hardware on M3+ | Required for many `.webm`s. |
+| MJPEG | Yes | Common in Live Photos / motion JPEGs. |
+
+### 2.3 Audio codecs
+
+AAC, MP3, ALAC, FLAC, PCM, Opus, Vorbis — same matrix as
+AVFoundation's defaults. We do not re-encode.
+
+### 2.4 Format detection
+
+Detection uses `UTType` via UniformTypeIdentifiers — *not* file
+extension alone:
+
+```swift
+let type = try url.resourceValues(forKeys: [.contentTypeKey]).contentType
+let isVideo = type?.conforms(to: .movie) ?? false
+```
+
+This catches files with the wrong extension (a `.dat` that is
+actually MPEG-4) and rejects files that pretend to be video but
+aren't.
+
+### 2.5 Live Photos and embedded motion video
+
+A JPEG / HEIC that carries an embedded motion video track (Apple
+Live Photo, motion photo) is rendered as a **still by default**, with
+a small play badge in the corner of the canvas. Tapping the badge or
+pressing Space switches to video playback of the embedded clip.
+Hitting Space again pauses; pressing `Escape` returns to the still.
+
+---
+
+## 3. Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ ViewerCanvasView  (SwiftUI)                                         │
+│                                                                     │
+│  ├─ if file isImage  → ImageCanvasMetalView  (existing)             │
+│  ├─ if file isVideo  → VideoCanvasView       (new, this doc)        │
+│  └─ if file isSVG    → SVGCanvasView         (see svg.mdx)          │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ VideoCanvasView  (NSViewRepresentable wrapping AVPlayerView)        │
+│                                                                     │
+│   AVPlayerView (AVKit)                                              │
+│     │                                                               │
+│     ├── controlsStyle = .floating  (overlays the bottom of canvas)  │
+│     ├── allowsPictureInPicturePlayback = true                       │
+│     ├── showsFullScreenToggleButton = true                          │
+│     └── player: AVPlayer                                            │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ VideoPlaybackController  (actor, owned by the window)               │
+│                                                                     │
+│   - currentItem: AVPlayerItem                                       │
+│   - player: AVPlayer                                                │
+│   - looper: AVPlayerLooper?     ← built when "Loop" is on           │
+│   - rateBeforePause: Float                                          │
+│   - mutedRestore: Float         ← volume to restore on unmute       │
+│                                                                     │
+│   Methods:                                                          │
+│     load(_ url: URL) async throws                                   │
+│     playPauseToggle()                                               │
+│     setMuted(_ on: Bool)                                            │
+│     setLoop(_ on: Bool)                                             │
+│     setRate(_ rate: Float)                                          │
+│     stepForward(frames: Int)                                        │
+│     stepBackward(frames: Int)                                       │
+│     snapshotCurrentFrame() async throws -> CGImage                  │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 3.1 Why AVPlayerView (AVKit) rather than SwiftUI `VideoPlayer`
+
+`AVKit.VideoPlayer` (SwiftUI) was introduced in iOS 14 / macOS 11 and
+ships a stripped-down chrome. On macOS specifically it is missing:
+
+* Floating / inline / minimal control style selection.
+* `showsFullScreenToggleButton` and `showsTimecodes`.
+* Direct PiP API access (`AVPictureInPictureController`).
+* Trick-play (frame step) gesture handling.
+
+`AVKit.AVPlayerView` (AppKit) ships all of the above and is the
+control Preview.app and QuickTime Player use. We host it via
+`NSViewRepresentable` and keep SwiftUI for everything *around* the
+canvas (menu binding, overlays, keyboard event dispatch).
+
+### 3.2 Loading and prepare-to-play
+
+```swift
+func load(_ url: URL) async throws {
+    let asset = AVURLAsset(url: url, options: [
+        AVURLAssetPreferPreciseDurationAndTimingKey: true,
+    ])
+    // Swift 6 async API: returns isPlayable + tracks + duration in one shot.
+    let (playable, tracks, duration) = try await asset.load(
+        .isPlayable, .tracks, .duration
+    )
+    guard playable else { throw VideoError.unplayable(url) }
+
+    let item = AVPlayerItem(asset: asset)
+    item.preferredForwardBufferDuration = 2.0   // local file; small buffer
+    item.appliesPerFrameHDRDisplayMetadata = true
+
+    await MainActor.run {
+        player.replaceCurrentItem(with: item)
+        if loopOn { rebuildLooper(for: item) }
+        if autoplayOn { player.play() }
+    }
+}
+```
+
+Loading happens off the main thread. The viewer shows a thin
+indeterminate progress bar over the canvas for the (typically <80 ms)
+load.
+
+### 3.3 The transport bar
+
+We use `AVPlayerView.controlsStyle = .floating`. The transport bar
+fades in on cursor movement over the canvas and fades out after 2.5 s
+of inactivity. It contains: Play / Pause, scrubber, current time /
+duration, volume, Loop toggle, PiP, AirPlay, fullscreen.
+
+We **suppress** the AVKit default keyboard handling and route Space /
+arrows / M / L / etc. through our own `NSResponder` chain (§4) so the
+key bindings are the same whether the transport bar is visible or
+hidden.
+
+### 3.4 Looping
+
+`AVPlayer` does not loop natively. The standard pattern is
+`AVPlayerLooper`, which requires `AVQueuePlayer`:
+
+```swift
+let queue = AVQueuePlayer()
+let looper = AVPlayerLooper(player: queue, templateItem: item)
+```
+
+When `Loop` is toggled on:
+
+* If the underlying player is an `AVQueuePlayer`, attach an
+  `AVPlayerLooper`.
+* If it is a plain `AVPlayer`, swap to `AVQueuePlayer`, copy current
+  rate / time / volume / muted state, then attach the looper.
+
+When Loop is toggled off, we detach the looper and let the item play
+once.
+
+### 3.5 Picture-in-Picture
+
+`AVPlayerView` exposes PiP via the property
+`allowsPictureInPicturePlayback = true`. The PiP window survives the
+parent window closing — but ImageGlass_Mac shuts down PiP cleanly on
+`applicationWillTerminate(_:)` so a stuck PiP doesn't outlive the app.
+
+### 3.6 Frame snapshot
+
+`snapshotCurrentFrame()` uses `AVAssetImageGenerator`:
+
+```swift
+let gen = AVAssetImageGenerator(asset: asset)
+gen.appliesPreferredTrackTransform = true
+gen.requestedTimeToleranceBefore = .zero
+gen.requestedTimeToleranceAfter = .zero
+let (cgImage, _) = try await gen.image(at: player.currentTime())
+```
+
+The result feeds the existing `Save As…` path so the user can write
+the frame to PNG / JPEG / TIFF.
+
+### 3.7 Hardware decode and color
+
+* `VideoToolbox` is the decode path for every codec listed in §2.2.
+* HDR10 / HLG / Dolby Vision tone-mapping uses
+  `AVPlayerItemMetadataOutput` and the system's EDR-capable
+  `CAMetalLayer` settings. On HDR-capable displays the highlights are
+  preserved; on SDR displays the player tone-maps via
+  `CAEDRMetadata`.
+* Color profile is honored — if the asset declares Rec. 709, BT.2020,
+  or Display P3, the renderer respects it.
+
+### 3.8 Threading
+
+* The player itself lives on the main actor (AVKit requirement).
+* `VideoPlaybackController` is an `actor` and serializes load /
+  snapshot / metadata work off the main thread.
+* Periodic time observers (`addPeriodicTimeObserver`) post to the
+  main actor at 10 Hz to drive scrubber and overlay updates.
+
+---
+
+## 4. Hotkeys (Video Surface)
+
+When the viewer canvas has key focus **and the current file is a
+video**, the following keys are bound. All bindings are routed through
+the `NSResponder` chain so SwiftUI text fields, sheets, and the
+Directory Panel can intercept first (a user typing in the Find field
+does not pause video by mistake).
+
+| Key | Action |
+| --- | --- |
+| ` ` (Space) | Play / Pause toggle |
+| `M` | Mute / Unmute |
+| `L` | Loop on / off |
+| `→` | Step forward 1 frame |
+| `←` | Step backward 1 frame |
+| `⇧ →` | Skip forward 5 s |
+| `⇧ ←` | Skip backward 5 s |
+| `⌥ →` | Skip forward 30 s |
+| `⌥ ←` | Skip backward 30 s |
+| `↑` | Volume up (5 %) |
+| `↓` | Volume down (5 %) |
+| `J` | Rate × 0.5 (or reverse if already 0.5) |
+| `K` | Play at normal rate (1.0×) |
+| `L` (long-press / repeated) | Rate × 2 |
+| `[` | Set loop in-point (v2) |
+| `]` | Set loop out-point (v2) |
+| `F` | Toggle full-screen video |
+| `P` | Toggle Picture-in-Picture |
+| `S` | Snapshot current frame → Save panel |
+| `Escape` | Exit fullscreen / PiP / return to image mode for Live Photos |
+
+> **Note on `L`:** the spec lists *Loop on/off* and the J/K/L
+> rate-shuttle convention on the same key. The disambiguation is
+> exactly the JKL convention used by Final Cut Pro and Premiere:
+> tapping `L` once toggles the **Loop** flag; tapping `L` *while
+> holding* (auto-repeat) accelerates playback rate. The implementation
+> distinguishes the two events on the AppKit key-down repeat flag.
+
+The arrow-key bindings here **conflict** with the file-list navigation
+arrows defined in [`menus.mdx` §4.8](./menus.mdx#48-go). The conflict
+is resolved by **focus context**: when the video canvas has key focus,
+arrows control the transport; when the Directory Panel has key focus,
+arrows navigate files. Tab moves focus between the two. The
+authoritative rule and the symmetric Slideshow / Space resolution are
+in §11.
+
+---
+
+## 5. The Video Menu (New)
+
+A new **Video** menu is added to the menu bar between `Image` and
+`Scope`. It is enabled (not greyed out) **only when the current file
+is a video**.
+
+### 5.1 Layout
+
+| Item | Shortcut | Notes |
+| --- | --- | --- |
+| Play / Pause | `␣` | Toggle. Item text flips between *Play* and *Pause* based on state. |
+| Stop and Rewind | `⌘ .` | Pauses and seeks to t = 0. |
+| — | | |
+| Sound On / Off (Mute) | `M` | Toggle. When muted, menu item reads *Sound On*. When playing, reads *Sound Off (Mute)*. |
+| Volume Up | `↑` | Active only when canvas has focus; gated by §11. |
+| Volume Down | `↓` | |
+| — | | |
+| Loop | `L` | Sticky per file. Persisted in Local Storage when the user enables *Remember Loop* in Settings. |
+| Playback Speed | submenu | `⌥ 1` = 0.25×, `⌥ 2` = 0.5×, `⌥ 3` = 1.0×, `⌥ 4` = 1.5×, `⌥ 5` = 2.0×. Current speed has a checkmark. |
+| — | | |
+| Step Forward One Frame | `→` | |
+| Step Backward One Frame | `←` | |
+| Skip Forward 5 s | `⇧ →` | |
+| Skip Backward 5 s | `⇧ ←` | |
+| Skip Forward 30 s | `⌥ →` | |
+| Skip Backward 30 s | `⌥ ←` | |
+| Go to Time… | `⌘ T` | Opens a small sheet with an `HH:MM:SS.mmm` field. |
+| — | | |
+| Snapshot Current Frame… | `S` | Opens Save panel. Default name `<basename>_<HHMMSS-mmm>.png`. |
+| Export Frames in Range… | — | Opens a sheet (start, end, every-N-frames, format). |
+| — | | |
+| Enter Full-Screen Video | `F` | Distinct from `⌃ ⌘ F` (window full-screen). See §11. |
+| Picture-in-Picture | `P` | Toggle. |
+| — | | |
+| Show Transport Bar | `⌃ T` | Toggle. When off, the floating bar never appears (useful for clean captures). |
+| Show Timecode Overlay | `⌥ T` | Toggle. Burns a small `HH:MM:SS;FF` overlay on the canvas (not the file). |
+
+### 5.2 Items disabled outside video context
+
+When the current file is **not** a video, all Video-menu items are
+disabled and show their shortcuts greyed out. The shortcuts
+themselves remain reserved: no other command claims them, so a user
+who memorizes the Video menu is never surprised by an "off-context"
+shortcut firing something unrelated.
+
+### 5.3 Sound On / Off — clarification
+
+The fork's product brief lists "spring sound on and off" as a Video
+menu item. We interpret this as **Sound On / Off (Mute)** — a single
+boolean that mutes the AVPlayer without changing the volume level, so
+that unmuting restores the user's prior volume exactly. The
+implementation uses `player.isMuted = on` rather than zeroing
+`player.volume`, which preserves the slider position in the floating
+transport bar.
+
+---
+
+## 6. Context Menu Additions
+
+The viewer canvas context menu defined in
+[`menus.mdx` §5.3](./menus.mdx#53-context-menu-on-the-main-viewer-the-image-canvas)
+gains a video-context section that appears only when the current file
+is a video:
+
+| Item | Notes |
+| --- | --- |
+| Play / Pause | Same as Video ▸ Play / Pause. |
+| Loop | Toggle. |
+| Sound On / Off | Toggle. |
+| Playback Speed ▸ | Submenu mirrors Video ▸ Playback Speed. |
+| Snapshot Current Frame… | |
+| Copy Current Frame | Puts a `CGImage` on the pasteboard. |
+| — | |
+| Picture-in-Picture | |
+
+The Directory Panel row context menu
+([`menus.mdx` §5.1](./menus.mdx#51-context-menu-on-a-file-row-in-the-directory-panel))
+gains, for video rows:
+
+| Item | Notes |
+| --- | --- |
+| Preview Inline | Hover-preview an N-second clip in the row (off by default; enabled in Settings). |
+| Mark as Reviewed | Cosmetic flag persisted in Local Storage. |
+
+---
+
+## 7. Settings (Persisted)
+
+A new **Video** section is added to [`settings.mdx`](./settings.mdx).
+Settings live in `~/Library/Application Support/ImageGlass_Mac/
+videoSettings.json` (alongside the other JSON-Codable settings files).
+
+```json
+{
+  "autoplayOnSelect": true,
+  "rememberLoopPerFile": true,
+  "defaultLoop": false,
+  "defaultMuted": false,
+  "defaultRate": 1.0,
+  "snapshotFormat": "png",
+  "snapshotDir": "~/Pictures/ImageGlass_Mac/Snapshots",
+  "transportBarFadeDelay": 2.5,
+  "hardwareDecodePreferred": true,
+  "hdrToneMapping": "system",
+  "mkvSupportEnabled": false,
+  "showTimecodeOverlay": false
+}
+```
+
+`rememberLoopPerFile = true` writes the loop flag into a
+`videoState.yaml` keyed by file URL (security-scoped bookmark) inside
+Local Storage, so opening a file the user previously loop-played
+restores the loop preference.
+
+---
+
+## 8. MCP Integration
+
+The MCP tool surface from [`mcp.mdx`](./mcp.mdx) gains the following
+**video** tools. Every Video menu item has an MCP counterpart so a
+Claude Code workflow can reproduce any GUI action.
+
+| Tool | Args | Returns |
+| --- | --- | --- |
+| `video_play` | — | `{ rate, currentTime }` |
+| `video_pause` | — | `{ currentTime }` |
+| `video_toggle_play` | — | `{ isPlaying, currentTime }` |
+| `video_seek` | `{ time: Double }` (seconds) | `{ currentTime }` |
+| `video_step_frame` | `{ direction: "forward" or "backward", count: Int }` | `{ currentTime }` |
+| `video_set_rate` | `{ rate: Double }` (0.25–2.0) | `{ rate }` |
+| `video_set_muted` | `{ muted: Bool }` | `{ muted, volume }` |
+| `video_set_volume` | `{ volume: Double }` (0.0–1.0) | `{ volume }` |
+| `video_set_loop` | `{ loop: Bool }` | `{ loop }` |
+| `video_snapshot` | `{ outputPath?: String, format?: "png" or "jpeg" }` | `{ path }` |
+| `video_export_frames` | `{ startTime: Double, endTime: Double, everyN: Int, outputDir: String, format: String }` | `{ files: [String] }` |
+| `video_enter_pip` | — | `{ pipActive: Bool }` |
+| `video_exit_pip` | — | `{ pipActive: Bool }` |
+| `video_describe` | — | Full state: duration, currentTime, rate, isPlaying, isMuted, volume, isLooping, codec, resolution, frameRate, hasAudio, audioTrackCount. |
+
+Tools are no-ops (returning a clear error) when the current file is
+not a video. The MCP server publishes a `video_state_changed`
+notification on every transport state transition so an external agent
+can react to playback events.
+
+---
+
+## 9. MKV / WebM Plugin
+
+`libavformat` (LGPL v2.1) provides the demuxer for Matroska / WebM.
+We embed it as a **plugin bundle** so users who do not need MKV
+playback never load the library, and we avoid an LGPL static-link
+question for the main app binary.
+
+* Bundle location: `Contents/PlugIns/MKVDemuxer.bundle/`.
+* Loaded on demand the first time a `.mkv` / `.webm` is opened.
+* Exposes a single Swift-level protocol:
+
+```swift
+public protocol VideoDemuxerPlugin {
+    static var supportedUTTypes: [UTType] { get }
+    func makeAsset(for url: URL) throws -> AVAsset
+}
+```
+
+* If the plugin is missing or disabled in Settings, the canvas shows
+  *"This video format is not supported. Enable MKV support in
+  Settings ▸ Video to install the plugin."* with an *Install Plugin…*
+  button that re-extracts it from the app bundle.
+
+---
+
+## 10. Performance and Resource Rules
+
+* **Decode is hardware-first.** `VTSelectAndCreateVideoDecoder` is
+  invoked with `kVTVideoDecoderSpecification_EnableHardwareAccelerated
+  Decoder = true`. We never force software decode unless the user
+  toggles `hardwareDecodePreferred = false`.
+* **Preroll budget: 80 ms.** A video that takes longer to preroll
+  surfaces the indeterminate progress bar. A video that takes longer
+  than 1.5 s logs a warning.
+* **Buffer cap: 2 s** of `preferredForwardBufferDuration` for local
+  files. The OS page cache and the SSD make a larger buffer wasteful.
+* **Memory cap: 256 MB** for a single playing item. Larger items
+  reduce internal decode width and downsample for preview. The user
+  can opt into full-resolution preview in Settings.
+* **GPU usage cap: 50 %.** Above that we throttle by lowering the
+  preview's `presentationSize` until the canvas reports under 50 %
+  Metal command-buffer time.
+* **Off-window pause.** When the ImageGlass_Mac window is fully
+  occluded or minimized, the player auto-pauses unless PiP is active.
+  This matches QuickTime Player behavior and saves battery.
+
+---
+
+## 11. Global Hotkey Reconciliation
+
+This section is **authoritative** for shortcut ownership across the
+entire app and supersedes [`menus.mdx` §7](./menus.mdx#7-shortcut-conflict-table-resolved)
+where the two disagree.
+
+### 11.1 Resolution rules
+
+1. **Focus wins.** When the video canvas has key focus, the canvas's
+   bindings win for `Space`, arrow keys, `J/K/L`, `M`, `F`, `P`, `S`.
+2. **Modifier always wins.** Any binding with `⌘`, `⌥`, `⌃`, or `⇧`
+   is resolved by the menu bar regardless of focus.
+3. **The Directory Panel owns un-modified arrows** when it has key
+   focus.
+4. **Tab** swaps key focus between Directory Panel and viewer
+   canvas; **Escape** returns focus to the canvas.
+
+### 11.2 Final shortcut table
+
+| Shortcut | Owner | Notes |
+| --- | --- | --- |
+| `␣` (Space) | **Video ▸ Play / Pause** when video is the current file. Otherwise **View ▸ Slideshow** (when the file list is focused). | Replaces `menus.mdx §7` — Slideshow gives up Space context-free. |
+| `⌥ ⌘ S` | View ▸ Start / Stop Slideshow | The unconditional, focus-independent Slideshow toggle. Added to View menu. |
+| `M` | Video ▸ Sound On / Off | Canvas focus only. |
+| `L` | Video ▸ Loop | Canvas focus only. Distinct from rate-shuttle behavior under auto-repeat. |
+| `J` | Video ▸ Rate × 0.5 | Canvas focus only. |
+| `K` | Video ▸ Rate × 1.0 | Canvas focus only. |
+| `F` | Video ▸ Enter Full-Screen Video | Distinct from `⌃ ⌘ F` (View ▸ Enter Full Screen — whole-window). |
+| `P` | Video ▸ Picture-in-Picture | Canvas focus only. |
+| `S` | Video ▸ Snapshot Current Frame… | Canvas focus only. |
+| `⌘ T` | Video ▸ Go to Time… | Distinct from Window ▸ Show / Hide Tab Bar (which is `⇧ ⌘ T` and does not exist in our app). |
+| `⌃ T` | Video ▸ Show Transport Bar | Toggle. |
+| `⌥ T` | Video ▸ Show Timecode Overlay | Toggle. |
+| `⌘ .` | Video ▸ Stop and Rewind | Repurposed from no current binding. |
+| `⌥ 1` … `⌥ 5` | Video ▸ Playback Speed (0.25× / 0.5× / 1× / 1.5× / 2×) | Canvas focus only. `⌥ 1`–`⌥ 5` are unbound elsewhere in the app. |
+| `→` `←` `⇧ →` `⇧ ←` `⌥ →` `⌥ ←` | Video transport, canvas focus only. | When the Directory Panel has focus, these navigate files (per `menus.mdx §4.8`). |
+| `↑` `↓` | Video volume, canvas focus only. | When the Directory Panel has focus, these navigate up/down the file list. |
+| `⌘ 0` | View ▸ Actual Size | Unchanged from `menus.mdx §7`. |
+| `⇧ ⌘ 0` | Panel ▸ Show All Panels | Unchanged. |
+| `⌘ R` | Scope ▸ Re-evaluate Scope | Unchanged. |
+| `⌘ D` | Scope ▸ Add Directory to Scope… | Unchanged. |
+| `⌘ I` | View ▸ Show File Info Overlay | Unchanged. |
+| `⌥ ⌘ I` | Image ▸ Show Metadata… | Unchanged. |
+
+### 11.3 Things this section explicitly changes vs. earlier specs
+
+* `Space` was previously bound to `View ▸ Slideshow` in
+  [`menus.mdx` §4.4](./menus.mdx#44-view). It is now context-aware:
+  Video first, Slideshow second.
+* `View ▸ Slideshow` adds an unconditional `⌥ ⌘ S` shortcut so power
+  users can still start a slideshow even when a video is on screen.
+* `F`, `P`, `S`, `M`, `L`, `J`, `K`, `⌘ T`, `⌃ T`, `⌥ T`, `⌘ .`,
+  `⌥ 1`–`⌥ 5` are newly reserved for the Video menu. None of them
+  collided with any existing binding in `menus.mdx` v1.
+
+### 11.4 Help ▸ Keyboard Shortcuts… update
+
+The Keyboard Shortcuts sheet (Help menu) must surface the Video
+section and reflect the §11.2 table when a video is selected. The
+sheet's source of truth is the same `KeyBindings.swift` module that
+wires the menu — there is one canonical map, not a separate
+hard-coded help list.
+
+---
+
+## 12. Tests and Acceptance Criteria
+
+Video preview is v1-complete when:
+
+1. Loading any file in §2.1 / §2.2 against a fresh build shows the
+   video on the canvas in under 1.5 s, with audio.
+2. Pressing `Space` toggles play and pause within one frame of the
+   refresh interval.
+3. `M` mutes and unmutes; unmute restores the prior volume exactly.
+4. `L` toggles loop, and a single-pass video that finishes mid-test
+   restarts within 50 ms when loop is on.
+5. Stepping with arrow keys advances exactly one frame at a time
+   (verified against a frame-counter test video).
+6. `F` enters fullscreen via `AVPlayerView` and exits cleanly on
+   `Escape`; `P` enters and exits PiP and the PiP window is destroyed
+   on app quit.
+7. `S` writes a snapshot whose pixel content matches
+   `AVAssetImageGenerator` output for the same time, byte-for-byte.
+8. Every MCP tool in §8 returns within 200 ms (except
+   `video_export_frames`, which is bounded by frame count) and
+   leaves the player in the documented state.
+9. Switching to a non-video file in the same window disposes the
+   AVPlayer (`player.replaceCurrentItem(with: nil)`), tears down PiP
+   if active, and frees the decode session within 500 ms (verified by
+   `VTDecompressionSessionInvalidate` call in the log).
+10. No video shortcut from §11.2 fires when the Directory Panel has
+    key focus; every Directory Panel shortcut from `menus.mdx`
+    continues to work unchanged when focus is on the panel.
+11. Help ▸ Keyboard Shortcuts… shows the Video section and matches
+    §11.2 verbatim, pulled from `KeyBindings.swift`.
+
+---
+
+## 13. Out of Scope (v1)
+
+* HLS / DASH streaming URLs.
+* Subtitle sidecar files (`.srt`, `.vtt`).
+* Audio track switching.
+* Video editing (trim, transcode, filter).
+* Camera capture / live capture preview.
+* External controller / Touch Bar customization beyond the AVKit
+  defaults.
+
+---
+
+## 14. References
+
+* [AVPlayer — Apple Developer Documentation](https://developer.apple.com/documentation/avfoundation/avplayer)
+* [Playback controls for video in a SwiftUI app — Create with Swift](https://www.createwithswift.com/playback-controls-for-video-in-a-swiftui-app/)
+* [Building a Custom Video Player in SwiftUI with AVKit — Cindori](https://cindori.com/developer/building-video-player-swiftui-avkit)
+* [Integrating AVKit with SwiftUI: A Practical Guide — Htet Moe Phyu](https://medium.com/@hmp.ucsm/integrating-avkit-with-swiftui-a-practical-guide-to-media-playback-63dafffca647)
+* [How to play movies with VideoPlayer — Hacking with Swift](https://www.hackingwithswift.com/quick-start/swiftui/how-to-play-movies-with-videoplayer)

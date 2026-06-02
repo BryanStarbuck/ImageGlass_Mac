@@ -107,8 +107,16 @@ final class ImageCanvasView: NSView {
         let url = URL(fileURLWithPath: path)
         let fs = FrameSource.load(url: url)
         frameSource = fs
+        if fs == nil || (fs?.frames.isEmpty ?? true) {
+            ErrorLog.log("FrameSource.load returned no frames for \(url.path)",
+                         class: String(describing: Self.self))
+        }
         // Fallback: still render with NSImage for tooltip/sourceImage parity.
         sourceImage = NSImage(contentsOfFile: path)
+        if sourceImage == nil {
+            ErrorLog.log("NSImage(contentsOfFile:) failed for \(path)",
+                         class: String(describing: Self.self))
+        }
         currentFrameIndex = 0
         applyFrame()
         panOffset = .zero
@@ -182,6 +190,8 @@ final class ImageCanvasView: NSView {
         guard let out = filter.outputImage,
               let result = ciContext.createCGImage(out, from: out.extent)
         else {
+            ErrorLog.log("CIFilter colorMatrix produced no output (channel=\(colorChannel))",
+                         class: String(describing: Self.self))
             filteredImage = cg
             return
         }
@@ -374,7 +384,11 @@ final class ImageCanvasView: NSView {
             data: nil, width: w, height: h,
             bitsPerComponent: 8, bytesPerRow: w * 4,
             space: cs, bitmapInfo: info
-        ) else { return cg }
+        ) else {
+            ErrorLog.log("CGContext init failed for RGBA8 sampling buffer (\(w)x\(h))",
+                         class: String(describing: Self.self))
+            return cg
+        }
         ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
         return ctx.makeImage()
     }

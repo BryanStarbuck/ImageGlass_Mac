@@ -1,0 +1,431 @@
+---
+title: Local Storage
+description: Product specification for the on-disk Local Storage feature — the plain-text YAML files in `~/T/_imageglass/` that hold application settings and scope definitions, and that serve as the single source of truth for both the GUI and the MCP server.
+---
+
+# Local Storage
+
+> **Document type:** Product specification.
+> **Audience:** Engineering (implementation, file I/O, schema) and
+> Product (data model, behavior on edit / load / corruption).
+> **Owners:** PM for what's stored and why; CTO for file layout,
+> atomicity, and schema versioning.
+> **Status:** v1 spec for the Mac-native fork. This document is the
+> authoritative schema referenced by `mcp.mdx`, `dir_ui.mdx`, and
+> `menus.mdx`.
+
+---
+
+## 1. Purpose
+
+**Local Storage** is the fork's on-disk configuration store. It holds
+two things:
+
+1. **Application settings** — UI state, theme, panel visibility,
+   active scope, and other process-wide preferences.
+2. **Scope definitions** — the named records that say *which
+   directories to include, which criteria to apply, which files were
+   resolved on the last walk, and when that walk happened*.
+
+Both live as **plain-text YAML files** in a single, well-known
+directory on the user's local machine. There is no binary settings
+blob, no SQLite database, no `UserDefaults` for these records.
+
+Local Storage is the single source of truth shared by:
+
+* The **GUI** (the Directory Panel renders it — see `dir_ui.mdx`).
+* The **menu bar** (the Scope menu mutates it — see `menus.mdx`).
+* The **MCP server** (Claude Code reads and writes it — see
+  `mcp.mdx`).
+
+All three surfaces talk to the same files. There is no second copy of
+state held in memory and never flushed to disk.
+
+---
+
+## 2. Why Plain Text YAML?
+
+Plain text is a **deliberate architectural decision**, not a temporary
+choice:
+
+* The MCP server can read and write the same files the GUI uses, with
+  no marshalling layer.
+* Claude Code can diff and edit scope definitions like any other
+  source file.
+* The user can inspect, hand-edit, back up, and version-control the
+  store without launching the app.
+* The system stays debuggable: if something looks wrong in the UI, the
+  user opens `~/T/_imageglass/` and sees exactly what the application
+  thinks the truth is.
+
+YAML specifically (rather than JSON or TOML) is chosen because:
+
+* Humans read and write it more comfortably than JSON.
+* It supports inline comments, which we encourage in
+  `directories.yaml` so the user can annotate scopes.
+* It round-trips list-of-string structures cleanly, which is what most
+  of our schema actually is.
+
+A binary store would close off all of the above workflows.
+
+---
+
+## 3. Directory Layout
+
+The application's Local Storage directory is:
+
+```
+~/T/_imageglass/
+   settings.yaml
+   directories.yaml
+```
+
+| Path | Purpose |
+| --- | --- |
+| `~/T/_imageglass/` | Local Storage root. Created on first launch if missing. |
+| `~/T/_imageglass/settings.yaml` | Application-level settings (§4). |
+| `~/T/_imageglass/directories.yaml` | Named scope definitions: directories + criteria + last evaluation results (§5). |
+
+### 3.1 Why `~/T/_imageglass/` and not `~/Library/Application Support/`?
+
+`~/Library/Application Support/` is the conventional macOS location
+for app data. We deliberately step away from it for Local Storage
+because:
+
+* Files under `~/Library/` are hidden from the user by default in
+  Finder.
+* The whole point of plain-text Local Storage is **discoverability** —
+  the user (and Claude Code) should be able to `cd ~/T/_imageglass/`
+  and `cat directories.yaml` without thinking about it.
+* `~/T/` is a short, easy-to-type path that no other macOS app
+  competes for.
+
+Caches, indexes, and Apple-mandated state still live in
+`~/Library/Application Support/ImageGlass/` and
+`~/Library/Caches/ImageGlass/`. Local Storage is specifically the
+**user-facing, plain-text** subset.
+
+### 3.2 Bootstrap on First Launch
+
+On first launch, if `~/T/_imageglass/` does not exist:
+
+1. Create the directory with permissions `0700` (owner read / write /
+   execute only).
+2. Write a starter `settings.yaml` with the v1 defaults (§4.3).
+3. Write a starter `directories.yaml` that contains one scope named
+   `default`, with `~/Pictures` as the only include directory, the
+   default extension list, and `hidden_files: true` for excludes.
+4. Mark the `default` scope as the active scope in `settings.yaml`.
+
+If the directory exists but one of the two files is missing, the
+missing file is regenerated from defaults; the file that exists is
+left alone.
+
+---
+
+## 4. `settings.yaml`
+
+### 4.1 Purpose
+
+`settings.yaml` holds **application-level** state — the things that
+affect the running app but are not tied to one specific scope.
+
+### 4.2 Schema (v1)
+
+```yaml
+schema_version: 1
+
+# Which scope from directories.yaml is currently active.
+active_scope: default
+
+ui:
+  theme: system            # system | light | dark
+  show_directory_panel: true
+  show_preview_panel: true
+  show_metadata_panel: false
+  show_toolbar: true
+  show_status_bar: true
+  show_file_info_overlay: false
+
+viewer:
+  default_zoom_mode: auto_fit  # auto_fit | auto_fill | lock | actual | scale_width | scale_height
+  interpolation: high          # none | low | medium | high
+  lock_zoom: false
+  frameless_window: false
+  slideshow_interval_seconds: 4
+
+navigation:
+  sort_panel_by: name          # name | date_modified | date_created | size | type
+  sort_ascending: true
+  loop_at_ends: false          # when at last image, ← Next wraps to first?
+
+scope_evaluation:
+  reevaluate_on_file_changes: true     # FSEvents trigger re-evaluation
+  evaluation_debounce_ms: 500
+
+# Most-recently-used items shown under File ▸ Open Recent.
+recents:
+  files: []
+  folders: []
+  scopes: []
+```
+
+### 4.3 Defaults
+
+The bootstrap-time defaults match the schema above verbatim. Each
+field has a sensible default; users only need to add keys they want to
+override. The application **merges** what's on disk with the
+defaults, so a partial `settings.yaml` is valid.
+
+### 4.4 Who Writes It
+
+| Surface | Typical writes |
+| --- | --- |
+| GUI menu bar (`menus.mdx`) | Theme switches, panel toggles, slideshow interval, sort settings. |
+| GUI on quit | `recents` lists, last-active scope. |
+| MCP server (`mcp.mdx`) | May write `active_scope` when a tool implies a switch; otherwise treats `settings.yaml` as read-mostly. |
+
+### 4.5 Unknown Keys
+
+Unknown top-level keys and unknown fields under known sections are
+**preserved on round-trip**. This is deliberate so that a newer build
+that knows about a key does not lose data when an older build of the
+app re-saves the file.
+
+---
+
+## 5. `directories.yaml`
+
+### 5.1 Purpose
+
+`directories.yaml` is the central file for the fork's headline
+feature. It holds the **named scopes**: which directories to walk,
+what filters to apply, which files were found last time, and when.
+
+### 5.2 Schema (v1)
+
+```yaml
+schema_version: 1
+
+scopes:
+  - name: default
+    description: "Default scope — your Pictures folder."
+    include:
+      directories:
+        - ~/Pictures
+      recursive: true
+      extensions:
+        - jpg
+        - jpeg
+        - png
+        - heic
+        - heif
+        - gif
+        - webp
+        - tiff
+        - bmp
+        - avif
+        - jxl
+      globs: []
+    exclude:
+      globs:
+        - "**/.DS_Store"
+        - "**/Thumbs.db"
+      hidden_files: true
+    last_evaluated: 2026-06-02T09:14:11Z
+    resolved_files:
+      - /Users/you/Pictures/2026-05-12/IMG_0001.heic
+      - /Users/you/Pictures/2026-05-12/IMG_0002.heic
+      # …truncated for the example.
+```
+
+### 5.3 Field-by-Field Specification
+
+#### Top level
+
+| Field | Type | Required | Notes |
+| --- | --- | --- | --- |
+| `schema_version` | integer | yes | Current value: `1`. Bumped on breaking changes. |
+| `scopes` | list of scope records | yes | One entry per named scope. Order is preserved on round-trip; users may reorder by hand. |
+
+#### Scope record
+
+| Field | Type | Required | Notes |
+| --- | --- | --- | --- |
+| `name` | string | yes | File-system-safe identifier. Unique within the file. Used as the canonical handle by the MCP server. |
+| `description` | string | no | Human-readable one-liner. Shown in scope pickers. |
+| `include` | object | yes | Inclusion rules (§5.3.1). |
+| `exclude` | object | yes | Exclusion rules (§5.3.2). |
+| `last_evaluated` | RFC 3339 timestamp | no | UTC timestamp of the last `evaluate_scope` run. `null` / absent if never evaluated. |
+| `resolved_files` | list of absolute paths | no | Snapshot of the file list produced on the last evaluation. Read by the Directory Panel on launch so the UI is responsive before the first re-walk completes. |
+
+##### 5.3.1 `include` object
+
+| Field | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `directories` | list of paths | `[]` | Absolute paths or tilde-prefixed paths (`~/Pictures`). Order does not affect filtering, only display order in the tree. |
+| `recursive` | boolean | `true` | If `true`, walk the whole hierarchy under each directory. If `false`, only the direct children of each directory are considered. |
+| `extensions` | list of strings | `[]` (interpreted as "all") | Lowercase, no leading dot. A file matches if its extension is in this list. Empty list means no extension filter. |
+| `globs` | list of strings | `[]` (interpreted as "all") | Standard `fnmatch(3)`-style globs against the file's relative path under the include directory. Empty list means no glob filter. |
+
+If both `extensions` and `globs` are non-empty, a file must pass
+**both** to be included (logical AND).
+
+##### 5.3.2 `exclude` object
+
+| Field | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `globs` | list of strings | `[]` | `fnmatch`-style globs. Any match removes the file from the result. |
+| `hidden_files` | boolean | `true` | If `true`, dotfiles and macOS-hidden files (chflags hidden) are excluded regardless of other rules. |
+
+Exclusion always wins over inclusion.
+
+### 5.4 Path Conventions
+
+* Paths may be written with a leading `~` for the user's home
+  directory. The application expands them at evaluation time.
+* On save, the application **contracts** absolute paths back to `~`
+  form when they live under `$HOME`, so the file stays portable
+  between machines that share a user name.
+* Trailing slashes are stripped on save.
+* On Windows-style path separators (`\`) — explicitly not supported.
+  YAML files written by hand should use POSIX paths.
+
+### 5.5 Resolved Files Are a Cache, Not Truth
+
+`resolved_files` is a **cache** of the last walk's result. It is *not*
+the truth about what is currently on disk:
+
+* On launch, the Directory Panel paints from `resolved_files`
+  immediately so the UI is responsive.
+* Then the application re-evaluates the scope in the background and
+  diffs against `resolved_files` — any drift is reconciled.
+* `last_evaluated` lets the application show staleness in the UI
+  (e.g., "Last walked 12 minutes ago").
+
+This means `resolved_files` can be safely deleted at any time without
+losing user intent — the next evaluation will rebuild it.
+
+---
+
+## 6. Atomicity and Concurrency
+
+Both files are mutated by both the GUI and the MCP server. To prevent
+corruption and lost writes:
+
+1. **Atomic replace.** Every save writes to a sibling temp file
+   (`directories.yaml.tmp-NNNN`) and then `rename(2)`s over the target.
+   `rename` is atomic on the same volume, which `~/T/_imageglass/`
+   always is.
+2. **In-process lock.** The application holds a per-file
+   `NSLock` / `os_unfair_lock` around each read-modify-write cycle, so
+   concurrent MCP tool calls cannot interleave.
+3. **Cross-process lock.** A POSIX advisory lock (`flock` on the
+   target file) is taken around any read-modify-write. This is the
+   defense against two ImageGlass_Mac processes running at the same
+   time (e.g., a dev build and a release build) clobbering each other.
+4. **Last-writer-wins for unknown keys.** Round-trip preservation
+   (§4.5) means unknown keys survive, but if two writers both set the
+   same known key, the last writer wins. There is no automatic
+   merge.
+
+---
+
+## 7. Schema Versioning and Migration
+
+* The `schema_version` integer at the top of each file is the canary.
+* The application reads any version `≤ schema_version_max_supported`
+  and refuses to read anything newer. (A newer file means the user
+  ran a newer build and then downgraded; the safe response is to
+  refuse, surface a clear error, and not silently lose data.)
+* Migrations are forward-only and written in code as a chain
+  `1 → 2 → 3 …`. Each step reads the prior version, transforms the
+  in-memory model, and writes the new version. The pre-migration
+  file is backed up as `directories.yaml.v{N}.bak` before the new
+  version overwrites the target.
+* The MCP server reports the schema version it expects in
+  `serverInfo.version` metadata (see `mcp.mdx` §11).
+
+---
+
+## 8. Backup, Recovery, and Corruption
+
+* On every write, the prior version of the file is kept as
+  `<name>.yaml.bak` (single rolling backup, not a chain). This is
+  cheap insurance against a bad edit.
+* On launch, if a YAML file fails to parse, the application:
+  1. Logs the parse error to `~/T/_imageglass/log/parse_errors.log`.
+  2. Renames the bad file to `<name>.yaml.corrupt-YYYYMMDD-HHMMSS`.
+  3. Restores the `.bak` if one exists; otherwise regenerates
+     defaults.
+  4. Shows a non-blocking banner in the UI: *"Settings could not be
+     read and were restored from backup. The unreadable file was
+     saved as <name>.yaml.corrupt-…"*.
+* The user can always **delete** the entire `~/T/_imageglass/`
+  directory; the app will re-bootstrap fresh on the next launch.
+
+---
+
+## 9. Permissions and Sandboxing
+
+* The directory is created with `0700`; files are created with
+  `0600`. The user is the only principal with access.
+* In App Sandbox builds, `~/T/_imageglass/` must be reachable. The
+  app's entitlements list `~/T/` (or, equivalently, a security-scoped
+  bookmark granted on first launch) so the sandbox does not block
+  reads / writes.
+* The directories listed inside `directories.yaml` are a separate
+  authorization question — see `mcp.mdx` §10. In sandboxed builds, the
+  application must hold a security-scoped bookmark for each include
+  directory; if a bookmark is missing or stale, the affected scope is
+  surfaced as needing user re-authorization.
+
+---
+
+## 10. Relationship to Other Specs
+
+| Other doc | What it covers | What it expects of Local Storage |
+| --- | --- | --- |
+| [`starbuck-fork.mdx`](./starbuck-fork.mdx) | Umbrella charter for the fork. | Names Local Storage as fork improvement #4 and frames the plain-text decision. |
+| [`mcp.mdx`](./mcp.mdx) | MCP server contract. | All tools read and write the files defined here. The data shapes referenced in §4 of `mcp.mdx` map one-to-one with the scope record above. |
+| [`dir_ui.mdx`](./dir_ui.mdx) | Directory Panel UI. | Renders the resolved file list, refreshes on changes to `directories.yaml`. |
+| [`menus.mdx`](./menus.mdx) | Menu bar and context menus. | The Scope and Panel menus, plus context menus, mutate `directories.yaml` and `settings.yaml`. |
+
+When any of those specs disagree with this one, **this one wins** and
+the other spec gets a follow-up edit. Local Storage is the
+single-source-of-truth document for the on-disk data model.
+
+---
+
+## 11. Non-Goals (v1)
+
+* No cloud sync. `~/T/_imageglass/` is a local directory. Users who
+  want sync can point `~/T/` at iCloud Drive or Dropbox themselves;
+  the app does not orchestrate that.
+* No multi-user account model. One macOS user account = one Local
+  Storage directory.
+* No encrypted-at-rest mode. YAML files inherit FileVault's
+  full-disk encryption like any other user file; there is no
+  application-level password.
+* No remote / shared scopes. Scopes are per-machine.
+
+---
+
+## 12. Acceptance Criteria for v1
+
+Local Storage is considered v1-complete when:
+
+1. First launch with no `~/T/_imageglass/` produces the directory,
+   `settings.yaml`, and a `directories.yaml` containing the
+   `default` scope (§3.2).
+2. The schema in §4 and §5 is what the application reads, writes,
+   and round-trips. Unknown keys survive a load-and-save cycle.
+3. Concurrent writes by the GUI and the MCP server produce no
+   corruption, no lost writes, and no interleaved scope records, as
+   verified by an integration test that fires N concurrent MCP
+   `set_directories` calls while the GUI is open.
+4. A deliberately corrupted `directories.yaml` is moved aside,
+   recovered from `.bak` if possible, and the UI shows the recovery
+   banner (§8).
+5. Every field referenced by `mcp.mdx` §4, `dir_ui.mdx` §3, and
+   `menus.mdx` §4.6 is present and behaves as specified here.

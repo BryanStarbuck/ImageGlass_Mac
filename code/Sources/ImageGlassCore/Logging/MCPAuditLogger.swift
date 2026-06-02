@@ -1,0 +1,255 @@
+import Foundation
+
+/// Append-only writer for the spec-mandated activity log at
+/// `~/Library/Application Support/ImageGlass_Mac/logs/log.log`. Every MCP
+/// call and every scope re-evaluation lands here as a single key=value
+/// line. See `docs/use_cases/mcp_file.mdx` §0 / §4 / §8 / §10 and
+/// `docs/error_handling.mdx` §4.2 for the line grammar this implements.
+///
+/// Format (one line per record):
+///
+/// ```
+/// ts=<ISO8601-ms> tool=mcp.<name> name=<scope> client=<id> corr=<8> ok=true [extra=…]
+/// ts=<ISO8601-ms> app=<event>      name=<scope>            corr=<8> count=<n> elapsed_ms=<n>
+/// ts=<ISO8601-ms> app=startup msg="layout=Browser scope=default"
+/// ```
+///
+/// The writer is process-wide (`shared`) and serializes appends behind an
+/// internal lock so concurrent MCP calls do not interleave lines.
+public final class MCPAuditLogger: @unchecked Sendable {
+
+    public static let shared = MCPAuditLogger()
+
+    /// Set to a non-nil URL to override the default log path (used by
+    /// `MacScopeStore` tests so they can write to a temp directory).
+    public var overrideLogFile: URL?
+
+    private let lock = NSLock()
+    private let dateFormatter: ISO8601DateFormatter
+
+    public init(overrideLogFile: URL? = nil) {
+        self.overrideLogFile = overrideLogFile
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        self.dateFormatter = f
+    }
+
+    /// Resolve the file path the writer will append to. Honors
+    /// `overrideLogFile` (for tests), otherwise the spec-mandated path.
+    public var logFileURL: URL {
+        overrideLogFile ?? AppPaths.macLogFile
+    }
+
+    /// Generate a short correlation id (8 hex chars) so a paired
+    /// `tool=mcp.…` and `app=scope.evaluate …` line can be joined.
+    public static func newCorrelationId() -> String {
+        var bytes = [UInt8](repeating: 0, count: 4)
+        for i in 0..<bytes.count {
+            bytes[i] = UInt8.random(in: 0...255)
+        }
+        return bytes.map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Write one record. `pairs` is appended after `ts=…` in the order
+    /// given so the line stays human-readable (`tool=…` first, then
+    /// `name=…`, then everything else).
+    public func log(_ pairs: [(String, String)]) {
+        var line = "ts=\(dateFormatter.string(from: Date()))"
+        for (k, v) in pairs {
+            line += " "
+            line += k
+            line += "="
+            line += format(value: v)
+        }
+        line += "\n"
+        guard let data = line.data(using: .utf8) else {
+            ErrorLog.log("failed to encode audit log line as UTF-8",
+                         class: "MCPAuditLogger")
+            return
+        }
+        appendData(data)
+    }
+
+    /// Convenience for a successful MCP call. Records
+    /// `tool=mcp.<name> name=<scope> client=<client> corr=<corr> ok=true`
+    /// plus any `extra` key/value pairs supplied by the caller.
+    public func logMCPCall(
+        toolName: String,
+        scope: String?,
+        client: String,
+        corr: String,
+        ok: Bool,
+        err: String? = nil,
+        extra: [(String, String)] = []
+    ) {
+        var pairs: [(String, String)] = [("tool", "mcp.\(toolName)")]
+        if let scope { pairs.append(("name", scope)) }
+        pairs.append(("client", client))
+        pairs.append(("corr", corr))
+        pairs.append(("ok", ok ? "true" : "false"))
+        if let err { pairs.append(("err", err)) }
+        pairs.append(contentsOf: extra)
+        log(pairs)
+    }
+
+    /// Convenience for a multi-scope walk (the legacy `scopes/<name>.json`
+    /// path; see `list_of_files.mdx` §3). Records
+    /// `app=scope.evaluate name=<scope> count=<n> elapsed_ms=<n> corr=<corr>`.
+    /// The directory-tree panel uses `logDirectoryWalk` below instead.
+    public func logScopeEvaluate(
+        scope: String,
+        count: Int,
+        elapsedMs: Int,
+        corr: String
+    ) {
+        log([
+            ("app", "scope.evaluate"),
+            ("name", scope),
+            ("count", String(count)),
+            ("elapsed_ms", String(elapsedMs)),
+            ("corr", corr),
+        ])
+    }
+
+    /// Variant used by the directory-tree MCP tools
+    /// (`docs/use_cases/mcp_file.mdx` §4.4 / §5.4 / §6.4 / §7.4 /
+    /// §10.6). The line carries
+    /// `tool=mcp.<name> path=<path> client=<id> corr=<corr> ok=true|false`
+    /// — no `name=` scope field, because directories.yaml is not a
+    /// scope file.
+    public func logDirectoryToolCall(
+        toolName: String,
+        path: String?,
+        client: String,
+        corr: String,
+        ok: Bool,
+        err: String? = nil,
+        extra: [(String, String)] = []
+    ) {
+        var pairs: [(String, String)] = [("tool", "mcp.\(toolName)")]
+        if let path { pairs.append(("path", path)) }
+        pairs.append(("client", client))
+        pairs.append(("corr", corr))
+        pairs.append(("ok", ok ? "true" : "false"))
+        if let err { pairs.append(("err", err)) }
+        pairs.append(contentsOf: extra)
+        log(pairs)
+    }
+
+    /// `app=directory.walk path=<path> count=<n> elapsed_ms=<n> corr=<corr>`
+    /// — paired with every successful `add_directory` /
+    /// `refresh_directory` call. See §4.4 / §10.6.
+    public func logDirectoryWalk(
+        path: String,
+        count: Int,
+        elapsedMs: Int,
+        corr: String
+    ) {
+        log([
+            ("app", "directory.walk"),
+            ("path", path),
+            ("count", String(count)),
+            ("elapsed_ms", String(elapsedMs)),
+            ("corr", corr),
+        ])
+    }
+
+    /// `app=directory.refilter roots=<n> visible_delta=<±n> elapsed_ms=<n> corr=<corr>`
+    /// — paired with every successful filter change. See §6.4 / §7.4.
+    /// `visibleDelta` is signed: negative if fewer files now visible.
+    public func logDirectoryRefilter(
+        roots: Int,
+        visibleDelta: Int,
+        elapsedMs: Int,
+        corr: String
+    ) {
+        let signed = visibleDelta > 0 ? "+\(visibleDelta)" : String(visibleDelta)
+        log([
+            ("app", "directory.refilter"),
+            ("roots", String(roots)),
+            ("visible_delta", signed),
+            ("elapsed_ms", String(elapsedMs)),
+            ("corr", corr),
+        ])
+    }
+
+    /// `app=panel.auto_select_first path=<path> corr=<corr> reason=<reason>`
+    /// — see §10.6. No `scope=` field; `directories.yaml` is the only
+    /// source.
+    public func logAutoSelectFirst(
+        path: String,
+        corr: String,
+        reason: String
+    ) {
+        log([
+            ("app", "panel.auto_select_first"),
+            ("path", path),
+            ("corr", corr),
+            ("reason", reason),
+        ])
+    }
+
+    /// `app=startup msg="layout=Browser directories=<n>"` — see §1.3.
+    public func logStartup(layout: String, directoryCount: Int) {
+        log([
+            ("app", "startup"),
+            ("msg", "layout=\(layout) directories=\(directoryCount)"),
+        ])
+    }
+
+    // MARK: - File I/O
+
+    private func appendData(_ data: Data) {
+        lock.lock()
+        defer { lock.unlock() }
+        let url = logFileURL
+        let fm = FileManager.default
+        do {
+            try fm.createDirectory(
+                at: url.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+        } catch {
+            // If the parent directory cannot be created (sandbox, read-only
+            // volume) the log line is silently dropped — the writer must
+            // never throw, because MCP tool callers treat logging as a
+            // best-effort audit trail rather than part of the call's
+            // correctness contract.
+            ErrorLog.log("could not create audit log parent directory \(url.deletingLastPathComponent().path)",
+                         error: error,
+                         class: "MCPAuditLogger")
+            return
+        }
+        if !fm.fileExists(atPath: url.path) {
+            do {
+                try data.write(to: url, options: .atomic)
+            } catch {
+                ErrorLog.log("failed to create audit log at \(url.path)",
+                             error: error,
+                             class: "MCPAuditLogger")
+            }
+            return
+        }
+        do {
+            let handle = try FileHandle(forWritingTo: url)
+            defer { try? handle.close() }
+            try handle.seekToEnd()
+            try handle.write(contentsOf: data)
+        } catch {
+            ErrorLog.log("failed to append to audit log at \(url.path)",
+                         error: error,
+                         class: "MCPAuditLogger")
+            return
+        }
+    }
+
+    /// Quote a value if it contains whitespace or `=` so the grep-able
+    /// `tool=mcp.update_scope` form stays parseable.
+    private func format(value: String) -> String {
+        if value.contains(" ") || value.contains("=") || value.contains("\t") {
+            let escaped = value.replacingOccurrences(of: "\"", with: "\\\"")
+            return "\"\(escaped)\""
+        }
+        return value
+    }
+}

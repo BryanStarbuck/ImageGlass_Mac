@@ -126,7 +126,11 @@ final class FloatingPanelController {
     }
 
     private func present(floating: FloatingPanel, model: PanelLayoutModel, appState: AppState) {
-        guard let panel = PanelRegistry.shared.panel(for: floating.id) else { return }
+        guard let panel = PanelRegistry.shared.panel(for: floating.id) else {
+            ErrorLog.log("floating panel id '\(floating.id)' has no registered panel",
+                         class: "FloatingPanelController")
+            return
+        }
         let nsPanel = NSPanel(
             contentRect: floating.frame,
             styleMask: [.titled, .closable, .resizable, .utilityWindow, .nonactivatingPanel],

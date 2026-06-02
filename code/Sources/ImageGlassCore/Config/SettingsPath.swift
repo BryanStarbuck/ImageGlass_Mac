@@ -24,7 +24,15 @@ public enum SettingsPath {
     /// Lists every dotted path that exists in `settings` paired with its
     /// JSON value. Mirrors the MCP `list_setting_paths()` tool.
     public static func listPaths(_ settings: Settings) -> [(path: String, value: Any)] {
-        let json = (try? encodeToJSONObject(settings)) ?? [:]
+        let json: [String: Any]
+        do {
+            json = try encodeToJSONObject(settings)
+        } catch {
+            ErrorLog.log("encodeToJSONObject failed in listPaths",
+                         error: error,
+                         class: "SettingsPath")
+            json = [:]
+        }
         var out: [(String, Any)] = []
         flatten(json, prefix: "", into: &out)
         return out.sorted(by: { $0.0 < $1.0 })

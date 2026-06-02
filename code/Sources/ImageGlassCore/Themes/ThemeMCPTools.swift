@@ -298,10 +298,16 @@ public struct ThemeMCPTools {
 
     private func readPersistedName(side: Side) -> String? {
         let url = side == .light ? AppPaths.currentLightThemeFile : AppPaths.currentDarkThemeFile
-        guard FileManager.default.fileExists(atPath: url.path),
-              let raw = try? String(contentsOf: url, encoding: .utf8) else {
-            // Backwards-compat: fall back to the legacy single file if the
-            // paired file isn't there yet (first MCP call after upgrade).
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            return readLegacyPersistedName(side: side)
+        }
+        let raw: String
+        do {
+            raw = try String(contentsOf: url, encoding: .utf8)
+        } catch {
+            ErrorLog.log("failed to read persisted theme name from \(url.path)",
+                         error: error,
+                         class: "ThemeMCPTools")
             return readLegacyPersistedName(side: side)
         }
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -310,8 +316,16 @@ public struct ThemeMCPTools {
 
     private func readLegacyPersistedName(side: Side) -> String? {
         let url = AppPaths.currentThemeFile
-        guard FileManager.default.fileExists(atPath: url.path),
-              let raw = try? String(contentsOf: url, encoding: .utf8) else {
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            return nil
+        }
+        let raw: String
+        do {
+            raw = try String(contentsOf: url, encoding: .utf8)
+        } catch {
+            ErrorLog.log("failed to read legacy persisted theme name from \(url.path)",
+                         error: error,
+                         class: "ThemeMCPTools")
             return nil
         }
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -328,8 +342,16 @@ public struct ThemeMCPTools {
 
     private func readAppearanceMode() -> ThemeAppearanceMode {
         let url = AppPaths.appearanceModeFile
-        guard FileManager.default.fileExists(atPath: url.path),
-              let raw = try? String(contentsOf: url, encoding: .utf8) else {
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            return .system
+        }
+        let raw: String
+        do {
+            raw = try String(contentsOf: url, encoding: .utf8)
+        } catch {
+            ErrorLog.log("failed to read appearance mode from \(url.path)",
+                         error: error,
+                         class: "ThemeMCPTools")
             return .system
         }
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -359,16 +381,33 @@ public struct ThemeMCPTools {
         let enc = JSONEncoder()
         enc.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         enc.dateEncodingStrategy = .iso8601
-        if let data = try? enc.encode(value), let s = String(data: data, encoding: .utf8) {
-            return s
+        do {
+            let data = try enc.encode(value)
+            if let s = String(data: data, encoding: .utf8) {
+                return s
+            }
+            ErrorLog.log("prettyJSON encoded data was not valid UTF-8",
+                         class: "ThemeMCPTools")
+        } catch {
+            ErrorLog.log("prettyJSON encode failed",
+                         error: error,
+                         class: "ThemeMCPTools")
         }
         return "{}"
     }
 
     private func prettyJSON(_ dict: [String: Any]) -> String {
-        if let data = try? JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted, .sortedKeys]),
-           let s = String(data: data, encoding: .utf8) {
-            return s
+        do {
+            let data = try JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted, .sortedKeys])
+            if let s = String(data: data, encoding: .utf8) {
+                return s
+            }
+            ErrorLog.log("prettyJSON(dict) data was not valid UTF-8",
+                         class: "ThemeMCPTools")
+        } catch {
+            ErrorLog.log("prettyJSON(dict) JSONSerialization failed",
+                         error: error,
+                         class: "ThemeMCPTools")
         }
         return "{}"
     }

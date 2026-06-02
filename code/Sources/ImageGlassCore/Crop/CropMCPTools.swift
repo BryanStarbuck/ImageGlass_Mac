@@ -134,8 +134,14 @@ public struct CropMCPTools {
             )
             return .text(prettyJSON(result))
         } catch let e as CropPipeline.Error {
+            ErrorLog.log("crop_image pipeline error for \(inputURL.path)",
+                         error: e,
+                         class: "CropMCPTools")
             return .text(e.description, isError: true)
         } catch {
+            ErrorLog.log("crop_image failed for \(inputURL.path)",
+                         error: error,
+                         class: "CropMCPTools")
             return .text("crop_image failed: \(error.localizedDescription)", isError: true)
         }
     }
@@ -202,16 +208,29 @@ public struct CropMCPTools {
         let enc = JSONEncoder()
         enc.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         enc.dateEncodingStrategy = .iso8601
-        if let data = try? enc.encode(value), let s = String(data: data, encoding: .utf8) {
-            return s
+        do {
+            let data = try enc.encode(value)
+            if let s = String(data: data, encoding: .utf8) { return s }
+            ErrorLog.log("prettyJSON encode produced non-UTF8 data",
+                         class: "CropMCPTools")
+        } catch {
+            ErrorLog.log("prettyJSON encode failed",
+                         error: error,
+                         class: "CropMCPTools")
         }
         return "{}"
     }
 
     private func prettyJSON(_ dict: [String: Any]) -> String {
-        if let data = try? JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted, .sortedKeys]),
-           let s = String(data: data, encoding: .utf8) {
-            return s
+        do {
+            let data = try JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted, .sortedKeys])
+            if let s = String(data: data, encoding: .utf8) { return s }
+            ErrorLog.log("prettyJSON(dict) produced non-UTF8 data",
+                         class: "CropMCPTools")
+        } catch {
+            ErrorLog.log("prettyJSON(dict) failed",
+                         error: error,
+                         class: "CropMCPTools")
         }
         return "{}"
     }

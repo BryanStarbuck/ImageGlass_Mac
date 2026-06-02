@@ -1,0 +1,446 @@
+---
+title: macOS Menu Bar and Context Menus
+description: Product specification for the menu bar, context menus, and keyboard shortcuts of ImageGlass_Mac — the full interactive surface for scopes, directories, viewing, and panels, designed for the native macOS menu bar.
+---
+
+# macOS Menu Bar and Context Menus
+
+> **Document type:** Product specification.
+> **Audience:** Engineering (implementation) and Product (text,
+> grouping, keyboard shortcuts).
+> **Owners:** PM for menu text, grouping, and discoverability; CTO for
+> the SwiftUI `CommandMenu` / AppKit `NSMenu` bridging and shortcut
+> conflicts.
+> **Status:** v1 spec for the Mac-native fork. Aligns with
+> `starbuck-fork.mdx`, `dir_ui.mdx`, `mcp.mdx`, and `local_storage.mdx`.
+
+---
+
+## 1. Purpose
+
+This document specifies the **full menu surface** of ImageGlass_Mac:
+the macOS menu bar, the context menus that appear on right-click in
+the Directory Panel and viewer, and the keyboard shortcuts attached to
+each command.
+
+The goal is to give the user a thoughtful, native-feeling set of menus
+that exposes every interactive behavior the application supports —
+especially the new fork-specific features: adding and removing
+directories, switching scopes, toggling panels, and triggering scope
+re-evaluation.
+
+We design these menus to follow Apple's macOS Human Interface
+Guidelines so the app feels like it shipped with the OS, not like a
+ported Windows application.
+
+---
+
+## 2. Design Principles
+
+1. **Native first.** Standard menus (App, File, Edit, View, Window,
+   Help) appear in their standard positions with their standard
+   shortcuts. The user's muscle memory works on day one.
+2. **One verb per menu item.** Item text reads as an active verb
+   phrase: *Add Directory…*, *Re-evaluate Scope*, *Reveal in Finder*.
+3. **Ellipses (`…`) for any item that opens a dialog or asks for
+   further input.** Items that act immediately do not get an ellipsis.
+4. **Capitalization follows macOS title case** — all major words
+   capitalized: *Show Preview Panel*, not *Show preview panel*.
+5. **Group related commands with separators.** Dense menus get
+   subdivided by intent (e.g., add vs. evaluate vs. switch).
+6. **Shortcut conflicts with system-reserved shortcuts are not
+   allowed.** Custom shortcuts never collide with Spotlight (`⌘ Space`),
+   Mission Control, or Edit-menu standards.
+7. **Every fork-specific menu item exists in only one place in the
+   menu bar.** Context menus may repeat menu-bar items for convenience,
+   but the menu bar is the canonical surface.
+
+---
+
+## 3. Menu Bar Layout
+
+The menu bar contains the following menus, in order:
+
+1. **ImageGlass_Mac** (application menu)
+2. **File**
+3. **Edit**
+4. **View**
+5. **Image**
+6. **Scope**
+7. **Panel**
+8. **Go**
+9. **Window**
+10. **Help**
+
+`Scope` and `Panel` are the two new fork-specific menus. They sit
+between `Image` and `Go` so the user encounters them after the
+upstream-style image commands but before the navigation menu.
+
+---
+
+## 4. Menus — Item by Item
+
+The following sections enumerate every menu, its items, and the
+keyboard shortcuts. Items marked **(new)** are fork additions not
+present in upstream ImageGlass.
+
+### 4.1 ImageGlass_Mac (Application Menu)
+
+Standard macOS application menu. Apple owns the structure; we own the
+text.
+
+| Item | Shortcut | Notes |
+| --- | --- | --- |
+| About ImageGlass_Mac | — | Opens an About window crediting Duong Dieu Phap and the Starbuck fork. |
+| Check for Updates… | — | Sparkle-style updater. Disabled if the app was installed via package manager. |
+| Settings… | ⌘ , | Opens the Settings scene. |
+| — | | |
+| Services | submenu | Standard macOS Services menu. |
+| — | | |
+| Hide ImageGlass_Mac | ⌘ H | |
+| Hide Others | ⌥ ⌘ H | |
+| Show All | — | |
+| — | | |
+| Quit ImageGlass_Mac | ⌘ Q | |
+
+### 4.2 File
+
+| Item | Shortcut | Notes |
+| --- | --- | --- |
+| Open… | ⌘ O | Standard file-open panel. Loads the file as a one-shot image without modifying the active scope. |
+| Open Folder… | ⇧ ⌘ O | Open a folder as a transient scope (not persisted to `directories.yaml`). |
+| Open Recent | submenu | Last 10 files / folders / scopes. Includes *Clear Menu*. |
+| — | | |
+| Close Window | ⌘ W | |
+| Close All Windows | ⌥ ⌘ W | |
+| — | | |
+| Reveal in Finder | ⌘ R | Reveals the currently viewed image. |
+| Copy File Path | ⌃ ⌘ C | Puts the absolute POSIX path on the clipboard. |
+| — | | |
+| Save As… | ⇧ ⌘ S | Save the current image to another path / format. |
+| Convert To | submenu | *PNG*, *JPEG*, *HEIC*, *TIFF*, *WebP*, *AVIF*, *JXL*. Convert opens a save panel. |
+| Export Frames… | — | For multi-frame formats (GIF, APNG, animated WebP). |
+| — | | |
+| Page Setup… | ⇧ ⌘ P | |
+| Print… | ⌘ P | |
+
+### 4.3 Edit
+
+Standard macOS Edit menu — we provide the standard items so system
+text fields, search fields, and rename dialogs work normally — plus
+image-specific copy items.
+
+| Item | Shortcut | Notes |
+| --- | --- | --- |
+| Undo | ⌘ Z | Undo the most recent destructive edit (rotate, crop, etc.). |
+| Redo | ⇧ ⌘ Z | |
+| — | | |
+| Cut | ⌘ X | Active in text fields. |
+| Copy | ⌘ C | In the viewer, copies the rendered image to the clipboard. In the Directory Panel, copies the file. |
+| Paste | ⌘ V | Pastes image data or file paths to open. |
+| Delete | ⌫ | In the Directory Panel: move the selected file to Trash (confirm). |
+| Select All | ⌘ A | |
+| — | | |
+| Find… | ⌘ F | Opens an inline search field in the Directory Panel that filters by filename. |
+| Find Next | ⌘ G | |
+| Find Previous | ⇧ ⌘ G | |
+| — | | |
+| Edit Scope Criteria… **(new)** | ⌥ ⌘ E | Opens a sheet to edit include / exclude globs and extensions for the active scope. |
+
+### 4.4 View
+
+| Item | Shortcut | Notes |
+| --- | --- | --- |
+| Show Toolbar | — | Toggle. |
+| Customize Toolbar… | — | Standard AppKit customization sheet. |
+| — | | |
+| Actual Size | ⌘ 0 | 100% zoom. |
+| Zoom In | ⌘ + | |
+| Zoom Out | ⌘ - | |
+| Zoom to Fit | ⌘ 9 | |
+| Zoom to Fill | ⇧ ⌘ 9 | |
+| Lock Zoom | ⌃ ⌘ L | Toggle. |
+| — | | |
+| Enter Full Screen | ⌃ ⌘ F | |
+| Frameless Window | ⇧ ⌘ F | Toggle. |
+| Slideshow | ␣ (Space) | Start / stop. Same shortcut upstream uses. |
+| — | | |
+| Appearance | submenu | *Match System*, *Light*, *Dark*. |
+| Show Status Bar | — | Toggle. Bottom-of-window info bar. |
+| Show File Info Overlay | ⌘ I | Toggle the on-image metadata overlay. |
+
+### 4.5 Image
+
+Image-level actions on the currently viewed file. These are
+non-destructive until the user explicitly saves.
+
+| Item | Shortcut | Notes |
+| --- | --- | --- |
+| Rotate Left | ⌘ L | 90° CCW. |
+| Rotate Right | ⌘ K | 90° CW. |
+| Flip Horizontal | ⌥ ⌘ H | |
+| Flip Vertical | ⌥ ⌘ V | |
+| — | | |
+| Crop… | ⌘ K then drag | Opens crop overlay. |
+| Resize… | ⌥ ⌘ R | |
+| Lossless Compress | — | Available for formats that support it (PNG, JPEG, WebP). |
+| — | | |
+| Color Picker | ⇧ ⌘ K | Pixel color sampler. |
+| Show Channels | submenu | *All*, *Red*, *Green*, *Blue*, *Alpha*, *Luminance*. |
+| — | | |
+| Show Metadata… | ⌥ ⌘ I | Opens a sheet with EXIF / IPTC / XMP. |
+
+### 4.6 Scope **(new)**
+
+The fork's central new menu. Every command that affects which files
+are in the active list lives here. This is the menu-bar twin of the
+MCP tool surface (`mcp.mdx` §6).
+
+| Item | Shortcut | Notes |
+| --- | --- | --- |
+| New Scope… | ⌘ N | Create a new named scope. Prompts for a name. |
+| Switch Scope | submenu | Lists every scope in `directories.yaml`. The current one has a checkmark. |
+| Rename Scope… | — | Rename the active scope. |
+| Duplicate Scope… | — | Copy the active scope under a new name. |
+| Delete Scope… | — | Confirm-then-delete. Disabled if it is the only scope. |
+| — | | |
+| Add Directory to Scope… | ⌘ D | Opens an `NSOpenPanel` (choose folders). Adds the chosen directory to the active scope as an include directory. |
+| Add Directories from Drop… | — | Reminds the user they can also drag folders onto the Directory Panel. (Hidden by default; visible in Edit-mode menu.) |
+| Remove Selected Directory | ⇧ ⌘ ⌫ | Removes the directory currently selected in the Directory Panel from the active scope. |
+| Make Recursive | — | Toggle. Applies to the selected root directory. |
+| Make Shallow | — | Toggle. Opposite of *Make Recursive*. |
+| — | | |
+| Edit Inclusion Criteria… | — | Opens a sheet for globs and extensions. |
+| Edit Exclusion Criteria… | — | Opens a sheet for exclude globs and the hidden-files flag. |
+| Reset Criteria | — | Removes all globs / extension filters from the active scope (keeps the directory list). |
+| — | | |
+| Re-evaluate Scope | ⌘ R | Walks the directories, applies filters, writes the resolved file list back to Local Storage. Same call MCP's `evaluate_scope` makes. |
+| Re-evaluate on File Changes | — | Toggle. When on, `FSEventStream` triggers re-evaluation automatically. |
+| — | | |
+| Export Scope as YAML… | — | Writes the active scope's record from `directories.yaml` to a chosen path. |
+| Import Scope from YAML… | — | Inverse of export. Creates a new scope from a YAML file. |
+| — | | |
+| Reveal Local Storage in Finder | ⌥ ⌘ G | Opens `~/T/_imageglass/` in Finder so the user can inspect the YAML directly. |
+
+### 4.7 Panel **(new)**
+
+Controls for the modular panels in the new column. Aligns with
+`dir_ui.mdx`.
+
+| Item | Shortcut | Notes |
+| --- | --- | --- |
+| Show Directory Panel | ⌘ 1 | Toggle. |
+| Show Preview Panel | ⌘ 2 | Toggle. Independent of the Directory Panel. |
+| Show Metadata Panel | ⌘ 3 | Toggle. (Reserved for v2; menu item present and disabled in v1.) |
+| — | | |
+| Hide All Panels | ⌥ ⌘ 0 | Collapse the new column entirely. |
+| Show All Panels | ⌘ 0 | Restore the previously-shown panels. *Note: `⌘ 0` is shared with View ▸ Actual Size; resolved by chord context — Panel ▸ Show All Panels is `⇧ ⌘ 0`.* |
+| — | | |
+| Expand Selected Subtree | ⌥ → | In the Directory Panel. Matches Finder. |
+| Collapse Selected Subtree | ⌥ ← | |
+| — | | |
+| Sort Panel By | submenu | *Name*, *Date Modified*, *Date Created*, *Size*, *Type*. Includes *Ascending* / *Descending* below a separator. |
+
+> **Conflict note:** the table above has `⌘ 0` listed for both *Actual
+> Size* and *Show All Panels*. Resolve by giving *Show All Panels* the
+> shortcut `⇧ ⌘ 0` in the final build; `⌘ 0` stays on *Actual Size*
+> because that matches user expectations from every other Mac image
+> viewer.
+
+### 4.8 Go
+
+Navigation through the resolved file list.
+
+| Item | Shortcut | Notes |
+| --- | --- | --- |
+| Next Image | → | Or `Page Down`. |
+| Previous Image | ← | Or `Page Up`. |
+| First Image | ⌘ ↑ | |
+| Last Image | ⌘ ↓ | |
+| Random Image | ⌘ ⇧ R | |
+| — | | |
+| Jump to Folder… | ⌘ J | Type-ahead jump to a directory in the active scope. |
+| Go to Filename… | ⇧ ⌘ J | Type-ahead jump to a filename. |
+| — | | |
+| Back | ⌘ [ | Selection history, like a browser. |
+| Forward | ⌘ ] | |
+
+### 4.9 Window
+
+Standard macOS Window menu plus our specific windows.
+
+| Item | Shortcut | Notes |
+| --- | --- | --- |
+| Minimize | ⌘ M | |
+| Zoom | — | |
+| Tile Window to Left of Screen | — | |
+| Tile Window to Right of Screen | — | |
+| — | | |
+| Show Previous Tab | ⌃ ⇧ ⇥ | |
+| Show Next Tab | ⌃ ⇥ | |
+| Move Tab to New Window | — | |
+| Merge All Windows | — | |
+| — | | |
+| Bring All to Front | — | |
+| — | | |
+| *(list of open windows, with the active one checked)* | — | |
+
+### 4.10 Help
+
+| Item | Shortcut | Notes |
+| --- | --- | --- |
+| Search | — | Standard help search field. |
+| ImageGlass_Mac Help | ⌘ ? | Opens the docs (`docs/overview.mdx`-derived help bundle). |
+| Keyboard Shortcuts… | — | Opens a sheet listing every shortcut in this document. |
+| — | | |
+| About the Starbuck Fork | — | Brief explainer of what differs from upstream. Links to `starbuck-fork.mdx`. |
+| Visit Upstream Project | — | Opens `https://github.com/d2phap/ImageGlass`. |
+| Report an Issue… | — | Opens the issue tracker for the fork. |
+
+---
+
+## 5. Context Menus
+
+Context menus repeat key items from the menu bar for convenience.
+They appear on right-click (or `⌃`-click) in the relevant surface.
+
+### 5.1 Context Menu on a File Row in the Directory Panel
+
+| Item | Notes |
+| --- | --- |
+| Open | Load into the main viewer. |
+| Open With | submenu of registered applications. |
+| Reveal in Finder | |
+| Copy File Path | |
+| Copy Image | |
+| — | |
+| Exclude This File from Scope | Adds a literal-filename exclude to the active scope. |
+| Add Containing Folder to a Different Scope ▸ | Submenu lists other scopes. |
+| — | |
+| Show Metadata… | |
+| Move to Trash | Confirm. |
+
+### 5.2 Context Menu on a Directory Row in the Directory Panel
+
+| Item | Notes |
+| --- | --- |
+| Reveal in Finder | |
+| Open in New Window | |
+| — | |
+| Make Recursive / Make Shallow | Toggles the `recursive` flag on this include directory. |
+| Remove Directory from Scope | |
+| Edit Inclusion Criteria for This Directory… | Lets the user attach per-directory globs. |
+| — | |
+| Expand All | |
+| Collapse All | |
+
+### 5.3 Context Menu on the Main Viewer (the Image Canvas)
+
+| Item | Notes |
+| --- | --- |
+| Next Image / Previous Image | |
+| — | |
+| Rotate Left / Rotate Right | |
+| Flip Horizontal / Flip Vertical | |
+| — | |
+| Copy Image | |
+| Copy File Path | |
+| Reveal in Finder | |
+| — | |
+| Show Metadata… | |
+| Open With ▸ | |
+| Save As… | |
+
+### 5.4 Context Menu on Empty Space in the Directory Panel
+
+| Item | Notes |
+| --- | --- |
+| Add Directory to Scope… | Same as Scope ▸ Add Directory to Scope… |
+| New Scope… | |
+| Switch Scope ▸ | |
+| — | |
+| Re-evaluate Scope | |
+| Reveal Local Storage in Finder | |
+
+---
+
+## 6. Toolbar (Brief)
+
+The toolbar is detailed in a separate spec, but it mirrors a small set
+of menu commands by default:
+
+* Previous / Next image
+* Rotate Left / Right
+* Toggle Directory Panel
+* Toggle Preview Panel
+* Scope picker (dropdown showing the active scope, lets the user
+  switch)
+* Re-evaluate Scope
+* Slideshow
+
+The user can fully customize via View ▸ Customize Toolbar.
+
+---
+
+## 7. Shortcut Conflict Table (Resolved)
+
+To eliminate ambiguity, the following shortcuts are explicitly resolved
+in v1:
+
+| Shortcut | Owner |
+| --- | --- |
+| `⌘ 0` | View ▸ Actual Size |
+| `⇧ ⌘ 0` | Panel ▸ Show All Panels |
+| `⌘ R` | Scope ▸ Re-evaluate Scope |
+| `⌘ ⇧ R` | Go ▸ Random Image |
+| `⌃ ⌘ R` | (reserved — no binding) |
+| `⌘ F` | Edit ▸ Find… |
+| `⌃ ⌘ F` | View ▸ Enter Full Screen |
+| `⇧ ⌘ F` | View ▸ Frameless Window |
+| `⌘ D` | Scope ▸ Add Directory to Scope… |
+| `⌘ I` | View ▸ Show File Info Overlay |
+| `⌥ ⌘ I` | Image ▸ Show Metadata… |
+
+A user-visible "Keyboard Shortcuts…" sheet (Help menu) lists the
+final set and lets the user view, but not yet rebind, them. Rebinding
+is a v2 feature.
+
+---
+
+## 8. Localization Notes
+
+* All menu strings live in a single `Menus.strings` file so they can be
+  localized without code changes.
+* Ellipses are the Unicode `…` character (U+2026), not three dots.
+* En dash (`–`) is used in shortcut display where applicable;
+  modifier glyphs (`⌘`, `⇧`, `⌥`, `⌃`) come from the system.
+
+---
+
+## 9. Non-Goals (v1)
+
+* Rebindable shortcuts. The shortcut set in this document is fixed in
+  v1; configurable hotkeys are deferred.
+* Touch Bar customization. The Touch Bar surface is small and
+  declining; a minimal "scope-aware" Touch Bar layout may ship later.
+* Per-scope menu customization. The menu bar is identical regardless of
+  active scope.
+
+---
+
+## 10. Acceptance Criteria for v1
+
+The menu surface is considered v1-complete when:
+
+1. Every menu and item in §4 is wired to a working command. Disabled
+   items show as grey and have a tooltip explaining why (e.g., "Delete
+   Scope is disabled because this is the only scope.").
+2. Every shortcut in §7 resolves to exactly one command in the active
+   focus context, with no system-shortcut conflicts.
+3. Context menus in §5 appear on right-click in their respective
+   surfaces and contain the listed items in the listed order.
+4. Scope ▸ Re-evaluate Scope and the MCP `evaluate_scope` tool produce
+   identical resolved file lists for the same scope (see `mcp.mdx`
+   §6).
+5. Help ▸ Keyboard Shortcuts… lists every binding in this document,
+   pulled from the same source of truth that wires the menu commands.

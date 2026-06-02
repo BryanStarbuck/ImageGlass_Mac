@@ -81,19 +81,38 @@ public final class ExternalToolIPC: @unchecked Sendable {
             do {
                 try AppPaths.ensureDirectories()
             } catch {
+                ErrorLog.log("AppPaths.ensureDirectories failed",
+                             error: error,
+                             class: String(describing: Self.self))
                 return
             }
             // Clean stale socket file.
-            try? FileManager.default.removeItem(atPath: socketPath)
+            do {
+                try FileManager.default.removeItem(atPath: socketPath)
+            } catch {
+                // Missing file is expected; log other failures.
+                let nsErr = error as NSError
+                if !(nsErr.domain == NSCocoaErrorDomain && nsErr.code == NSFileNoSuchFileError) {
+                    ErrorLog.log("removeItem(atPath:) failed for stale socket \(socketPath)",
+                                 error: error,
+                                 class: String(describing: Self.self))
+                }
+            }
 
             let fd = socket(AF_UNIX, SOCK_STREAM, 0)
-            guard fd >= 0 else { return }
+            guard fd >= 0 else {
+                ErrorLog.log("socket(AF_UNIX, SOCK_STREAM, 0) failed errno=\(errno)",
+                             class: String(describing: Self.self))
+                return
+            }
 
             var addr = sockaddr_un()
             addr.sun_family = sa_family_t(AF_UNIX)
             let pathBytes = Array(socketPath.utf8)
             let maxLen = MemoryLayout.size(ofValue: addr.sun_path) - 1
             guard pathBytes.count <= maxLen else {
+                ErrorLog.log("socket path too long (\(pathBytes.count) > \(maxLen)) for \(socketPath)",
+                             class: String(describing: Self.self))
                 close(fd)
                 return
             }
@@ -110,10 +129,14 @@ public final class ExternalToolIPC: @unchecked Sendable {
                 }
             }
             guard bindRes == 0 else {
+                ErrorLog.log("bind() failed for socket \(socketPath) errno=\(errno)",
+                             class: String(describing: Self.self))
                 close(fd)
                 return
             }
             guard listen(fd, 8) == 0 else {
+                ErrorLog.log("listen() failed for socket \(socketPath) errno=\(errno)",
+                             class: String(describing: Self.self))
                 close(fd)
                 return
             }
@@ -150,7 +173,16 @@ public final class ExternalToolIPC: @unchecked Sendable {
                 close(listenFD)
                 listenFD = -1
             }
-            try? FileManager.default.removeItem(atPath: socketPath)
+            do {
+                try FileManager.default.removeItem(atPath: socketPath)
+            } catch {
+                let nsErr = error as NSError
+                if !(nsErr.domain == NSCocoaErrorDomain && nsErr.code == NSFileNoSuchFileError) {
+                    ErrorLog.log("removeItem(atPath:) failed for socket \(socketPath) on stop",
+                                 error: error,
+                                 class: String(describing: Self.self))
+                }
+            }
         }
     }
 
@@ -169,7 +201,15 @@ public final class ExternalToolIPC: @unchecked Sendable {
     }
 
     public func broadcast(_ message: [String: Any]) {
-        guard let data = try? JSONSerialization.data(withJSONObject: message) else { return }
+        let data: Data
+        do {
+            data = try JSONSerialization.data(withJSONObject: message)
+        } catch {
+            ErrorLog.log("JSONSerialization.data(withJSONObject:) failed for broadcast",
+                         error: error,
+                         class: String(describing: Self.self))
+            return
+        }
         queue.async { [weak self] in
             guard let self else { return }
             for fd in self.clientFDs {
@@ -189,7 +229,11 @@ public final class ExternalToolIPC: @unchecked Sendable {
         var clientAddr = sockaddr()
         var len: socklen_t = socklen_t(MemoryLayout<sockaddr>.size)
         let cfd = accept(listenFD, &clientAddr, &len)
-        guard cfd >= 0 else { return }
+        guard cfd >= 0 else {
+            ErrorLog.log("accept() failed on listen FD errno=\(errno)",
+                         class: String(describing: Self.self))
+            return
+        }
 
         clientFDs.insert(cfd)
 
@@ -221,8 +265,17 @@ public final class ExternalToolIPC: @unchecked Sendable {
             if buf[i] == 0x0A {
                 if i > start {
                     let line = Data(buf[start..<i])
-                    if let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any] {
-                        incomingMessageHandler?(fd, obj)
+                    do {
+                        if let obj = try JSONSerialization.jsonObject(with: line) as? [String: Any] {
+                            incomingMessageHandler?(fd, obj)
+                        } else {
+                            ErrorLog.log("client JSON line was not a top-level object on fd \(fd)",
+                                         class: String(describing: Self.self))
+                        }
+                    } catch {
+                        ErrorLog.log("JSONSerialization.jsonObject failed for client line on fd \(fd)",
+                                     error: error,
+                                     class: String(describing: Self.self))
                     }
                 }
                 start = i + 1

@@ -1,6 +1,6 @@
 ---
 title: Use Case — MCP File Panel Tour
-description: Step-by-step user-scenario tour for the directory / filename panel and the MCP calls that drive it. Walks through first launch, clicking an image into the viewer, switching to file-tree view, and the four MCP mutations (add directory, remove directory, extension filter, path filter) — each with the YAML written into Local Storage and the line written into log.log. Each scenario lists actions in order with an explicit verify step that proves it worked.
+description: Step-by-step user-scenario tour for the directory / filename panel and the MCP calls that drive it. Walks through first launch, clicking an image into the viewer, switching to file-tree view, and the four MCP mutations (add directory, remove directory, per-root filter, exclude-by-negate filter) — each with the YAML written into directories.yaml and the line written into log.log. Each scenario lists actions in order with an explicit verify step that proves it worked.
 ---
 
 # Use Case — MCP File Panel Tour
@@ -16,14 +16,19 @@ It is the user-facing companion to:
 * [Automation](../automation.mdx) §2 (panels) and §4–§5 (Local
   Storage + MCP) — the charter being implemented.
 * [Panels](../panels.mdx) — the framework the file panel lives in.
-* [File List Panel](../list_of_files.mdx) — the panel itself, its
-  five view modes, and the MCP tool list.
-* [Error Handling](../error_handling.mdx) §4.2 — the `log.log` record
-  format that every MCP call in this tour must produce.
+* [File List Panel](../list_of_files.mdx) §3A — the engineering
+  spec for `directories.yaml`, the background walker, the in-memory
+  tree, the filter shape, the Directories menu, and the directory
+  MCP tools exercised here. Every behavior verified in this tour
+  has its contract pinned down in §3A.
+* [Error Handling](../error_handling.mdx) §4.2 — the `log.log`
+  record format that every MCP call in this tour must produce.
 
 Nothing in this tour adds new MCP tools. It exercises the existing
-ones from a user's point of view and pins down the verifiable
-outcome of each call.
+ones from
+[list_of_files.mdx §3A.10](../list_of_files.mdx#3a10-mcp-tools-for-the-file-tree)
+from a user's point of view and pins down the verifiable outcome of
+each call.
 
 ---
 
@@ -41,21 +46,23 @@ them.
 
   ```
   ~/Library/Application Support/ImageGlass_Mac/
-  ├── scopes/
-  │   └── default.yaml            # the active scope (created on first launch)
+  ├── directories.yaml         # the file tree panel's root-directory list
   └── logs/
-      └── log.log                 # every MCP call lands here
+      └── log.log              # every MCP call lands here
   ```
 
-* Scope files in this tour are **YAML** (`.yaml`), not JSON. The
-  field names match the JSON schema in
-  [list_of_files.mdx](../list_of_files.mdx) §3.1 — only the on-disk
-  encoding differs. The MCP server reads and writes YAML; the GUI
-  loads YAML through the same `ScopeStore`.
+* `directories.yaml` is the **only** file backing the file tree
+  panel for this tour. Its schema, in-memory mirror, and lifecycle
+  are spec'd in
+  [list_of_files.mdx §3A](../list_of_files.mdx#3a-the-file-tree-panel--directoriesyaml-and-live-walker).
 * The viewer canvas is in the center. The file panel docks on the
   **left** by default (see [Panels](../panels.mdx) §7.2 — the
   *Browser* preset).
-* Test image fixtures live under `~/Pictures/tour/`:
+* The panel only ever lists files of three kinds — images, SVG,
+  video — per the built-in file-kind filter in
+  [§3A.3](../list_of_files.mdx#3a3-built-in-file-kind-filter). Other
+  files in the same directory (e.g. `README.txt`) are never visible.
+* Test fixtures live under `~/Pictures/tour/`:
 
   ```
   ~/Pictures/tour/
@@ -66,7 +73,7 @@ them.
   ├── mountains/
   │   ├── peak.heic
   │   └── peak.jpg
-  └── README.txt
+  └── README.txt          # never appears in the panel (not image/SVG/video)
   ```
 
 * "Verify" means: read the named file with `cat`, look at the named
@@ -87,12 +94,12 @@ them.
 * The main window opens with the *Browser* layout preset (panels
   §7.2): toolbar on top, **file panel docked on the left**, gallery
   strip + status bar on the bottom, viewer in the center.
-* The file panel's header reads `Files` and its scope picker reads
-  `default`.
-* `default.yaml` exists at
-  `~/Library/Application Support/ImageGlass_Mac/scopes/default.yaml`
-  with an empty `criteria:` list and a `resolved: []` list. No source
-  directories have been added yet.
+* The file panel's header reads `Files`.
+* `directories.yaml` exists at
+  `~/Library/Application Support/ImageGlass_Mac/directories.yaml`
+  with an empty `root_directories:` list. The
+  [DirectoryTreeWalker](../list_of_files.mdx#3a5-background-walker-thread)
+  starts in the sleeping state because there are no roots to watch.
 
 ### 1.3 Verify
 
@@ -101,22 +108,20 @@ them.
 * On disk:
 
   ```sh
-  cat ~/Library/Application\ Support/ImageGlass_Mac/scopes/default.yaml
+  cat ~/Library/Application\ Support/ImageGlass_Mac/directories.yaml
   ```
 
-  Output begins with:
+  Output:
 
   ```yaml
-  name: default
   schema_version: 1
-  criteria: []
-  resolved: []
+  root_directories: []
   ```
 
 * On disk: `logs/log.log` has a single startup line of the form
 
   ```
-  2026-06-02T10:00:00.123Z ts=… app=startup msg="layout=Browser scope=default"
+  ts=2026-06-02T10:00:00.123Z app=startup msg="layout=Browser directories=0"
   ```
 
 ---
@@ -126,11 +131,15 @@ them.
 ### 2.1 Preconditions
 
 * Scenario 1 completed.
-* Add a directory by hand for this scenario (the MCP version is
-  covered in §4):
-  drag `~/Pictures/tour/beach` onto the file panel's drop target.
-  The panel re-walks; its list now shows `001.jpg`, `002.jpg`,
-  `notes_old.png`.
+* Add a root directory by hand for this scenario (the MCP version is
+  covered in §4). Two equivalent GUI paths:
+  * Menu: **Directories → Add Directory…** (default hotkey ⌥⌘D, see
+    [§3A.8](../list_of_files.mdx#3a8-directories-menu-and-hotkeys)),
+    pick `~/Pictures/tour/beach`.
+  * Drag `~/Pictures/tour/beach` from Finder onto the file panel.
+  The panel walks; its list now shows `001.jpg`, `002.jpg`,
+  `notes_old.png`. `README.txt` is **not** shown — it is dropped at
+  the built-in file-kind filter.
 
 ### 2.2 Actions, in order
 
@@ -144,8 +153,9 @@ them.
   it fit-to-window.
 * The status bar reads the file name, pixel dimensions, and file
   size of `001.jpg`.
-* The MCP server emits a `selection_changed` push event (file list
-  §8.1) with payload `["/Users/.../beach/001.jpg"]`.
+* The MCP server emits a `selection_changed` push event
+  ([list_of_files.mdx §8.1](../list_of_files.mdx#81-push-events))
+  with payload `["/Users/.../beach/001.jpg"]`.
 
 ### 2.4 Verify
 
@@ -167,7 +177,10 @@ them.
 
 The same panel can render its file list as either a flat sequence
 (strip / grid / details) or as a hierarchical tree that mirrors the
-source directory layout.
+source directory layout. The tree view is the mode that maps
+**one-to-one** with `directories.yaml` — every visible row is either
+a root from `root_directories[]` or a descendant directory / file
+the walker placed in the in-memory tree.
 
 ### 3.1 Preconditions
 
@@ -184,7 +197,7 @@ source directory layout.
 * The panel re-lays out as an outline:
 
   ```
-  ▾ beach
+  ▾ /Users/<you>/Pictures/tour/beach
       001.jpg
       002.jpg
       notes_old.png
@@ -206,85 +219,87 @@ source directory layout.
 
 ---
 
-## 4. MCP Adds a Directory to the Scope
+## 4. MCP Adds a Directory
 
 Now the same panel is driven from outside. Claude Code (or any MCP
-client) wants the panel to show a second directory in addition to
-`~/Pictures/tour/beach`.
+client) wants the panel to show a second root directory in addition
+to `~/Pictures/tour/beach`.
 
 ### 4.1 Preconditions
 
-* Scenario 3 completed. The active scope is `default`. `default.yaml`
-  contains one criterion with `root: ~/Pictures/tour/beach`.
+* Scenario 3 completed. `directories.yaml` contains one root with
+  `path: /Users/<you>/Pictures/tour/beach`.
 
 ### 4.2 Actions, in order
 
 1. From Claude Code:
 
    ```
-   update_scope(name="default", patch={
-       "add_criteria": [
-           { "root": "~/Pictures/tour/mountains", "recursive": true }
-       ]
-   })
+   add_directory(path="~/Pictures/tour/mountains")
    ```
+
+   The optional `filter` argument is omitted; the new root inherits
+   the empty filter (everything that passes the built-in file-kind
+   filter is included).
 
 ### 4.3 Expected result
 
-* The MCP server validates the patch, applies it to `default.yaml`,
-  and writes the file atomically (temp file + rename).
-* `FSEventStream` fires on the scope file; the panel re-walks both
-  source directories on a background task.
-* Within ~250 ms the panel's list (still in tree mode from §3) shows:
+* The MCP server canonicalizes the path
+  (`/Users/<you>/Pictures/tour/mountains`), validates that it
+  exists, appends the new entry to `root_directories[]`, and writes
+  `directories.yaml` atomically.
+* The
+  [background walker](../list_of_files.mdx#3a5-background-walker-thread)
+  wakes from sleep, walks the new hierarchy, builds the in-memory
+  tree, and registers a recursive `FSEventStream` watcher on the
+  root.
+* Within ~250 ms the panel's list (still in tree mode from §3)
+  shows:
 
   ```
-  ▾ beach
+  ▾ /Users/<you>/Pictures/tour/beach
       001.jpg
       002.jpg
       notes_old.png
-  ▾ mountains
+  ▾ /Users/<you>/Pictures/tour/mountains
       peak.heic
       peak.jpg
   ```
 
-* `last_evaluated` in `default.yaml` advances to the wall-clock
-  timestamp of the re-walk.
+* `last_walked` on the new root advances to the wall-clock timestamp
+  of the walk.
 * Two new lines land in `log.log`: the MCP request, and the
-  re-evaluation result.
+  walk-completion event.
 
 ### 4.4 Verify
 
 * On disk:
 
   ```sh
-  cat ~/Library/Application\ Support/ImageGlass_Mac/scopes/default.yaml
+  cat ~/Library/Application\ Support/ImageGlass_Mac/directories.yaml
   ```
 
   contains:
 
   ```yaml
-  name: default
   schema_version: 1
-  criteria:
-    - root: /Users/<you>/Pictures/tour/beach
-      recursive: true
-    - root: /Users/<you>/Pictures/tour/mountains
-      recursive: true
-  last_evaluated: 2026-06-02T10:05:11Z
-  resolved:
-    - path: /Users/<you>/Pictures/tour/beach/001.jpg
-    - path: /Users/<you>/Pictures/tour/beach/002.jpg
-    - path: /Users/<you>/Pictures/tour/beach/notes_old.png
-    - path: /Users/<you>/Pictures/tour/mountains/peak.heic
-    - path: /Users/<you>/Pictures/tour/mountains/peak.jpg
+  root_directories:
+    - path: /Users/<you>/Pictures/tour/beach
+      filter:
+        items: []
+      last_walked: 2026-06-02T10:05:00Z
+    - path: /Users/<you>/Pictures/tour/mountains
+      filter:
+        items: []
+      last_walked: 2026-06-02T10:05:11Z
   ```
 
 * On screen: the panel shows both directory roots, expanded.
 * On disk: `log.log` contains the two lines
 
   ```
-  ts=… tool=mcp.update_scope name=default client=claude-code corr=ab12cd34 ok=true
-  ts=… app=scope.evaluate name=default count=5 elapsed_ms=43
+  ts=… tool=mcp.add_directory path=…/mountains client=claude-code corr=ab12cd34 ok=true
+  ts=… app=directory.walk path=…/mountains count=2 elapsed_ms=43 corr=ab12cd34
   ```
 
   (Both lines share the same `corr=` correlation id so a debugger
@@ -293,106 +308,134 @@ client) wants the panel to show a second directory in addition to
 
 ---
 
-## 5. MCP Removes a Directory From the Scope
+## 5. MCP Removes a Directory
 
 ### 5.1 Preconditions
 
-* Scenario 4 completed. The scope has two criteria.
+* Scenario 4 completed. `directories.yaml` has two roots.
 
 ### 5.2 Actions, in order
 
 1. From Claude Code:
 
    ```
-   update_scope(name="default", patch={
-       "remove_criteria_with_root": ["~/Pictures/tour/beach"]
-   })
+   remove_directory(path="~/Pictures/tour/beach")
    ```
 
 ### 5.3 Expected result
 
-* The MCP server rewrites `default.yaml` with only the `mountains`
-  criterion. `FSEventStream` fires; the panel re-walks.
+* The MCP server rewrites `directories.yaml` without the `beach`
+  entry. The walker tears down `beach`'s `FSEventStream` watcher and
+  drops its in-memory tree.
 * The viewer's current selection (`001.jpg` from `beach`) is no
-  longer in scope. The panel clears the selection and selects the
-  first item of the new resolved list (`peak.heic`). The viewer
-  loads `peak.heic`.
+  longer in any root. The panel clears the selection and selects the
+  first item of the remaining tree (`peak.heic`). The viewer loads
+  `peak.heic`.
 * If the user prefers no auto-advance, the
   `panel.on_remove_active = keep-empty` Setting overrides this
   behavior — see scenario 9 for the empty-viewer state.
 
 ### 5.4 Verify
 
-* On disk: `default.yaml` `criteria:` has one entry (`mountains`)
-  and `resolved:` lists only the two `mountains` files.
+* On disk: `directories.yaml` has one entry (`mountains`). The
+  `beach` entry is gone.
 * On screen: the panel shows only the `mountains` outline; the
   viewer shows `peak.heic`.
-* On disk: two new `log.log` lines —
-  `tool=mcp.update_scope` and `app=scope.evaluate count=2`.
+* On disk: one new `log.log` line —
+  `tool=mcp.remove_directory path=…/beach ok=true`. No
+  `directory.walk` line is emitted because removal does not require
+  walking.
 
 ---
 
-## 6. MCP Applies an Extension Filter
+## 6. MCP Applies a Per-Root Filter
+
+Filters in `directories.yaml` are positive by default: items match
+filenames, and `match: any` (OR) combines them. The same
+[`update_directory_filter`](../list_of_files.mdx#3a10-mcp-tools-for-the-file-tree)
+tool replaces the whole filter for one root in a single call. The
+update is applied to the in-memory tree by
+[§3A.7](../list_of_files.mdx#3a7-filter-re-evaluation--no-re-walk)
+— **no filesystem walk** — so the panel updates within tens of
+milliseconds even on a large root.
 
 ### 6.1 Preconditions
 
 * Scenario 4 completed (both directories in scope). Re-add the
-  `beach` criterion first if you ran scenario 5, so this scenario
-  starts with five resolved files.
+  `beach` root first if you ran scenario 5, so this scenario starts
+  with five visible files.
 
 ### 6.2 Actions, in order
 
 1. From Claude Code:
 
    ```
-   update_scope(name="default", patch={
-       "set_include_exts_global": ["jpg", "jpeg"]
+   set_global_filter(filter={
+       "match": "any",
+       "items": [
+           { "pattern": "*.jpg",  "kind": "glob" },
+           { "pattern": "*.jpeg", "kind": "glob" }
+       ]
    })
    ```
 
-   This sets `include_exts` on every criterion in the scope.
+   `set_global_filter` applies the same filter to every existing
+   root in `directories.yaml`.
 
 ### 6.3 Expected result
 
-* `default.yaml` now records `include_exts: [jpg, jpeg]` on each
-  criterion entry.
-* The walker re-runs; the resolved set narrows to the JPG files
-  only: `001.jpg`, `002.jpg`, `peak.jpg`. The HEIC and PNG files
-  drop out.
+* Each root's `filter` is replaced with the new value.
+* The walker traverses the in-memory tree and flips `passesFilter`
+  on every `.file` node: `001.jpg`, `002.jpg`, `peak.jpg` → `true`;
+  `notes_old.png`, `peak.heic` → `false`. The walker does not touch
+  the filesystem; this is the in-memory re-eval guarantee from §3A.7.
 * The panel (still in tree mode) shows:
 
   ```
-  ▾ beach
+  ▾ /Users/<you>/Pictures/tour/beach
       001.jpg
       002.jpg
-  ▾ mountains
+  ▾ /Users/<you>/Pictures/tour/mountains
       peak.jpg
   ```
 
 ### 6.4 Verify
 
-* On disk: `default.yaml` shows `include_exts: [jpg, jpeg]` on each
-  criterion and `resolved:` lists three entries.
+* On disk: `directories.yaml` shows the same two-item glob filter on
+  each root.
 * On screen: `notes_old.png` and `peak.heic` are no longer visible.
 * On disk: `log.log` shows
-  `tool=mcp.update_scope name=default fields=[criteria.include_exts]`
-  and a matching `scope.evaluate count=3` line.
+
+  ```
+  ts=… tool=mcp.set_global_filter items=2 client=claude-code corr=… ok=true
+  ts=… app=directory.refilter roots=2 visible_delta=-2 elapsed_ms=… corr=…
+  ```
+
+  Note `app=directory.refilter`, not `directory.walk` — the filter
+  change did not re-walk the filesystem.
 
 ---
 
-## 7. MCP Applies a Path-Glob Filter
+## 7. MCP Applies an Exclude-by-Negate Filter Item
 
-Same scope; now exclude anything whose filename contains `_old`.
+The same filter shape supports exclusion via a `negate: true` flag
+on any item. This is how the user (or MCP) writes "include all of
+this kind **except** files whose name contains `_old`."
 
 ### 7.1 Preconditions
 
-* Scenario 6 completed (`include_exts: [jpg, jpeg]`).
-* To show the glob doing real work, temporarily widen the extensions
-  back to `[jpg, jpeg, png]` so `notes_old.png` is in scope again:
+* Scenario 6 completed (glob filter `[*.jpg, *.jpeg]`).
+* To show the `negate` item doing real work, first widen the filter
+  back so PNGs are in scope again:
 
   ```
-  update_scope(name="default", patch={
-      "set_include_exts_global": ["jpg", "jpeg", "png"]
+  set_global_filter(filter={
+      "match": "any",
+      "items": [
+          { "pattern": "*.jpg",  "kind": "glob" },
+          { "pattern": "*.jpeg", "kind": "glob" },
+          { "pattern": "*.png",  "kind": "glob" }
+      ]
   })
   ```
 
@@ -404,27 +447,41 @@ Same scope; now exclude anything whose filename contains `_old`.
 1. From Claude Code:
 
    ```
-   update_scope(name="default", patch={
-       "set_exclude_globs_global": ["**/*_old*", "**/.imageglass/**"]
+   update_directory_filter(path="~/Pictures/tour/beach", filter={
+       "match": "any",
+       "items": [
+           { "pattern": "*.jpg",  "kind": "glob" },
+           { "pattern": "*.jpeg", "kind": "glob" },
+           { "pattern": "*.png",  "kind": "glob" },
+           { "pattern": "*_old*", "kind": "glob", "negate": true }
+       ]
    })
    ```
 
+   `update_directory_filter` replaces the filter on a **single**
+   root — here just `beach`. The `mountains` filter is unchanged.
+
 ### 7.3 Expected result
 
-* `default.yaml` records `exclude_globs: ["**/*_old*",
-  "**/.imageglass/**"]` on each criterion.
-* The walker re-runs. `notes_old.png` is dropped by the
-  `**/*_old*` glob. The resolved set is back to four files.
-* The panel updates within ~250 ms.
+* `beach`'s filter records the four-item array. The fourth item's
+  `negate: true` means a match excludes the file.
+* In-memory refilter on the `beach` tree only: `notes_old.png` flips
+  back to `passesFilter: false`. `mountains` is untouched.
+* The panel updates within ~50 ms.
 
 ### 7.4 Verify
 
-* On disk: `default.yaml` shows the two `exclude_globs:` patterns on
-  each criterion.
-* On screen: `notes_old.png` is gone.
+* On disk: `directories.yaml` shows the four-item filter on
+  `beach`. The `mountains` root still has the three-item global
+  filter from §7.1.
+* On screen: `notes_old.png` is gone; `peak.jpg` and `peak.heic` are
+  unaffected.
 * On disk: `log.log` shows
-  `tool=mcp.update_scope fields=[criteria.exclude_globs]` and
-  `scope.evaluate count=4`.
+
+  ```
+  ts=… tool=mcp.update_directory_filter path=…/beach items=4 negate_items=1 corr=… ok=true
+  ts=… app=directory.refilter roots=1 visible_delta=-1 elapsed_ms=… corr=…
+  ```
 
 ---
 
@@ -445,31 +502,35 @@ on its own so it is testable as one acceptance criterion.
   (because no other MCP calls happened):
 
   ```
-  ts=… app=startup …                                   # if app restarted
-  ts=… tool=mcp.update_scope … corr=… ok=true          # §4 add directory
-  ts=… app=scope.evaluate name=default count=5 …       # §4 walk
-  ts=… tool=mcp.update_scope … corr=… ok=true          # §5 remove directory
-  ts=… app=scope.evaluate name=default count=2 …       # §5 walk
-  ts=… tool=mcp.update_scope … corr=… ok=true          # §6 ext filter
-  ts=… app=scope.evaluate name=default count=3 …       # §6 walk
-  ts=… tool=mcp.update_scope … corr=… ok=true          # §7 glob filter
-  ts=… app=scope.evaluate name=default count=4 …       # §7 walk
+  ts=… app=startup …                                              # if app restarted
+  ts=… tool=mcp.add_directory          path=…/mountains corr=… ok=true   # §4
+  ts=… app=directory.walk              path=…/mountains count=2  corr=…
+  ts=… tool=mcp.remove_directory       path=…/beach     corr=… ok=true   # §5
+  ts=… tool=mcp.set_global_filter      items=2          corr=… ok=true   # §6
+  ts=… app=directory.refilter          roots=2          corr=…
+  ts=… tool=mcp.update_directory_filter path=…/beach    corr=… ok=true   # §7
+  ts=… app=directory.refilter          roots=1          corr=…
   ```
 
 * Every `tool=mcp.*` line records `client=` (which MCP client
   called), `corr=` (8-char correlation id), `ok=true|false`, and on
   failure an `err=` field with the error code.
 * Failed calls are also written. To test, send a deliberately
-  malformed `update_scope` (e.g. `criteria` not an array). The line
-  reads `ok=false err=invalid_criteria` and the scope file is **not**
+  malformed `add_directory` (e.g. `path` is not a string, or
+  `filter.items` is missing `pattern`). The line reads
+  `ok=false err=invalid_filter` and `directories.yaml` is **not**
   modified.
+* `directory.walk` lines appear only for tools that mutate
+  `root_directories[]` (add / remove). Filter changes produce
+  `directory.refilter` lines instead — they do not touch the
+  filesystem.
 
 ### 8.3 Verify
 
 * On disk:
 
   ```sh
-  grep "tool=mcp.update_scope" \
+  grep -E "tool=mcp\\.(add|remove|set_global|update_directory)" \
       ~/Library/Application\ Support/ImageGlass_Mac/logs/log.log \
       | wc -l
   ```
@@ -478,87 +539,94 @@ on its own so it is testable as one acceptance criterion.
 * On disk:
 
   ```sh
-  grep "app=scope.evaluate" \
-      ~/Library/Application\ Support/ImageGlass_Mac/logs/log.log \
-      | wc -l
+  grep "app=directory.walk"    ~/Library/Application\ Support/ImageGlass_Mac/logs/log.log | wc -l   # 1 (just §4)
+  grep "app=directory.refilter" ~/Library/Application\ Support/ImageGlass_Mac/logs/log.log | wc -l   # 2 (§6, §7)
   ```
-
-  prints `4`.
-* Every successful `tool=mcp.update_scope` line is followed (within
-  ~500 ms by wall clock in the timestamps) by a matching
-  `app=scope.evaluate` line.
+* Every successful `tool=mcp.add_directory` line is followed (within
+  ~500 ms by wall clock) by a matching `app=directory.walk` line
+  with the same `corr=`. Every successful filter change is followed
+  by a matching `app=directory.refilter` line with the same `corr=`.
 
 ---
 
 ## 9. No Image Previewed — Empty Viewer State
 
-This covers the case where the file panel has zero resolved files,
-or no file is selected. The viewer must remain in a defined empty
-state instead of holding a stale image.
+This covers the case where the panel has zero roots, or no file in
+any root passes the active filter. The viewer must remain in a
+defined empty state instead of holding a stale image.
 
 ### 9.1 Actions, in order
 
-1. Starting from any scenario above, remove every criterion:
+1. Starting from any scenario above, clear every root:
 
    ```
-   update_scope(name="default", patch={ "clear_criteria": true })
+   clear_directories()
    ```
 
 ### 9.2 Expected result
 
-* `default.yaml` has `criteria: []` and `resolved: []`.
+* `directories.yaml` has `root_directories: []`. The walker tears
+  down every `FSEventStream` watcher and drops every in-memory tree.
 * The panel renders its empty state: a centered SF Symbol
-  (`photo.on.rectangle.angled`), the label `No files in scope`, and
-  a secondary action `[+ Add directory]` that opens an `NSOpenPanel`.
+  (`photo.on.rectangle.angled`), the label `No directories added`,
+  and a secondary action `[+ Add directory]` that opens
+  `NSOpenPanel` — the same action as the Directories menu's
+  `Add Directory…` item.
 * The viewer canvas renders its empty state: a centered placeholder
   reading `No image previewed` in the theme's secondary-label color.
   No stale image remains on the canvas.
 * The status bar reads `0 files`.
 * The MCP server keeps responding normally; e.g.
-  `list_files_in_scope(name="default")` returns `[]`.
+  `list_directories()` returns `{ "root_directories": [] }`.
 
 ### 9.3 Verify
 
-* On disk: `default.yaml` shows `criteria: []` and `resolved: []`.
+* On disk: `directories.yaml` shows `root_directories: []`.
 * On screen: the viewer placeholder text is present; no pixels from
   the previous image remain.
 * MCP: a follow-up call
 
   ```
-  list_files_in_scope(name="default")
+  list_directories()
   ```
 
-  returns `{ "files": [], "total": 0 }`.
+  returns `{ "root_directories": [] }`.
 
 This empty state is also the precondition for §10: if the next MCP
-call introduces a new directory, the panel auto-selects the first
-image it finds.
+call adds a directory, the panel auto-selects the first image it
+finds.
 
 ---
 
 ## 10. Auto-Select First Image When Viewer Is Empty
 
-When an MCP call introduces a new directory **and** the viewer is in
-the empty `No image previewed` state from §9, the panel walks the
-new directory hierarchy in the background and auto-selects the first
-image it finds. The selection lands in the file-tree UI without the
-user touching the keyboard or mouse.
+When an MCP call adds a directory **and** the viewer is in the empty
+`No image previewed` state from §9, the
+[background walker](../list_of_files.mdx#3a5-background-walker-thread)
+auto-selects the first image it finds. The selection lands in the
+file-tree UI without the user touching the keyboard or mouse.
 
-The rule exists so a Claude Code interaction like *"set up a scope
-for my screenshots and show me one"* lands the user looking at a
-real image without a second prompt.
+The rule exists so a Claude Code interaction like *"set up a
+directory of my screenshots and show me one"* lands the user looking
+at a real image without a second prompt.
 
 ### 10.1 Trigger conditions — all must hold
 
 1. The viewer is in the empty state from §9 (no image loaded; either
-   `0 files` or the prior selection is no longer in scope).
-2. An incoming MCP call introduces at least one new source
-   directory. Specifically any of:
-   * `create_scope` with non-empty `criteria`,
-   * `update_scope` patch that adds a `criteria` entry with a `root`,
-   * `set_active_scope` to a scope whose `criteria` is non-empty.
-3. The new criteria, after applying `include_exts` / `exclude_globs`,
-   resolve to at least one file whose UTI conforms to `public.image`.
+   `0 files` or the prior selection is no longer in any root).
+2. An incoming MCP call adds at least one new directory.
+   Specifically any of:
+   * `add_directory` with a valid `path`,
+   * `set_active_scope` to a multi-scope target whose criteria
+     resolve to ≥ 1 root (only relevant for users on the §3
+     multi-scope feature; not exercised in this tour),
+   * `refresh_directory(path)` that re-walks a previously empty
+     root and now finds at least one file (e.g. the user just
+     plugged in an external drive).
+3. After the walk + filter eval, at least one file has
+   `passesFilter: true` AND its `kind` is `.image` (the auto-select
+   rule fires for images only — video/SVG do not auto-load in the
+   viewer in v1).
 
 If any condition fails the panel does **not** auto-advance — the
 viewer stays empty and waits for an explicit `select_file`. In
@@ -566,41 +634,47 @@ particular:
 
 * If the viewer already shows an image, the user is mid-task and
   auto-selection would yank their focus. Do nothing.
-* If the new criteria resolve to zero images (only `.txt`, for
-  example), the viewer stays empty.
+* If the new root contains only `.svg` or `.mp4` files, the viewer
+  stays empty (those kinds populate the panel but do not
+  auto-preview in v1).
+* If every file is filtered out (`passesFilter: false`), the viewer
+  stays empty.
 
 ### 10.2 Walk + selection algorithm
 
-1. The MCP call writes the scope YAML and returns immediately. It
-   does **not** block on the walk.
-2. `ScopeWalker` enumerates the new directory hierarchies on a
-   background `Task` (off the main actor). The walk uses
+1. The MCP call writes `directories.yaml` and returns immediately.
+   It does **not** block on the walk.
+2. The
+   [DirectoryTreeWalker](../list_of_files.mdx#3a5-background-walker-thread)
+   enumerates the new root on a background `Task` (off the main
+   actor) using
    `FileManager.enumerator(at:includingPropertiesForKeys:options:)`
-   with `.skipsHiddenFiles` and the scope's `exclude_globs`.
-3. **Order**: depth-first, children visited in lexicographic order by
-   filename. This makes "first image" deterministic and reproducible.
-4. As soon as the walker hits a path whose UTI conforms to
-   `public.image` and which passes the scope's
-   `include_exts` / `exclude_globs`, it posts a `firstImageFound(URL)`
-   message to the main actor and **continues the walk in the
-   background** for the rest of the resolved list.
+   with `.skipsHiddenFiles`. UTI is checked at the gate: only
+   `public.image`, `public.svg-image`, `public.movie` pass.
+3. **Order**: depth-first, children visited in lexicographic order
+   by filename. This makes "first image" deterministic and
+   reproducible.
+4. As soon as the walker hits a `.file` node whose `kind == .image`
+   and whose `passesFilter == true`, it posts a
+   `firstImageFound(URL)` message to the main actor and **continues
+   the walk in the background** to populate the rest of the tree.
 5. On the main actor, the panel:
    * Re-checks the trigger conditions. If the viewer is no longer
      empty (the user clicked something while the walk ran), the
      auto-selection is abandoned and the walk continues silently.
    * Otherwise: switches the file panel to **tree** view if it is
-     not already, expands the outline rows from each scope root down
-     to the file's parent directory, sets `selection = [URL]`,
-     scrolls the row into view, and loads the image in the viewer.
-6. The background walk continues until the full resolved list is
-   materialized and written to the scope YAML. The panel updates as
-   later batches arrive; the auto-selected file remains selected
-   unless the user moves the selection.
+     not already, expands the outline rows from the root down to
+     the file's parent directory, sets `selection = [URL]`, scrolls
+     the row into view, and loads the image in the viewer.
+6. The background walk continues until the full in-memory tree is
+   built. The panel updates as later batches arrive; the
+   auto-selected file remains selected unless the user moves the
+   selection.
 
 ### 10.3 Race and cancellation rules
 
-* If two MCP calls arrive in quick succession (e.g. `create_scope`
-  immediately followed by `update_scope`), only the most recent
+* If two MCP calls arrive in quick succession (e.g. `add_directory`
+  immediately followed by `add_directory`), only the most recent
   walk's `firstImageFound` is honored. Earlier walks are canceled
   via `Task.cancel()` and their pending callbacks are discarded.
 * If the user clicks any row in the panel between the MCP call and
@@ -619,12 +693,12 @@ This scenario starts from §9's empty state.
 2. From Claude Code:
 
    ```
-   update_scope(name="default", patch={
-       "add_criteria": [
-           { "root": "~/Pictures/tour", "recursive": true }
-       ]
-   })
+   add_directory(path="~/Pictures/tour")
    ```
+
+   `~/Pictures/tour` is the parent of both `beach/` and `mountains/`.
+   No filter is supplied; the built-in file-kind filter is the only
+   gate.
 
 ### 10.5 Expected result
 
@@ -639,13 +713,14 @@ This scenario starts from §9's empty state.
   * Highlights row `001.jpg`.
   * Scrolls the row into view.
 * The viewer loads `001.jpg` and renders it fit-to-window.
-* `default.yaml` `resolved:` continues filling in as the background
-  walk completes.
+* The background walk continues; `directories.yaml` `last_walked`
+  fills in when the walk completes.
 
 The choice of `001.jpg` (not `peak.heic` or `notes_old.png`) follows
 from the depth-first lexicographic walk: `beach < mountains`, then
 within `beach`, `001.jpg < 002.jpg < notes_old.png`. `README.txt` is
-skipped because its UTI does not conform to `public.image`.
+skipped because its UTI does not conform to `public.image`,
+`public.svg-image`, or `public.movie`.
 
 ### 10.6 Verify
 
@@ -654,7 +729,7 @@ skipped because its UTI does not conform to `public.image`.
 * On disk:
 
   ```sh
-  grep -E "mcp.update_scope|scope.evaluate|panel.auto_select_first" \
+  grep -E "mcp.add_directory|directory.walk|panel.auto_select_first" \
       ~/Library/Application\ Support/ImageGlass_Mac/logs/log.log \
       | tail -n 3
   ```
@@ -662,9 +737,9 @@ skipped because its UTI does not conform to `public.image`.
   shows three lines, in this order:
 
   ```
-  ts=… tool=mcp.update_scope name=default corr=… ok=true
-  ts=… app=panel.auto_select_first scope=default path=…/beach/001.jpg corr=… reason=viewer_empty
-  ts=… app=scope.evaluate name=default count=5 elapsed_ms=… corr=…
+  ts=… tool=mcp.add_directory          path=…/tour corr=… ok=true
+  ts=… app=panel.auto_select_first     path=…/beach/001.jpg corr=… reason=viewer_empty
+  ts=… app=directory.walk              path=…/tour count=5 elapsed_ms=… corr=…
   ```
 
   The `panel.auto_select_first` line is the proof that the
@@ -676,20 +751,27 @@ skipped because its UTI does not conform to `public.image`.
 Each is a quick sub-scenario; together they prove the rule fires
 only when it should.
 
-* **Viewer already has an image.** Re-run the §4 add-directory call
+* **Viewer already has an image.** Re-run §4's `add_directory`
   while `001.jpg` is loaded. Verify: no `panel.auto_select_first`
   line; the viewer continues to show `001.jpg`; the panel adds the
   new files but the selection does not move.
-* **New criteria resolve to no images.** From the empty viewer, add
-  a directory that contains only `.txt` files. Verify: no
-  `panel.auto_select_first` line; the viewer stays empty;
-  `log.log` records `app=scope.evaluate count=0`.
-* **User clicks during the walk.** From the empty viewer, add a very
-  large directory. While the walk is still running, click any row
-  that has already appeared. Verify: `panel.auto_select_first` is
-  **not** written (the walker's first-image callback is discarded on
-  the main actor because `selection != []`), and the row the user
-  clicked remains selected.
+* **New root contains no images.** From the empty viewer, add a
+  directory that contains only `.svg` (or only `.mp4`) files.
+  Verify: no `panel.auto_select_first` line; the viewer stays
+  empty; the panel renders the SVG/video files (they pass the
+  built-in file-kind filter) but no auto-preview happens.
+* **Every file filtered out.** From the empty viewer, add a
+  directory and immediately set a `set_global_filter` whose items
+  match nothing. Verify: no `panel.auto_select_first` line; the
+  viewer stays empty; `directories.yaml` has the root with the
+  un-matching filter; `log.log` records `app=directory.walk` (the
+  walk did happen) but no auto-select line.
+* **User clicks during the walk.** From the empty viewer, add a
+  very large directory. While the walk is still running, click any
+  row that has already appeared. Verify: `panel.auto_select_first`
+  is **not** written (the walker's first-image callback is
+  discarded on the main actor because `selection != []`), and the
+  row the user clicked remains selected.
 
 ---
 
@@ -697,24 +779,32 @@ only when it should.
 
 A run of this tour passes when **all of**:
 
-* §1 — file panel is on the left by default after a clean launch.
-* §2 — clicking a row in the panel loads the image in the viewer.
+* §1 — file panel is on the left by default after a clean launch;
+  `directories.yaml` exists with `root_directories: []`.
+* §2 — clicking a row in the panel loads the image in the viewer;
+  `README.txt` never appears (built-in file-kind filter).
 * §3 — tree-view toggle re-lays the same files into an outline that
-  mirrors the source directory tree.
-* §4 — `update_scope` add path persists to YAML, triggers a re-walk,
-  and the new directory appears in the panel.
-* §5 — `update_scope` remove path persists to YAML and the
-  directory disappears from the panel.
-* §6 — extension filter persists and narrows the resolved set.
-* §7 — exclude-glob persists and removes matching files.
-* §8 — every MCP call wrote a `tool=mcp.*` line, every re-walk
-  wrote a matching `app=scope.evaluate` line, and a deliberately
-  malformed call wrote `ok=false err=…` without mutating the scope.
-* §9 — clearing all criteria leaves the viewer in the explicit
+  mirrors the source directory tree — the one-to-one mapping with
+  `directories.yaml` that
+  [§3A.1](../list_of_files.mdx#3a1-directoriesyaml) requires.
+* §4 — `add_directory` persists to YAML, triggers a walk + FS
+  watcher, and the new root appears in the panel.
+* §5 — `remove_directory` persists to YAML, tears down the watcher,
+  and the root disappears.
+* §6 — `set_global_filter` updates every root's filter and triggers
+  an in-memory re-eval (not a re-walk).
+* §7 — `update_directory_filter` updates one root's filter; a
+  `negate: true` item removes matching files; in-memory re-eval
+  only.
+* §8 — every MCP call wrote a `tool=mcp.*` line; mutations produced
+  `directory.walk` or `directory.refilter` accordingly; a
+  deliberately malformed call wrote `ok=false err=…` without
+  mutating `directories.yaml`.
+* §9 — `clear_directories` leaves the viewer in the explicit
   `No image previewed` empty state with `0 files` in the status bar.
-* §10 — from §9's empty state, an MCP call that introduces a
-  directory triggers a background walk, auto-selects the first
-  image (depth-first lexicographic), expands the tree to it,
+* §10 — from §9's empty state, an `add_directory` call triggers a
+  background walk, auto-selects the first image (depth-first
+  lexicographic, image kind only), expands the tree to it,
   highlights the row, and loads it in the viewer — and only fires
   when the trigger conditions of §10.1 hold (negative cases in
   §10.7 stay empty).

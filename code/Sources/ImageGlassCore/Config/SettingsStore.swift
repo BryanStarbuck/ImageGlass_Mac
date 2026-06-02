@@ -70,6 +70,9 @@ public actor SettingsStore {
         do {
             return try load()
         } catch {
+            ErrorLog.log("settings load failed, falling back to defaults",
+                         error: error,
+                         class: "SettingsStore")
             return Settings.defaults
         }
     }
@@ -90,9 +93,30 @@ public actor SettingsStore {
         let fm = FileManager.default
         if fm.fileExists(atPath: paths.fileURL.path) {
             // Best-effort backup rotation; never block the save on backup IO.
-            try? fm.removeItem(at: paths.backupURL)
-            try? fm.copyItem(at: paths.fileURL, to: paths.backupURL)
-            try? fm.removeItem(at: paths.fileURL)
+            do {
+                try fm.removeItem(at: paths.backupURL)
+            } catch {
+                let nsErr = error as NSError
+                if !(nsErr.domain == NSCocoaErrorDomain && nsErr.code == NSFileNoSuchFileError) {
+                    ErrorLog.log("backup remove failed: \(paths.backupURL.path)",
+                                 error: error,
+                                 class: "SettingsStore")
+                }
+            }
+            do {
+                try fm.copyItem(at: paths.fileURL, to: paths.backupURL)
+            } catch {
+                ErrorLog.log("backup copy failed: \(paths.fileURL.path) -> \(paths.backupURL.path)",
+                             error: error,
+                             class: "SettingsStore")
+            }
+            do {
+                try fm.removeItem(at: paths.fileURL)
+            } catch {
+                ErrorLog.log("settings remove failed: \(paths.fileURL.path)",
+                             error: error,
+                             class: "SettingsStore")
+            }
         }
         try fm.moveItem(at: tempURL, to: paths.fileURL)
     }
@@ -101,7 +125,15 @@ public actor SettingsStore {
     /// store re-validates and writes back atomically. Returns the new value.
     @discardableResult
     public func update(_ mutate: (inout Settings) throws -> Void) throws -> Settings {
-        var current = (try? load()) ?? Settings.defaults
+        var current: Settings
+        do {
+            current = try load()
+        } catch {
+            ErrorLog.log("update: load failed, using defaults",
+                         error: error,
+                         class: "SettingsStore")
+            current = Settings.defaults
+        }
         try mutate(&current)
         try save(current)
         return current

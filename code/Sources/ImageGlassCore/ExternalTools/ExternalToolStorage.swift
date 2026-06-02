@@ -40,7 +40,16 @@ public final class ExternalToolStorage {
     }
 
     public func listTools() throws -> [ExternalTool] {
-        try listToolIds().compactMap { try? loadTool($0) }
+        try listToolIds().compactMap { id in
+            do {
+                return try loadTool(id)
+            } catch {
+                ErrorLog.log("loadTool failed for id '\(id)' during listTools()",
+                             error: error,
+                             class: String(describing: Self.self))
+                return nil
+            }
+        }
     }
 
     public func toolURL(for id: String) -> URL {

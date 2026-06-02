@@ -23,7 +23,13 @@ public final class PanelLayoutModel {
     /// (typically from MCP).
     public func startWatching() {
         stopWatching()
-        try? AppPaths.ensureLayoutDirectories()
+        do {
+            try AppPaths.ensureLayoutDirectories()
+        } catch {
+            ErrorLog.log("AppPaths.ensureLayoutDirectories failed",
+                         error: error,
+                         class: String(describing: Self.self))
+        }
         let w = FileWatcher(url: AppPaths.layoutDir) { [weak self] in
             Task { @MainActor in self?.reloadFromDisk() }
         }
@@ -57,8 +63,13 @@ public final class PanelLayoutModel {
     }
 
     public func hidePanel(_ id: String) {
-        if let new = try? PanelLayoutMutations.hidePanel(layout, id: id) {
+        do {
+            let new = try PanelLayoutMutations.hidePanel(layout, id: id)
             apply(new)
+        } catch {
+            ErrorLog.log("PanelLayoutMutations.hidePanel failed for id '\(id)'",
+                         error: error,
+                         class: String(describing: Self.self))
         }
     }
 
@@ -73,19 +84,29 @@ public final class PanelLayoutModel {
     public func movePanel(_ id: String, to position: DockPosition) {
         let descriptor = BuiltInPanelCatalog.descriptor(for: id)
         if position == .floating, descriptor?.supportsFloating == false { return }
-        if let new = try? PanelLayoutMutations.movePanel(
-            layout,
-            id: id,
-            to: position,
-            preferredSize: descriptor?.preferredSize ?? .init(width: 320, height: 600)
-        ) {
+        do {
+            let new = try PanelLayoutMutations.movePanel(
+                layout,
+                id: id,
+                to: position,
+                preferredSize: descriptor?.preferredSize ?? .init(width: 320, height: 600)
+            )
             apply(new)
+        } catch {
+            ErrorLog.log("PanelLayoutMutations.movePanel failed for id '\(id)' -> \(position)",
+                         error: error,
+                         class: String(describing: Self.self))
         }
     }
 
     public func setSize(panelID: String, size: CGFloat) {
-        if let new = try? PanelLayoutMutations.setPanelSize(layout, id: panelID, size: size) {
+        do {
+            let new = try PanelLayoutMutations.setPanelSize(layout, id: panelID, size: size)
             apply(new)
+        } catch {
+            ErrorLog.log("PanelLayoutMutations.setPanelSize failed for id '\(panelID)' size=\(size)",
+                         error: error,
+                         class: String(describing: Self.self))
         }
     }
 
@@ -103,13 +124,24 @@ public final class PanelLayoutModel {
             apply(builtIn.layout())
             return
         }
-        if let user = try? LayoutStore.shared.loadUserPreset(name: name) {
+        do {
+            let user = try LayoutStore.shared.loadUserPreset(name: name)
             apply(user)
+        } catch {
+            ErrorLog.log("LayoutStore.loadUserPreset failed for name '\(name)'",
+                         error: error,
+                         class: String(describing: Self.self))
         }
     }
 
     public func saveCurrentLayout(name: String) {
-        try? LayoutStore.shared.saveUserPreset(name: name, layout: layout)
+        do {
+            try LayoutStore.shared.saveUserPreset(name: name, layout: layout)
+        } catch {
+            ErrorLog.log("LayoutStore.saveUserPreset failed for name '\(name)'",
+                         error: error,
+                         class: String(describing: Self.self))
+        }
     }
 
     /// Toggle the active preset's "Reset" — reload the active preset from disk
@@ -141,6 +173,9 @@ public final class PanelLayoutModel {
         do {
             try LayoutStore.shared.save(new)
         } catch {
+            ErrorLog.log("LayoutStore.save failed — layout persistence",
+                         error: error,
+                         class: String(describing: Self.self))
             NSLog("ImageGlass: failed to persist layout: \(error)")
         }
     }

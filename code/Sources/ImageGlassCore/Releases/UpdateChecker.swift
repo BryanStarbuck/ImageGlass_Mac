@@ -96,14 +96,27 @@ public struct UpdateChecker: Sendable {
         do {
             (data, response) = try await session.data(for: req)
         } catch {
+            ErrorLog.log("update check network request failed for \(endpointURL.absoluteString)",
+                         error: error,
+                         class: "UpdateChecker")
             throw UpdateCheckError.networkUnavailable
         }
 
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            ErrorLog.log("update check returned HTTP \(http.statusCode) for \(endpointURL.absoluteString)",
+                         class: "UpdateChecker")
             throw UpdateCheckError.httpStatus(http.statusCode)
         }
 
-        let latest = try Self.parseLatest(data: data, channel: channel)
+        let latest: LatestRelease?
+        do {
+            latest = try Self.parseLatest(data: data, channel: channel)
+        } catch {
+            ErrorLog.log("update check failed to parse response from \(endpointURL.absoluteString)",
+                         error: error,
+                         class: "UpdateChecker")
+            throw error
+        }
         let available = Self.isNewer(latest?.version, than: currentVersion)
         return UpdateCheckResult(
             currentVersion: currentVersion,
