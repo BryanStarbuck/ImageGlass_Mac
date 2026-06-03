@@ -763,6 +763,964 @@ validates the filter before writing.
 
 ---
 
+## 3B. Mac-Native Hierarchy Display Controls
+
+The file tree panel requires a native macOS control that can render an
+expandable/collapsible directory hierarchy. Apple provides exactly three
+built-in controls for this job; no third-party library is needed. This
+section describes each one, explains when to use it, and records the
+architectural decision for this project.
+
+### 3B.1 NSOutlineView (AppKit)
+
+`NSOutlineView` is the primary AppKit tree-view control. It displays
+indented rows with disclosure triangles and has been in macOS since
+OS X 10.0. It is the control behind Finder's List view, Xcode's
+Project Navigator, and Mail's mailbox sidebar.
+
+**Strengths:**
+* Mature, highly optimised for large hierarchies (virtual rendering —
+  only visible rows are created).
+* Full delegate/data-source API for fine-grained cell control.
+* Drag-and-drop, multi-select, expand-all/collapse-all, persistent
+  expand state all built in.
+* Accessible by default (VoiceOver announces depth and expansion state).
+
+**Weaknesses:**
+* Requires `NSViewRepresentable` bridging in a SwiftUI app, which adds
+  boilerplate and a `Coordinator` class.
+* Cell layout is done in AppKit (XIBs or `NSTableCellView`), so mixing
+  SwiftUI `View`s into cells is awkward.
+
+**When to prefer it:** when the tree has > ~5 000 visible rows, or when
+you need row-level drag-and-drop and Finder-exact visual behaviour.
+
+### 3B.2 NSBrowser (AppKit)
+
+`NSBrowser` is the column-based hierarchical browser that powers
+Finder's Column view. The user navigates deeper by clicking into
+progressively-appearing columns rather than expanding inline rows.
+
+**Strengths:**
+* Perfect "wide directory hierarchy" experience when the user spends
+  time navigating depth rather than scanning breadth.
+* Each column scrolls independently.
+
+**Weaknesses:**
+* Consumes a lot of horizontal space — not well-suited to a narrow
+  side panel.
+* Not the expected affordance for "show the full tree alongside the
+  image canvas."
+* Harder to show a multi-root scope where each root is a top-level
+  peer.
+
+**When to prefer it:** when the panel is wide (> 500 pt) and the user
+is primarily *navigating* rather than *browsing a known set*. Deferred
+to §2.5's Column mode (v1.1).
+
+### 3B.3 List + OutlineGroup (SwiftUI)
+
+`OutlineGroup` is SwiftUI's declarative equivalent of `NSOutlineView`.
+It wraps a recursive data structure and renders an indented, expandable
+tree inside a `List`. Available since macOS 11; mature in macOS 14+.
+
+```swift
+List(roots, children: \.children) { node in
+    Label(node.name, systemImage: node.isDirectory ? "folder" : "photo")
+}
+```
+
+Or, for a collection of top-level items each with optional children:
+
+```swift
+List {
+    OutlineGroup(roots, children: \.children) { node in
+        Label(node.name, systemImage: node.isDirectory ? "folder" : "photo")
+    }
+}
+```
+
+**Strengths:**
+* Pure SwiftUI — no bridging layer, binds directly to `@Observable`
+  view models, supports `@State` expand state automatically.
+* Sidebar `List` style gives native macOS source-list appearance
+  (translucent, grouped) for free.
+* Row content is any SwiftUI `View` — thumbnails, badges, and labels
+  can be mixed freely.
+* `DisclosureGroup` gives per-node expand-state control when needed.
+
+**Weaknesses:**
+* Internally backed by `NSTableView`, but the implementation is opaque
+  — some edge cases in virtual rendering for very large trees (> 50 000
+  rows) still appeared in macOS 14 beta; resolved in 14.4+.
+* Does **not** support drag between rows as elegantly as
+  `NSOutlineView` yet (drag-within-list requires workarounds).
+
+**When to prefer it:** the default choice for a SwiftUI-first app with
+a side panel that shows up to ~50 000 nodes. Matches the app's overall
+SwiftUI stack and avoids an `NSViewRepresentable` wrapper.
+
+### 3B.4 Decision for ImageGlass_Mac
+
+**The file tree panel uses `OutlineGroup` inside a `List` (SwiftUI).**
+
+Reasons:
+1. The app's primary UI layer is SwiftUI (see CLAUDE.md technology
+   decision). Introducing `NSViewRepresentable` for the tree view would
+   add bridging complexity across the entire panel.
+2. The expected node count (< 50 000 in any real scope) is within
+   `OutlineGroup`'s performance envelope.
+3. `OutlineGroup` is data-binding-native — the `DirectoryNode` enum
+   tree (§3A.4) maps directly to the `children:` parameter without a
+   separate data-source object.
+4. Row content is arbitrary SwiftUI, so thumbnail images, SF Symbol
+   badges, and disclosure-state animations are all native.
+
+The `NSOutlineView` path is kept available as a performance fallback:
+if a scope exceeds 50 000 tree nodes the panel switches to an
+`NSOutlineViewRepresentable` backed by a virtual data source. This
+threshold is logged and covered in §6.7's memory budget table.
+
+### 3B.5 Correct OutlineGroup usage
+
+The single most common mistake when using `OutlineGroup` for a
+directory tree — and the root cause of the recurring "tree appears
+blank" bug (§3C) — is **passing the root directory node as the item**
+instead of its children.
+
+```swift
+// WRONG — renders one collapsed "📁 Photos" row; nothing visible
+OutlineGroup(rootNode, children: \.children) { node in
+    Label(node.name, ...)
+}
+
+// CORRECT — renders the root's direct children as top-level rows
+OutlineGroup(rootNode.children, children: \.children) { node in
+    Label(node.name, ...)
+}
+```
+
+When a `List` is in `.sidebar` style (which ImageGlass_Mac uses for the
+file-tree panel), a single-item `OutlineGroup` collapses that item into
+one disclosure row. The user sees only `▶ 📁 Photos` and has to click
+to expand it — which looks like an empty list at first glance.
+
+The correct pattern for a multi-root scope (where each root is a
+top-level peer):
+
+```swift
+List {
+    ForEach(walkerRoots) { root in
+        Section(header: Text(root.displayPath)) {
+            OutlineGroup(root.directChildren, children: \.children) { node in
+                FileTreeRowView(node: node)
+            }
+        }
+    }
+}
+.listStyle(.sidebar)
+```
+
+This renders each root's immediate children as top-level rows under a
+section header that already names the root — no redundant disclosure
+triangle for the root itself.
+
+---
+
+## 3C. Tree View Rendering — Known Failure Modes
+
+Getting the file tree to render visibly has been the most persistent
+implementation challenge in this project. This section is an
+**engineering audit** of every failure mode that has been found, what
+caused it, how it was diagnosed, and what the fix is. Future
+contributors must read this before touching `DirectoryFilenamePanel.swift`
+or `DirectoryTreeWalker`.
+
+### 3C.1 Background: the failure pattern
+
+The symptom is always the same: the file tree panel appears but shows
+nothing (or shows one collapsed row that the user does not know to
+click). The panel loads, the walker runs successfully, `directories.yaml`
+is populated — but the UI control renders blank. This has led to
+multiple rounds of "I thought it was fixed, but it wasn't" during
+development.
+
+The root cause in every instance has been one of three things:
+
+1. `OutlineGroup` received the wrong starting node (single root instead
+   of its children) — see §3C.3.
+2. File path strings were constructed incorrectly, so rows rendered but
+   selection/navigation was silently broken — see §3C.2.
+3. The SwiftUI view checked the wrong state variable and showed a
+   spinner or empty branch before the walk completed — see §3C.4.
+
+### 3C.2 Bug: double-appended file paths (buildView)
+
+**Symptom.** The tree renders directory structure and shows file rows,
+but tapping/clicking a file does nothing. The file viewer does not load.
+No error is logged.
+
+**Root cause.** In `buildView`, the `.file` case constructed the path
+as:
+
+```swift
+// BROKEN
+let path = parentPath.appendingPathComponent(name).path
+```
+
+But the caller had **already** appended `name` to `parentPath` before
+passing it into `buildView`. Every file's `path` string ended up as
+`/Photos/img.jpg/img.jpg`. The `.tag` modifier and the selection binding
+used this doubled path, so selection never matched any real file on
+disk.
+
+**Fix.**
+
+```swift
+// CORRECT — parentPath is already the full path of this node
+let path = parentPath.path
+```
+
+**How to detect in the future.** If clicking a file in the tree does
+nothing, add a temporary `print(path)` in the selection handler.
+A doubled path segment (`/foo.jpg/foo.jpg`) is immediately visible.
+
+**Test case.** Select any leaf file node in tree mode → the viewer
+canvas must load the image within 300 ms. Run this on a directory with
+at least two levels of nesting.
+
+### 3C.3 Bug: tree showed one collapsed root row (walkerTreeView)
+
+**Symptom.** The tree shows exactly one row: `▶ 📁 Photos`. Expanding
+it reveals the files, but until the user clicks the disclosure triangle
+the tree looks empty. Users do not click because they think "no photos
+are loaded yet."
+
+**Root cause.** `OutlineGroup` was called with the root `DirectoryNode`
+as the single item:
+
+```swift
+// BROKEN — one collapsed root row
+OutlineGroup(rootNode, children: \.children) { node in ... }
+```
+
+In a `.sidebar`-style `List`, this renders as a single disclosure row
+for the root. The section header already shows the root path, making
+the collapsed row redundant and confusing.
+
+**Fix.** Extract the root's direct children and start `OutlineGroup`
+one level below:
+
+```swift
+// CORRECT — children are the top-level rows
+let topNodes = rootNode.children   // [DirectoryNode]
+OutlineGroup(topNodes, children: \.children) { node in ... }
+```
+
+For a multi-root scope, the `ForEach + Section` pattern in §3B.5 is the
+canonical form.
+
+**Why this keeps recurring.** The SwiftUI documentation example for
+`OutlineGroup` typically shows a single-item call where the item is a
+folder. For `FileManager`-backed trees, that example maps naturally to
+"pass the root," which is wrong. The fix is unintuitive because it
+requires knowing that the `Section` header already carries the root
+label.
+
+**Test case.** Add one directory to the tree. Without clicking anything,
+the tree must show that directory's immediate children as visible rows
+(not one collapsed row). Assert `walkerRoots.first?.directChildren` is
+non-empty and that those nodes appear rendered.
+
+### 3C.4 Bug: blank tree during walk startup (treeView)
+
+**Symptom.** On first launch (or after clearing all directories), the
+tree shows blank for 2–5 seconds even though `directories.yaml` lists
+valid roots. A spinner eventually appears, then the files load.
+
+**Root cause.** The `treeView` property checked `walkerRoots.isEmpty`
+and when true fell through to `legacyTreeView`. But `legacyTreeView`
+also checked `resolvedFiles`, which was empty because the background
+walk had not finished. The result: no spinner, no content, nothing.
+The user saw a completely blank panel.
+
+The condition that exposed this:
+* `walkerRoots.isEmpty` — true (the background walk had not yet
+  populated `walkerRoots`)
+* `storedRootCount > 0` — true (roots exist in `directories.yaml`)
+* `resolvedFiles.isEmpty` — true (walk not yet complete)
+
+**Fix.** The `treeView` state machine now has an explicit "walk in
+progress" branch:
+
+```swift
+var treeView: some View {
+    if walkerRoots.isEmpty && storedRootCount > 0 {
+        // Walk started but not yet delivered first results
+        VStack(spacing: 12) {
+            ProgressView()
+            Text("Loading directory tree…")
+                .foregroundStyle(.secondary)
+        }
+    } else if walkerRoots.isEmpty {
+        emptyStateView          // no roots at all
+    } else {
+        walkerTreeView          // normal render path
+    }
+}
+```
+
+**Test case.** Quit the app with two valid roots in `directories.yaml`.
+Relaunch. The tree must show a spinner + "Loading directory tree…" within
+100 ms of the panel becoming visible, and must replace the spinner with
+content within 5 s (on a local directory of up to 10 000 files).
+
+### 3C.5 Minor fix: legacy tree single-node collapse
+
+**Symptom.** `legacyTreeView` (the fallback code path) also showed one
+collapsed `▶ /` row — the synthetic root node that `FileTreeNode.build`
+wraps everything under.
+
+**Root cause.** Same as §3C.3: `OutlineGroup(root, ...)` where `root` is
+the synthetic "/" node.
+
+Additionally, `.tag(node.fullPath ?? "")` mapped directory nodes to an
+empty string `""`, so selecting a directory triggered selection of the
+wrong item.
+
+**Fix.**
+* Use `OutlineGroup(topNodes, ...)` starting one level below "/".
+* Use `.tag(node.fullPath as String?)` (the `Optional<String>` form) so
+  directory nodes, which have no meaningful path to select, tag as `nil`
+  and are not selectable.
+
+### 3C.6 Diagnostic checklist
+
+When the tree appears blank or broken, run through this list in order:
+
+| # | Check | How to verify |
+| --- | --- | --- |
+| 1 | Is `directories.yaml` populated? | Read `~/Library/Application Support/ImageGlass_Mac/directories.yaml`. Must have ≥ 1 entry in `root_directories`. |
+| 2 | Did the walk complete? | `walkerRoots` in the view model must be non-empty after ≤ 5 s for a local directory. Check `storedRootCount > 0 && walkerRoots.isEmpty` — if true, the spinner state (§3C.4) should be showing. |
+| 3 | Is `OutlineGroup` receiving the root or its children? | Add `print(topNodes.count)` before the `OutlineGroup` call. Must be ≥ 1. If 0, the walk returned an empty children array — check the built-in file-kind filter (§3A.3). |
+| 4 | Are file paths correct? | Print the `path` tag of any file node. Must not contain a doubled filename component (`img.jpg/img.jpg`). See §3C.2. |
+| 5 | Is the `List` style `.sidebar`? | A `.inset` or `.plain` style suppresses disclosure triangles. The file tree panel must use `.listStyle(.sidebar)`. |
+| 6 | Does clicking a file load the image? | If the tree renders but clicks do nothing, the tag/selection mismatch from §3C.2 is likely. |
+
+### 3C.7 Acceptance bar for tree rendering
+
+The tree view is considered working when **all** of the following are
+true simultaneously, without the user taking any action:
+
+1. Within 5 s of the panel becoming visible, at least one row is
+   rendered for each root in `directories.yaml`.
+2. Files appear as leaf rows without requiring the user to expand any
+   disclosure triangle.
+3. Clicking a file row loads that file in the viewer canvas within
+   300 ms.
+4. The correct file loads (path is not doubled, not truncated, not
+   missing the extension).
+5. On a fresh launch, a spinner is shown while the walk runs, and
+   disappears when the first results arrive.
+
+If any of these five conditions fails, the tree is not working — even
+if it looks partially correct.
+
+---
+
+## 3D. How We Find and Link the Tree View Control
+
+This section pins down exactly where the tree view control lives in the
+source code, which Swift types are involved, and how the control connects
+to the data model. It is the authoritative answer to "where does the
+`OutlineGroup` actually live, and what feeds it?"
+
+### 3D.1 The control used: List + OutlineGroup (SwiftUI)
+
+The file tree panel uses option 3 from §3B: **`OutlineGroup` inside a
+`List`**, pure SwiftUI throughout. There is no `NSOutlineView` and no
+`NSBrowser` anywhere in the codebase. The backing AppKit control is an
+`NSOutlineView` that SwiftUI creates and manages internally — it is never
+referenced directly.
+
+### 3D.2 Primary implementation: `walkerTreeView`
+
+**File:** `code/Sources/ImageGlass/DirectoryFilenamePanel.swift`
+**Lines:** approximately 224–251 (changes as the file evolves — use the
+symbol names below to locate the current positions)
+
+```swift
+// walkerTreeView — the outer List that holds all roots
+// Lines ~224–233
+List(selection: $state.selectedFile) {
+    ForEach(state.walkerRoots, id: \.path) { root in
+        Section(header: rootHeader(root)) {
+            walkerRootContent(root)   // ← calls OutlineGroup inside
+        }
+    }
+}
+.listStyle(.sidebar)
+
+// walkerRootContent — the OutlineGroup for a single root
+// Lines ~238–251
+func walkerRootContent(_ root: WalkerRoot) -> some View {
+    let views = rootChildViews(for: root)   // extracts root.directChildren
+    return OutlineGroup(views, children: \.children) { node in
+        row(for: node).tag(node.fullPath as String?)
+    }
+}
+```
+
+Key points:
+
+* `walkerRootContent` calls `rootChildViews(for:)` — a helper that
+  extracts the root's **direct children**, not the root node itself.
+  This is the fix for Bug 2 (§3C.3): passing `views` (a collection)
+  instead of `root` (a single node) prevents the single-collapsed-row
+  anti-pattern.
+* `.tag(node.fullPath as String?)` uses the `Optional<String>` form.
+  Directory nodes have a `nil` `fullPath` and are therefore not
+  selectable — only leaf file nodes carry a non-nil path tag that
+  binds to `$state.selectedFile`.
+* `.listStyle(.sidebar)` gives native macOS source-list appearance
+  (translucent, grouped) and renders disclosure triangles automatically.
+
+### 3D.3 Fallback: `legacyTreeView`
+
+**Lines:** approximately 273–293
+
+```swift
+// legacyTreeView — used when walkerRoots is unavailable
+// (e.g., file-tree walker not yet ready, or app still using legacy path)
+List(selection: $state.selectedFile) {
+    OutlineGroup(topNodes, children: \.children) { node in
+        row(for: node).tag(node.fullPath as String?)
+    }
+}
+.listStyle(.sidebar)
+```
+
+`topNodes` is `FileTreeNode.build(...)` stripped of its synthetic `/`
+root, starting one level below. The fix for Minor Fix §3C.5 was to use
+`topNodes` (a collection) rather than `root` (the single `/` node).
+
+### 3D.4 The disclosure-triangle data contract
+
+The children:` key path (`\.children`) on `NodeView` (or `FileTreeNode`)
+is what drives the disclosure triangles:
+
+```swift
+struct NodeView: Identifiable {
+    let id: String
+    let name: String
+    let fullPath: String?       // nil for directories
+    let isDirectory: Bool
+    let children: [NodeView]?   // nil = leaf (file); non-nil = expandable node (dir)
+}
+```
+
+`OutlineGroup` renders a disclosure triangle **only** when `children` is
+non-nil. A directory with `children: []` (empty array, not nil) still
+renders a disclosure triangle — it just expands to nothing. The correct
+representation for an empty directory is `children: []`, not `children:
+nil` (which would render it as a non-expandable leaf, which is wrong).
+
+### 3D.5 State machine that routes to the right view
+
+`treeView` (the composite property that `body` calls) chooses between
+`walkerTreeView`, spinner, and empty state:
+
+```
+walkerRoots.isEmpty && storedRootCount > 0  →  spinner + "Loading…"    (§3C.4)
+walkerRoots.isEmpty && storedRootCount == 0 →  emptyStateView
+otherwise                                   →  walkerTreeView            (§3D.2)
+```
+
+`storedRootCount` is the number of entries in `directories.yaml` at
+startup — a value that is available immediately from disk before the
+background walker has delivered its first results. This two-phase design
+avoids the blank-panel problem: the spinner appears within < 1 ms of
+panel layout, then is replaced by real content when the walk finishes.
+
+### 3D.6 Locating symbols in Xcode
+
+To jump to any of these in the Xcode editor:
+
+| Symbol | How to find |
+| --- | --- |
+| `walkerTreeView` | `⇧⌘O` (Open Quickly) → type `walkerTreeView` |
+| `walkerRootContent` | `⇧⌘O` → `walkerRootContent` |
+| `legacyTreeView` | `⇧⌘O` → `legacyTreeView` |
+| `rootChildViews` | `⇧⌘O` → `rootChildViews` |
+| `NodeView` | `⇧⌘O` → `NodeView` |
+| `DirectoryTreeWalker` | `⇧⌘O` → `DirectoryTreeWalker` |
+| `treeView` | `⇧⌘O` → `treeView` (disambiguate: the one in `DirectoryFilenamePanel.swift`) |
+
+All symbols above are in `DirectoryFilenamePanel.swift`. `DirectoryTreeWalker`
+is the actor in a separate file (`DirectoryTreeWalker.swift`).
+
+---
+
+## 3E. Debugging the Tree View UI
+
+This section is the practical engineering guide for **inspecting the live
+tree-view control at runtime** — from both inside and outside the Xcode
+debugger. The goal: be able to observe exactly what UI is on screen, what
+accessibility elements exist, and what SwiftUI thinks is in the view tree,
+without relying on inference from source code alone.
+
+Getting the tree to render has been difficult (§3C). Having real, working
+diagnostic access to the live control is how we confirm it is actually
+present, actually populated, and actually selectable — not just "probably
+working."
+
+### 3E.1 Layer model: what to inspect and where
+
+The tree control spans three software layers. Different tools see different
+layers.
+
+| Layer | What you see | Best tools |
+| --- | --- | --- |
+| SwiftUI logical body | `List`, `OutlineGroup`, `Section`, `Label`, modifiers | Xcode View Hierarchy; `_viewDebugData()` SPI; ViewInspector |
+| AppKit backing (`NSView`) | `NSHostingView > NSScrollView > NSClipView > NSOutlineView > NSTableRowView > NSTableCellView > NSHostingView (per cell)` | Xcode View Hierarchy; LLDB `recursiveDescription`; Chisel `pviews`; Reveal.app |
+| Accessibility (AX) | `AXOutline > AXRow > AXText` (and other elements with accessibility identifiers) | Accessibility Inspector; `axcli`; `osascript`; XCUITest `debugDescription` |
+
+For diagnosing the blank-tree bug: start at the AppKit layer to confirm
+the `NSOutlineView` has rows. If it has rows but nothing renders, move to
+the SwiftUI layer to check hosting views. If you need to test from
+outside the process (automation, CI), use the AX layer.
+
+### 3E.2 Xcode: Capture View Hierarchy (AppKit + SwiftUI)
+
+**When to use:** the first thing to try. Gives a 3D exploded view of the
+full `NSView` tree, pausing the app in place.
+
+**How to trigger:**
+1. Run the app in Xcode (Debug configuration).
+2. Menu: `Debug > View Debugging > Capture View Hierarchy`
+3. Or click the camera icon (⏱ icon) in the debug bar at the bottom of the
+   Xcode window.
+
+**What to look for in the tree:**
+```
+NSWindow
+  NSVisualEffectView  (sidebar blur)
+    NSHostingView                       ← SwiftUI root
+      _UIHostingView or NSHostingView   ← inner hosting wrapper
+        NSScrollView
+          NSClipView
+            NSOutlineView               ← THE CONTROL
+              NSTableRowView            ← one per visible row
+                NSTableCellView
+                  NSHostingView         ← per-cell SwiftUI content
+                    Label / Text
+```
+
+If `NSOutlineView` has **zero** `NSTableRowView` children, the data source
+returned zero rows. Check `walkerRoots` and `rootChildViews` (§3D.2).
+
+If `NSOutlineView` is **not present at all** in the hierarchy, the `List`
+is not being rendered — check that `treeView` is selected (not
+`emptyStateView` or the spinner) and that the panel is actually visible.
+
+**Limitations:** Requires Debug build; app must be running in Xcode.
+
+### 3E.3 Xcode Accessibility Inspector (AX layer)
+
+**When to use:** verifying that the tree is accessible — that rows have
+labels, that the outline is correctly identified, and that VoiceOver /
+UI automation can find the elements.
+
+**Launch:**
+```bash
+open "/Applications/Xcode.app/Contents/Applications/Accessibility Inspector.app"
+```
+Or: `Xcode > Open Developer Tool > Accessibility Inspector`
+
+**Workflow:**
+1. Start the app.
+2. In Accessibility Inspector, select the app from the process picker
+   (top-left).
+3. Click the cursor icon (Inspection mode). Hover over the tree panel.
+4. The inspector shows the element under the cursor: its role, label,
+   value, frame, and children.
+
+**What to look for:**
+- The panel itself: `AXGroup` or `AXScrollArea`
+- The outline: `AXOutline` (this is the `NSOutlineView`)
+- Rows: `AXRow` — each file or directory node is one `AXRow`
+- If the outline shows **AXOutline with 0 children**, the backing
+  `NSOutlineView` has no rows — same conclusion as §3E.2 above
+- If there are `AXRow` children but they are unlabeled ("AXRow (no label)"),
+  add `.accessibilityLabel(node.name)` to the row view in `walkerRootContent`
+
+**Limitations:** GUI-only; no batch export; requires Accessibility
+permission granted to Xcode.
+
+### 3E.4 LLDB — AppKit layer (in Xcode debugger)
+
+These commands run in the LLDB console inside Xcode (the bottom-left
+pane when paused or from the `Debug > Debugger Console` menu).
+
+**Print the full NSView tree from the main window:**
+```
+(lldb) expression -l objc -O -- [[[NSApplication sharedApplication] mainWindow] contentView].recursiveDescription
+```
+This dumps every `NSView` subclass with its frame, `isHidden`, and
+`wantsLayer` flags. The `NSOutlineView` and its child row views are all
+visible here.
+
+**In a Swift context (if you have a view variable):**
+```
+(lldb) po someView.value(forKey: "recursiveDescription")!
+```
+
+**Print SwiftUI state changes (inside a `body` breakpoint):**
+```
+(lldb) po Self._printChanges()
+```
+This shows which `@State` / `@Observable` property triggered the current
+`body` evaluation. Use this when the tree is re-rendering unexpectedly
+often (performance) or not re-rendering when it should (bug).
+
+**Log SwiftUI changes to Console.app (Xcode 15+):**
+```
+(lldb) po Self._logChanges()
+```
+Output goes to `os_log` (subsystem `com.apple.SwiftUI`, category
+`Changed Body Properties`). Filter in Console.app with
+`subsystem:com.apple.SwiftUI`.
+
+### 3E.5 Chisel — LLDB plugin (Homebrew)
+
+Chisel is Facebook's set of LLDB extension commands. Its `pviews` command
+is the fastest way to dump the NSView hierarchy without writing a
+`recursiveDescription` expression.
+
+**Install:**
+```bash
+brew install chisel
+```
+
+Add to `~/.lldbinit`:
+```
+command script import /opt/homebrew/opt/chisel/libexec/fbchisellldb.py
+# Intel Mac: /usr/local/opt/chisel/libexec/fbchisellldb.py
+```
+Restart Xcode for the commands to load.
+
+**Key commands in the LLDB console:**
+
+| Command | What it does |
+| --- | --- |
+| `pviews` | Print the full NSView hierarchy for the key window |
+| `presponder <view>` | Print the responder chain from a given view |
+| `visualize <view>` | Render the view's bitmap and open it in Preview.app |
+| `border --color red <view>` | Draw a live red border around the view on screen |
+| `unborder <view>` | Remove the border |
+
+**Most useful for the tree panel:**
+```
+(lldb) pviews
+```
+Find the `NSOutlineView` line in the output. Count its `NSTableRowView`
+children — if zero, the `OutlineGroup` has no data.
+
+**Limitation:** Chisel was written for iOS UIKit; the commands work on
+macOS AppKit equivalents but some iOS-only commands will error. This is
+fine — `pviews`, `presponder`, and `visualize` all work on macOS.
+
+### 3E.6 SwiftUI-Introspect — access the live NSOutlineView from Swift
+
+`SwiftUI-Introspect` is an SPM package that lets you reach through the
+SwiftUI layer and grab the underlying `NSOutlineView` at runtime. Add it
+to the Debug build only.
+
+**Install (SPM, add to the app target under `#if DEBUG` guard):**
+```swift
+.package(url: "https://github.com/siteline/swiftui-introspect",
+         from: "1.4.0")
+```
+
+**Usage inside `walkerTreeView` or a diagnostic view modifier:**
+```swift
+#if DEBUG
+List(selection: $state.selectedFile) {
+    // ... existing content ...
+}
+.listStyle(.sidebar)
+.introspect(.list, on: .macOS(.v14, .v15)) { (outline: NSOutlineView) in
+    print("Tree rows: \(outline.numberOfRows)")
+    print("Is hidden: \(outline.isHidden)")
+    print("Frame: \(outline.frame)")
+    // Walk the rows:
+    for row in 0 ..< outline.numberOfRows {
+        let item = outline.item(atRow: row)
+        print("  Row \(row): \(String(describing: item))")
+    }
+}
+#endif
+```
+
+**What this tells you:**
+- `outline.numberOfRows == 0` with `walkerRoots` non-empty → the `OutlineGroup`
+  is receiving an empty collection, or `children: \.children` is returning `nil`
+  for every node (meaning everything is treated as a leaf).
+- `outline.isHidden == true` → something above the `List` in the view tree is
+  hiding it — check the `treeView` state machine (§3D.5).
+- `outline.numberOfRows > 0` but nothing is visible → the rows exist but are
+  rendered off-screen, clipped, or with alpha = 0. Use `pviews` or Reveal to
+  find the clipping ancestor.
+
+Remove the introspect block before any release build — it is a debug-only
+diagnostic, not part of the panel's production code.
+
+### 3E.7 osascript — CLI AX tree dump (no Xcode required)
+
+`osascript` is pre-installed on every Mac. It uses the same Accessibility
+API as Accessibility Inspector and can run from any terminal.
+
+**Setup (one-time):** Grant Accessibility permission to Terminal:
+`System Settings > Privacy & Security > Accessibility > add Terminal.app`
+
+**Dump top-level UI elements of the running app:**
+```bash
+osascript -e '
+tell application "System Events"
+  tell process "ImageGlass"
+    get every UI element of window 1
+  end tell
+end tell
+'
+```
+
+**Walk one level deeper — find the outline:**
+```bash
+osascript -e '
+tell application "System Events"
+  tell process "ImageGlass"
+    set w to window 1
+    repeat with elem in (every UI element of w)
+      set kids to every UI element of elem
+      log "role:" & (role of elem) & " subelements:" & (count of kids)
+    end repeat
+  end tell
+end tell
+'
+```
+
+**Count rows in the outline (AXOutline):**
+```bash
+osascript -e '
+tell application "System Events"
+  tell process "ImageGlass"
+    -- Walk to find AXOutline
+    set outline to first UI element of window 1 whose role is "AXOutline"
+    set rowCount to count of (every UI element of outline whose role is "AXRow")
+    log "AX rows: " & rowCount
+  end tell
+end tell
+'
+```
+
+If `rowCount` is 0, the AX tree reports no rows — this aligns with
+`NSOutlineView.numberOfRows == 0` from §3E.6. Both confirm the data
+source has no items.
+
+**Limitation:** AppleScript is serial and slow on deep trees. For large
+hierarchies use `axcli` (§3E.8) instead.
+
+### 3E.8 axcli — Fast CLI AX dump (Cargo-installed)
+
+`axcli` is a Rust CLI tool that wraps the macOS Accessibility API. It
+is faster than `osascript` for full-tree dumps and produces structured
+text output.
+
+**Install:**
+```bash
+# Requires Rust — install with:
+curl https://sh.rustup.rs | sh
+# Then:
+cargo install axcli
+```
+
+**Grant Accessibility permission** to the terminal app (same as §3E.7).
+
+**Dump the full AX tree of the running app:**
+```bash
+axcli snapshot --app "ImageGlass"
+```
+
+**Dump by PID (if you know it):**
+```bash
+axcli snapshot --pid $(pgrep -x ImageGlass)
+```
+
+**Filter to the outline element only:**
+```bash
+axcli snapshot --app "ImageGlass" --selector "[role=AXOutline]"
+```
+
+**List all running accessible apps:**
+```bash
+axcli list-apps
+```
+
+**Interpreting the output:** the snapshot is indented text. Look for the
+`AXOutline` element and count its `AXRow` children. An `AXOutline` with
+no `AXRow` children means the backing `NSOutlineView` has zero visible
+rows.
+
+**GitHub:** `https://github.com/andelf/axcli`
+
+### 3E.9 XCUITest — programmatic AX dump for CI
+
+In a `UITest` target, `XCUIApplication.debugDescription` prints the full
+AX tree in one call. This is the machine-readable equivalent of
+Accessibility Inspector, and it runs on any macOS test destination
+without a display.
+
+**Setup:** Add a UI test target to the Xcode project if one does not
+exist (`File > New > Target > macOS UI Testing Bundle`).
+
+**Dump the hierarchy in a test:**
+```swift
+import XCTest
+
+final class TreeViewDiagnosticTests: XCTestCase {
+    func testDumpTreeHierarchy() throws {
+        let app = XCUIApplication()
+        app.launch()
+        // Add a directory via MCP or initial launch state here if needed
+        print(app.debugDescription)  // full AX tree to the test log
+    }
+
+    func testOutlineHasRows() throws {
+        let app = XCUIApplication()
+        app.launch()
+        let outline = app.outlineViews.firstMatch
+        XCTAssert(outline.exists, "NSOutlineView must exist in the window")
+        XCTAssertGreaterThan(outline.cells.count, 0, "Outline must have at least one row")
+    }
+}
+```
+
+**Run from command line:**
+```bash
+xcrun xcodebuild test \
+  -project code/ImageGlass_Mac.xcodeproj \
+  -scheme ImageGlass_Mac \
+  -destination 'platform=macOS' \
+  -only-testing "ImageGlass_MacUITests/TreeViewDiagnosticTests"
+```
+
+The `debugDescription` output goes to `xcresult` logs. View it in Xcode
+(`⌘9 > Results`) or extract with:
+```bash
+xcrun xcresulttool get --path TestResults.xcresult --format json
+```
+
+**Automated accessibility audit (Xcode 15+):**
+```swift
+func testAccessibilityAudit() throws {
+    let app = XCUIApplication()
+    app.launch()
+    try app.performAccessibilityAudit()  // fails on standard AX violations
+}
+```
+
+### 3E.10 Reveal.app — 3D GUI inspector (paid)
+
+Reveal is the industry-standard commercial view-hierarchy debugger. It
+provides a 3D exploded view, live property editing, and a detailed
+inspector — similar to Xcode's built-in "Capture View Hierarchy" but
+faster and with a better inspector panel.
+
+**Download:** `https://revealapp.com` — 14-day free trial, then paid
+subscription.
+
+**Integration via LLDB breakpoint (zero source changes):**
+
+Add a Symbolic Breakpoint in Xcode:
+- Symbol: `NSApplicationMain`
+- Action: Debugger Command:
+  ```
+  expr -l objc -- (void)dlopen("/Applications/Reveal.app/Contents/SharedSupport/iOS-Libraries/RevealServer.xcframework/macos-arm64_x86_64/RevealServer.framework/RevealServer", 0x2)
+  ```
+- Check "Automatically continue after evaluating actions"
+
+Run the app. Reveal will auto-detect it. No source-code changes needed.
+
+**What Reveal adds over Xcode's built-in debugger:**
+- Stays connected to the live running process (no pause required)
+- Inspector panel shows all `NSView` properties, layers, and constraints
+  side by side with the 3D view
+- Can modify values (background color, frame, alpha) live in the inspector
+  and see the change instantly in the app
+- Labeling of SwiftUI hosting views is clearer
+
+**For the tree panel specifically:** use Reveal to confirm that
+`NSOutlineView` is in the hierarchy, check `numberOfRows` in the
+inspector, and verify that each `NSTableCellView` wraps a `NSHostingView`
+whose content is a `Label` or custom row view (not an empty view).
+
+### 3E.11 Recommended debugging workflow
+
+Use this sequence when the tree appears blank or broken:
+
+**Step 1 — Confirm data reaches the control (LLDB / Chisel)**
+```
+(lldb) pviews
+```
+Find `NSOutlineView` in the output. If it has zero `NSTableRowView`
+children, the `OutlineGroup` has no data. Verify `walkerRoots` is
+non-empty:
+```
+(lldb) po state.walkerRoots.count
+(lldb) po state.walkerRoots.first?.directChildren.count
+```
+
+**Step 2 — Confirm the AX tree matches (osascript, no Xcode needed)**
+```bash
+axcli snapshot --app "ImageGlass" --selector "[role=AXOutline]"
+```
+Or use `osascript` from §3E.7. If `AXRow` count matches
+`NSOutlineView.numberOfRows`, the two layers are in sync.
+
+**Step 3 — Inspect the SwiftUI layer (Xcode View Hierarchy)**
+Trigger `Debug > View Debugging > Capture View Hierarchy`. Locate the
+`NSHostingView` that wraps the `List`. Confirm its `NSOutlineView`
+child exists and has rows. If the `NSOutlineView` exists but is zero
+height or zero width, the panel's layout constraints are wrong —
+check that the panel's container gives the `List` a non-zero frame.
+
+**Step 4 — Confirm paths are correct (breakpoint)**
+Add a breakpoint in `walkerRootContent` on the `row(for:)` call.
+Inspect `node.fullPath` for a file node — it must be a non-doubled,
+accessible path. See §3C.2's diagnostic.
+
+**Step 5 — CI regression test**
+Add `testOutlineHasRows` from §3E.9 to the UI test target. Run it
+in CI on every PR that touches `DirectoryFilenamePanel.swift` or
+`DirectoryTreeWalker.swift`. A failing test surfaces the blank-tree
+bug immediately instead of after a manual test cycle.
+
+### 3E.12 Tool quick-reference
+
+| Tool | Installed how | Layer seen | Requires Xcode | Requires debug build |
+| --- | --- | --- | --- | --- |
+| Xcode View Hierarchy | Built into Xcode | NSView + SwiftUI hosting | Yes | Yes |
+| Accessibility Inspector | Built into Xcode | AX tree | No (standalone) | No |
+| `osascript` | Pre-installed | AX tree | No | No |
+| `axcli` | `cargo install axcli` | AX tree | No | No |
+| Chisel `pviews` | `brew install chisel` | NSView tree | Yes (LLDB) | Yes |
+| LLDB `recursiveDescription` | Built into Xcode | NSView tree | Yes | Yes |
+| SwiftUI-Introspect | SPM package | Live NSOutlineView object | No | No (but guard behind `#if DEBUG`) |
+| XCUITest `debugDescription` | Built into Xcode | AX tree | Yes (xcrun) | No |
+| Reveal.app | revealapp.com (paid) | NSView + SwiftUI | No (uses LLDB breakpoint) | Yes |
+
+---
+
 ## 4. UI Mechanics
 
 ### 4.1 Panel chrome
