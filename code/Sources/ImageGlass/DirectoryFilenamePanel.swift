@@ -211,21 +211,10 @@ struct DirectoryFilenamePanel: View {
     }
 
     private var walkerTreeView: some View {
-        List(selection: $state.selectedFile) {
-            ForEach(state.walkerRoots, id: \.path) { root in
-                Section(header: rootHeader(root)) {
-                    if let tree = root.tree,
-                       let view = Self.buildView(node: tree,
-                                                 parentPath: root.path) {
-                        OutlineGroup(view, children: \.children) { node in
-                            row(for: node)
-                                .tag(node.fullPath as String?)
-                        }
-                    }
-                }
-            }
-        }
-        .listStyle(.sidebar)
+        // docs/list_of_files.mdx §3D.5 — the renderer is selected at
+        // runtime from the View ▸ Tree View submenu. The walker / data
+        // layer is untouched on a swap.
+        SelectableTreeRenderer(state: state, useYellowBackground: false)
     }
 
     /// Legacy code path: when `directories.yaml` is empty but the

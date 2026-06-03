@@ -11,11 +11,27 @@ import ImageGlassCore
 /// callbacks that read/write that observable.
 final class ImageCanvasView: NSView {
 
+    /// Bright cyan — debug background so we can see immediately
+    /// whether the canvas is mounted in the window, vs. being
+    /// covered, vs. being given zero size by a layout bug. Used by
+    /// both the layer background and the `draw(_:)` fill so it shows
+    /// up regardless of which path is active.
+    static let debugBackgroundColor = NSColor(red: 0.0, green: 1.0, blue: 1.0, alpha: 1.0)
+
     // Inputs
     private(set) var sourceImage: NSImage?
     private(set) var sourceCGImage: CGImage?
     private(set) var frameSource: FrameSource?
     private var filteredImage: CGImage?
+
+    /// Path of the image currently mounted in the canvas, normalized
+    /// the same way `CanvasHost.updateNSView` normalizes
+    /// `state.selectedFile`. Previously the host used `self.toolTip`
+    /// as a side-channel for this, which broke silently when toolTip
+    /// got cleared or pre-populated by any other layer. Owning the
+    /// state here means a fresh path *always* triggers
+    /// `setImage(path:)` from the host.
+    private(set) var loadedPath: String?
 
     // Cached for color-picker readouts. May differ from `sourceCGImage` only
     // by colorspace conversion (Generic RGB so RGBA sampling is meaningful).
@@ -69,7 +85,7 @@ final class ImageCanvasView: NSView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
-        layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        layer?.backgroundColor = Self.debugBackgroundColor.cgColor
         setupTrackingArea()
     }
 
@@ -94,6 +110,7 @@ final class ImageCanvasView: NSView {
 
     func setImage(path: String?) {
         stopAnimationTimer()
+        loadedPath = path
         guard let path else {
             sourceImage = nil
             sourceCGImage = nil
@@ -227,7 +244,7 @@ final class ImageCanvasView: NSView {
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        NSColor.windowBackgroundColor.setFill()
+        Self.debugBackgroundColor.setFill()
         dirtyRect.fill()
 
         guard let cg = filteredImage else { return }

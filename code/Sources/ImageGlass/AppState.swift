@@ -121,6 +121,18 @@ public final class AppState {
         public var label: String { self == .list ? "List" : "Tree" }
     }
 
+    /// docs/list_of_files.mdx §3D — user-selectable tree rendering
+    /// technology. The walker / data layer is unchanged; only the
+    /// SwiftUI view that hosts the tree differs. Persisted to
+    /// `UserDefaults` under `ig.tree_render_tech`. Default is
+    /// `.swiftUI` per §3D.3.
+    public var treeRenderTechnology: TreeRenderTechnology = TreeRenderTechnology.loadOrDefault() {
+        didSet {
+            guard oldValue != treeRenderTechnology else { return }
+            treeRenderTechnology.save()
+        }
+    }
+
     /// Crop subsystem controller. Owned by AppState so the SwiftUI panel
     /// and the overlay can share one observable instance. See `Crop/`.
     public let cropController: CropController = CropController()

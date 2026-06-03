@@ -72,7 +72,14 @@ struct ImageViewer: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color(NSColor.windowBackgroundColor))
+        // Bright cyan debug background — matches
+        // `ImageCanvasView.debugBackgroundColor`. If the user sees
+        // cyan with no image, the SwiftUI container is on screen but
+        // either the canvas didn't load (Bug 1 — selectedFile not
+        // propagating) or the file failed to decode. If they see no
+        // cyan at all, the viewer is being covered or sized to zero
+        // by a panel-host layout problem.
+        .background(Color(red: 0.0, green: 1.0, blue: 1.0))
     }
 
     /// Spacebar. videos.mdx §11.2 / svg.mdx §10.2 — focus-context rule:
@@ -196,8 +203,14 @@ private struct CanvasHost: NSViewRepresentable {
     }
 
     func updateNSView(_ v: ImageCanvasView, context: Context) {
+        // Always reload when `selectedFile` changes. Previously this
+        // compared `v.toolTip` to the new path, which broke silently
+        // whenever `toolTip` was reset out from under us — and the
+        // canvas would refuse to load even though a fresh file was
+        // selected in the file tree. Tracking `loadedPath` on the
+        // view itself removes the side-channel.
         let resolvedPath = state.selectedFile.map { AppPaths.expandTilde($0) }
-        if v.toolTip != resolvedPath {
+        if v.loadedPath != resolvedPath {
             v.setImage(path: resolvedPath)
             v.toolTip = resolvedPath
         }

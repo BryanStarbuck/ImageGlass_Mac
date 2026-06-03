@@ -16,10 +16,36 @@ struct ContentView: View {
         PanelHostView(state: state, model: state.panelLayout) {
             VStack(spacing: 0) {
                 HStack(spacing: 0) {
+                    // docs/list_of_files.mdx §3C — the same yellow
+                    // file-list / file-tree the detached floating
+                    // window renders, also embedded inside the main
+                    // app window so the bright-yellow surface is
+                    // visible without a separate window.
+                    //
+                    // Layout hardening (Bryan reported the column
+                    // disappearing on multi-monitor restore): the
+                    // outer ZStack paints yellow unconditionally so
+                    // the column is visible even if SwiftUI's HStack
+                    // squeezes the inner FileTreeFloatingView during
+                    // the screen-change transition. `minWidth ==
+                    // idealWidth == maxWidth == 360` plus
+                    // `layoutPriority(1)` lock the column at exactly
+                    // 360pt — SwiftUI gives the flexible image
+                    // viewer everything else and can't take any of
+                    // this column's space.
+                    ZStack {
+                        Color(red: 1.0, green: 1.0, blue: 0.0)
+                            .ignoresSafeArea(edges: .vertical)
+                        FileTreeFloatingView(state: state)
+                    }
+                    .frame(minWidth: 360, idealWidth: 360, maxWidth: 360)
+                    .layoutPriority(1)
+                    Divider()
                     VStack(spacing: 0) {
                         ImageViewer(state: state, viewer: state.viewer)
                         statusBar
                     }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                     if state.crop.isActive {
                         Divider()
                         CropPanelView(controller: state.crop)
@@ -40,6 +66,11 @@ struct ContentView: View {
             // Drain any Finder-supplied file URLs that arrived before SwiftUI
             // mounted (cold-launch Open With).
             AboutAppDelegate.registerListenerAndFlush()
+            // docs/list_of_files.mdx §3C.1 — default-on. Open the
+            // detached floating File Tree window automatically on
+            // every cold launch. Idempotent: a relaunch into a hot
+            // window just brings the cached one forward.
+            FloatingFileTreeWindowController.shared.show(state: state)
         }
         .onAppear {
             state.themeStore.updateSystemColorScheme(SystemColorScheme(systemColorScheme))

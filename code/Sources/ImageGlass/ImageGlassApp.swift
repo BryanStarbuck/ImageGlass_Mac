@@ -50,6 +50,25 @@ struct ImageGlassApp: App {
                     state.showPanelColumn.toggle()
                 }
                 .keyboardShortcut("0", modifiers: [.command, .option])
+                // docs/list_of_files.mdx §3C — detached floating
+                // window holding the file list + file tree on a
+                // bright-yellow background. Default-on; the cold
+                // launch opens it automatically via the AppDelegate.
+                Button(FloatingFileTreeWindowController.shared.isVisible
+                       ? "Hide Floating File Tree"
+                       : "Show Floating File Tree") {
+                    FloatingFileTreeWindowController.shared.toggle(state: state)
+                }
+                .keyboardShortcut("f", modifiers: [.command, .option, .control])
+                // docs/list_of_files.mdx §3D — submenu lets the user
+                // pick which of the three tree rendering technologies
+                // draws the file tree (in both the inline panel and the
+                // floating window). Checkmark marks the active one.
+                Menu("Tree View") {
+                    treeRenderTechItem(.appKit, key: "1")
+                    treeRenderTechItem(.swiftUI, key: "2")
+                    treeRenderTechItem(.catalyst, key: "3")
+                }
                 Button("Re-evaluate Active Scope") {
                     Task { await state.reevaluateActive() }
                 }
@@ -82,6 +101,25 @@ struct ImageGlassApp: App {
         Settings {
             SettingsScene(state: state)
         }
+    }
+
+    // MARK: - Tree View submenu helper
+
+    /// docs/list_of_files.mdx §3D.2 — one item per renderer. A leading
+    /// checkmark glyph (`✓ ` / `  `) marks the active choice; the
+    /// hotkey is `⌃⌥⌘<key>`. Selecting an unchecked item swaps the
+    /// renderer; selecting the active one is a no-op.
+    @ViewBuilder
+    private func treeRenderTechItem(_ tech: TreeRenderTechnology,
+                                    key: Character) -> some View {
+        let active = state.treeRenderTechnology == tech
+        Button("\(active ? "✓ " : "   ")\(tech.menuTitle)") {
+            if state.treeRenderTechnology != tech {
+                state.treeRenderTechnology = tech
+            }
+        }
+        .keyboardShortcut(KeyEquivalent(key),
+                          modifiers: [.command, .option, .control])
     }
 
     // MARK: - Crop menu
