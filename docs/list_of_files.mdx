@@ -755,7 +755,7 @@ the verify shape used in [mcp_file.mdx](./use_cases/mcp_file.mdx) §8.
 | --- | --- |
 | `list_directories()` | Return the `root_directories[]` array with path + filter + last_walked. |
 | `get_directory(path)` | Return a single root directory entry. |
-| `add_directory(path, filter?)` | Append a new root with an optional filter. Idempotent: if the path is already a root, returns `already_exists`. Writes `directories.yaml`; the main app's §3A.1 watcher detects the change within 250 ms and calls `scheduleWalk` (§3A.5.1). |
+| `add_directory(path, filter?)` | Append a new root with an optional filter. **Idempotent and duplicate-safe**: the path is canonicalized (tilde expansion + symlink resolution) before comparison, and the entire load → check → append → save sequence is performed under a single exclusive lock so concurrent or repeated calls cannot introduce duplicate entries. If the canonical path is already a root, returns `already_exists=true` without modifying the file and without scheduling a background walk. Writes `directories.yaml`; the main app's §3A.1 watcher detects the change within 250 ms and calls `scheduleWalk` (§3A.5.1). |
 | `remove_directory(path)` | Drop a root entry. Writes `directories.yaml`; the main app's §3A.1 watcher calls `removeRoot` within 250 ms — tearing down the FS watcher and discarding the in-memory tree. |
 | `update_directory_filter(path, filter)` | Replace the filter for one root. Writes `directories.yaml`; the main app's §3A.1 watcher calls `refilter` within 250 ms — in-memory recompute only (§3A.7), no filesystem walk. |
 | `set_global_filter(filter)` | Apply the same filter to every existing root. Writes `directories.yaml`; the main app's §3A.1 watcher calls `refilter` on each root within 250 ms. |

@@ -229,6 +229,9 @@ struct DirectoryFilenamePanel: View {
             }
         }
         .listStyle(.sidebar)
+        .scrollContentBackground(.hidden)
+        .background(Color.yellow)
+        .border(Color.red, width: 8)
     }
 
     /// Content rows for one walker root inside its Section. Extracted
