@@ -1721,6 +1721,424 @@ bug immediately instead of after a manual test cycle.
 
 ---
 
+## 3F. Concrete Test Case: JFK/UX Directory Tree
+
+This section is a **ground-truth acceptance test** for the file tree panel.
+It uses a real directory on disk — not a synthetic fixture — and provides a
+complete CLI diagnostic script that walks the live app's window hierarchy and
+reports whether the expected content is visible. If the content is absent,
+the section names the specific code path to fix.
+
+### 3F.1 Test fixture — the directory
+
+**Root path (the directory added via MCP's `add_directory`):**
+```
+/Users/bryanstarbuck/BGit/work/into_Work/StarbuckLabs/JFK/UX
+```
+
+**Precondition:** this path must be recorded in `directories.yaml`. Verify:
+```bash
+cat ~/Library/Application\ Support/ImageGlass_Mac/directories.yaml
+```
+
+Expected output (minimum — other roots may also be present):
+```yaml
+schema_version: 1
+root_directories:
+  - path: /Users/bryanstarbuck/BGit/work/into_Work/StarbuckLabs/JFK/UX
+```
+
+> **Current state (as of 2026-06-02):** `directories.yaml` has
+> `root_directories: []` — the MCP `add_directory` call has not been
+> executed yet, or its write did not persist. The MCP call must be issued
+> and the write confirmed before any UI verification is meaningful.
+
+### 3F.2 Expected tree structure
+
+After the root is added and the background walker completes, the tree panel
+must render the following hierarchy (showing only the `img_*.jpg` files
+under the two `JFK_Mar_c_files` directories; the full tree is much larger):
+
+```
+▼ /Users/bryanstarbuck/BGit/work/into_Work/StarbuckLabs/JFK/UX
+    ▶ _Figma
+    ▶ _Great_Design
+    ▼ 2026_April_10_HTML
+        ▶ Bookmarks
+        ▶ Compose_Post
+        ▶ Create_Account
+        ▶ Direct_Messages
+        ▶ Explore
+        ▶ External
+        ▼ Feed
+            ▼ JFK_Mar_c_files        ← KEY NODE
+                img_7.jpg
+                img_8.jpg
+                img_10.jpg
+                img_11.jpg
+                img_12.jpg
+                img_13.jpg
+                img_14.jpg
+                img_15.jpg
+                img_16.jpg
+                img_20.jpg
+                img_23.jpg
+                img_27.jpg
+        ▼ FreeTok
+            ▼ JFK_Mar_c_files        ← KEY NODE
+                (images here)
+        ▶ Home_Feed
+        ▶ Login
+        ...
+    ▶ Admin
+    ▶ Feed
+    ▶ freetok
+    ...
+```
+
+**Canonical file paths** (verified on disk):
+```
+/Users/bryanstarbuck/BGit/work/into_Work/StarbuckLabs/JFK/UX/2026_April_10_HTML/Feed/JFK_Mar_c_files/img_7.jpg
+/Users/bryanstarbuck/BGit/work/into_Work/StarbuckLabs/JFK/UX/2026_April_10_HTML/Feed/JFK_Mar_c_files/img_8.jpg
+/Users/bryanstarbuck/BGit/work/into_Work/StarbuckLabs/JFK/UX/2026_April_10_HTML/Feed/JFK_Mar_c_files/img_10.jpg
+/Users/bryanstarbuck/BGit/work/into_Work/StarbuckLabs/JFK/UX/2026_April_10_HTML/Feed/JFK_Mar_c_files/img_11.jpg
+/Users/bryanstarbuck/BGit/work/into_Work/StarbuckLabs/JFK/UX/2026_April_10_HTML/Feed/JFK_Mar_c_files/img_12.jpg
+/Users/bryanstarbuck/BGit/work/into_Work/StarbuckLabs/JFK/UX/2026_April_10_HTML/Feed/JFK_Mar_c_files/img_13.jpg
+/Users/bryanstarbuck/BGit/work/into_Work/StarbuckLabs/JFK/UX/2026_April_10_HTML/Feed/JFK_Mar_c_files/img_14.jpg
+/Users/bryanstarbuck/BGit/work/into_Work/StarbuckLabs/JFK/UX/2026_April_10_HTML/Feed/JFK_Mar_c_files/img_15.jpg
+/Users/bryanstarbuck/BGit/work/into_Work/StarbuckLabs/JFK/UX/2026_April_10_HTML/Feed/JFK_Mar_c_files/img_16.jpg
+/Users/bryanstarbuck/BGit/work/into_Work/StarbuckLabs/JFK/UX/2026_April_10_HTML/Feed/JFK_Mar_c_files/img_20.jpg
+/Users/bryanstarbuck/BGit/work/into_Work/StarbuckLabs/JFK/UX/2026_April_10_HTML/Feed/JFK_Mar_c_files/img_23.jpg
+/Users/bryanstarbuck/BGit/work/into_Work/StarbuckLabs/JFK/UX/2026_April_10_HTML/Feed/JFK_Mar_c_files/img_27.jpg
+```
+
+### 3F.3 CLI diagnostic script — full window-hierarchy walk
+
+This script runs entirely from the terminal. It does not require Xcode to be
+open or the app to be in a debug build. It:
+
+1. Finds the running process by name
+2. Walks the window hierarchy via the macOS Accessibility API
+3. Locates the `AXOutline` (the tree control)
+4. Dumps all visible row labels
+5. Checks for the two key `JFK_Mar_c_files` rows
+6. Exits 0 (pass) or 1 (fail) with a diagnostic message
+
+**Prerequisites:**
+- Grant Terminal Accessibility permission once:
+  `System Settings > Privacy & Security > Accessibility > add Terminal.app`
+- The app must be running with the `UX` root added to `directories.yaml`
+- The tree panel must be in Tree view mode (not Strip / Grid / Details)
+
+**Save as `scripts/verify_tree_jfk.sh`** in the project root and
+`chmod +x` it:
+
+```bash
+#!/usr/bin/env bash
+# verify_tree_jfk.sh
+# Verifies that the JFK/UX directory tree is visible in the ImageGlass
+# file tree panel by walking the live Accessibility hierarchy.
+#
+# Usage:  ./scripts/verify_tree_jfk.sh
+# Exit:   0 = PASS   1 = FAIL
+
+set -euo pipefail
+
+APP_NAME="ImageGlass"          # exact process name — adjust if bundle name differs
+FEED_MARKER="JFK_Mar_c_files"  # label that must appear under Feed
+REQUIRED_FILE="img_10"         # spot-check one leaf file label
+
+# ── Step 1: Confirm the process is running ────────────────────────────────────
+PID=$(pgrep -x "$APP_NAME" 2>/dev/null || true)
+if [[ -z "$PID" ]]; then
+  echo "FAIL: '$APP_NAME' is not running. Launch the app first."
+  exit 1
+fi
+echo "OK:   Process '$APP_NAME' found (PID $PID)"
+
+# ── Step 2: Confirm directories.yaml has the root ────────────────────────────
+YAML="$HOME/Library/Application Support/ImageGlass_Mac/directories.yaml"
+if ! grep -q "into_Work/StarbuckLabs/JFK/UX" "$YAML" 2>/dev/null; then
+  echo "FAIL: JFK/UX root is not in directories.yaml."
+  echo "      Run the MCP add_directory tool first:"
+  echo "      add_directory('/Users/bryanstarbuck/BGit/work/into_Work/StarbuckLabs/JFK/UX')"
+  exit 1
+fi
+echo "OK:   JFK/UX root found in directories.yaml"
+
+# ── Step 3: Walk the AX tree and dump all row labels ─────────────────────────
+#
+# Strategy:
+#   - Use System Events to reach into the app's window
+#   - Find the AXOutline element (the backing NSOutlineView)
+#   - Collect every AXRow's AXDescription or title attribute
+#   - The script writes the dump to a temp file for inspection
+#
+TMPFILE=$(mktemp /tmp/ax_dump_XXXXXX.txt)
+
+osascript <<APPLESCRIPT > "$TMPFILE" 2>&1
+tell application "System Events"
+  tell process "$APP_NAME"
+    -- Walk window 1 to find an AXOutline anywhere in its hierarchy
+    set found to false
+    set rowLabels to {}
+
+    -- Helper: recursively search for AXOutline in an element's children
+    -- (AppleScript doesn't have real recursion, so we go 5 levels deep)
+    repeat with level1 in (every UI element of window 1)
+      if role of level1 is "AXOutline" then
+        set found to true
+        set allRows to (every UI element of level1 whose role is "AXRow")
+        repeat with r in allRows
+          try
+            set end of rowLabels to (value of attribute "AXDescription" of r)
+          on error
+            try
+              set end of rowLabels to (title of r)
+            on error
+              set end of rowLabels to "(unlabeled row)"
+            end try
+          end try
+        end repeat
+      else
+        repeat with level2 in (every UI element of level1)
+          if role of level2 is "AXOutline" then
+            set found to true
+            set allRows to (every UI element of level2 whose role is "AXRow")
+            repeat with r in allRows
+              try
+                set end of rowLabels to (value of attribute "AXDescription" of r)
+              on error
+                try
+                  set end of rowLabels to (title of r)
+                on error
+                  set end of rowLabels to "(unlabeled row)"
+                end try
+              end try
+            end repeat
+          else
+            repeat with level3 in (every UI element of level2)
+              if role of level3 is "AXOutline" then
+                set found to true
+                set allRows to (every UI element of level3 whose role is "AXRow")
+                repeat with r in allRows
+                  try
+                    set end of rowLabels to (value of attribute "AXDescription" of r)
+                  on error
+                    try
+                      set end of rowLabels to (title of r)
+                    on error
+                      set end of rowLabels to "(unlabeled row)"
+                    end try
+                  end try
+                end repeat
+              end if
+            end repeat
+          end if
+        end repeat
+      end if
+    end repeat
+
+    if found then
+      return "OUTLINE_FOUND row_count:" & (count of rowLabels) & linefeed & (rowLabels as text)
+    else
+      return "NO_OUTLINE_FOUND"
+    end if
+  end tell
+end tell
+APPLESCRIPT
+
+DUMP=$(cat "$TMPFILE")
+echo ""
+echo "── AX dump (first 60 lines) ─────────────────────────────────────────────"
+head -60 "$TMPFILE"
+echo "─────────────────────────────────────────────────────────────────────────"
+
+# ── Step 4: Evaluate the dump ─────────────────────────────────────────────────
+FAIL=0
+
+if echo "$DUMP" | grep -q "NO_OUTLINE_FOUND"; then
+  echo ""
+  echo "FAIL: No AXOutline element found in window 1."
+  echo "      The tree control is not in the accessibility hierarchy at all."
+  echo "      → Check that the panel is in Tree view mode (§2.4)."
+  echo "      → Check that walkerTreeView is the active branch in treeView (§3D.5)."
+  FAIL=1
+else
+  ROW_COUNT=$(echo "$DUMP" | grep -o 'row_count:[0-9]*' | cut -d: -f2 || echo 0)
+  echo "OK:   AXOutline found with $ROW_COUNT visible rows"
+
+  if [[ "$ROW_COUNT" -eq 0 ]]; then
+    echo "FAIL: AXOutline has 0 rows — control is present but empty."
+    echo "      → Check walkerRoots.count (§3D.5): must be ≥ 1"
+    echo "      → Check rootChildViews(for:) returns non-empty array (§3D.2)"
+    echo "      → Check that NodeView.children is non-nil for directory nodes (§3D.4)"
+    FAIL=1
+  fi
+
+  if ! echo "$DUMP" | grep -q "$FEED_MARKER"; then
+    echo "FAIL: '$FEED_MARKER' row not found in AX tree."
+    echo "      Expected it under: 2026_April_10_HTML > Feed > JFK_Mar_c_files"
+    echo "      → Directory may not be expanded in the UI (disclosure triangle not open)."
+    echo "      → Or walker did not recurse into 2026_April_10_HTML/Feed/ — check"
+    echo "        built-in file-kind filter (§3A.3): only image/SVG/video files appear."
+    echo "        Directory nodes appear regardless of file content, so an empty"
+    echo "        JFK_Mar_c_files dir would still show as a node."
+    FAIL=1
+  else
+    echo "OK:   '$FEED_MARKER' row is visible in AX tree"
+  fi
+
+  if ! echo "$DUMP" | grep -q "$REQUIRED_FILE"; then
+    echo "WARN: Leaf file '$REQUIRED_FILE' not found in visible rows."
+    echo "      This may mean the 2026_April_10_HTML/Feed/JFK_Mar_c_files"
+    echo "      node is collapsed — expand it in the UI and re-run."
+    echo "      Or check passesFilter for .jpg files (§3A.7)."
+  else
+    echo "OK:   Leaf file '$REQUIRED_FILE' is visible in AX tree"
+  fi
+fi
+
+rm -f "$TMPFILE"
+
+# ── Step 5: Summary ───────────────────────────────────────────────────────────
+echo ""
+if [[ "$FAIL" -eq 0 ]]; then
+  echo "RESULT: PASS — JFK/UX tree is correctly rendered in the file panel."
+  exit 0
+else
+  echo "RESULT: FAIL — see diagnostics above."
+  echo ""
+  echo "Next steps:"
+  echo "  1. Run: pviews in LLDB (§3E.5) to confirm NSOutlineView row count."
+  echo "  2. Check: po state.walkerRoots.count in LLDB."
+  echo "  3. If row count > 0 but AX rows are 0 — add .accessibilityLabel(node.name)"
+  echo "     to the row view in walkerRootContent (DirectoryFilenamePanel.swift §3D.2)."
+  echo "  4. If row count == 0 — the walker returned no results for this root."
+  echo "     Add #if DEBUG introspect block (§3E.6) to read NSOutlineView.numberOfRows live."
+  exit 1
+fi
+```
+
+### 3F.4 axcli variant (faster, structured output)
+
+If `axcli` is installed (`cargo install axcli` — see §3E.8), this variant
+is faster on deep trees than the AppleScript above:
+
+```bash
+#!/usr/bin/env bash
+# verify_tree_jfk_axcli.sh — axcli variant
+
+APP_NAME="ImageGlass"
+
+PID=$(pgrep -x "$APP_NAME" 2>/dev/null || true)
+if [[ -z "$PID" ]]; then
+  echo "FAIL: $APP_NAME not running"; exit 1
+fi
+
+echo "Dumping AX tree for PID $PID..."
+axcli snapshot --pid "$PID" > /tmp/ax_full.txt 2>&1
+
+OUTLINE_LINES=$(grep -c "AXOutline\|AXRow" /tmp/ax_full.txt || echo 0)
+echo "Lines mentioning AXOutline or AXRow: $OUTLINE_LINES"
+
+if grep -q "JFK_Mar_c_files" /tmp/ax_full.txt; then
+  echo "PASS: JFK_Mar_c_files found in AX snapshot"
+else
+  echo "FAIL: JFK_Mar_c_files not found"
+  echo "Full snapshot saved to /tmp/ax_full.txt — inspect with:"
+  echo "  grep -A5 -B5 'Feed' /tmp/ax_full.txt"
+  exit 1
+fi
+```
+
+### 3F.5 What each failure means and where to fix it
+
+| Failure symptom | Root cause | File and symbol to fix |
+| --- | --- | --- |
+| Process not found | App is not running | Launch the app |
+| Root missing from `directories.yaml` | MCP `add_directory` was not called or its write failed | Call `add_directory("/Users/bryanstarbuck/BGit/work/into_Work/StarbuckLabs/JFK/UX")` via MCP; check atomic-rename write in `DirectoryTreeWalker.addRoot` |
+| `NO_OUTLINE_FOUND` | `treeView` is not routing to `walkerTreeView`; or the panel is not in Tree view mode; or the AXOutline is not exposed to Accessibility | `DirectoryFilenamePanel.swift` → `treeView` (§3D.5); add `.accessibilityElement(children: .contain)` to the `List` |
+| `AXOutline` has 0 rows | `OutlineGroup` is receiving an empty collection | `DirectoryFilenamePanel.swift` → `rootChildViews(for:)` (§3D.2): confirm it returns `root.directChildren`, not an empty array. Also check `DirectoryTreeWalker.addRoot` completed its walk. |
+| `AXOutline` has rows but `JFK_Mar_c_files` not found | Node is collapsed (user has not expanded the tree) | Not a code bug — expand the `2026_April_10_HTML > Feed` disclosure group in the UI and re-run the script |
+| `JFK_Mar_c_files` node exists but `img_10` leaf not found | Leaf file rows are collapsed, or `passesFilter` is `false` for `.jpg` files | Check the per-root filter in `directories.yaml` — if `include_globs` is set to something that excludes `*.jpg`, fix that filter. If no filter is set, check `RootFilter.evaluate` (§3A.7). |
+| Double-file-name in row label (e.g. `img_10.jpg/img_10.jpg`) | Bug 1 (§3C.2) — `buildView` path construction | `DirectoryFilenamePanel.swift` → `buildView`: use `parentPath.path` not `parentPath.appendingPathComponent(name).path` |
+
+### 3F.6 Registering this as a permanent XCUITest
+
+Once the CLI script passes, lock the behavior in a UI test so it runs on
+every PR that touches the tree-view code:
+
+```swift
+// ImageGlass_MacUITests/JFKTreeViewTests.swift
+
+import XCTest
+
+final class JFKTreeViewTests: XCTestCase {
+
+    func testJFKUXRootAppearsInTree() throws {
+        // Precondition: directories.yaml must already have the UX root.
+        // In CI, seed it via a setUp script that writes the YAML before launch.
+        let app = XCUIApplication()
+        app.launch()
+
+        // Give the walker time to complete (adjust timeout as needed for CI)
+        let outline = app.outlineViews.firstMatch
+        XCTAssert(outline.waitForExistence(timeout: 10),
+                  "NSOutlineView must exist within 10 s of launch")
+
+        // The JFK_Mar_c_files node must be in the AX tree
+        // (may require expanding 2026_April_10_HTML > Feed first)
+        let feedGroup = outline.cells.containing(.staticText,
+                                                  identifier: "2026_April_10_HTML").firstMatch
+        if feedGroup.exists { feedGroup.click() }  // expand if collapsed
+
+        let jfkNode = outline.cells.containing(.staticText,
+                                                identifier: "JFK_Mar_c_files").firstMatch
+        XCTAssert(jfkNode.waitForExistence(timeout: 5),
+                  "JFK_Mar_c_files node must appear in tree within 5 s of expanding")
+
+        // Expand JFK_Mar_c_files and check for a leaf image
+        jfkNode.click()
+        let leafFile = outline.cells.containing(.staticText,
+                                                 identifier: "img_10.jpg").firstMatch
+        XCTAssert(leafFile.waitForExistence(timeout: 3),
+                  "img_10.jpg must appear as a leaf row after expanding JFK_Mar_c_files")
+    }
+
+    func testClickingImageLoadsViewer() throws {
+        let app = XCUIApplication()
+        app.launch()
+
+        // Navigate to the leaf file and click it
+        let outline = app.outlineViews.firstMatch
+        XCTAssert(outline.waitForExistence(timeout: 10))
+        // ... (expand path as above) ...
+        let leafFile = outline.cells.containing(.staticText,
+                                                 identifier: "img_10.jpg").firstMatch
+        XCTAssert(leafFile.waitForExistence(timeout: 5))
+        leafFile.click()
+
+        // The viewer canvas should now show img_10.jpg
+        // (check window title or a canvas accessibility label)
+        let title = app.windows.firstMatch.title
+        XCTAssertTrue(title.contains("img_10"),
+                      "Window title must contain 'img_10' after selecting the file; got: \(title)")
+    }
+}
+```
+
+Run the test:
+```bash
+xcrun xcodebuild test \
+  -project code/ImageGlass_Mac.xcodeproj \
+  -scheme ImageGlass_Mac \
+  -destination 'platform=macOS' \
+  -only-testing "ImageGlass_MacUITests/JFKTreeViewTests"
+```
+
+---
+
 ## 4. UI Mechanics
 
 ### 4.1 Panel chrome
