@@ -2995,7 +2995,7 @@ Visual elements:
     on selection would surprise the user with sound.
   Selection never silently fails: if the file is unreadable, the
   viewer renders its standard error placeholder and writes an
-  `error.err` record with the file URL.
+  error record to `log.log` with the file URL.
 * **Multi-select** (Shift / Cmd-click) enables batch operations:
   * Delete (⌫) — moves to Trash via `FileManager.trashItem(at:resultingItemURL:)`.
   * Copy paths (⌘C in plain selection mode) — writes paths to the

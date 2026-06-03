@@ -12,6 +12,20 @@ public final class AppState {
     public var activeScopeName: String = ""
     public var activeScope: Scope? = nil
     public var resolvedFiles: [String] = []
+    /// UserDefaults key for the most recently previewed file. Restored
+    /// on cold launch in `bootstrap()` so both the main and second
+    /// viewer windows come up showing the user's last image. Written
+    /// from `selectedFile.didSet` on every selection change after the
+    /// restore-from-launch phase completes.
+    private static let lastSelectedFileKey = "ig.last_selected_file"
+
+    /// True while `bootstrap()` is still seeding the initial selection
+    /// (either from `resolvedFiles.first` in `activate()` or from the
+    /// persisted `lastSelectedFileKey`). Suppresses the persistence
+    /// write in `didSet` so we don't clobber the saved value with the
+    /// transient scope-first assignment before we get to restore it.
+    private var isRestoringSelection = true
+
     public var selectedFile: String? = nil {
         didSet {
             // mcp_file.mdx §2.3 — every selection change (whether the
@@ -20,6 +34,14 @@ public final class AppState {
             // `notifications/imageglass/selection_changed` push event
             // so connected MCP clients see the move.
             guard oldValue != selectedFile else { return }
+            // Persist the latest non-nil selection so the next cold
+            // launch can restore it (and both viewer windows come up
+            // showing the user's last image). Skipped during bootstrap
+            // restoration so the seed value from `activate()` does not
+            // overwrite the saved value before we read it.
+            if !isRestoringSelection, let path = selectedFile {
+                UserDefaults.standard.set(path, forKey: Self.lastSelectedFileKey)
+            }
             // Defensive: any path that lands here must be a full
             // absolute path (or `~/` prefixed — we expand at the
             // canvas). A bare filename like "img_6.gif" cannot resolve
@@ -270,10 +292,48 @@ public final class AppState {
                     root: root.path, filter: root.filter, corr: corr
                 )
             }
+            // Restore the last image the user previewed (saved on
+            // every selection via `lastSelectedFileKey`). Runs after
+            // `activate()` so it can override the scope's first-file
+            // seed when the saved path is still readable on disk.
+            // Both viewer windows observe `selectedFile`, so this one
+            // assignment makes the main viewer and the floating
+            // second viewer load the same image at launch.
+            restoreLastSelectedFileIfAvailable()
+            isRestoringSelection = false
         } catch {
             ErrorLog.log("bootstrap failed", error: error, class: String(describing: Self.self))
             NSLog("ImageGlass bootstrap failed: \(error)")
+            isRestoringSelection = false
         }
+    }
+
+    /// Read the persisted last-previewed file from UserDefaults and,
+    /// if it still points at a readable image on disk, assign it to
+    /// `selectedFile`. A missing/invalid value is left alone so the
+    /// `activate()` seed (first file in the active scope) remains in
+    /// place — the user just sees the scope's default image instead.
+    private func restoreLastSelectedFileIfAvailable() {
+        guard let saved = UserDefaults.standard.string(forKey: Self.lastSelectedFileKey),
+              !saved.isEmpty else {
+            return
+        }
+        let expanded = AppPaths.expandTilde(saved)
+        let result = ImageCanvasView.validate(path: expanded)
+        guard result == .ok else {
+            ErrorLog.log(
+                "restoreLastSelectedFile: skipping '\(saved)' (\(result))",
+                class: String(describing: Self.self)
+            )
+            return
+        }
+        // Ensure prev/next navigation works even if the restored file
+        // isn't in the active scope (e.g. it was opened via drag-drop
+        // last session and the scope is now different).
+        if !resolvedFiles.contains(saved) {
+            resolvedFiles.insert(saved, at: 0)
+        }
+        selectedFile = saved
     }
 
     /// Loads `settings.json` via the actor-backed `SettingsStore`. Any

@@ -991,7 +991,7 @@ bug, not a logic bug.
 * **Path does not exist.** If the user mistypes the path (e.g.
   `JFK/UI` instead of `JFK/UX`), the MCP call returns
   `ok=false err=path_not_found`; `directories.yaml` is **not**
-  modified; one `error.err` record carries the offending path. The
+  modified; one error record in `log.log` carries the offending path. The
   viewer stays empty.
 * **Path exists but contains no media.** The walk completes; the
   panel renders the empty root row; the viewer stays in the
@@ -1267,8 +1267,8 @@ directory-name matching ("carve out every file under any
 * **Invalid regex.** If the pattern is `.*_DM_(.*\.jpg$`
   (unbalanced paren), the MCP call returns
   `ok=false err=invalid_regex`; `directories.yaml` is unchanged;
-  the panel state is unchanged; one `error.err` record carries
-  the offending pattern and the `corr=` id.
+  the panel state is unchanged; one error record in `log.log`
+  carries the offending pattern and the `corr=` id.
 * **Unknown root path.** If `path` does not match any entry in
   `root_directories[]`, the call returns
   `ok=false err=path_not_found`.
@@ -1348,5 +1348,6 @@ A run of this tour passes when **all of**:
   divergence between memory and disk.
 
 If any step fails, the failing line in `log.log` (with its `corr=`
-correlation id) is the first place to look — joining it against the
-matching `error.err` record reproduces the call in full.
+correlation id) is the first place to look — `grep corr=<id>
+log.log` returns the audit line(s) interleaved with the matching
+error record, reproducing the call in full.

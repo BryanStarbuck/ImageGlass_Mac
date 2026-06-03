@@ -71,6 +71,10 @@ struct ContentView: View {
             // every cold launch. Idempotent: a relaunch into a hot
             // window just brings the cached one forward.
             FloatingFileTreeWindowController.shared.show(state: state)
+            // Companion floating image-only window — mirrors the
+            // current selection so two displays can show the same
+            // image at once. Title flips to "Second: <filename>".
+            SecondViewerWindowController.shared.show(state: state)
         }
         .onAppear {
             state.themeStore.updateSystemColorScheme(SystemColorScheme(systemColorScheme))

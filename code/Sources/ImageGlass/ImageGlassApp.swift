@@ -60,6 +60,16 @@ struct ImageGlassApp: App {
                     FloatingFileTreeWindowController.shared.toggle(state: state)
                 }
                 .keyboardShortcut("f", modifiers: [.command, .option, .control])
+                // Second viewer: a passive floating image-only window
+                // that mirrors `state.selectedFile`. Title flips to
+                // "Second: <filename>" every time the main viewer
+                // loads a new image.
+                Button(SecondViewerWindowController.shared.isVisible
+                       ? "Hide Second Viewer"
+                       : "Show Second Viewer") {
+                    SecondViewerWindowController.shared.toggle(state: state)
+                }
+                .keyboardShortcut("2", modifiers: [.command, .option, .control])
                 // docs/list_of_files.mdx §3D — submenu lets the user
                 // pick which of the three tree rendering technologies
                 // draws the file tree (in both the inline panel and the

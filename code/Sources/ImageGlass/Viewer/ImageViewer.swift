@@ -161,15 +161,10 @@ private struct MediaCanvasDispatcher: View {
     let path: String
 
     var body: some View {
-        let kind = MediaKind.detect(path: path)
-        switch kind {
-        case .image:
-            CanvasHost(state: state, viewer: viewer)
-        case .video:
-            VideoCanvasView(state: state, controller: state.video, path: path)
-        case .svg:
-            SVGCanvasView(state: state, controller: state.svg, path: path)
-        }
+        // Bryan: temporarily route every selection through the static
+        // image canvas. The SVG and video canvases are disabled for
+        // now; restoring them is a switch back to `MediaKind.detect`.
+        CanvasHost(state: state, viewer: viewer)
     }
 }
 
