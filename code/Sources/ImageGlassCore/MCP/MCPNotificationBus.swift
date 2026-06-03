@@ -26,13 +26,8 @@ public final class MCPNotificationBus: @unchecked Sendable {
     /// output channel.
     public struct Notification: Sendable {
         public let method: String
-<<<<<<< HEAD
         public let params: [String: String]
         public init(method: String, params: [String: String]) {
-=======
-        public let params: [String: any Sendable]
-        public init(method: String, params: [String: any Sendable]) {
->>>>>>> refs/remotes/origin/main
             self.method = method
             self.params = params
         }

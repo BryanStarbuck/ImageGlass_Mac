@@ -112,14 +112,53 @@ final class ImageCanvasView: NSView {
         stopAnimationTimer()
         loadedPath = path
         guard let path else {
-            sourceImage = nil
-            sourceCGImage = nil
-            frameSource = nil
-            samplingImage = nil
-            filteredImage = nil
-            needsDisplay = true
+            clearImageState()
             onFrameSourceChanged?(nil)
             return
+        }
+        // Reject anything that isn't a real absolute path on disk before we
+        // hand it to ImageIO. Each failure mode logs its own line so the
+        // cyan-without-image case (the user's report) is diagnosable from
+        // ~/Library/Application Support/ImageGlass_Mac/log.log alone.
+        switch Self.validate(path: path) {
+        case .empty:
+            ErrorLog.log("setImage rejected: empty path",
+                         class: String(describing: Self.self))
+            clearImageState()
+            onFrameSourceChanged?(nil)
+            return
+        case .notAbsolute:
+            ErrorLog.log("setImage rejected: path is not absolute (must start with '/' or '~/'): '\(path)'",
+                         class: String(describing: Self.self))
+            clearImageState()
+            onFrameSourceChanged?(nil)
+            return
+        case .bareFilename:
+            ErrorLog.log("setImage rejected: bare filename without directory: '\(path)'",
+                         class: String(describing: Self.self))
+            clearImageState()
+            onFrameSourceChanged?(nil)
+            return
+        case .missing:
+            ErrorLog.log("setImage rejected: file does not exist at '\(path)'",
+                         class: String(describing: Self.self))
+            clearImageState()
+            onFrameSourceChanged?(nil)
+            return
+        case .isDirectory:
+            ErrorLog.log("setImage rejected: path is a directory, not a file: '\(path)'",
+                         class: String(describing: Self.self))
+            clearImageState()
+            onFrameSourceChanged?(nil)
+            return
+        case .unreadable:
+            ErrorLog.log("setImage rejected: file is not readable (permissions/sandbox?) at '\(path)'",
+                         class: String(describing: Self.self))
+            clearImageState()
+            onFrameSourceChanged?(nil)
+            return
+        case .ok:
+            break
         }
         let url = URL(fileURLWithPath: path)
         let fs = FrameSource.load(url: url)
@@ -136,10 +175,60 @@ final class ImageCanvasView: NSView {
         }
         currentFrameIndex = 0
         applyFrame()
+        // Reset pan + lock to defaults so a new image always lands centered
+        // at the host's chosen zoom mode (the host writes viewer.zoomMode /
+        // lockedZoom / panOffset right after this returns).
         panOffset = .zero
+        lockedZoom = 1.0
         onFrameSourceChanged?(fs)
         startAnimationTimerIfNeeded()
         needsDisplay = true
+    }
+
+    private func clearImageState() {
+        sourceImage = nil
+        sourceCGImage = nil
+        frameSource = nil
+        samplingImage = nil
+        filteredImage = nil
+        needsDisplay = true
+    }
+
+    /// Reasons `setImage` will refuse to load a path. Each maps to a
+    /// distinct ErrorLog line so the operator can tell from the log
+    /// whether the path was bad, the file was missing, or the file was
+    /// just unreadable.
+    enum PathValidation {
+        case ok
+        case empty
+        case notAbsolute
+        case bareFilename
+        case missing
+        case isDirectory
+        case unreadable
+    }
+
+    /// Validate that a string is a real absolute filesystem path that
+    /// points at a readable, non-directory file. Pure — no logging.
+    static func validate(path: String) -> PathValidation {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return .empty }
+        // `~/foo` is absolute once expanded; anything else lacking a
+        // leading `/` is a bare name or relative path and will fail
+        // unpredictably depending on the process's cwd.
+        if !trimmed.hasPrefix("/") && !trimmed.hasPrefix("~/") && trimmed != "~" {
+            // A path with no `/` at all is just a filename.
+            if !trimmed.contains("/") { return .bareFilename }
+            return .notAbsolute
+        }
+        let fm = FileManager.default
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: trimmed, isDirectory: &isDir) else {
+            return .missing
+        }
+        if isDir.boolValue { return .isDirectory }
+        if !fm.isReadableFile(atPath: trimmed) { return .unreadable }
+        return .ok
     }
 
     /// Pull the current frame's CGImage out of `frameSource` and refresh

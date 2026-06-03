@@ -221,65 +221,10 @@ struct DirectoryFilenamePanel: View {
     }
 
     private var walkerTreeView: some View {
-<<<<<<< HEAD
         // docs/list_of_files.mdx §3D.5 — the renderer is selected at
         // runtime from the View ▸ Tree View submenu. The walker / data
         // layer is untouched on a swap.
         SelectableTreeRenderer(state: state, useYellowBackground: false)
-=======
-        List(selection: $state.selectedFile) {
-            ForEach(state.walkerRoots, id: \.path) { root in
-                Section(header: rootHeader(root)) {
-                    walkerRootContent(root)
-                }
-            }
-        }
-        .listStyle(.sidebar)
-        .scrollContentBackground(.hidden)
-        .background(Color.yellow)
-        .border(Color.red, width: 8)
-    }
-
-    /// Content rows for one walker root inside its Section. Extracted
-    /// so the `let views` binding is legal inside a @ViewBuilder context.
-    @ViewBuilder
-    private func walkerRootContent(_ root: RootDirectory) -> some View {
-        let views = Self.rootChildViews(for: root)
-        if views.isEmpty {
-            // `tree == nil` means the path did not exist on disk when the
-            // walk ran. Otherwise the root exists but is completely empty
-            // (no subdirectories, no supported image/video/SVG files).
-            Text(root.tree == nil ? "Directory not found — check log.log" : "Empty directory")
-                .foregroundStyle(.secondary)
-                .font(.caption)
-                .padding(.leading, 8)
-        } else {
-            OutlineGroup(views, children: \.children) { node in
-                row(for: node)
-                    .tag(node.fullPath as String?)
-            }
-        }
-    }
-
-    /// Project the direct children of `root.tree` into `NodeView` values
-    /// for the tree. Each child is projected relative to `root.path` so
-    /// the IDs and fullPaths are correct absolute URLs. The root directory
-    /// itself is shown in the Section header, so only its children are
-    /// passed to OutlineGroup.
-    ///
-    /// Directory children are always included (even if they contain no
-    /// matching files) so the full hierarchy is visible. File children are
-    /// included only when `passesFilter == true`.
-    static func rootChildViews(for root: RootDirectory) -> [NodeView] {
-        guard let tree = root.tree,
-              case .directory(_, let children) = tree else { return [] }
-        return children.compactMap { child in
-            buildView(
-                node: child,
-                parentPath: root.path.appendingPathComponent(child.name)
-            )
-        }
->>>>>>> refs/remotes/origin/main
     }
 
     /// Legacy code path: when `directories.yaml` is empty but the

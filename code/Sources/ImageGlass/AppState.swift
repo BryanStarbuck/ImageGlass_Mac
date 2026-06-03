@@ -20,6 +20,23 @@ public final class AppState {
             // `notifications/imageglass/selection_changed` push event
             // so connected MCP clients see the move.
             guard oldValue != selectedFile else { return }
+            // Defensive: any path that lands here must be a full
+            // absolute path (or `~/` prefixed — we expand at the
+            // canvas). A bare filename like "img_6.gif" cannot resolve
+            // to a real file unless the process cwd happens to be its
+            // parent. We log but do NOT roll back: the canvas runs the
+            // same validation and refuses to load, and a downstream
+            // consumer correcting the path is preferable to a silent
+            // hop back to oldValue that would mask the source of the
+            // bad selection. This is the "cyan-but-no-image"
+            // diagnostic the user asked for.
+            if let path = selectedFile {
+                let result = ImageCanvasView.validate(path: AppPaths.expandTilde(path))
+                if result != .ok {
+                    ErrorLog.log("AppState.selectedFile invalid path (\(result)) — canvas will refuse to load: '\(path)'",
+                                 class: String(describing: Self.self))
+                }
+            }
             // mcp_file.mdx §10.1 trigger condition #1 / §10.7 negative
             // case: the walker only auto-selects when the viewer is
             // empty. Mirror selectedFile into the walker so a manual

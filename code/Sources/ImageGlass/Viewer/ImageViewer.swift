@@ -209,10 +209,39 @@ private struct CanvasHost: NSViewRepresentable {
         // canvas would refuse to load even though a fresh file was
         // selected in the file tree. Tracking `loadedPath` on the
         // view itself removes the side-channel.
+        //
+        // The expanded path is also re-validated against the filesystem
+        // here (in addition to inside setImage). A `state.selectedFile`
+        // that is a bare filename or a stale path produces a single
+        // log line and the canvas falls back to "no image" rather than
+        // silently presenting an empty cyan window.
         let resolvedPath = state.selectedFile.map { AppPaths.expandTilde($0) }
         if v.loadedPath != resolvedPath {
+            if let raw = state.selectedFile, let expanded = resolvedPath {
+                let result = ImageCanvasView.validate(path: expanded)
+                if result != .ok {
+                    ErrorLog.log("CanvasHost.updateNSView: invalid selectedFile (\(result)) raw='\(raw)' expanded='\(expanded)'",
+                                 class: "CanvasHost")
+                }
+            }
             v.setImage(path: resolvedPath)
             v.toolTip = resolvedPath
+            // ViewerState carries the user's current zoom/pan across
+            // image changes via SwiftUI. That breaks the "every new
+            // image opens fit-to-window, centered" contract — a previous
+            // pan-and-zoom from the last image survives into the next
+            // one and the new image lands off-screen. Resetting here
+            // (in the host, on the SwiftUI side) is the only place that
+            // sticks, because `updateNSView` runs again right after and
+            // would otherwise stamp the old values back onto the view.
+            Task { @MainActor in
+                viewer.zoomMode = .fit
+                viewer.lockedZoom = 1.0
+                viewer.panOffset = .zero
+                viewer.rotationQuarterTurns = 0
+                viewer.flipHorizontal = false
+                viewer.flipVertical = false
+            }
         }
         v.zoomMode = viewer.zoomMode
         v.lockedZoom = viewer.lockedZoom
