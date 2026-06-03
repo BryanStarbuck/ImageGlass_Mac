@@ -291,9 +291,15 @@ public struct DirectoriesMCPTools: Sendable {
         } catch let e as DirectoriesStoreError {
             logger.logDirectoryToolCall(
                 toolName: "add_directory", path: raw, client: client,
-                corr: corr, ok: false, err: "path_not_found"
+                corr: corr, ok: false, err: e.auditCode
             )
             return .text(e.description, isError: true)
+        } catch {
+            logger.logDirectoryToolCall(
+                toolName: "add_directory", path: raw, client: client,
+                corr: corr, ok: false, err: "io"
+            )
+            return .text("Failed to save directory: \(error.localizedDescription)", isError: true)
         }
 
         if already {

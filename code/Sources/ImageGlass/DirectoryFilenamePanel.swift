@@ -238,7 +238,10 @@ struct DirectoryFilenamePanel: View {
     private func walkerRootContent(_ root: RootDirectory) -> some View {
         let views = Self.rootChildViews(for: root)
         if views.isEmpty {
-            Text(root.tree == nil ? "Directory not found" : "No matching files")
+            // `tree == nil` means the path did not exist on disk when the
+            // walk ran. Otherwise the root exists but is completely empty
+            // (no subdirectories, no supported image/video/SVG files).
+            Text(root.tree == nil ? "Directory not found — check log.log" : "Empty directory")
                 .foregroundStyle(.secondary)
                 .font(.caption)
                 .padding(.leading, 8)
@@ -255,6 +258,10 @@ struct DirectoryFilenamePanel: View {
     /// the IDs and fullPaths are correct absolute URLs. The root directory
     /// itself is shown in the Section header, so only its children are
     /// passed to OutlineGroup.
+    ///
+    /// Directory children are always included (even if they contain no
+    /// matching files) so the full hierarchy is visible. File children are
+    /// included only when `passesFilter == true`.
     static func rootChildViews(for root: RootDirectory) -> [NodeView] {
         guard let tree = root.tree,
               case .directory(_, let children) = tree else { return [] }
@@ -454,10 +461,12 @@ struct DirectoryFilenamePanel: View {
         let children: [NodeView]?
     }
 
-    /// Recursive projection. Drops `.file` nodes whose
-    /// `passesFilter == false`; preserves the directory skeleton even
-    /// when every descendant is filtered out (so the user can still
-    /// see *where* the carved-out files live).
+    /// Recursive projection. Drops `.file` nodes whose `passesFilter == false`
+    /// so the tree only shows files the active filter allows. Directories are
+    /// always preserved in full — `children` is never `nil` for a directory
+    /// node, even when every descendant file is filtered out. This keeps the
+    /// full directory skeleton visible so the user can navigate the hierarchy
+    /// regardless of which file types the filter currently admits.
     static func buildView(node: DirectoryNode, parentPath: URL) -> NodeView? {
         switch node {
         case .file(let name, let kind, let passes):
@@ -478,11 +487,16 @@ struct DirectoryFilenamePanel: View {
                     parentPath: parentPath.appendingPathComponent($0.name)
                 )
             }
+            // Always return a non-nil children array for directories so the
+            // full hierarchy is visible even when no descendant files pass
+            // the current filter. OutlineGroup treats [] as a leaf (no
+            // disclosure triangle) on macOS, which is correct for a truly
+            // empty directory; the user still sees the directory row.
             return NodeView(
                 id: parentPath.path, name: name,
                 fullPath: nil, kind: nil,
                 isDirectory: true,
-                children: projected.isEmpty ? nil : projected
+                children: projected
             )
         }
     }

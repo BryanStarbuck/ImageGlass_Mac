@@ -748,6 +748,42 @@ The MCP write tools accept the same `filter` shape as
 `directories.yaml` (§3A.2). The server canonicalizes the path and
 validates the filter before writing.
 
+### 3A.10.1 Per-node log events
+
+Every background walk emits structured lines to `log.log` for each
+node it discovers, making it possible to trace exactly what the walker
+found without running a debugger. The three new `app=tree.*` events
+appear in timestamp order for each walk:
+
+| `app=` value | When emitted | Key fields |
+| --- | --- | --- |
+| `tree.walk_start` | Immediately before the filesystem walk begins | `path` = root dir, `corr` |
+| `tree.node` | Once per node after the walk commits | `type` = `directory` / `image` / `svg` / `video`, `path` = full absolute path, `corr` |
+| `tree.walk_failed` | When `walkSync` returns `nil` (path doesn't exist or isn't a directory) | `path` = root dir, `corr` |
+| `directory.walk` | When the walk completes (existing event) | `path`, `count` = visible file count, `elapsed_ms`, `corr` |
+
+A `tree.node type=directory` line appears for the root itself and for
+every subdirectory discovered recursively. `tree.node type=image` (or
+`svg` / `video`) lines appear for every file that passed the
+`FileKind.classify` gate — both files that pass the current
+`RootFilter` and files that do not (the `type=` field distinguishes
+them; `passesFilter` is not recorded in this event).
+
+Example walk sequence for root `/Users/bryan/Photos`:
+
+```
+ts=2026-06-02T10:30:01.123Z app=tree.walk_start path=/Users/bryan/Photos corr=a1b2c3d4
+ts=2026-06-02T10:30:01.240Z app=tree.node type=directory path=/Users/bryan/Photos corr=a1b2c3d4
+ts=2026-06-02T10:30:01.241Z app=tree.node type=directory path=/Users/bryan/Photos/2026 corr=a1b2c3d4
+ts=2026-06-02T10:30:01.242Z app=tree.node type=image path=/Users/bryan/Photos/2026/img_01.jpg corr=a1b2c3d4
+ts=2026-06-02T10:30:01.243Z app=tree.node type=video path=/Users/bryan/Photos/2026/clip.mp4 corr=a1b2c3d4
+ts=2026-06-02T10:30:01.244Z app=directory.walk path=/Users/bryan/Photos count=2 elapsed_ms=121 corr=a1b2c3d4
+```
+
+If `tree.walk_start` appears in the log but neither `tree.node` nor
+`tree.walk_failed` follows, the walk process crashed or deadlocked
+between the filesystem scan and the commit step.
+
 ### 3A.11 Cross-references
 
 * [use_cases/mcp_file.mdx](./use_cases/mcp_file.mdx) — the

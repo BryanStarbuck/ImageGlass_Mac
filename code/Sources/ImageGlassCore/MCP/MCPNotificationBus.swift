@@ -19,8 +19,8 @@ public final class MCPNotificationBus: @unchecked Sendable {
     /// output channel.
     public struct Notification: Sendable {
         public let method: String
-        public let params: [String: Any]
-        public init(method: String, params: [String: Any]) {
+        public let params: [String: any Sendable]
+        public init(method: String, params: [String: any Sendable]) {
             self.method = method
             self.params = params
         }

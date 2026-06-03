@@ -9,6 +9,8 @@ import ImageGlassCore
 
 do {
     try AppPaths.ensureDirectories()
+    try AppPaths.ensureMacDirectories()
+    _ = try DirectoriesStore.shared.ensureExists()
     _ = try LocalStorage.shared.bootstrapIfNeeded()
 } catch {
     ErrorLog.log("imageglass-mcp bootstrap failed",
