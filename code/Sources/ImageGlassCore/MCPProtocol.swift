@@ -112,12 +112,22 @@ public struct AnyCodable: Codable, @unchecked Sendable {
         var c = encoder.singleValueContainer()
         guard let v = value else { try c.encodeNil(); return }
         switch v {
-        case let b as Bool: try c.encode(b)
-        case let i as Int: try c.encode(i)
-        case let i as Int64: try c.encode(i)
+        case let b as Bool:   try c.encode(b)
+        case let i as Int:    try c.encode(i)
+        case let i as Int64:  try c.encode(i)
         case let d as Double: try c.encode(d)
         case let s as String: try c.encode(s)
-        case let arr as [Any?]: try c.encode(arr.map { AnyCodable($0) })
+        // Typed arrays — Swift does NOT implicitly bridge [String]/[Int]/[Bool]
+        // to [Any?] at runtime, so they would fall through to `default:
+        // encodeNil()` without these explicit cases. That turns enum/type
+        // arrays in JSON Schema tool descriptors into `null`, producing the
+        // `tools.N.custom.input_schema: JSON schema is invalid` 400 error
+        // from the Anthropic API.
+        case let arr as [String]: try c.encode(arr)
+        case let arr as [Int]:    try c.encode(arr)
+        case let arr as [Double]: try c.encode(arr)
+        case let arr as [Bool]:   try c.encode(arr)
+        case let arr as [Any?]:   try c.encode(arr.map { AnyCodable($0) })
         case let dict as [String: Any?]:
             var out: [String: AnyCodable] = [:]
             for (k, val) in dict { out[k] = AnyCodable(val) }

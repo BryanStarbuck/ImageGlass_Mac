@@ -153,6 +153,14 @@ public final class AppState {
     /// write (temp-file + rename) replaces the inode, which would break a
     /// kqueue watcher on the file's old file descriptor.
     private var directoriesFileWatcher: FileWatcher?
+    /// Token for the `NSDistributedNotificationCenter` subscription that gives
+    /// the MCP server an immediate push channel into this process. Complements
+    /// the kqueue watcher — whichever fires first wins; the other is a no-op
+    /// because `reloadDirectoriesFromDisk()` is idempotent.
+    private var directoriesChangedToken: NSObjectProtocol?
+    /// Repeating timer that refreshes `heartbeat.txt` every 30 s so the MCP
+    /// server can determine whether this process is alive via `kill(pid, 0)`.
+    private var heartbeatTimer: Timer?
     /// Set to `true` while a scope walk is in flight on a background task
     /// (mcp_file.mdx §10.5 — the toolbar's refresh icon spins while this is true).
     public var isWalking: Bool = false
@@ -220,6 +228,8 @@ public final class AppState {
             startViewModeWatcher()
             startDirectoryTreeWalkerObserver()
             startDirectoriesFileWatcher()
+            writeHeartbeat()
+            startHeartbeatTimer()
             // mcp_file.mdx §3A.5: the walker is "running even when the
             // component is turned off" — so every root in
             // directories.yaml is scheduled at boot. A relaunch with
@@ -685,6 +695,11 @@ public final class AppState {
     /// We watch the parent DIRECTORY (not the file itself) because the
     /// atomic write path uses rename, which replaces the inode. A kqueue
     /// watcher on the file's old fd would go silent after the first write.
+    ///
+    /// We also subscribe to a Darwin distributed notification posted by the
+    /// MCP server immediately after each write. Whichever arrives first
+    /// (notification or kqueue event) triggers the reload; the second is a
+    /// no-op because `reloadDirectoriesFromDisk()` is idempotent.
     private func startDirectoriesFileWatcher() {
         directoriesFileWatcher?.cancel()
         let dir = AppPaths.macAppSupportDir
@@ -697,6 +712,35 @@ public final class AppState {
         }
         w.start()
         directoriesFileWatcher = w
+
+        if let t = directoriesChangedToken {
+            DistributedNotificationCenter.default().removeObserver(t)
+        }
+        directoriesChangedToken = DistributedNotificationCenter.default().addObserver(
+            forName: .init(MCPNotificationBus.directoriesChangedNotificationName),
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.reloadDirectoriesFromDisk()
+            }
+        }
+    }
+
+    /// Write this process's PID to `heartbeat.txt`. The MCP server reads
+    /// the PID and probes liveness via `kill(pid, 0)` to populate the
+    /// `app_running` field in write-tool responses.
+    private func writeHeartbeat() {
+        let url = AppPaths.macAppSupportDir.appendingPathComponent("heartbeat.txt")
+        let pid = "\(ProcessInfo.processInfo.processIdentifier)"
+        try? pid.data(using: .utf8)?.write(to: url, options: .atomic)
+    }
+
+    private func startHeartbeatTimer() {
+        heartbeatTimer?.invalidate()
+        heartbeatTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+            self?.writeHeartbeat()
+        }
     }
 
     /// Diff the on-disk `directories.yaml` against the walker's current

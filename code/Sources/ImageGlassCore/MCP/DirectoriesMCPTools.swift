@@ -310,6 +310,7 @@ public struct DirectoriesMCPTools: Sendable {
             return .text(prettyJSON([
                 "path": canonical.path,
                 "already_exists": true,
+                "app_running": appIsRunning(),
                 "corr": corr,
             ] as [String: Any]))
         }
@@ -319,14 +320,19 @@ public struct DirectoriesMCPTools: Sendable {
             corr: corr, ok: true
         )
 
-        // Kick off the walk on a background task. The corr id is forwarded
-        // so the eventual `app=directory.walk` line joins back to the MCP
-        // request (§4.4).
-        walker.scheduleWalk(root: canonical, filter: filter, corr: corr)
+        // Notify the running desktop app immediately via a Darwin distributed
+        // notification. The kqueue FileWatcher in AppState is the fallback;
+        // this is the fast path (no 250 ms debounce). The MCP server's own
+        // walker.scheduleWalk() was removed — that walked in the MCP process's
+        // memory and never reached the desktop app. The desktop app's own
+        // DirectoryTreeWalker picks up the new root from directories.yaml when
+        // it receives this notification (or the kqueue event).
+        postDirectoriesChanged()
 
         return .text(prettyJSON([
             "path": canonical.path,
             "already_exists": false,
+            "app_running": appIsRunning(),
             "corr": corr,
         ] as [String: Any]))
     }
@@ -351,16 +357,16 @@ public struct DirectoriesMCPTools: Sendable {
             )
             return .text("Failed to remove: \(error)", isError: true)
         }
-        // Tear down watcher + drop the in-memory tree even if the path
-        // was already gone — the walker treats this as idempotent.
         walker.removeRoot(path: canonical)
         logger.logDirectoryToolCall(
             toolName: "remove_directory", path: canonical.path, client: client,
             corr: corr, ok: true, extra: [("removed", removed ? "true" : "false")]
         )
+        postDirectoriesChanged()
         return .text(prettyJSON([
             "path": canonical.path,
             "removed": removed,
+            "app_running": appIsRunning(),
             "corr": corr,
         ] as [String: Any]))
     }
@@ -381,8 +387,10 @@ public struct DirectoriesMCPTools: Sendable {
             toolName: "clear_directories", path: nil, client: client,
             corr: corr, ok: true, extra: [("removed", String(before.count))]
         )
+        postDirectoriesChanged()
         return .text(prettyJSON([
             "removed": before.count,
+            "app_running": appIsRunning(),
             "corr": corr,
         ] as [String: Any]))
     }
@@ -543,9 +551,7 @@ public struct DirectoriesMCPTools: Sendable {
         } else {
             targets = file.roots
         }
-        for r in targets {
-            walker.scheduleWalk(root: r.path, filter: r.filter, corr: corr)
-        }
+        postDirectoriesChanged()
         logger.logDirectoryToolCall(
             toolName: "refresh_directory",
             path: targets.count == 1 ? targets.first!.path.path : nil,
@@ -554,6 +560,7 @@ public struct DirectoriesMCPTools: Sendable {
         )
         return .text(prettyJSON([
             "roots": targets.count,
+            "app_running": appIsRunning(),
             "corr": corr,
         ] as [String: Any]))
     }
@@ -718,5 +725,32 @@ public struct DirectoriesMCPTools: Sendable {
             of: #"\{\s*\}"#, with: "{}", options: .regularExpression
         )
         return out
+    }
+
+    // MARK: - App liveness + cross-process push
+
+    /// Post a Darwin distributed notification so the running desktop app is
+    /// woken up immediately instead of waiting for the kqueue 250 ms debounce.
+    /// `deliverImmediately: true` bypasses the run-loop coalescing that would
+    /// otherwise batch rapid-fire writes into a single callback.
+    private func postDirectoriesChanged() {
+        DistributedNotificationCenter.default().postNotificationName(
+            .init(MCPNotificationBus.directoriesChangedNotificationName),
+            object: nil,
+            deliverImmediately: true
+        )
+    }
+
+    /// Return `true` when the desktop app is running. The app writes its PID
+    /// to `heartbeat.txt` at launch and every 30 s; `kill(pid, 0)` probes
+    /// liveness without sending a signal. Returns `false` when the file is
+    /// absent, unparseable, or the PID is no longer alive.
+    private func appIsRunning() -> Bool {
+        let url = AppPaths.macAppSupportDir.appendingPathComponent("heartbeat.txt")
+        guard let data = try? Data(contentsOf: url),
+              let str = String(data: data, encoding: .utf8),
+              let pid = Int32(str.trimmingCharacters(in: .whitespacesAndNewlines)),
+              pid > 0 else { return false }
+        return kill(pid, 0) == 0
     }
 }
