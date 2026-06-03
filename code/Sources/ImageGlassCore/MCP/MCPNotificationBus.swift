@@ -14,13 +14,25 @@ public final class MCPNotificationBus: @unchecked Sendable {
 
     public static let shared = MCPNotificationBus()
 
+    /// Darwin distributed-notification name posted by the MCP server after
+    /// any mutation to `directories.yaml`. The desktop app subscribes in
+    /// `AppState.startDirectoriesFileWatcher()` for an immediate wake-up
+    /// instead of waiting for the kqueue 250 ms debounce.
+    public static let directoriesChangedNotificationName =
+        "com.imageglass.mac.directoriesChanged"
+
     /// One notification record. Encoded as `{"jsonrpc":"2.0","method":…,
     /// "params":…}` and written newline-delimited on the MCP server's
     /// output channel.
     public struct Notification: Sendable {
         public let method: String
+<<<<<<< HEAD
         public let params: [String: String]
         public init(method: String, params: [String: String]) {
+=======
+        public let params: [String: any Sendable]
+        public init(method: String, params: [String: any Sendable]) {
+>>>>>>> refs/remotes/origin/main
             self.method = method
             self.params = params
         }

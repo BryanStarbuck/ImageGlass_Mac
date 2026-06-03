@@ -34,6 +34,20 @@ public final class DirectoriesStore: @unchecked Sendable {
     public func load() throws -> DirectoriesFile {
         lock.lock()
         defer { lock.unlock() }
+        return try loadUnlocked()
+    }
+
+    /// Save the entire `DirectoriesFile` atomically.
+    public func save(_ file: DirectoriesFile) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        try saveUnlocked(file)
+    }
+
+    // MARK: - Private unlocked I/O helpers
+    // Call only while `lock` is held by the caller.
+
+    private func loadUnlocked() throws -> DirectoriesFile {
         let url = fileURL
         if !FileManager.default.fileExists(atPath: url.path) {
             return DirectoriesFile()
@@ -45,10 +59,7 @@ public final class DirectoriesStore: @unchecked Sendable {
         return try DirectoriesYAML.decode(s)
     }
 
-    /// Save the entire `DirectoriesFile` atomically.
-    public func save(_ file: DirectoriesFile) throws {
-        lock.lock()
-        defer { lock.unlock() }
+    private func saveUnlocked(_ file: DirectoriesFile) throws {
         try ensureContainerDir()
         let yaml = DirectoriesYAML.encode(file)
         guard let data = yaml.data(using: .utf8) else {
@@ -74,15 +85,20 @@ public final class DirectoriesStore: @unchecked Sendable {
 
     /// Append a new root. Returns the canonical path it was stored at
     /// and a flag indicating whether the path was already present.
+    /// The entire load → check → append → save sequence is performed
+    /// under a single lock acquisition, preventing duplicate entries
+    /// from concurrent calls (spec §3A.10, idempotency guarantee).
     @discardableResult
     public func addRoot(path: String, filter: RootFilter = .empty) throws -> (URL, alreadyExisted: Bool) {
         let canonical = try Self.canonicalize(path)
-        var file = (try? load()) ?? DirectoriesFile()
-        if let _ = file.roots.firstIndex(where: { $0.path == canonical }) {
+        lock.lock()
+        defer { lock.unlock() }
+        var file = (try? loadUnlocked()) ?? DirectoriesFile()
+        if file.roots.contains(where: { $0.path == canonical }) {
             return (canonical, true)
         }
         file.roots.append(RootDirectory(path: canonical, filter: filter))
-        try save(file)
+        try saveUnlocked(file)
         return (canonical, false)
     }
 
@@ -91,11 +107,13 @@ public final class DirectoriesStore: @unchecked Sendable {
     @discardableResult
     public func removeRoot(path: String) throws -> Bool {
         let canonical = try Self.canonicalize(path, mustExist: false)
-        var file = (try? load()) ?? DirectoriesFile()
+        lock.lock()
+        defer { lock.unlock() }
+        var file = (try? loadUnlocked()) ?? DirectoriesFile()
         let before = file.roots.count
         file.roots.removeAll { $0.path == canonical }
         let removed = file.roots.count != before
-        if removed { try save(file) }
+        if removed { try saveUnlocked(file) }
         return removed
     }
 
@@ -104,12 +122,14 @@ public final class DirectoriesStore: @unchecked Sendable {
     @discardableResult
     public func updateFilter(path: String, filter: RootFilter) throws -> Bool {
         let canonical = try Self.canonicalize(path, mustExist: false)
-        var file = (try? load()) ?? DirectoriesFile()
+        lock.lock()
+        defer { lock.unlock() }
+        var file = (try? loadUnlocked()) ?? DirectoriesFile()
         guard let idx = file.roots.firstIndex(where: { $0.path == canonical }) else {
             return false
         }
         file.roots[idx].filter = filter
-        try save(file)
+        try saveUnlocked(file)
         return true
     }
 
@@ -117,31 +137,37 @@ public final class DirectoriesStore: @unchecked Sendable {
     /// of roots affected.
     @discardableResult
     public func setGlobalFilter(_ filter: RootFilter) throws -> Int {
-        var file = (try? load()) ?? DirectoriesFile()
+        lock.lock()
+        defer { lock.unlock() }
+        var file = (try? loadUnlocked()) ?? DirectoriesFile()
         for i in file.roots.indices {
             file.roots[i].filter = filter
         }
         let n = file.roots.count
-        try save(file)
+        try saveUnlocked(file)
         return n
     }
 
     /// Wipe every root. Used by §9's `clear_directories`.
     public func clearAll() throws {
-        var file = (try? load()) ?? DirectoriesFile()
+        lock.lock()
+        defer { lock.unlock() }
+        var file = (try? loadUnlocked()) ?? DirectoriesFile()
         file.roots = []
-        try save(file)
+        try saveUnlocked(file)
     }
 
     /// Update the cached `last_walked` timestamp for one root after the
     /// walker completes a pass.
     public func setLastWalked(path: URL, at date: Date) throws {
-        var file = (try? load()) ?? DirectoriesFile()
+        lock.lock()
+        defer { lock.unlock() }
+        var file = (try? loadUnlocked()) ?? DirectoriesFile()
         guard let idx = file.roots.firstIndex(where: { $0.path == path }) else {
             return
         }
         file.roots[idx].lastWalked = date
-        try save(file)
+        try saveUnlocked(file)
     }
 
     // MARK: - Helpers

@@ -56,13 +56,12 @@ struct DirectoryFilenamePanel: View {
         .background(Color(NSColor.windowBackgroundColor))
     }
 
-    /// `directories.yaml` root count. Used by the body switch so the
-    /// column renders a tree skeleton between launch and walk-complete
-    /// instead of the §9.2 empty state. Cheap read because
-    /// `DirectoriesStore.shared.load()` is just a small YAML file.
+    /// `directories.yaml` root count. Reads from `state.directoriesRootCount`
+    /// (cached by `AppState.bootstrap` and `reloadDirectoriesFromDisk`) rather
+    /// than hitting disk on every SwiftUI render pass.
     private var storedRootCount: Int {
         if !state.walkerRoots.isEmpty { return state.walkerRoots.count }
-        return (try? DirectoriesStore.shared.load().roots.count) ?? 0
+        return state.directoriesRootCount
     }
 
     // MARK: - Header (toolbar)
@@ -203,18 +202,84 @@ struct DirectoryFilenamePanel: View {
     /// tree from `state.resolvedFiles` when the walker has no roots.
     @ViewBuilder
     private var treeView: some View {
-        if state.walkerRoots.isEmpty {
-            legacyTreeView
-        } else {
+        if !state.walkerRoots.isEmpty {
             walkerTreeView
+        } else if storedRootCount > 0 {
+            // Roots are stored in directories.yaml but the background walk
+            // hasn't completed yet — show a spinner instead of the empty
+            // legacy fallback.
+            VStack(spacing: 12) {
+                ProgressView()
+                Text("Loading directory tree…")
+                    .foregroundStyle(.secondary)
+                    .font(.caption)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            legacyTreeView
         }
     }
 
     private var walkerTreeView: some View {
+<<<<<<< HEAD
         // docs/list_of_files.mdx §3D.5 — the renderer is selected at
         // runtime from the View ▸ Tree View submenu. The walker / data
         // layer is untouched on a swap.
         SelectableTreeRenderer(state: state, useYellowBackground: false)
+=======
+        List(selection: $state.selectedFile) {
+            ForEach(state.walkerRoots, id: \.path) { root in
+                Section(header: rootHeader(root)) {
+                    walkerRootContent(root)
+                }
+            }
+        }
+        .listStyle(.sidebar)
+        .scrollContentBackground(.hidden)
+        .background(Color.yellow)
+        .border(Color.red, width: 8)
+    }
+
+    /// Content rows for one walker root inside its Section. Extracted
+    /// so the `let views` binding is legal inside a @ViewBuilder context.
+    @ViewBuilder
+    private func walkerRootContent(_ root: RootDirectory) -> some View {
+        let views = Self.rootChildViews(for: root)
+        if views.isEmpty {
+            // `tree == nil` means the path did not exist on disk when the
+            // walk ran. Otherwise the root exists but is completely empty
+            // (no subdirectories, no supported image/video/SVG files).
+            Text(root.tree == nil ? "Directory not found — check log.log" : "Empty directory")
+                .foregroundStyle(.secondary)
+                .font(.caption)
+                .padding(.leading, 8)
+        } else {
+            OutlineGroup(views, children: \.children) { node in
+                row(for: node)
+                    .tag(node.fullPath as String?)
+            }
+        }
+    }
+
+    /// Project the direct children of `root.tree` into `NodeView` values
+    /// for the tree. Each child is projected relative to `root.path` so
+    /// the IDs and fullPaths are correct absolute URLs. The root directory
+    /// itself is shown in the Section header, so only its children are
+    /// passed to OutlineGroup.
+    ///
+    /// Directory children are always included (even if they contain no
+    /// matching files) so the full hierarchy is visible. File children are
+    /// included only when `passesFilter == true`.
+    static func rootChildViews(for root: RootDirectory) -> [NodeView] {
+        guard let tree = root.tree,
+              case .directory(_, let children) = tree else { return [] }
+        return children.compactMap { child in
+            buildView(
+                node: child,
+                parentPath: root.path.appendingPathComponent(child.name)
+            )
+        }
+>>>>>>> refs/remotes/origin/main
     }
 
     /// Legacy code path: when `directories.yaml` is empty but the
@@ -223,20 +288,21 @@ struct DirectoryFilenamePanel: View {
     /// Stage E still work.
     private var legacyTreeView: some View {
         let roots = FileTreeNode.build(from: state.resolvedFiles)
+        // Skip the synthetic "/" / "~" wrapper level so the first real
+        // path component (e.g. "Users", "home") is the top-level row.
+        let topNodes: [FileTreeNode] = roots.flatMap { $0.children ?? [] }
         return List(selection: $state.selectedFile) {
-            ForEach(roots) { root in
-                OutlineGroup(root, children: \.children) { node in
-                    HStack(spacing: 6) {
-                        Image(systemName: node.isDirectory
-                              ? "folder"
-                              : iconForPath(node.fullPath ?? node.name))
-                            .foregroundStyle(node.isDirectory ? .blue : .secondary)
-                        Text(node.name)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                    }
-                    .tag(node.fullPath ?? "" as String?)
+            OutlineGroup(topNodes, children: \.children) { node in
+                HStack(spacing: 6) {
+                    Image(systemName: node.isDirectory
+                          ? "folder"
+                          : iconForPath(node.fullPath ?? node.name))
+                        .foregroundStyle(node.isDirectory ? .blue : .secondary)
+                    Text(node.name)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
                 }
+                .tag(node.fullPath as String?)
             }
         }
         .listStyle(.sidebar)
@@ -404,15 +470,20 @@ struct DirectoryFilenamePanel: View {
         let children: [NodeView]?
     }
 
-    /// Recursive projection. Drops `.file` nodes whose
-    /// `passesFilter == false`; preserves the directory skeleton even
-    /// when every descendant is filtered out (so the user can still
-    /// see *where* the carved-out files live).
+    /// Recursive projection. Drops `.file` nodes whose `passesFilter == false`
+    /// so the tree only shows files the active filter allows. Directories are
+    /// always preserved in full — `children` is never `nil` for a directory
+    /// node, even when every descendant file is filtered out. This keeps the
+    /// full directory skeleton visible so the user can navigate the hierarchy
+    /// regardless of which file types the filter currently admits.
     static func buildView(node: DirectoryNode, parentPath: URL) -> NodeView? {
         switch node {
         case .file(let name, let kind, let passes):
             guard passes else { return nil }
-            let path = parentPath.appendingPathComponent(name).path
+            // parentPath is already the file's own URL (the caller appended
+            // the child name before passing), so use it directly. Appending
+            // `name` again would double the filename in the path.
+            let path = parentPath.path
             return NodeView(
                 id: path, name: name,
                 fullPath: path, kind: kind,
@@ -425,11 +496,16 @@ struct DirectoryFilenamePanel: View {
                     parentPath: parentPath.appendingPathComponent($0.name)
                 )
             }
+            // Always return a non-nil children array for directories so the
+            // full hierarchy is visible even when no descendant files pass
+            // the current filter. OutlineGroup treats [] as a leaf (no
+            // disclosure triangle) on macOS, which is correct for a truly
+            // empty directory; the user still sees the directory row.
             return NodeView(
                 id: parentPath.path, name: name,
                 fullPath: nil, kind: nil,
                 isDirectory: true,
-                children: projected.isEmpty ? nil : projected
+                children: projected
             )
         }
     }

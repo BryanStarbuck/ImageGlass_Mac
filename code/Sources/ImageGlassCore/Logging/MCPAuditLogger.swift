@@ -197,6 +197,42 @@ public final class MCPAuditLogger: @unchecked Sendable {
         ])
     }
 
+    /// `app=tree.walk_start path=<path> corr=<corr>` — emitted immediately
+    /// before each background walk begins. Paired with `app=directory.walk`
+    /// on completion so walk duration and any gap between start and the
+    /// notification post are visible in the log.
+    public func logTreeWalkStart(path: String, corr: String) {
+        log([
+            ("app", "tree.walk_start"),
+            ("path", path),
+            ("corr", corr),
+        ])
+    }
+
+    /// `app=tree.node type=<type> path=<full_path> corr=<corr>` — one line
+    /// per node added to the in-memory tree during a walk. `type` is
+    /// `directory`, `image`, `svg`, or `video`. Written after the walk
+    /// completes so concurrent root walks don't interleave their node lines.
+    public func logTreeNode(type: String, path: String, corr: String) {
+        log([
+            ("app", "tree.node"),
+            ("type", type),
+            ("path", path),
+            ("corr", corr),
+        ])
+    }
+
+    /// `app=tree.walk_failed path=<path> corr=<corr>` — emitted when
+    /// `walkSync` returns a nil tree, meaning the root path did not exist
+    /// or was not a directory at walk time.
+    public func logTreeWalkFailed(path: String, corr: String) {
+        log([
+            ("app", "tree.walk_failed"),
+            ("path", path),
+            ("corr", corr),
+        ])
+    }
+
     // MARK: - File I/O
 
     private func appendData(_ data: Data) {

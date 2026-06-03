@@ -146,6 +146,10 @@ public final class DirectoryTreeWalker: @unchecked Sendable {
     // MARK: - Walk
 
     private func runWalk(root: URL, filter: RootFilter, corr: String) async {
+        // Log walk start immediately so a hung walk is diagnosable even
+        // if the completion line never appears.
+        logger.logTreeWalkStart(path: root.path, corr: corr)
+
         // Wallclock for the audit line. The walk itself runs off the
         // queue so multiple roots walk in parallel.
         let walkStart = Date()
@@ -163,6 +167,14 @@ public final class DirectoryTreeWalker: @unchecked Sendable {
             self.inflight[root] = nil
         }
         try? store.setLastWalked(path: root, at: Date())
+
+        // Per-node log: one line per directory and file added to the tree.
+        // Written after the walk so concurrent root walks don't interleave.
+        if let tree = result.tree {
+            traverseAndLog(tree, at: root, corr: corr)
+        } else {
+            logger.logTreeWalkFailed(path: root.path, corr: corr)
+        }
 
         logger.logDirectoryWalk(
             path: root.path,
@@ -187,6 +199,23 @@ public final class DirectoryTreeWalker: @unchecked Sendable {
                 object: first,
                 userInfo: ["corr": corr]
             )
+        }
+    }
+
+    /// Depth-first traversal of the built tree, emitting one `tree.node`
+    /// log line per node. `url` is the full absolute path of `node`.
+    /// All file nodes are logged (both visible and filter-hidden) so the
+    /// log reflects what the walker found on disk, not just what the
+    /// current filter exposes.
+    private func traverseAndLog(_ node: DirectoryNode, at url: URL, corr: String) {
+        switch node {
+        case .directory(_, let children):
+            logger.logTreeNode(type: "directory", path: url.path, corr: corr)
+            for child in children {
+                traverseAndLog(child, at: url.appendingPathComponent(child.name), corr: corr)
+            }
+        case .file(_, let kind, _):
+            logger.logTreeNode(type: kind.rawValue, path: url.path, corr: corr)
         }
     }
 
