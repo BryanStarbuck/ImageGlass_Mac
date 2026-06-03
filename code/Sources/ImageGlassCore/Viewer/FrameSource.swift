@@ -42,6 +42,11 @@ public final class FrameSource: @unchecked Sendable {
     /// Load a FrameSource from disk. Returns nil for empty/unreadable files
     /// and a single-frame FrameSource for ordinary stills.
     public static func load(url: URL) -> FrameSource? {
+        if isGitLFSPointer(at: url) {
+            ErrorLog.log("Git LFS pointer file (not real image bytes); run 'git lfs pull' to materialize: \(url.path)",
+                         class: "FrameSource")
+            return nil
+        }
         let opts: [CFString: Any] = [kCGImageSourceShouldCache: false]
         guard let src = CGImageSourceCreateWithURL(url as CFURL, opts as CFDictionary) else {
             ErrorLog.log("CGImageSourceCreateWithURL returned nil for \(url.path)",
@@ -49,6 +54,20 @@ public final class FrameSource: @unchecked Sendable {
             return nil
         }
         return decode(source: src, contextLabel: url.lastPathComponent)
+    }
+
+    /// True when `url` points at a Git LFS pointer file rather than a real
+    /// image: a tiny text file whose first line is exactly
+    /// `version https://git-lfs.github.com/spec/v1`. We peek at the first
+    /// few bytes because the alternative — letting ImageIO fail and logging
+    /// `CGImageSourceGetCount returned 0` — gives the user no actionable
+    /// signal about why the image can't load.
+    private static func isGitLFSPointer(at url: URL) -> Bool {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
+        defer { try? handle.close() }
+        let prefix = (try? handle.read(upToCount: 64)) ?? Data()
+        guard let head = String(data: prefix, encoding: .utf8) else { return false }
+        return head.hasPrefix("version https://git-lfs.github.com/spec/")
     }
 
     public static func load(data: Data) -> FrameSource? {

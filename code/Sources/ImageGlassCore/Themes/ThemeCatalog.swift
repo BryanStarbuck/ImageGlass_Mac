@@ -65,9 +65,13 @@ public struct ThemeCatalog {
                 let theme = try loadTheme(fromFolder: entry)
                 out.append(theme)
             } catch {
-                ErrorLog.log("loadTheme failed for \(entry.lastPathComponent)",
-                             error: error,
-                             class: "ThemeCatalog")
+                // By design (see ThemeTests.testCatalogSkipsInvalidManifests):
+                // invalid manifests are silently skipped. Use NSLog so the
+                // skip is still visible to developers but does not pollute
+                // the user-facing error stream on every launch.
+                NSLog("ThemeCatalog: skipping invalid theme '%@': %@",
+                      entry.lastPathComponent,
+                      String(describing: error))
             }
         }
         return out

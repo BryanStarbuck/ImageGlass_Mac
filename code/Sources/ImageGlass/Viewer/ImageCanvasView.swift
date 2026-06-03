@@ -163,14 +163,14 @@ final class ImageCanvasView: NSView {
         let url = URL(fileURLWithPath: path)
         let fs = FrameSource.load(url: url)
         frameSource = fs
-        if fs == nil || (fs?.frames.isEmpty ?? true) {
-            ErrorLog.log("FrameSource.load returned no frames for \(url.path)",
-                         class: String(describing: Self.self))
-        }
         // Fallback: still render with NSImage for tooltip/sourceImage parity.
+        // When fs is nil, FrameSource has already logged the specific cause
+        // (Git LFS pointer, ImageIO refusal, zero frames, ...). NSImage uses
+        // the same decoders so re-logging its failure here would duplicate
+        // that line without adding new information.
         sourceImage = NSImage(contentsOfFile: path)
-        if sourceImage == nil {
-            ErrorLog.log("NSImage(contentsOfFile:) failed for \(path)",
+        if fs != nil && sourceImage == nil {
+            ErrorLog.log("FrameSource decoded \(url.lastPathComponent) but NSImage(contentsOfFile:) did not — possible decoder divergence",
                          class: String(describing: Self.self))
         }
         currentFrameIndex = 0
