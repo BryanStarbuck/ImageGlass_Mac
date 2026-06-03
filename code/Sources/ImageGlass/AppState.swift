@@ -61,6 +61,12 @@ public final class AppState {
     /// emitting; populated for every root in `directories.yaml`.
     public var walkerRoots: [RootDirectory] = []
 
+    /// Cached count of root entries in `directories.yaml`. Set by bootstrap
+    /// and updated by `reloadDirectoriesFromDisk` so the panel's spinner
+    /// gate (`walkerRoots.isEmpty && directoriesRootCount > 0`) never reads
+    /// the YAML file on the SwiftUI render hot-path.
+    public var directoriesRootCount: Int = 0
+
     /// Layout of all modular panels (toolbar, file panel, status bar, ...).
     /// Loaded from `layout.json` at bootstrap, persisted on every mutation.
     /// See docs/panels.mdx.
@@ -140,6 +146,13 @@ public final class AppState {
     /// so MCP `panel.set_view_mode` switches the file panel between list
     /// and tree views without a wire-level push (mcp_file.mdx §3).
     private var viewModeWatcher: FileWatcher?
+    /// Watches `~/Library/Application Support/ImageGlass_Mac/` (the parent
+    /// directory) so that when the MCP server process writes `directories.yaml`
+    /// the GUI app notices and schedules walks for any newly-added roots.
+    /// We watch the directory rather than the file itself because the atomic
+    /// write (temp-file + rename) replaces the inode, which would break a
+    /// kqueue watcher on the file's old file descriptor.
+    private var directoriesFileWatcher: FileWatcher?
     /// Set to `true` while a scope walk is in flight on a background task
     /// (mcp_file.mdx §10.5 — the toolbar's refresh icon spins while this is true).
     public var isWalking: Bool = false
@@ -194,6 +207,7 @@ public final class AppState {
                 let file = try DirectoriesStore.shared.ensureExists()
                 directoryCount = file.roots.count
                 storedRoots = file.roots
+                self.directoriesRootCount = directoryCount
             } catch {
                 ErrorLog.log("DirectoriesStore.ensureExists failed",
                              error: error, class: String(describing: Self.self))
@@ -205,6 +219,7 @@ public final class AppState {
             startSelectionWatcher()
             startViewModeWatcher()
             startDirectoryTreeWalkerObserver()
+            startDirectoriesFileWatcher()
             // mcp_file.mdx §3A.5: the walker is "running even when the
             // component is turned off" — so every root in
             // directories.yaml is scheduled at boot. A relaunch with
@@ -659,6 +674,60 @@ public final class AppState {
                     )
                 }
             }
+        }
+    }
+
+    /// Watch the `ImageGlass_Mac/` support directory for changes to
+    /// `directories.yaml`. When the MCP server (a separate process) writes
+    /// new roots, this fires and schedules walks on the GUI's own
+    /// `DirectoryTreeWalker` so the file tree panel updates live.
+    ///
+    /// We watch the parent DIRECTORY (not the file itself) because the
+    /// atomic write path uses rename, which replaces the inode. A kqueue
+    /// watcher on the file's old fd would go silent after the first write.
+    private func startDirectoriesFileWatcher() {
+        directoriesFileWatcher?.cancel()
+        let dir = AppPaths.macAppSupportDir
+        guard FileManager.default.fileExists(atPath: dir.path) else { return }
+        let w = FileWatcher(url: dir) { [weak self] in
+            Task { @MainActor in
+                guard let self else { return }
+                self.reloadDirectoriesFromDisk()
+            }
+        }
+        w.start()
+        directoriesFileWatcher = w
+    }
+
+    /// Diff the on-disk `directories.yaml` against the walker's current
+    /// in-memory snapshot and reconcile all three change types
+    /// (list_of_files.mdx §3A.1 cross-process update guarantee):
+    ///
+    /// * New root → `scheduleWalk` (background walk + FS watch)
+    /// * Removed root → `removeRoot` (watcher torn down, tree dropped)
+    /// * Filter changed → `refilter` (in-memory recompute, no re-walk)
+    private func reloadDirectoriesFromDisk() {
+        let file = (try? DirectoriesStore.shared.load()) ?? DirectoriesFile()
+        directoriesRootCount = file.roots.count
+        let current = DirectoryTreeWalker.shared.snapshot()
+        var currentByPath: [URL: RootDirectory] = [:]
+        for r in current { currentByPath[r.path] = r }
+        var filePaths: Set<URL> = []
+        for root in file.roots {
+            filePaths.insert(root.path)
+            if let existing = currentByPath[root.path] {
+                if existing.filter != root.filter {
+                    DirectoryTreeWalker.shared.refilter(root: root.path, filter: root.filter)
+                }
+            } else {
+                DirectoryTreeWalker.shared.scheduleWalk(
+                    root: root.path, filter: root.filter,
+                    corr: MCPAuditLogger.newCorrelationId()
+                )
+            }
+        }
+        for path in currentByPath.keys where !filePaths.contains(path) {
+            DirectoryTreeWalker.shared.removeRoot(path: path)
         }
     }
 

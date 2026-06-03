@@ -396,8 +396,27 @@ per-root filter.
 
 The file is the source of truth for the panel. There is **no**
 hidden binary state — the GUI and the MCP server read and write the
-same file. Writes are atomic (temp file + rename); the panel reloads
-via `FSEventStream` on the file itself.
+same file. Writes are atomic (temp file + rename).
+
+**Cross-process update guarantee.** The `imageglass-mcp` sidecar and
+the main app are separate OS processes. The sidecar's in-process
+`DirectoryTreeWalker.didChangeNotification` never reaches the main
+app's GUI. The main app bridges this gap by watching the containing
+`macAppSupportDir` with `FileWatcher` (kqueue, 250 ms debounce —
+same mechanism as `selection.txt` and `panel_view_mode.txt`). On
+every change to the directory the app reads `directories.yaml` and
+reconciles against the current `DirectoryTreeWalker` snapshot:
+
+| Diff result | Action |
+| --- | --- |
+| Root in YAML, not in walker | `scheduleWalk` — background walk + FSEventStream watch (§3A.5.1) |
+| Root in walker, not in YAML | `removeRoot` — watcher torn down, in-memory tree dropped |
+| Root in both, filter changed | `refilter` — in-memory recompute, no filesystem walk (§3A.7) |
+| Root in both, filter unchanged | No-op |
+
+The reconcile fires within the 250 ms debounce window so the panel
+updates in the same animation frame the sidecar returns the MCP
+response — the user never waits for an app restart.
 
 Relationship to §3's `scopes/<name>.json`:
 
@@ -736,11 +755,11 @@ the verify shape used in [mcp_file.mdx](./use_cases/mcp_file.mdx) §8.
 | --- | --- |
 | `list_directories()` | Return the `root_directories[]` array with path + filter + last_walked. |
 | `get_directory(path)` | Return a single root directory entry. |
-| `add_directory(path, filter?)` | Append a new root with an optional filter. Triggers a walk + FS watch (§3A.5.1). Idempotent: if the path is already a root, returns `already_exists`. |
-| `remove_directory(path)` | Drop a root directory entry; tear down its watcher; remove its in-memory tree. |
-| `update_directory_filter(path, filter)` | Replace the filter for one root. Triggers in-memory re-evaluation (§3A.7), not a re-walk. |
-| `set_global_filter(filter)` | Apply the same filter to every existing root. Triggers in-memory re-evaluation on each. |
-| `clear_directories()` | Remove every root directory. Used by the negative path of [mcp_file.mdx](./use_cases/mcp_file.mdx) §9. |
+| `add_directory(path, filter?)` | Append a new root with an optional filter. Idempotent: if the path is already a root, returns `already_exists`. Writes `directories.yaml`; the main app's §3A.1 watcher detects the change within 250 ms and calls `scheduleWalk` (§3A.5.1). |
+| `remove_directory(path)` | Drop a root entry. Writes `directories.yaml`; the main app's §3A.1 watcher calls `removeRoot` within 250 ms — tearing down the FS watcher and discarding the in-memory tree. |
+| `update_directory_filter(path, filter)` | Replace the filter for one root. Writes `directories.yaml`; the main app's §3A.1 watcher calls `refilter` within 250 ms — in-memory recompute only (§3A.7), no filesystem walk. |
+| `set_global_filter(filter)` | Apply the same filter to every existing root. Writes `directories.yaml`; the main app's §3A.1 watcher calls `refilter` on each root within 250 ms. |
+| `clear_directories()` | Remove every root. Writes `directories.yaml` to `root_directories: []`; the main app's §3A.1 watcher calls `removeRoot` on every root within 250 ms. |
 | `reveal_directory(path)` | Equivalent to the Directories menu's "Reveal in Finder" item. |
 | `refresh_directory(path?)` | Force a re-walk of one root, or all roots if `path` is omitted. |
 

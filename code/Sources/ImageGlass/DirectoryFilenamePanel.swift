@@ -56,13 +56,12 @@ struct DirectoryFilenamePanel: View {
         .background(Color(NSColor.windowBackgroundColor))
     }
 
-    /// `directories.yaml` root count. Used by the body switch so the
-    /// column renders a tree skeleton between launch and walk-complete
-    /// instead of the §9.2 empty state. Cheap read because
-    /// `DirectoriesStore.shared.load()` is just a small YAML file.
+    /// `directories.yaml` root count. Reads from `state.directoriesRootCount`
+    /// (cached by `AppState.bootstrap` and `reloadDirectoriesFromDisk`) rather
+    /// than hitting disk on every SwiftUI render pass.
     private var storedRootCount: Int {
         if !state.walkerRoots.isEmpty { return state.walkerRoots.count }
-        return (try? DirectoriesStore.shared.load().roots.count) ?? 0
+        return state.directoriesRootCount
     }
 
     // MARK: - Header (toolbar)
