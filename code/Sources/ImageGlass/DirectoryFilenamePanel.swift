@@ -415,6 +415,29 @@ struct DirectoryFilenamePanel: View {
         let children: [NodeView]?
     }
 
+    /// NSViewRepresentable debug border. Rendered as a real NSView subview
+    /// so it is z-ordered above the AppKit NSScrollView that backs List —
+    /// pure SwiftUI overlays (.border, .overlay with Shape) live in the CA
+    /// layer tree and are occluded by List's NSScrollView on macOS.
+    private struct DebugBorderOverlay: NSViewRepresentable {
+        let color: NSColor
+        let lineWidth: CGFloat
+
+        func makeNSView(context: Context) -> NSView {
+            let v = NSView()
+            v.wantsLayer = true
+            v.layer?.borderColor = color.cgColor
+            v.layer?.borderWidth = lineWidth
+            v.layer?.backgroundColor = NSColor.clear.cgColor
+            return v
+        }
+
+        func updateNSView(_ nsView: NSView, context: Context) {
+            nsView.layer?.borderColor = color.cgColor
+            nsView.layer?.borderWidth = lineWidth
+        }
+    }
+
     /// Recursive projection. Drops `.file` nodes whose `passesFilter == false`
     /// so the tree only shows files the active filter allows. Directories are
     /// always preserved in full — `children` is never `nil` for a directory
