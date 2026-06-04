@@ -23,6 +23,11 @@ struct ImageGlassApp: App {
             print(CLIArguments.helpText())
             exit(0)
         }
+        // First-launch seed: drop settings.yaml / panels.yaml into
+        // ~/Library/Application Support/ImageGlass_Mac/ before AppState
+        // wakes up, so a fresh machine has a complete starting state on
+        // disk instead of relying on in-memory defaults.
+        InitialConfigSeeder.seedIfMissing()
         let s = AppState()
         let parsed = ImageGlassLaunchArguments.parse(CommandLine.arguments)
         s.applyLaunchArguments(parsed)
