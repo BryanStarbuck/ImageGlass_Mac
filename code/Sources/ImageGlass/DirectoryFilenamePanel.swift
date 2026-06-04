@@ -231,7 +231,11 @@ struct DirectoryFilenamePanel: View {
         .listStyle(.sidebar)
         .scrollContentBackground(.hidden)
         .background(Color.yellow)
-        .border(Color.red, width: 8)
+        // SwiftUI .border() draws in the CA layer tree, which the AppKit
+        // NSScrollView backing List renders on top of. Use NSViewRepresentable
+        // so the debug border is an NSView subview added after the NSScrollView,
+        // giving it proper z-order above the list's AppKit layer.
+        .overlay(DebugBorderOverlay(color: .red, lineWidth: 8))
     }
 
     /// Content rows for one walker root inside its Section. Extracted
@@ -461,6 +465,29 @@ struct DirectoryFilenamePanel: View {
         let kind: FileKind?
         let isDirectory: Bool
         let children: [NodeView]?
+    }
+
+    /// NSViewRepresentable debug border. Rendered as a real NSView subview
+    /// so it is z-ordered above the AppKit NSScrollView that backs List —
+    /// pure SwiftUI overlays (.border, .overlay with Shape) live in the CA
+    /// layer tree and are occluded by List's NSScrollView on macOS.
+    private struct DebugBorderOverlay: NSViewRepresentable {
+        let color: NSColor
+        let lineWidth: CGFloat
+
+        func makeNSView(context: Context) -> NSView {
+            let v = NSView()
+            v.wantsLayer = true
+            v.layer?.borderColor = color.cgColor
+            v.layer?.borderWidth = lineWidth
+            v.layer?.backgroundColor = NSColor.clear.cgColor
+            return v
+        }
+
+        func updateNSView(_ nsView: NSView, context: Context) {
+            nsView.layer?.borderColor = color.cgColor
+            nsView.layer?.borderWidth = lineWidth
+        }
     }
 
     /// Recursive projection. Drops `.file` nodes whose `passesFilter == false`
