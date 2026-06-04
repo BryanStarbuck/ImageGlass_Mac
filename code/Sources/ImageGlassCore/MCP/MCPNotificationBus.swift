@@ -26,8 +26,8 @@ public final class MCPNotificationBus: @unchecked Sendable {
     /// output channel.
     public struct Notification: Sendable {
         public let method: String
-        public let params: [String: any Sendable]
-        public init(method: String, params: [String: any Sendable]) {
+        public let params: [String: String]
+        public init(method: String, params: [String: String]) {
             self.method = method
             self.params = params
         }
@@ -74,7 +74,7 @@ public final class MCPNotificationBus: @unchecked Sendable {
     /// the GUI selection (or an MCP `select_file` call) lands on a new
     /// file. Spec mcp_file.mdx §2.3 / §10.
     public func emitSelectionChanged(path: String, corr: String? = nil) {
-        var params: [String: Any] = ["path": path]
+        var params: [String: String] = ["path": path]
         if let corr { params["corr"] = corr }
         emit(.init(
             method: "notifications/imageglass/selection_changed",
@@ -85,7 +85,7 @@ public final class MCPNotificationBus: @unchecked Sendable {
     /// `notifications/imageglass/view_mode_changed` — emitted whenever
     /// the file panel's view mode changes. Spec mcp_file.mdx §3.
     public func emitViewModeChanged(mode: String, corr: String? = nil) {
-        var params: [String: Any] = ["mode": mode]
+        var params: [String: String] = ["mode": mode]
         if let corr { params["corr"] = corr }
         emit(.init(
             method: "notifications/imageglass/view_mode_changed",

@@ -105,6 +105,33 @@ run:
     @echo "==> launching"
     @nohup "{{pkg}}/.build/debug/ImageGlass" >/dev/null 2>&1 & echo "==> launched (pid $!)"
 
+# Open code/Package.swift in Xcode and start a debug session on the
+# ImageGlass scheme. Xcode owns the run from this point — set
+# breakpoints, step, inspect variables, etc. in Xcode's debugger.
+# First open on a fresh clone can take ~30s while Xcode indexes the
+# package before the debug session starts.
+debug:
+    @echo "==> killing any existing ImageGlass process"
+    @pkill -x ImageGlass || true
+    @echo "==> opening {{pkg}}/Package.swift in Xcode and starting debugger"
+    @osascript \
+        -e 'set pkgPath to "{{justfile_directory()}}/{{pkg}}/Package.swift"' \
+        -e 'tell application "Xcode"' \
+        -e '  activate' \
+        -e '  open pkgPath' \
+        -e '  set waited to 0' \
+        -e '  repeat until (exists workspace document 1) and (loaded of workspace document 1)' \
+        -e '    delay 1' \
+        -e '    set waited to waited + 1' \
+        -e '    if waited > 240 then error "Xcode never finished loading the package (waited 240s)"' \
+        -e '  end repeat' \
+        -e '  set theWorkspace to workspace document 1' \
+        -e '  try' \
+        -e '    set active scheme of theWorkspace to (first scheme of theWorkspace whose name is "ImageGlass")' \
+        -e '  end try' \
+        -e '  debug theWorkspace' \
+        -e 'end tell'
+
 # Launch the MCP server on stdio (debug).
 mcp:
     cd {{pkg}} && swift run imageglass-mcp

@@ -8,8 +8,14 @@ import ImageGlassCore
 @MainActor
 @Observable
 public final class ViewerState {
-    // Zoom & pan
-    public var zoomMode: ZoomMode = .auto
+    // Zoom & pan.
+    // Default is `.fit` (not `.auto`): every newly loaded image is
+    // scaled along its most-constraining axis to fill the viewport
+    // while preserving aspect ratio and staying centered. `.auto`
+    // would leave small images at 100%, which presents as "cyan
+    // letterbox bars with a tiny image lost in the middle." See
+    // `ImageCanvasView.resetTransformForNewImage`.
+    public var zoomMode: ZoomMode = .fit
     /// User-driven zoom factor — only consulted when `zoomMode == .lock`,
     /// but kept up-to-date for all modes so toggling into Lock is seamless.
     public var lockedZoom: CGFloat = 1.0

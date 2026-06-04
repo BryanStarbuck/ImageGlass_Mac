@@ -22,6 +22,13 @@ public final class LocalStorage {
 
     // MARK: - Discovery
 
+    /// Sidecar JSON files that live next to scope files in `scopes/` but are
+    /// not Scope records. `crop.json` is `CropConfigStore.fileURL`;
+    /// `crop-live.json` is legacy bridge state left over from earlier builds.
+    /// Treating them as scopes makes `bootstrapIfNeeded()` pick them up and
+    /// then `loadScope()` fails to decode them.
+    private static let reservedSidecarNames: Set<String> = ["crop", "crop-live"]
+
     public func listScopes() throws -> [String] {
         try AppPaths.ensureDirectories()
         let fm = FileManager.default
@@ -32,6 +39,7 @@ public final class LocalStorage {
         return urls
             .filter { $0.pathExtension == "json" }
             .map { $0.deletingPathExtension().lastPathComponent }
+            .filter { !Self.reservedSidecarNames.contains($0) }
             .sorted()
     }
 

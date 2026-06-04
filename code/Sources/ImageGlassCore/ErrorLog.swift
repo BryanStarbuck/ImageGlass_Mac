@@ -6,11 +6,16 @@
 // should funnel error / unexpected-condition reports through `ErrorLog.log`
 // instead of writing ad-hoc `print` statements or silently swallowing errors.
 //
-// Output sink:
-//   ~/Library/Application Support/ImageGlass_Mac/error.err
+// Output sink (shared with MCPAuditLogger):
+//   ~/Library/Application Support/ImageGlass_Mac/log.log
 //
-// Each entry is appended on its own line and contains:
+// Error entries are appended on their own line and contain:
 //   [ISO-8601 timestamp] [source file path:line] [function] [class] message error=<err>
+//
+// MCPAuditLogger writes structured `ts=… tool=…` / `ts=… app=…` lines into
+// the same file; the two formats are unambiguously distinguishable so grep
+// can isolate either stream (`grep '^\['` for errors, `grep '^ts='` for
+// audit records).
 //
 // The writer is serialized through a private utility-QoS dispatch queue so
 // concurrent callers from multiple actors do not interleave bytes on disk.
@@ -21,7 +26,7 @@ public enum ErrorLog {
 
     // MARK: - Public API
 
-    /// Append one error entry to `error.err`.
+    /// Append one error entry to the shared `log.log` file.
     ///
     /// - Parameters:
     ///   - message:   Human-readable description of what went wrong.
@@ -51,9 +56,11 @@ public enum ErrorLog {
         }
     }
 
-    /// Absolute path to the error log file. Exposed for tests and tooling.
+    /// Absolute path to the log file. Exposed for tests and tooling.
+    /// Resolves to `AppPaths.macLogFile`, the same file MCPAuditLogger writes
+    /// to, so all observability for ImageGlass_Mac lives in one place.
     public static var logURL: URL {
-        return Self.resolvedLogURL
+        return AppPaths.macLogFile
     }
 
     // MARK: - Internals
@@ -69,20 +76,8 @@ public enum ErrorLog {
         return f
     }()
 
-    private static let resolvedLogURL: URL = {
-        let base = FileManager.default.urls(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask
-        ).first ?? URL(fileURLWithPath: NSHomeDirectory())
-            .appendingPathComponent("Library/Application Support", isDirectory: true)
-
-        return base
-            .appendingPathComponent("ImageGlass_Mac", isDirectory: true)
-            .appendingPathComponent("error.err")
-    }()
-
     private static func append(_ entry: String) {
-        let url = Self.resolvedLogURL
+        let url = AppPaths.macLogFile
         let dir = url.deletingLastPathComponent()
 
         // Ensure the parent directory exists. Failures here cannot themselves

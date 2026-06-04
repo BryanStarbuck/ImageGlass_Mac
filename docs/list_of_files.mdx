@@ -818,6 +818,338 @@ between the filesystem scan and the commit step.
 
 ---
 
+<<<<<<< HEAD
+## 3B. Debugging the File Tree Control from the Command Line
+
+This section catalogs the command-line tools used to inspect the
+**running** ImageGlass_Mac process — its windows, the file tree
+panel's `NSOutlineView` / SwiftUI `OutlineGroup` hierarchy, and the
+per-row properties (frame, role, value, children, accessibility
+attributes). It exists because reproducing a tree-control bug almost
+always requires reading the live state of the control without
+attaching Xcode and without modifying the running build.
+
+The short answer up front: **there is no single `brew install <tool>`
+that does all of this for a native AppKit / SwiftUI app.** The
+upstream ImageGlass project on Windows has WinAppDriver / Inspect.exe
+to lean on; macOS has the Accessibility API plus the Objective-C
+runtime, and the practical CLI workflow is a small set of cooperating
+tools — none of them a Homebrew formula by themselves.
+
+### 3B.1 What we want from a debugger-like CLI
+
+| Capability | Why it matters for the file tree panel |
+| --- | --- |
+| Attach to a running process by PID or bundle ID | The bug is in the live `directories.yaml`-driven tree (§3A); we cannot reproduce it by reading code. |
+| Enumerate the process's windows | Confirm the panel is in the expected `NSWindow`; rule out a stale floating panel ([panels.mdx](./panels.mdx)). |
+| Recursively walk the native UI control hierarchy | The whole point — see every `OutlineGroup` row, its parent root, its children. |
+| Extract all properties per control / element | Role, title, value, frame, `passesFilter` (when bridged), AX children, identifier. |
+| Print to stdout (no GUI) | Pipe into `grep`, `jq`, snapshot diffs, CI scripts. |
+
+No Homebrew formula covers all five. The Apple-shipped GUI tool that
+*does* is **Accessibility Inspector** (ships inside Xcode → Open
+Developer Tool → Accessibility Inspector). It is not CLI and not
+brew-installable; it is the reference for what the CLI tools below
+approximate.
+
+### 3B.2 Tool matrix — closest options
+
+| Tool | Install | Attach by | Walks native UI? | Output | Verdict for the tree control |
+| --- | --- | --- | --- | --- | --- |
+| `macapptree` | `pip install macapptree` (Python; **not** brew) | Bundle ID, `--all-apps` | Yes — full AX tree | JSON file (or stdout via redirect) | **Best read-only option.** Mirrors the panel hierarchy via the Accessibility API; structured JSON is easy to diff. |
+| Frida | `pip install frida-tools` (**not** a brew formula) | PID or process name | Yes — via Obj-C runtime + AppKit | stdout (script-controlled) | Best when AX is insufficient; reaches private internals like `_subtreeDescription`. Requires a short JS script. |
+| lldb | `xcode-select --install` (Xcode CLT; **not** brew) | PID | Yes — via Obj-C `po` expressions | stdout | Always available on a dev Mac. Clunky for batch dumps but unbeatable for "what is this view *right now*." |
+| Accessibility Inspector | Ships in Xcode | GUI pick | Yes — full AX tree | GUI | Not CLI; useful as the **reference** for what AX exposes. |
+| `xctree` | `brew install xctree` exists | iOS Simulator processes only | Yes | stdout / JSON | **Does not apply** to a native macOS app process. Listed only to prevent confusion — the name implies otherwise. |
+| Appium + Mac driver | `brew install node` + `npm i -g appium` | WebDriver session | Yes | JSON over WebDriver | Overkill for a snapshot dump; appropriate for full UI automation, not for one-off inspection. |
+| Chromium `ax_dump_tree` | Source build | Chromium processes only | Yes | stdout | **Does not apply** to AppKit / SwiftUI apps. |
+
+The verdict, condensed: read-only snapshot → **macapptree**; runtime
+inspection of internals → **Frida**; ad-hoc debugger sessions →
+**lldb**.
+
+### 3B.3 macapptree — the read-only AX snapshot
+
+`macapptree` walks the macOS Accessibility tree for an app (by bundle
+ID) and emits structured JSON. The tree it produces is the same tree
+the file tree panel renders, because both the panel and AX read from
+the same `NSAccessibility` protocol implementation.
+
+Install (no brew formula; this is a Python package):
+
+```sh
+python3 -m pip install macapptree
+```
+
+Snapshot the running ImageGlass_Mac and dump to stdout:
+
+```sh
+python3 -m macapptree.main \
+    -a com.starbuck.imageglass \
+    --oa /dev/stdout \
+    | jq '.children[] | select(.role == "AXOutline")'
+```
+
+The `jq` filter narrows to the `AXOutline` element, which is the
+`NSOutlineView` backing the SwiftUI `OutlineGroup` in §2.4. Each
+child is one tree row; properties include `AXRole`, `AXTitle`,
+`AXValue`, `AXFrame`, `AXChildren`, and `AXIdentifier`.
+
+Caveats:
+
+* Targets by **bundle ID**, not PID. If multiple instances are
+  running, pick the one whose AX tree contains the expected root via
+  `jq`.
+* Reads only what the AX API exposes. Per-row internal state like
+  `passesFilter` (§3A.4) is **not** in AX unless we explicitly bridge
+  it via `accessibilityValue` or a custom AX attribute.
+* Requires the user to grant the running Python interpreter
+  Accessibility permission once (System Settings → Privacy & Security
+  → Accessibility).
+
+### 3B.4 Frida — runtime introspection of internals
+
+When the AX tree is not enough — typically when a tree row's behavior
+depends on `passesFilter`, `RootFilter.evaluate`, or another property
+not exposed via AX — Frida attaches to the live process and reads the
+Objective-C runtime directly.
+
+Install:
+
+```sh
+python3 -m pip install frida-tools
+```
+
+Attach and dump the main window's view hierarchy:
+
+```sh
+frida -p "$(pgrep -f ImageGlass_Mac)" -e '
+  const NSApp = ObjC.classes.NSApplication.sharedApplication();
+  const windows = NSApp.windows();
+  for (let i = 0; i < windows.count(); i++) {
+      const w = windows.objectAtIndex_(i);
+      console.log(`Window: ${w.title()}`);
+      console.log(w.contentView()._subtreeDescription().toString());
+  }
+'
+```
+
+`_subtreeDescription` is a private `NSView` method (the same one
+Xcode's "Debug View Hierarchy" calls under the hood) that prints
+every `NSView` with its frame, autoresizing mask, and class. For the
+outline view specifically:
+
+```sh
+frida -p "$PID" -e '
+  // find every NSOutlineView in the process
+  ObjC.choose(ObjC.classes.NSOutlineView, {
+      onMatch(o) {
+          console.log(`AXOutline: ${o.numberOfRows()} rows`);
+          for (let r = 0; r < o.numberOfRows(); r++) {
+              const item = o.itemAtRow_(r);
+              console.log(`  row ${r}: ${item}`);
+          }
+      },
+      onComplete() {}
+  });
+'
+```
+
+Notes:
+
+* Frida attaches **as a debugger** — the running process must allow
+  it. Disable hardened-runtime debugger protections in the
+  `Debug`-configuration build, or pass `--allow-debugger` flags when
+  signing. Production / notarized builds will refuse the attach.
+* Frida sees private state but does not respect Swift-only APIs;
+  pure-Swift structs (`DirectoryNode`, `RootFilter`, see §3A.4) are
+  not directly enumerable from the Obj-C runtime. To inspect Swift
+  values from a CLI, bridge them through an Obj-C-visible
+  property on the view model (e.g., a `@objc dynamic var
+  debugDescription: String`).
+
+### 3B.5 lldb — debugger sessions when AX and Frida fall short
+
+`lldb` ships with the Xcode Command Line Tools and is always
+available on a dev Mac. For one-off questions about the tree
+control's live state:
+
+```sh
+lldb -p "$(pgrep -f ImageGlass_Mac)"
+
+(lldb) po [[NSApplication sharedApplication] windows]
+(lldb) po [[[NSApplication sharedApplication] mainWindow] contentView]
+(lldb) po [(NSView *)0x600003af0000 _subtreeDescription]
+(lldb) expression -l swift -- import ImageGlass_Mac
+(lldb) expression -l swift -- print(FileTreeViewModel.shared.snapshot())
+```
+
+The Swift `expression -l swift` form is the only way to read pure-Swift
+state (`FileTreeViewModel.snapshot()` from §3A.5) without bridging.
+It requires the running binary to have its full DWARF debug
+information present — i.e., a `Debug` build, not the stripped Release
+binary.
+
+### 3B.6 Workflow — picking the right tool
+
+| Symptom | Start with |
+| --- | --- |
+| "The panel is missing a row I expect to see" | `macapptree` snapshot → `jq` for the path → confirm AX has it. If AX is missing it, the bug is in §3A.5's walker, not in the renderer. |
+| "The panel shows a row but it looks wrong (wrong filter result, wrong indent)" | Frida `_subtreeDescription` → confirm the `NSView` hierarchy matches expectations. Then bridge `passesFilter` to AX or read it via lldb Swift expressions. |
+| "I want a CI regression check that the tree renders as expected" | `macapptree --oa` JSON → diff against a snapshotted baseline. This is the only option that produces stable, diffable output. |
+| "I need to step through `RootFilter.evaluate`" | `lldb -p` + Swift breakpoints. Frida cannot break on pure-Swift code reliably. |
+
+### 3B.7 What we are *not* doing
+
+* **No bundled GUI inspector.** We are not shipping a custom AX
+  inspector inside ImageGlass_Mac; Accessibility Inspector already
+  exists and the engineering team uses it during development.
+* **No `brew tap` for a custom CLI.** We considered packaging a small
+  Swift CLI (`igmac-inspect`) that wraps the AX API and prints the
+  tree to stdout. It is out of scope for v1 — `macapptree` covers the
+  same ground without us shipping a separate binary. Revisit if
+  `macapptree` proves insufficient.
+* **No AX bridging of every internal field by default.** Bridging
+  `passesFilter`, `kind`, and other §3A.4 fields into AX makes the
+  panel observable to *every* AX client, including screen readers,
+  with unclear UX consequences. Bridge selectively, behind a
+  `DEBUG`-only build flag, when an investigation needs it.
+
+### 3B.8 Cross-references
+
+* [error_handling.mdx](./error_handling.mdx) §4.2 — `log.log` is the
+  first thing to read before reaching for any of the tools in this
+  section. The CLI inspectors are for state the logs do not capture.
+* [panels.mdx](./panels.mdx) §10 — panel-framework keyboard
+  shortcuts; useful when confirming via `macapptree` that the panel
+  reachable via AX is the same panel the user is interacting with.
+* §3A.4 — the in-memory `DirectoryNode` / `RootFilter` types whose
+  state these tools surface.
+
+---
+
+## 3C. Floating File Tree Window
+
+This section pins down a **detached, floating window** that hosts the
+file list and file tree — independent of the main viewer window. The
+goal is twofold: give the user a persistent navigator that stays put
+even when the main window is moved, resized, or full-screened, and
+give Claude Code / MCP a stable surface for driving file selection
+without competing for chrome in the main viewer.
+
+### 3C.1 Behavior
+
+* **Detached.** The window is a separate `NSWindow` owned by a shared
+  `FloatingFileTreeWindowController`. It is not a child window, not a
+  sheet, and not a `WindowGroup` member of the main `App` scene. It
+  has its own title bar, traffic lights, minimize button, and resize
+  grip.
+* **Default on.** The window opens automatically on every cold launch
+  after `applicationDidFinishLaunching`. The user can dismiss it (red
+  traffic light or the menu item toggle); the next launch re-opens it.
+  Persisting "user explicitly closed it" across launches is out of
+  scope for v1 — default-on is the contract.
+* **Independent lifecycle.** Closing the main viewer window does
+  **not** close the floating window. Closing the floating window does
+  **not** quit the app or close any viewer window.
+  `applicationShouldTerminateAfterLastWindowClosed` continues to fire
+  only when the user closes the *last* window of any kind.
+* **Title.** *File Tree* (no app prefix; the system already shows the
+  app name in the menu bar). The dock menu lists it as `File Tree`.
+* **Content.** A `FileTreeFloatingView` that renders the same
+  `RootDirectory` graph the in-window `DirectoryFilenamePanel`
+  renders (§3A.4 + the panel's `walkerTreeView`) — i.e. the file list
+  on top and the recursive file tree below, both driven by
+  `state.walkerRoots`. Selection in the floating window is the same
+  `AppState.selectedFile` binding the main viewer uses, so clicking
+  in the floating window loads the image in the main viewer canvas
+  (§4.3).
+* **Toggle without selection side effects.** Opening or closing the
+  floating window must not change `selectedFile`, `panelLayout`,
+  `panelViewMode`, or `walkerRoots`. The window is a *render* of those
+  values; toggling its visibility is purely a window-management
+  action.
+
+### 3C.2 Menu placement and item name
+
+The floating window's toggle lives in the **View** menu — the same
+menu that already owns *Show Panel Column*. Adding it next to its
+sibling makes the relationship obvious: *Show Panel Column* toggles
+the **inline** file panel docked inside the main window, *Show
+Floating File Tree* toggles the **detached** floating file tree
+window. They are independent toggles and can be on or off in any
+combination.
+
+| Menu | Item | Shortcut | Toggle behavior |
+| --- | --- | --- | --- |
+| View | Show Floating File Tree | ⌃⌥⌘F | When the window is open, the item reads *Hide Floating File Tree*. Selecting it closes the window. When closed, the item reads *Show Floating File Tree*; selecting it opens (or brings forward) the window. |
+
+The hotkey is `⌃⌥⌘F` (Control-Option-Command-F). It avoids the
+already-bound `⌃⌘F` (View ▸ Enter Full Screen) and `⇧⌘F` (View ▸
+Frameless Window) in [menus.mdx](./menus.mdx) §4.4 and the
+`⌥⌘F` (Directories ▸ Edit Filter… in §3A.8). The triple-modifier
+form is appropriate for a window-management toggle the user rarely
+rebinds.
+
+The item is a single SwiftUI `Button` whose label flips between *Show
+Floating File Tree* and *Hide Floating File Tree* depending on
+`FloatingFileTreeWindowController.shared.isVisible`. We do **not**
+use a `Toggle` because SwiftUI's `Toggle` in a menu renders a
+checkmark, which is a weaker affordance than a verb that flips —
+"Show" / "Hide" reads as an action while a checkmark reads as a
+status (HIG §Menus).
+
+### 3C.3 Background color — bright yellow
+
+The file tree's background is **bright yellow** (`#FFFF00`,
+`Color(red: 1.0, green: 1.0, blue: 0.0)`). The yellow fills the
+content rect of the floating window edge-to-edge, behind the file
+list rows and the tree rows, behind the row hover highlights, and
+behind the selection accent overlay (which sits on top of the
+yellow with `Color.accentColor.opacity(0.18)` per the existing tree
+row rendering in `DirectoryFilenamePanel.walkerTreeView`).
+
+Yellow is **only** applied inside the floating window. The inline
+file panel (`DirectoryFilenamePanel` docked in the main window) keeps
+its `Color(NSColor.windowBackgroundColor)` so the inline path stays
+on theme. This makes the floating window visually distinguishable at
+a glance, which matters when both renderings of the same data are
+open at once.
+
+Implementation contract: the yellow is applied as a `.background`
+modifier on the root `VStack` of `FileTreeFloatingView`, not on the
+window's `backgroundColor`. Two reasons:
+
+1. The window's `backgroundColor` only paints the area not covered
+   by the content view; setting it does not guarantee the tree
+   rows themselves render on yellow.
+2. The `.background` modifier composes with the SwiftUI `List` /
+   `OutlineGroup` styling — the rows render their default chrome on
+   top of the yellow without us fighting `NSTableView` defaults.
+
+The yellow is not configurable in v1. The bright-yellow color is the
+spec contract.
+
+### 3C.4 Wiring
+
+The window is owned by a single `MainActor`-isolated controller
+mirroring the existing `AboutWindowController` and
+`ReleasesWindowController` patterns:
+
+```swift
+@MainActor
+final class FloatingFileTreeWindowController {
+    static let shared = FloatingFileTreeWindowController()
+
+    private var window: NSWindow?
+
+    var isVisible: Bool { window?.isVisible == true }
+
+    func show(state: AppState) { /* create-or-foreground, see §3C.5 */ }
+    func hide()               { window?.orderOut(nil) }
+    func toggle(state: AppState) {
+        if isVisible { hide() } else { show(state: state) }
+=======
 ## 3B. Mac-Native Hierarchy Display Controls
 
 The file tree panel requires a native macOS control that can render an
@@ -891,10 +1223,367 @@ Or, for a collection of top-level items each with optional children:
 List {
     OutlineGroup(roots, children: \.children) { node in
         Label(node.name, systemImage: node.isDirectory ? "folder" : "photo")
+>>>>>>> refs/remotes/origin/main
     }
 }
 ```
 
+<<<<<<< HEAD
+The View menu item calls `toggle(state:)`. The
+`AboutAppDelegate.applicationDidFinishLaunching` opens the window
+once via `show(state:)` so the default-on contract from §3C.1 is met.
+
+### 3C.5 Window construction
+
+* **Style mask:** `[.titled, .closable, .miniaturizable, .resizable]`.
+* **Initial size:** 360 × 600 (portrait — a navigator shape).
+* **Min size:** 240 × 320.
+* **Position:** centered on the screen the cursor is on at first
+  launch; on subsequent toggles, restored to its last position via
+  `NSWindow.setFrameAutosaveName("ImageGlass.FloatingFileTree")`.
+* **Floating level?** No. The window uses `NSWindow.Level.normal`. A
+  true floating-above-all level would steal focus from full-screen
+  viewer mode and surprise the user; it is documented as out of
+  scope.
+* **Release on close:** false (`isReleasedWhenClosed = false`) so the
+  controller can re-show the same window without rebuilding it.
+* **Restorable:** false. State restoration would conflict with the
+  default-on contract (a closed-by-user window would re-open as
+  closed on relaunch, contradicting §3C.1's "next launch re-opens
+  it").
+
+### 3C.6 Content composition
+
+```
+┌───────────────────────────────── File Tree ─┐  ← title bar
+│ ⌕ filter            ↻                       │  ← compact header
+├─────────────────────────────────────────────┤
+│   ▣ 001.dng                                 │
+│   ▣ 002.dng                                 │  ← file list (top half)
+│   ▣ 003.dng                                 │
+├─────────────────────────────────────────────┤
+│ ▼ /Users/bryan/Pictures/tour/beach          │
+│     001.jpg                                 │  ← file tree
+│     002.jpg                                 │     (bottom half)
+│ ▼ /Users/bryan/Pictures/tour/mountains      │
+│     peak.heic                               │
+└─────────────────────────────────────────────┘
+   ← every row sits on the bright-yellow background →
+```
+
+A vertical split: file list on top (flat union of every visible file,
+matching `DirectoryFilenamePanel.flattenVisible`), file tree on
+bottom (one `Section` per root with an `OutlineGroup`, matching
+`DirectoryFilenamePanel.walkerTreeView`). The split is a SwiftUI
+`VSplitView` (AppKit-backed) with a 50/50 default ratio that the user
+can drag. Both halves bind to `state.selectedFile`, so a click in
+either half loads the image in the main viewer canvas (§4.3
+"selection drives the viewer canvas").
+
+### 3C.7 Empty state
+
+When `directories.yaml` has no roots **and** the active scope has no
+resolved files, the floating window renders the same
+`emptyState` view that `DirectoryFilenamePanel` uses (§3A.10
+fallback) — an `[+ Add directory]` button that opens an `NSOpenPanel`
+folder picker and routes through `DirectoriesStore.shared.addRoot` +
+`DirectoryTreeWalker.shared.scheduleWalk`. The yellow background
+remains visible behind the empty-state SF Symbol + label.
+
+### 3C.8 MCP
+
+The floating window is **observable** through MCP via a single tool:
+
+| Tool | Effect |
+| --- | --- |
+| `set_floating_file_tree_visible(visible)` | When `true`, calls `FloatingFileTreeWindowController.shared.show(state:)`. When `false`, calls `hide()`. Returns the new `isVisible`. |
+
+No additional MCP tools are needed: every file-list / file-tree
+read/write tool already in §3A.10 and §8 operates on the same
+underlying `directories.yaml` and `AppState`, so the floating window
+re-renders without a tool dedicated to it.
+
+### 3C.9 Acceptance criteria (in addition to §11)
+
+The floating window ships when **all** of the following pass — these
+are the spec-compliance proofs the implementation must satisfy:
+
+1. **Default-on.** Launching the app with no prior state opens the
+   floating window automatically.
+2. **Detached.** The floating window has its own title bar and
+   traffic lights, is reported as a separate `NSWindow` in
+   `NSApp.windows`, and can be moved independently of the main
+   viewer window.
+3. **Menu toggle exists.** A View-menu item named *Show Floating
+   File Tree* (or *Hide Floating File Tree* when open) is present
+   and bound to `⌃⌥⌘F`.
+4. **Toggle works in both directions.** With the window open, the
+   menu item closes it. With the window closed, the menu item opens
+   it (creating a fresh window or bringing the cached one forward).
+5. **Yellow background.** The content rect of the floating window
+   renders the file list and file tree on `#FFFF00`. The yellow is
+   visible behind both populated rows and the empty-state view.
+6. **Content parity.** The floating window's tree renders the same
+   `state.walkerRoots` data the inline `DirectoryFilenamePanel`
+   renders; mutations via MCP (`add_directory`,
+   `update_directory_filter`, etc.) update the floating window
+   within one debounced FS-events tick (§6.6 = 250 ms).
+7. **Selection round-trip.** Clicking a file row in the floating
+   window updates `state.selectedFile`, which loads the file in the
+   main viewer canvas. Selecting a different file via the main
+   viewer's `→` / `←` keys updates the highlighted row in the
+   floating window.
+8. **No close-on-quit dependency.** Closing the floating window with
+   its red traffic light does not quit the app while the main viewer
+   window is still open.
+
+These criteria are individually verifiable by inspection or by a
+test that drives the menu item + checks `NSApp.windows` + checks
+the rendered SwiftUI hierarchy.
+
+---
+
+## 3D. Selectable Tree View
+
+This section pins down a **user-selectable rendering technology** for
+the file tree (§2.4 and §3A.4). The file tree's *data* is fixed —
+the `RootDirectory` graph the walker maintains in memory (§3A.4). The
+*renderer* that turns that data into on-screen rows is a runtime
+choice the user makes from the menu bar. Switching renderers swaps
+the SwiftUI view that hosts the tree without re-walking the
+filesystem and without resetting the user's selection or scroll
+position.
+
+The three rendering paths Apple provides for **native** macOS UI
+(where the OS draws and manages the controls, as opposed to
+Electron/web-based or fully custom-drawn views) are catalogued in
+§3D.1. All three produce a tree the user can browse with the same
+keyboard, mouse, and accessibility behavior — only the underlying
+framework differs.
+
+### 3D.1 The three rendering technologies
+
+| Renderer | Framework | Macro-control | Suited to |
+| --- | --- | --- | --- |
+| **AppKit** | AppKit + Objective-C-bridged Swift, hosted in SwiftUI via `NSViewRepresentable` | `NSOutlineView` inside `NSScrollView`, driven by `NSOutlineViewDataSource` / `NSOutlineViewDelegate`. Disclosure triangles, drag-and-drop, sidebar styling are all native AppKit behavior. | The classic, battle-tested macOS path. Finder uses `NSOutlineView` in its list-view sidebar. Closest match to native macOS feel; most direct control over drag-and-drop and context menus. |
+| **SwiftUI** | SwiftUI declarative views | `OutlineGroup` inside a `List`, or a `List` with the `children:` keypath modifier. Hierarchy, expansion/collapse, and disclosure rendered automatically. | The modern, declarative path. Least code; tightest integration with SwiftUI state and `@Observable`. Apple's preferred framework for new macOS apps. |
+| **Catalyst-styled** | AppKit + SwiftUI rendering UIKit-flavored chrome (see §3D.7 — this is **not** a true Catalyst target build; ImageGlass_Mac is and remains an AppKit/SwiftUI Mac-native app) | Custom `List` styled to mimic `UITableView` with `UICollectionView` compositional-layout-style outline rows — flat indented rows, iOS-style disclosure chevrons, iOS row insets, no AppKit disclosure triangle. | A visual alternative for users who prefer the iPadOS / Catalyst look. Useful side-by-side comparison reference. Stylistic only — no functional gain over AppKit. |
+
+The fourth option — fully custom-drawn (Core Graphics, no native
+control) — is explicitly excluded; it would not feel like a
+"first-class macOS app" per the project goal.
+
+### 3D.2 The View ▸ Tree View submenu
+
+The renderer choice is exposed through a new submenu on the View
+menu in the menu bar:
+
+```
+View
+  Show Panel Column                    ⌃⌥P
+  Show Floating File Tree              ⌃⌥⌘F
+  ─────
+  Tree View ▸
+    ✓ AppKit  (NSOutlineView)           ⌃⌥⌘1
+      SwiftUI (OutlineGroup)            ⌃⌥⌘2
+      Catalyst (UIKit-styled)           ⌃⌥⌘3
+```
+
+Item behavior:
+
+* **Exactly one item is checkmarked** at any time — the currently
+  active renderer. The checkmark is rendered with the standard
+  `NSMenuItem.state = .on` glyph (`✓`).
+* Selecting an unchecked item:
+  1. Sets it as the active renderer in the shared `TreeRenderTechnology`
+     setting (§3D.4).
+  2. Moves the checkmark to the newly selected item.
+  3. Triggers a SwiftUI view-tree swap in both the inline file panel
+     (`DirectoryFilenamePanel`) and the floating file tree window
+     (`FileTreeFloatingView` — §3C). The walker / data layer is
+     untouched.
+* Selecting the already-checkmarked item is a no-op.
+* Each item has a hotkey: `⌃⌥⌘1` (AppKit), `⌃⌥⌘2` (SwiftUI),
+  `⌃⌥⌘3` (Catalyst). The triple-modifier form keeps the renderer
+  toggle out of the way of viewer / panel shortcuts.
+
+Submenu placement — under the View menu, right below the
+*Show Floating File Tree* item (§3C.2). This co-locates every
+file-tree-presentation control in one menu.
+
+### 3D.3 Default renderer
+
+The factory default is **SwiftUI**. It is the lowest-friction path
+for a fresh install: no `NSViewRepresentable` bridging, the
+shortest code path, and the framework Apple is investing in. The
+default is overridable both by the user (via the submenu) and by
+Claude Code (via the MCP tool in §3D.6).
+
+If `UserDefaults` has never recorded a choice (first launch), the
+app initializes the setting to `.swiftUI` and writes it back so
+subsequent launches read a stable value.
+
+### 3D.4 Setting model
+
+The renderer choice lives in a single source-of-truth setting:
+
+```swift
+enum TreeRenderTechnology: String, CaseIterable, Codable, Sendable {
+    case appKit    = "appkit"      // NSOutlineView via NSViewRepresentable
+    case swiftUI   = "swiftui"     // OutlineGroup inside List
+    case catalyst  = "catalyst"    // UIKit-styled rendering in AppKit/SwiftUI
+
+    var displayName: String {
+        switch self {
+        case .appKit:   return "AppKit"
+        case .swiftUI:  return "SwiftUI"
+        case .catalyst: return "Catalyst"
+        }
+    }
+}
+```
+
+The setting is held on `AppState` as a `@MainActor`-isolated
+property and mirrored to `UserDefaults` under the key
+`ig.tree_render_tech`. Persistence is automatic — every write to
+the property flushes to `UserDefaults` synchronously, the same
+pattern `panelLayout` and `panelViewMode` use today.
+
+### 3D.5 Renderer contract
+
+Every renderer is a SwiftUI `View` that takes the same input and
+emits the same callbacks. The interface is:
+
+```swift
+protocol FileTreeRenderer: View {
+    init(state: AppState)
+    // Implementations read state.walkerRoots for the data,
+    // bind to state.selectedFile for selection, and update
+    // state.selectedFile on click. They do not own scroll
+    // position; SwiftUI's List/ScrollView state handles that.
+}
+```
+
+The single switch point is in `DirectoryFilenamePanel.walkerTreeView`
+(and `FileTreeFloatingView`'s equivalent half), which picks the
+concrete renderer:
+
+```swift
+switch state.treeRenderTechnology {
+case .appKit:   AppKitOutlineTreeView(state: state)
+case .swiftUI:  SwiftUIOutlineTreeView(state: state)   // existing FileListTreeView refactored
+case .catalyst: CatalystStyledTreeView(state: state)
+}
+```
+
+Switching the enum re-renders the host view; the inactive
+renderers' state (expanded-folder set, AppKit datasource cache) is
+dropped, by design — a fresh renderer always starts from the
+walker's current `walkerRoots` snapshot. The user's `selectedFile`
+survives because it lives on `AppState`, not in the renderer.
+
+### 3D.6 MCP tool
+
+A single read/write tool exposes the setting:
+
+| Tool | Effect |
+| --- | --- |
+| `get_tree_render_tech()` | Returns `"appkit"` / `"swiftui"` / `"catalyst"`. |
+| `set_tree_render_tech(value)` | Sets the active renderer. Accepts the same three strings. Invalid values return `invalid_value`. Has the same effect as selecting the menu item — the checkmark moves and the view swaps. |
+
+The tool is journaled to `log.log` per
+[error_handling.mdx](./error_handling.mdx) §4.2 like every other
+write tool.
+
+### 3D.7 The Catalyst renderer — implementation honesty
+
+ImageGlass_Mac is a Mac-native AppKit/SwiftUI app, not a Mac
+Catalyst app. Mac Catalyst is a *whole-app* build target — the
+entire process must be UIKit-based — so a real Catalyst `UITableView`
+or `UICollectionView` cannot be embedded inside this app's
+`NSWindow`. The "Catalyst" renderer in §3D.1 is therefore a
+**UIKit-styled** renderer: AppKit/SwiftUI primitives configured to
+match the Catalyst look. Specifically:
+
+* No `NSOutlineView` disclosure triangle; the row leads with an
+  iOS-style chevron (`chevron.right` rotated 90° when expanded) at
+  the iPad chevron size.
+* Row insets, font (`SF Pro Text` in `.body` size), and row height
+  (44 pt) match Catalyst defaults.
+* Selection background is iOS-style: a tinted system fill that
+  spans the row width with rounded corners on the outside, not the
+  AppKit accent-color slab.
+* No native AppKit drag handle; drag-and-drop is wired via SwiftUI
+  `.onDrag` / `.onDrop` modifiers (which work but feel more
+  iPad-like than Finder-like).
+
+This is intentional and called out in the submenu's tooltip:
+*"Catalyst — UIKit-styled rendering. Visual alternative to AppKit
+and SwiftUI; no functional difference."*
+
+A future major version may add a true Catalyst build target as a
+separate distribution; if it does, this renderer becomes the
+native renderer for that build, and the submenu collapses to a
+single available option per build target.
+
+### 3D.8 Accessibility, keyboard, and selection parity
+
+All three renderers must behave identically from the user's
+perspective on the dimensions below. The contract is:
+
+| Dimension | All three renderers |
+| --- | --- |
+| Keyboard navigation | ↑ / ↓ moves selection one row; → expands; ← collapses; Return loads the selection into the viewer canvas. |
+| VoiceOver | Each row announces filename, kind (directory vs image / SVG / video), and depth. Disclosure state is announced as "expanded" / "collapsed". |
+| Selection model | Single-select drives `state.selectedFile`. Multi-select is **out of scope** for the file tree in v1 — multi-select lives in the grid and details modes (§4.3). |
+| Expand-all / Collapse-all | ⌥-click on a disclosure triangle (or its renderer-equivalent) expands / collapses the entire subtree. |
+| Click target | Whole row is clickable, not just the chevron. The chevron and the label are visually distinct but share the row's click area. |
+| Right-click menu | Context menu contents (Reveal in Finder, Remove Directory, Edit Filter…) are identical across renderers. |
+
+The three SwiftUI views share these behaviors via a small set of
+helpers — `treeRowHandlers(state:)`, `treeKeyboardHandlers(state:)`
+— so the contract is enforced by composition, not by re-implementation
+in each renderer.
+
+### 3D.9 Cross-references
+
+* §3A.4 — the in-memory `RootDirectory` / `DirectoryNode` graph
+  every renderer reads.
+* §3C.6 — `FileTreeFloatingView`'s composition; the floating
+  window swaps renderers identically to the inline panel.
+* [menus.mdx](./menus.mdx) §4.4 — full View-menu layout; the
+  *Tree View ▸* submenu is added there.
+* [settings.mdx](./settings.mdx) §4.10 — Gallery settings, where
+  the renderer choice surfaces alongside other tree-view defaults.
+
+### 3D.10 Acceptance criteria (in addition to §11)
+
+The Selectable Tree View ships when all of the following pass:
+
+1. **Three menu items exist.** View ▸ Tree View has exactly three
+   items: AppKit, SwiftUI, Catalyst — in that order — with the
+   hotkeys ⌃⌥⌘1 / ⌃⌥⌘2 / ⌃⌥⌘3.
+2. **One checkmark always.** Exactly one of the three items has a
+   checkmark glyph; the others do not. The checkmark is on the
+   item matching `state.treeRenderTechnology`.
+3. **Toggle round-trips.** Selecting an unchecked item updates the
+   checkmark, swaps the rendered view in both the inline panel
+   and the floating window, and survives an app relaunch.
+4. **Data parity.** The same `state.walkerRoots` graph renders in
+   each renderer; toggling does not lose or duplicate rows.
+5. **Selection parity.** Selecting a file in any renderer updates
+   `state.selectedFile` and loads the file in the viewer canvas
+   (§4.3).
+6. **Default is SwiftUI.** A fresh `UserDefaults` (no prior key
+   stored) leaves the SwiftUI item checkmarked on first launch and
+   writes `"swiftui"` to `ig.tree_render_tech`.
+7. **MCP round-trip.** `set_tree_render_tech("appkit")` moves the
+   checkmark to AppKit and swaps the renderer within one main-actor
+   tick; `get_tree_render_tech()` returns `"appkit"`.
+8. **No re-walk on swap.** Switching renderers does not increment
+   any root directory's `last_walked` value and does not trigger
+   an `FSEventStream` callback.
+=======
 **Strengths:**
 * Pure SwiftUI — no bridging layer, binds directly to `@Observable`
   view models, supports `@State` expand state automatically.
@@ -2191,6 +2880,7 @@ xcrun xcodebuild test \
   -destination 'platform=macOS' \
   -only-testing "ImageGlass_MacUITests/JFKTreeViewTests"
 ```
+>>>>>>> refs/remotes/origin/main
 
 ---
 
@@ -2305,7 +2995,7 @@ Visual elements:
     on selection would surprise the user with sound.
   Selection never silently fails: if the file is unreadable, the
   viewer renders its standard error placeholder and writes an
-  `error.err` record with the file URL.
+  error record to `log.log` with the file URL.
 * **Multi-select** (Shift / Cmd-click) enables batch operations:
   * Delete (⌫) — moves to Trash via `FileManager.trashItem(at:resultingItemURL:)`.
   * Copy paths (⌘C in plain selection mode) — writes paths to the

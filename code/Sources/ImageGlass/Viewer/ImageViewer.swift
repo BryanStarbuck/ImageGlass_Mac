@@ -72,7 +72,14 @@ struct ImageViewer: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color(NSColor.windowBackgroundColor))
+        // Bright cyan debug background — matches
+        // `ImageCanvasView.debugBackgroundColor`. If the user sees
+        // cyan with no image, the SwiftUI container is on screen but
+        // either the canvas didn't load (Bug 1 — selectedFile not
+        // propagating) or the file failed to decode. If they see no
+        // cyan at all, the viewer is being covered or sized to zero
+        // by a panel-host layout problem.
+        .background(Color(red: 0.0, green: 1.0, blue: 1.0))
     }
 
     /// Spacebar. videos.mdx §11.2 / svg.mdx §10.2 — focus-context rule:
@@ -154,15 +161,10 @@ private struct MediaCanvasDispatcher: View {
     let path: String
 
     var body: some View {
-        let kind = MediaKind.detect(path: path)
-        switch kind {
-        case .image:
-            CanvasHost(state: state, viewer: viewer)
-        case .video:
-            VideoCanvasView(state: state, controller: state.video, path: path)
-        case .svg:
-            SVGCanvasView(state: state, controller: state.svg, path: path)
-        }
+        // Bryan: temporarily route every selection through the static
+        // image canvas. The SVG and video canvases are disabled for
+        // now; restoring them is a switch back to `MediaKind.detect`.
+        CanvasHost(state: state, viewer: viewer)
     }
 }
 
@@ -196,10 +198,45 @@ private struct CanvasHost: NSViewRepresentable {
     }
 
     func updateNSView(_ v: ImageCanvasView, context: Context) {
+        // Always reload when `selectedFile` changes. Previously this
+        // compared `v.toolTip` to the new path, which broke silently
+        // whenever `toolTip` was reset out from under us — and the
+        // canvas would refuse to load even though a fresh file was
+        // selected in the file tree. Tracking `loadedPath` on the
+        // view itself removes the side-channel.
+        //
+        // The expanded path is also re-validated against the filesystem
+        // here (in addition to inside setImage). A `state.selectedFile`
+        // that is a bare filename or a stale path produces a single
+        // log line and the canvas falls back to "no image" rather than
+        // silently presenting an empty cyan window.
         let resolvedPath = state.selectedFile.map { AppPaths.expandTilde($0) }
-        if v.toolTip != resolvedPath {
+        if v.loadedPath != resolvedPath {
+            if let raw = state.selectedFile, let expanded = resolvedPath {
+                let result = ImageCanvasView.validate(path: expanded)
+                if result != .ok {
+                    ErrorLog.log("CanvasHost.updateNSView: invalid selectedFile (\(result)) raw='\(raw)' expanded='\(expanded)'",
+                                 class: "CanvasHost")
+                }
+            }
             v.setImage(path: resolvedPath)
             v.toolTip = resolvedPath
+            // ViewerState carries the user's current zoom/pan across
+            // image changes via SwiftUI. That breaks the "every new
+            // image opens fit-to-window, centered" contract — a previous
+            // pan-and-zoom from the last image survives into the next
+            // one and the new image lands off-screen. Resetting here
+            // (in the host, on the SwiftUI side) is the only place that
+            // sticks, because `updateNSView` runs again right after and
+            // would otherwise stamp the old values back onto the view.
+            Task { @MainActor in
+                viewer.zoomMode = .fit
+                viewer.lockedZoom = 1.0
+                viewer.panOffset = .zero
+                viewer.rotationQuarterTurns = 0
+                viewer.flipHorizontal = false
+                viewer.flipVertical = false
+            }
         }
         v.zoomMode = viewer.zoomMode
         v.lockedZoom = viewer.lockedZoom

@@ -11,11 +11,27 @@ import ImageGlassCore
 /// callbacks that read/write that observable.
 final class ImageCanvasView: NSView {
 
+    /// Bright cyan — debug background so we can see immediately
+    /// whether the canvas is mounted in the window, vs. being
+    /// covered, vs. being given zero size by a layout bug. Used by
+    /// both the layer background and the `draw(_:)` fill so it shows
+    /// up regardless of which path is active.
+    static let debugBackgroundColor = NSColor(red: 0.0, green: 1.0, blue: 1.0, alpha: 1.0)
+
     // Inputs
     private(set) var sourceImage: NSImage?
     private(set) var sourceCGImage: CGImage?
     private(set) var frameSource: FrameSource?
     private var filteredImage: CGImage?
+
+    /// Path of the image currently mounted in the canvas, normalized
+    /// the same way `CanvasHost.updateNSView` normalizes
+    /// `state.selectedFile`. Previously the host used `self.toolTip`
+    /// as a side-channel for this, which broke silently when toolTip
+    /// got cleared or pre-populated by any other layer. Owning the
+    /// state here means a fresh path *always* triggers
+    /// `setImage(path:)` from the host.
+    private(set) var loadedPath: String?
 
     // Cached for color-picker readouts. May differ from `sourceCGImage` only
     // by colorspace conversion (Generic RGB so RGBA sampling is meaningful).
@@ -69,7 +85,7 @@ final class ImageCanvasView: NSView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
-        layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        layer?.backgroundColor = Self.debugBackgroundColor.cgColor
         setupTrackingArea()
     }
 
@@ -94,35 +110,125 @@ final class ImageCanvasView: NSView {
 
     func setImage(path: String?) {
         stopAnimationTimer()
+        loadedPath = path
         guard let path else {
-            sourceImage = nil
-            sourceCGImage = nil
-            frameSource = nil
-            samplingImage = nil
-            filteredImage = nil
-            needsDisplay = true
+            clearImageState()
             onFrameSourceChanged?(nil)
             return
+        }
+        // Reject anything that isn't a real absolute path on disk before we
+        // hand it to ImageIO. Each failure mode logs its own line so the
+        // cyan-without-image case (the user's report) is diagnosable from
+        // ~/Library/Application Support/ImageGlass_Mac/log.log alone.
+        switch Self.validate(path: path) {
+        case .empty:
+            ErrorLog.log("setImage rejected: empty path",
+                         class: String(describing: Self.self))
+            clearImageState()
+            onFrameSourceChanged?(nil)
+            return
+        case .notAbsolute:
+            ErrorLog.log("setImage rejected: path is not absolute (must start with '/' or '~/'): '\(path)'",
+                         class: String(describing: Self.self))
+            clearImageState()
+            onFrameSourceChanged?(nil)
+            return
+        case .bareFilename:
+            ErrorLog.log("setImage rejected: bare filename without directory: '\(path)'",
+                         class: String(describing: Self.self))
+            clearImageState()
+            onFrameSourceChanged?(nil)
+            return
+        case .missing:
+            ErrorLog.log("setImage rejected: file does not exist at '\(path)'",
+                         class: String(describing: Self.self))
+            clearImageState()
+            onFrameSourceChanged?(nil)
+            return
+        case .isDirectory:
+            ErrorLog.log("setImage rejected: path is a directory, not a file: '\(path)'",
+                         class: String(describing: Self.self))
+            clearImageState()
+            onFrameSourceChanged?(nil)
+            return
+        case .unreadable:
+            ErrorLog.log("setImage rejected: file is not readable (permissions/sandbox?) at '\(path)'",
+                         class: String(describing: Self.self))
+            clearImageState()
+            onFrameSourceChanged?(nil)
+            return
+        case .ok:
+            break
         }
         let url = URL(fileURLWithPath: path)
         let fs = FrameSource.load(url: url)
         frameSource = fs
-        if fs == nil || (fs?.frames.isEmpty ?? true) {
-            ErrorLog.log("FrameSource.load returned no frames for \(url.path)",
-                         class: String(describing: Self.self))
-        }
         // Fallback: still render with NSImage for tooltip/sourceImage parity.
+        // When fs is nil, FrameSource has already logged the specific cause
+        // (Git LFS pointer, ImageIO refusal, zero frames, ...). NSImage uses
+        // the same decoders so re-logging its failure here would duplicate
+        // that line without adding new information.
         sourceImage = NSImage(contentsOfFile: path)
-        if sourceImage == nil {
-            ErrorLog.log("NSImage(contentsOfFile:) failed for \(path)",
+        if fs != nil && sourceImage == nil {
+            ErrorLog.log("FrameSource decoded \(url.lastPathComponent) but NSImage(contentsOfFile:) did not — possible decoder divergence",
                          class: String(describing: Self.self))
         }
         currentFrameIndex = 0
         applyFrame()
+        // Reset pan + lock to defaults so a new image always lands centered
+        // at the host's chosen zoom mode (the host writes viewer.zoomMode /
+        // lockedZoom / panOffset right after this returns).
         panOffset = .zero
+        lockedZoom = 1.0
         onFrameSourceChanged?(fs)
         startAnimationTimerIfNeeded()
         needsDisplay = true
+    }
+
+    private func clearImageState() {
+        sourceImage = nil
+        sourceCGImage = nil
+        frameSource = nil
+        samplingImage = nil
+        filteredImage = nil
+        needsDisplay = true
+    }
+
+    /// Reasons `setImage` will refuse to load a path. Each maps to a
+    /// distinct ErrorLog line so the operator can tell from the log
+    /// whether the path was bad, the file was missing, or the file was
+    /// just unreadable.
+    enum PathValidation {
+        case ok
+        case empty
+        case notAbsolute
+        case bareFilename
+        case missing
+        case isDirectory
+        case unreadable
+    }
+
+    /// Validate that a string is a real absolute filesystem path that
+    /// points at a readable, non-directory file. Pure — no logging.
+    static func validate(path: String) -> PathValidation {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return .empty }
+        // `~/foo` is absolute once expanded; anything else lacking a
+        // leading `/` is a bare name or relative path and will fail
+        // unpredictably depending on the process's cwd.
+        if !trimmed.hasPrefix("/") && !trimmed.hasPrefix("~/") && trimmed != "~" {
+            // A path with no `/` at all is just a filename.
+            if !trimmed.contains("/") { return .bareFilename }
+            return .notAbsolute
+        }
+        let fm = FileManager.default
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: trimmed, isDirectory: &isDir) else {
+            return .missing
+        }
+        if isDir.boolValue { return .isDirectory }
+        if !fm.isReadableFile(atPath: trimmed) { return .unreadable }
+        return .ok
     }
 
     /// Pull the current frame's CGImage out of `frameSource` and refresh
@@ -227,7 +333,7 @@ final class ImageCanvasView: NSView {
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        NSColor.windowBackgroundColor.setFill()
+        Self.debugBackgroundColor.setFill()
         dirtyRect.fill()
 
         guard let cg = filteredImage else { return }
