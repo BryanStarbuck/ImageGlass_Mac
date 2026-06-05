@@ -42,6 +42,14 @@ public final class WindowRegistry {
     /// `bootstrap(loaded:)` reseeds it.
     public private(set) var nextWindowID: Int = 1
 
+    /// Installed by the GUI at launch so the registry can notify the
+    /// `AppState` to mirror the new frontmost window's per-window
+    /// `viewer` / `selectedFile` into its observable bindings. Kept as
+    /// a closure to avoid `WindowRegistry` depending on `AppState`
+    /// (which would create a cycle — `AppState` already touches the
+    /// registry via the MCP retarget hooks).
+    public var onFrontmostChanged: ((WindowState) -> Void)?
+
     public init() {}
 
     // MARK: - Allocation
@@ -108,7 +116,16 @@ public final class WindowRegistry {
         if let id = windowID {
             precondition(windows[id] != nil, "setFrontmost(windowID: \(id)) — unknown window")
         }
+        let changed = frontmostWindowID != windowID
         frontmostWindowID = windowID
+        // Notify the AppState mirror so it can swap in the new
+        // window's `viewer` / `selectedFile` (multi_window.mdx §2.1,
+        // §4.1). Only on actual changes — re-entrant calls with the
+        // same `windowID` happen during the AppKit observer
+        // installation and should not re-fire bindings.
+        if changed, let id = windowID, let state = windows[id] {
+            onFrontmostChanged?(state)
+        }
     }
 
     // MARK: - Close / retire

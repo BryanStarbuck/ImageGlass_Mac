@@ -42,6 +42,26 @@ public final class WindowState {
     /// (§7.1, §7.4).
     public var slideshow: WindowSlideshowRuntimeState
 
+    /// Per-window viewer state (multi_window.mdx §2.1 — zoom mode, pan
+    /// offset, rotation, overlays). Created per `WindowState` so two
+    /// windows can hold different zoom / pan / overlay state. The main
+    /// `AppState.viewer` reference points at this instance for whichever
+    /// window is currently frontmost so the SwiftUI bindings continue to
+    /// work; window-switch swaps the AppState reference to the new
+    /// frontmost window's `viewer`.
+    public let viewer: ViewerState = ViewerState()
+
+    /// Per-window cursor file — the path the viewer is currently
+    /// showing (multi_window.mdx §2.1, §8). Independent across
+    /// windows: window 1 can be on a UX design frame while window 2
+    /// is on a family photo. Persisted to
+    /// `settings_window_<N>.yaml#session.selection.current_file` via
+    /// `persistSelection(_:)`. Group D: the frontmost window's
+    /// `selectedFile` is mirrored into `AppState.selectedFile` on
+    /// activation so the SwiftUI bindings continue to render the
+    /// correct image.
+    public var selectedFile: String?
+
     public var isOpen: Bool { window != nil }
     public var isFrontmost: Bool { window?.isKeyWindow == true }
 
@@ -71,6 +91,10 @@ public final class WindowState {
         self.settingsStore = settingsStore
         self.directoriesStore = directoriesStore
         self.slideshow = WindowSlideshowRuntimeState(persisted: settings.slideshow)
+        // Seed the per-window selection cursor from the persisted YAML
+        // so resurrection lands the viewer on the same image the user
+        // last saw (multi_window.mdx §8 / §9.9).
+        self.selectedFile = settings.session.selection.currentFile
     }
 
     // MARK: - Persistence helpers

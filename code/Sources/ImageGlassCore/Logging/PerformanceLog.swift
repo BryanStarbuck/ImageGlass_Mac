@@ -66,6 +66,7 @@ public final class PerformanceLog: @unchecked Sendable {
         self.overrideLogFile = overrideLogFile
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        f.timeZone = TimeZone.current
         self.dateFormatter = f
         self.signposter = OSSignposter(
             subsystem: "org.imageglass.mac",
@@ -306,6 +307,8 @@ public final class PerformanceLog: @unchecked Sendable {
         if action.hasPrefix("Video.") { return "Video" }
         if action.hasPrefix("SVG.") { return "SVG" }
         if action.hasPrefix("Theme.") { return "Theme" }
+        if action.hasPrefix("Releases.") { return "Releases" }
+        if action.hasPrefix("ExternalTool.") { return "ExternalTool" }
         if action.hasPrefix("AppLaunch.") { return "AppLaunch" }
         if action.hasPrefix("Window.") { return "Window" }
         if action.hasPrefix("Panel.") { return "Panel" }

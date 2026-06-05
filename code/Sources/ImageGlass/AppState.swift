@@ -77,6 +77,14 @@ public final class AppState {
             if let path = selectedFile {
                 MCPNotificationBus.shared.emitSelectionChanged(path: path)
             }
+            // multi_window.mdx §8 — mirror the new selection into the
+            // bound window's per-window state so persistence on quit
+            // writes the correct `session.selection.current_file`. Skip
+            // during bootstrap restoration so we don't clobber a
+            // freshly-loaded YAML before the bind happens.
+            if !isRestoringSelection, let window = boundWindow {
+                window.selectedFile = selectedFile
+            }
         }
     }
     public var lastEvaluated: Date? = nil
@@ -120,9 +128,22 @@ public final class AppState {
     /// See docs/panels.mdx.
     public let panelLayout = PanelLayoutModel()
 
-    /// Per-window viewer state (zoom mode, pan, rotation, overlays, ...).
-    /// Lives here so menu commands and the SwiftUI viewer can share it.
+    /// The frontmost window's viewer state (zoom mode, pan, rotation,
+    /// overlays, ...). Lives here so menu commands and the SwiftUI
+    /// viewer can share it. In the multi-window model
+    /// (multi_window.mdx §2.1, §4.1) every `WindowState` owns its own
+    /// `ViewerState`; this property points at the **frontmost
+    /// window's** instance. `bindToFrontmostWindow(_:)` swaps the
+    /// reference when the user activates a different window, which
+    /// re-fires SwiftUI observation so the canvas re-renders against
+    /// the new window's zoom / pan / overlay state.
     public var viewer: ViewerState = ViewerState()
+
+    /// The `WindowState` whose `viewer` / `selectedFile` are currently
+    /// mirrored into `AppState`. Set by `bindToFrontmostWindow(_:)` on
+    /// every focus transition. Nil during early bootstrap before any
+    /// window has registered.
+    public weak var boundWindow: WindowState?
 
     /// Centralized tree-expansion + arrow-key cursor for the Directory
     /// Panel. See `TreeNavigator` and `docs/hotkeys.mdx` §4.
@@ -269,6 +290,29 @@ public final class AppState {
                 ErrorLog.log("WindowRegistryBootstrap.runIfNeeded failed",
                              error: error, class: String(describing: Self.self))
             }
+            // multi_window.mdx §2.1 / §4.1 — install the frontmost-
+            // window mirror hook so window-switches (⌘\`, Window menu,
+            // click) swap AppState.viewer / AppState.selectedFile to
+            // the new window's instances. Done here (after the
+            // registry bootstrap) so the first becomeKey landing in
+            // `WindowRegistryFrontmostObserver` already has the hook
+            // available.
+            WindowRegistry.shared.onFrontmostChanged = { [weak self] window in
+                self?.bindToFrontmostWindow(window)
+            }
+            // Bind eagerly to the lowest-numbered registered window
+            // (window 1 in the single-window case) so AppState's
+            // viewer / selectedFile are pointing at a real
+            // `WindowState` instance before bootstrap restores the
+            // last-selected file. Without this, the bootstrap-time
+            // assignment to `selectedFile` would not yet mirror into
+            // any window's per-window storage.
+            if let firstWindow = WindowRegistry.shared.windows.values
+                .sorted(by: { $0.windowID < $1.windowID })
+                .first
+            {
+                bindToFrontmostWindow(firstWindow)
+            }
             await loadConfig()
             await loadSettings()
             themeStore.bootstrap()
@@ -348,6 +392,49 @@ public final class AppState {
             NSLog("ImageGlass bootstrap failed: \(error)")
             isRestoringSelection = false
         }
+    }
+
+    /// Bind `AppState` to a specific `WindowState` so that
+    /// `state.viewer` and `state.selectedFile` mirror that window's
+    /// per-window storage (multi_window.mdx §2.1, §4.1). Called when
+    /// the user activates a different window via ⌘\` / Window menu /
+    /// click. Two-way sync:
+    ///
+    /// * Before swapping, snapshot the **outgoing** window's
+    ///   `selectedFile` from `AppState.selectedFile` (the live SwiftUI
+    ///   binding may have moved since the last switch).
+    /// * After swapping, copy the incoming window's `selectedFile`
+    ///   into `AppState.selectedFile` so the canvas re-renders against
+    ///   the right image.
+    ///
+    /// The `viewer` instance is replaced wholesale; SwiftUI's
+    /// observation tracker re-runs every `state.viewer.*` binding
+    /// because the published value changed.
+    public func bindToFrontmostWindow(_ newWindow: WindowState) {
+        // 1. Snapshot the outgoing window's selection back into its
+        //    own `WindowState` before we overwrite AppState's mirror.
+        if let outgoing = boundWindow, outgoing !== newWindow {
+            outgoing.selectedFile = selectedFile
+        }
+        boundWindow = newWindow
+
+        // 2. Swap in the new window's viewer instance. The bindings
+        //    that observe `state.viewer.*` re-fire automatically
+        //    because the stored property changed.
+        if viewer !== newWindow.viewer {
+            viewer = newWindow.viewer
+        }
+
+        // 3. Mirror the new window's selection into the AppState
+        //    binding so the canvas / panel re-render against it. The
+        //    `didSet` on `selectedFile` does its own bookkeeping; the
+        //    `isRestoringSelection` flag suppresses the UserDefaults
+        //    write during this swap so window-switch does not clobber
+        //    the global last-image marker.
+        let wasRestoring = isRestoringSelection
+        isRestoringSelection = true
+        selectedFile = newWindow.selectedFile
+        isRestoringSelection = wasRestoring
     }
 
     /// Read the persisted last-previewed file from UserDefaults and,

@@ -52,6 +52,13 @@ struct ImageGlassHotkeysModifier: ViewModifier {
             // matches the shifted character, so this routes solely
             // to copy-path while bare `p` routes to previous-image.
             .onKeyPress("P", phases: .down) { handleCopyPathKey($0) }
+            // slideshow.mdx §1 / §3 / §5 — bare `S` toggles the
+            // slideshow. Lives on the shared modifier so the binding
+            // fires from either the viewer canvas or the Directory
+            // Panel; without this, hitting S with focus on the file
+            // tree beeped because no responder owned the key.
+            .onKeyPress("s", phases: .down) { handleSlideshowKey($0) }
+            .onKeyPress("S", phases: .down) { handleSlideshowKey($0) }
     }
 
     private enum ArrowDir { case left, right, up, down }
@@ -141,6 +148,23 @@ struct ImageGlassHotkeysModifier: ViewModifier {
         case .next:     state.selectNext(wrap: wrap)
         case .previous: state.selectPrevious(wrap: wrap)
         }
+        return .handled
+    }
+
+    /// slideshow.mdx §1 / §3 / §5 — bare `S` toggles the slideshow.
+    /// Modifier-gated so ⌘/⌥/⌃ chords still route through the menu
+    /// (e.g. ⌥⌘S for the menu item). Crop mode suppresses the key —
+    /// the user is mid-task.
+    private func handleSlideshowKey(_ press: KeyPress) -> KeyPress.Result {
+        let _trace = PerformanceLog.shared.start(
+            "Hotkey.Handle",
+            extra: [("key", "S:slideshow")]
+        )
+        defer { _trace.finish() }
+        guard !state.crop.isActive else { return .ignored }
+        let blocking: EventModifiers = [.command, .option, .control]
+        if !press.modifiers.intersection(blocking).isEmpty { return .ignored }
+        SlideshowController.shared.toggle(appState: state, source: "key:S")
         return .handled
     }
 

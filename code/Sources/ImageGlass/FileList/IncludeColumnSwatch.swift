@@ -40,7 +40,19 @@ struct IncludeColumnSwatch: View {
 
     var body: some View {
         let relativePath = IncludePath.relative(absolutePath: absolutePath, root: root.path)
-        let decision = root.decision(for: relativePath)
+        // §1.0 / §5.2 — for a root row the explicit state lives in
+        // `defaultIncludeState`, not the include_overrides[] map. Without this
+        // branch the swatch would render the muted "inherit" variant on a
+        // freshly-added root, contradicting the two-state cycle.
+        let decision: EffectiveIncludeDecision = {
+            if isRoot {
+                let state: IncludeState = root.defaultIncludeState == .inherit
+                    ? .include
+                    : root.defaultIncludeState
+                return EffectiveIncludeDecision(explicit: state, resolved: state)
+            }
+            return root.decision(for: relativePath)
+        }()
         // §2.5 — Button form. A view-level `.onTapGesture` is
         // swallowed by the parent row's tap gesture in the file
         // panel; `Button` registers through AppKit's hit-test path

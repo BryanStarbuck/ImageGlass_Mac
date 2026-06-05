@@ -192,6 +192,7 @@ struct ImageGlassApp: App {
             layoutMenuCommands
             cropMenuCommands
             directoriesMenuCommands
+            windowMenuCommands
             // `videoMenuCommands` / `svgMenuCommands` placeholders are
             // wired in by a parallel WIP; once they land they slot back here.
         }
@@ -684,6 +685,28 @@ struct ImageGlassApp: App {
         }
     }
 
+    // MARK: - Window menu (multi_window.mdx §5)
+
+    /// Items added to the standard macOS Window menu via
+    /// `CommandGroup(after: .windowList)`. The native `Minimize`,
+    /// `Zoom`, `Bring All to Front`, and the auto-appended list of
+    /// open windows stay in place; we layer the multi-window
+    /// lifecycle controls on top.
+    @CommandsBuilder
+    private var windowMenuCommands: some Commands {
+        CommandGroup(after: .windowList) {
+            Divider()
+            WindowMenuCloseItem()
+            WindowMenuCycleNextItem()
+            WindowMenuCyclePreviousItem()
+            Divider()
+            WindowMenuReopenSubmenu()
+            WindowMenuForgetSubmenu()
+            Divider()
+            WindowMenuRenameItem()
+        }
+    }
+
     @CommandsBuilder
     private var layoutMenuCommands: some Commands {
         CommandMenu("Layout") {
@@ -1054,22 +1077,304 @@ struct ImageGlassApp: App {
 /// is not directly accessible inside an `App`'s `.commands` body. The
 /// shortcut is `⌘N`. The audit line is emitted by the action closure
 /// so a debugger can correlate the keystroke with the opened window.
+///
+/// multi_window.mdx §5.1 — also allocates a fresh `window_id` from the
+/// registry and writes the matching `settings_window_<N>.yaml` and
+/// `directories_window_<N>.yaml` immediately so a crash before the
+/// first user mutation does not lose the window.
 private struct NewWindowMenuItem: View {
     @Bindable var state: AppState
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
-        Button("New Window") {
-            let corr = MCPAuditLogger.newCorrelationId()
-            openWindow(id: "main")
-            MCPAuditLogger.shared.log([
-                ("tool", "window.new"),
-                ("source", FileActions.Source.keyCmdN.rawValue),
-                ("corr", corr),
-                ("ok", "true"),
-            ])
+        Button("New Image Window") {
+            ImageGlassWindowActions.openNewImageWindow(
+                openWindow: openWindow,
+                source: FileActions.Source.keyCmdN.rawValue
+            )
         }
         .keyboardShortcut("n", modifiers: [.command])
+    }
+}
+
+/// multi_window.mdx §5 — actions that need both the SwiftUI
+/// `openWindow` environment value AND the cross-cutting
+/// `WindowRegistry` mutation. Kept as a single namespace so the Window
+/// menu commands and the MCP `open_window` tool can share one
+/// implementation.
+enum ImageGlassWindowActions {
+    /// multi_window.mdx §5.1 — New Image Window (⌘N). Allocates the
+    /// next `window_id`, writes empty per-window YAML, posts the
+    /// audit line, then asks SwiftUI to materialize a new `main`
+    /// `WindowGroup` instance. The frontmost observer binds the new
+    /// NSWindow to the freshly-registered `WindowState` on its first
+    /// `becomeKey`.
+    @MainActor
+    static func openNewImageWindow(
+        openWindow: OpenWindowAction,
+        source: String
+    ) {
+        let corr = MCPAuditLogger.newCorrelationId()
+        let id = WindowRegistry.shared.allocateNextWindowID()
+        do {
+            try registerNewWindowState(id: id)
+        } catch {
+            ErrorLog.log(
+                "ImageGlassWindowActions.openNewImageWindow: registerNewWindowState failed for window_id=\(id)",
+                error: error,
+                class: "ImageGlassWindowActions"
+            )
+        }
+        openWindow(id: "main")
+        MCPAuditLogger.shared.log([
+            ("app", "window.open"),
+            ("window_id", String(id)),
+            ("source", source),
+            ("corr", corr),
+        ])
+    }
+
+    @MainActor
+    static func reopenClosedWindow(
+        windowID: Int,
+        openWindow: OpenWindowAction,
+        source: String
+    ) {
+        guard let state = WindowRegistry.shared.window(id: windowID) else { return }
+        // Flip the persisted flag so the next launch also resurrects
+        // the window (§5.2 step 4).
+        do {
+            try state.persistWasOpenOnQuit(true)
+        } catch {
+            ErrorLog.log(
+                "ImageGlassWindowActions.reopenClosedWindow: persistWasOpenOnQuit failed for window_id=\(windowID)",
+                error: error,
+                class: "ImageGlassWindowActions"
+            )
+        }
+        openWindow(id: "main")
+        let corr = MCPAuditLogger.newCorrelationId()
+        MCPAuditLogger.shared.log([
+            ("app", "window.open"),
+            ("window_id", String(windowID)),
+            ("source", source),
+            ("corr", corr),
+        ])
+    }
+
+    @MainActor
+    static func forgetClosedWindow(windowID: Int) {
+        do {
+            try WindowRegistry.shared.retire(windowID: windowID)
+            MCPAuditLogger.shared.log([
+                ("app", "window.retire"),
+                ("window_id", String(windowID)),
+            ])
+        } catch {
+            ErrorLog.log(
+                "ImageGlassWindowActions.forgetClosedWindow: retire failed for window_id=\(windowID)",
+                error: error,
+                class: "ImageGlassWindowActions"
+            )
+        }
+    }
+
+    @MainActor
+    static func closeFrontmostWindow() {
+        guard let id = WindowRegistry.shared.frontmostWindowID,
+              let state = WindowRegistry.shared.window(id: id) else { return }
+        // Per §1.3 step 5 / §5.2 step 4: explicit close persists
+        // `wasOpenOnQuit = false` so next launch does not resurrect
+        // this window.
+        try? state.persistWasOpenOnQuit(false)
+        WindowRegistry.shared.close(windowID: id)
+        MCPAuditLogger.shared.log([
+            ("app", "window.close"),
+            ("window_id", String(id)),
+            ("reason", "user"),
+        ])
+    }
+
+    /// multi_window.mdx §5.4 — cycle to the next/previous open
+    /// window by `window_id`, wrap at ends.
+    @MainActor
+    static func cycleWindow(forward: Bool) {
+        let open = WindowRegistry.shared.openWindows
+        guard open.count >= 2 else { return }
+        let currentID = WindowRegistry.shared.frontmostWindowID
+        let ordered = open.map(\.windowID)
+        let currentIdx = currentID.flatMap { ordered.firstIndex(of: $0) } ?? 0
+        let nextIdx: Int
+        if forward {
+            nextIdx = (currentIdx + 1) % ordered.count
+        } else {
+            nextIdx = (currentIdx - 1 + ordered.count) % ordered.count
+        }
+        let target = ordered[nextIdx]
+        if let win = WindowRegistry.shared.window(id: target)?.window {
+            win.makeKeyAndOrderFront(nil)
+            MCPAuditLogger.shared.log([
+                ("app", "window.activate"),
+                ("window_id", String(target)),
+            ])
+        }
+    }
+
+    @MainActor
+    static func renameFrontmostWindow(to newName: String?) {
+        guard let id = WindowRegistry.shared.frontmostWindowID,
+              let state = WindowRegistry.shared.window(id: id) else { return }
+        do {
+            try state.rename(newName)
+            MCPAuditLogger.shared.log([
+                ("app", "window.rename"),
+                ("window_id", String(id)),
+                ("name", newName ?? ""),
+            ])
+        } catch {
+            ErrorLog.log(
+                "ImageGlassWindowActions.renameFrontmostWindow failed for window_id=\(id)",
+                error: error,
+                class: "ImageGlassWindowActions"
+            )
+        }
+    }
+
+    /// multi_window.mdx §5.1 — write empty per-window YAML for a
+    /// freshly-allocated `window_id` and register the matching
+    /// `WindowState` so the registry knows about it before the
+    /// AppKit window's first `becomeKey` arrives.
+    @MainActor
+    private static func registerNewWindowState(id: Int) throws {
+        let settingsStore = WindowScopedSettingsStore(windowID: id)
+        let settings = WindowScopedSettings(windowID: id)
+        try settingsStore.save(settings)
+
+        let directoriesStore = DirectoriesStore(windowID: id)
+        try directoriesStore.ensureExists()
+
+        let state = WindowState(
+            windowID: id,
+            settings: settings,
+            settingsStore: settingsStore,
+            directoriesStore: directoriesStore
+        )
+        WindowRegistry.shared.register(state)
+    }
+}
+
+/// multi_window.mdx §5.1 ⌘W — Close the frontmost image window.
+/// Persists `was_open_on_quit = false` so the window does not
+/// resurrect on next launch. The on-disk YAML stays in place so the
+/// user can reopen via `Reopen Closed Window ▸`.
+private struct WindowMenuCloseItem: View {
+    var body: some View {
+        Button("Close Window") {
+            ImageGlassWindowActions.closeFrontmostWindow()
+        }
+        .keyboardShortcut("w", modifiers: [.command])
+    }
+}
+
+/// multi_window.mdx §5.4 — ⌘\` cycle to the next open image window.
+private struct WindowMenuCycleNextItem: View {
+    var body: some View {
+        Button("Cycle to Next Window") {
+            ImageGlassWindowActions.cycleWindow(forward: true)
+        }
+        .keyboardShortcut("`", modifiers: [.command])
+    }
+}
+
+private struct WindowMenuCyclePreviousItem: View {
+    var body: some View {
+        Button("Cycle to Previous Window") {
+            ImageGlassWindowActions.cycleWindow(forward: false)
+        }
+        .keyboardShortcut("`", modifiers: [.command, .shift])
+    }
+}
+
+/// multi_window.mdx §5.2 — Reopen Closed Window ▸ submenu. Lists every
+/// non-retired window whose `NSWindow` is currently nil. Selecting an
+/// item resurrects the window with its persisted geometry / cursor /
+/// panel layout.
+private struct WindowMenuReopenSubmenu: View {
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        Menu("Reopen Closed Window") {
+            let closed = WindowRegistry.shared.closedWindows
+            if closed.isEmpty {
+                Button("No Closed Windows") {}.disabled(true)
+            } else {
+                ForEach(closed, id: \.windowID) { state in
+                    Button(state.displayTitle) {
+                        ImageGlassWindowActions.reopenClosedWindow(
+                            windowID: state.windowID,
+                            openWindow: openWindow,
+                            source: "menu:window_reopen"
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// multi_window.mdx §5.3 — Forget Closed Window ▸ submenu. Moves the
+/// chosen window's YAML files to `Trash/window_<N>/` and adds the
+/// number to `retired_window_ids` so it is never reused.
+private struct WindowMenuForgetSubmenu: View {
+    var body: some View {
+        Menu("Forget Closed Window") {
+            let closed = WindowRegistry.shared.closedWindows
+            if closed.isEmpty {
+                Button("No Closed Windows") {}.disabled(true)
+            } else {
+                ForEach(closed, id: \.windowID) { state in
+                    Button(state.displayTitle) {
+                        let alert = NSAlert()
+                        alert.messageText = "Forget \(state.displayTitle)?"
+                        alert.informativeText =
+                            "This moves the window's YAML files to ~/Library/Application Support/ImageGlass_Mac/Trash/window_\(state.windowID)/ and prevents the window number from being reused."
+                        alert.addButton(withTitle: "Forget")
+                        alert.addButton(withTitle: "Cancel")
+                        if alert.runModal() == .alertFirstButtonReturn {
+                            ImageGlassWindowActions.forgetClosedWindow(
+                                windowID: state.windowID
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// multi_window.mdx §5.6 — Rename Window… opens a sheet that lets the
+/// user set `window_name`. Updates the WindowState, persists the YAML,
+/// and refreshes the AppKit auto-list in the Window menu via the
+/// `NSWindow.title` update.
+private struct WindowMenuRenameItem: View {
+    var body: some View {
+        Button("Rename Window…") {
+            let alert = NSAlert()
+            alert.messageText = "Rename Window"
+            alert.informativeText =
+                "Set a display name for the frontmost window. Leave blank to clear."
+            let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 22))
+            if let id = WindowRegistry.shared.frontmostWindowID,
+               let existing = WindowRegistry.shared.window(id: id)?.settings.windowName {
+                field.stringValue = existing
+            }
+            alert.accessoryView = field
+            alert.addButton(withTitle: "Save")
+            alert.addButton(withTitle: "Cancel")
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+            let raw = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            ImageGlassWindowActions.renameFrontmostWindow(to: raw.isEmpty ? nil : raw)
+        }
     }
 }
 

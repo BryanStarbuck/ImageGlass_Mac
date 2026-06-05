@@ -21,22 +21,44 @@ import ImageGlassCore
 final class SlideshowController {
     static let shared = SlideshowController()
 
-    private var window: NSWindow?
-    private var countdownTimer: Timer?
-    private var hostingState: ViewerState?
-    private var appState: AppState?
-    private var nextAdvanceAt: Date?
+    /// One slideshow run per window (multi_window.mdx §7). Window 1 can
+    /// be cycling a UX-design tour while window 2 is hand-stepping
+    /// family photos; both timers tick independently and write to
+    /// their own per-window YAML on quit.
+    private struct Run {
+        let windowID: Int
+        var window: NSWindow?
+        var countdownTimer: Timer?
+        var hostingState: ViewerState?
+        var appState: AppState?
+        var nextAdvanceAt: Date?
+        var runCorr: String = ""
+        var runStart: Date = .distantPast
+        var advanceCount: Int = 0
+    }
 
-    /// Audit bookkeeping per run. Reset on `start`, used by `stop`
-    /// to write the `app=slideshow.stop advances=N elapsed_s=…` line.
-    private var runCorr: String = ""
-    private var runStart: Date = .distantPast
-    private var advanceCount: Int = 0
+    /// Keyed by `window_id`. Absent key ⇒ no slideshow running in
+    /// that window.
+    private var runs: [Int: Run] = [:]
 
-    /// True while a slideshow window is open and advancing.
-    /// `slideshow.mdx` §1.3 and §3.4 use this as the toggle pivot —
-    /// `S` branches to `start` or `stop` on its value.
-    var isRunning: Bool { window != nil }
+    /// Aggregate "is any window currently running a slideshow"
+    /// (multi_window.mdx §7.3). Used by the View menu's
+    /// Start/Stop label which currently has a single toggle.
+    var isRunning: Bool { !runs.isEmpty }
+
+    /// Per-window predicate (multi_window.mdx §7.1). The Window menu's
+    /// Slideshow indicator and quit-time `wasRunningOnQuit` flag use
+    /// this.
+    func isRunning(windowID: Int) -> Bool { runs[windowID] != nil }
+
+    /// Resolve the implicit MCP / menu target window for slideshow
+    /// commands (multi_window.mdx §7.2). Falls back to window 1 when
+    /// the registry has no frontmost yet (very early launch, tests).
+    private func resolveTargetWindowID() -> Int {
+        WindowRegistry.shared.frontmostWindowID
+            ?? WindowRegistry.shared.windows.keys.sorted().first
+            ?? 1
+    }
 
     private init() {}
 
@@ -47,14 +69,19 @@ final class SlideshowController {
     /// slider is the source of truth for the interval. The `source`
     /// argument is recorded verbatim in the `tool=slideshow.toggle`
     /// audit line so an external observer can identify the trigger.
-    func toggle(appState: AppState, source: String) {
-        if isRunning {
-            stop(reason: "user_toggle", source: source)
+    ///
+    /// multi_window.mdx §7.2 — per-window. When `windowID` is nil the
+    /// frontmost window is the implicit target.
+    func toggle(appState: AppState, source: String, windowID: Int? = nil) {
+        let target = windowID ?? resolveTargetWindowID()
+        if isRunning(windowID: target) {
+            stop(windowID: target, reason: "user_toggle", source: source)
         } else {
             start(
                 appState: appState,
                 seconds: appState.settings.slideshow.interval_seconds,
-                source: source
+                source: source,
+                windowID: target
             )
         }
     }
@@ -64,18 +91,29 @@ final class SlideshowController {
     /// err=no_files_available` audit line so external observers see
     /// the attempted toggle and the reason it produced nothing
     /// (slideshow.mdx §8.4).
-    func start(appState: AppState, seconds: Double, source: String) {
+    ///
+    /// multi_window.mdx §7 — per-window. `windowID` is the window the
+    /// run is attributed to (audit, persistence on quit). When omitted
+    /// the frontmost window is used. Two windows can have independent
+    /// runs at the same time.
+    func start(appState: AppState, seconds: Double, source: String, windowID: Int? = nil) {
+        let target = windowID ?? resolveTargetWindowID()
         let _trace = PerformanceLog.shared.start(
             "Slideshow.Start",
-            extra: [("source", source), ("interval_s", String(seconds))]
+            extra: [
+                ("source", source),
+                ("interval_s", String(seconds)),
+                ("window_id", String(target)),
+            ]
         )
         defer { _trace.finish() }
-        // Idempotent restart: if a previous run is still up, tear it
-        // down so we don't end up with two slideshow windows. The
-        // stop here records `reason=user_toggle` because the new
-        // start is itself driven by the user.
-        if isRunning {
-            stop(reason: "user_toggle", source: source)
+        // Idempotent restart for the *same* window: if a previous run
+        // is still up in this window, tear it down so we don't end up
+        // with two slideshow windows for one. The stop here records
+        // `reason=user_toggle` because the new start is itself driven
+        // by the user. Other windows' runs are untouched (§7.3).
+        if isRunning(windowID: target) {
+            stop(windowID: target, reason: "user_toggle", source: source)
         }
 
         let corr = MCPAuditLogger.newCorrelationId()
@@ -100,75 +138,115 @@ final class SlideshowController {
         viewerState.slideshowRemaining = seconds
         viewerState.isSlideshowRunning = true
 
-        let root = SlideshowRoot(state: appState, viewer: viewerState)
+        let root = SlideshowRoot(state: appState, viewer: viewerState, windowID: target)
         let hosting = NSHostingController(rootView: root)
         let win = NSWindow(contentViewController: hosting)
-        win.title = "ImageGlass Slideshow"
+        win.title = "ImageGlass Slideshow — Window \(target)"
         win.styleMask = [.titled, .closable, .resizable, .fullSizeContentView]
         win.titlebarAppearsTransparent = true
         win.setContentSize(NSSize(width: 960, height: 720))
         win.center()
         win.makeKeyAndOrderFront(nil)
 
-        self.window = win
-        self.hostingState = viewerState
-        self.appState = appState
-        self.runCorr = corr
-        self.runStart = Date()
-        self.advanceCount = 0
+        var run = Run(windowID: target)
+        run.window = win
+        run.hostingState = viewerState
+        run.appState = appState
+        run.runCorr = corr
+        run.runStart = Date()
+        run.advanceCount = 0
+        runs[target] = run
+
+        // multi_window.mdx §7.1 — mark the per-window slideshow as
+        // running in-memory. Persistence of `wasRunningOnQuit`
+        // happens on quit-time flush (§7.4 / §11.2).
+        if let windowState = WindowRegistry.shared.window(id: target) {
+            windowState.slideshow.isRunning = true
+            windowState.slideshow.lastAdvancedAt = nil
+        }
 
         MCPAuditLogger.shared.logSlideshowToggle(
             on: true, interval: seconds, source: source,
             corr: corr, ok: true
         )
 
-        scheduleTick(every: seconds)
+        scheduleTick(windowID: target, every: seconds)
     }
 
+    /// Adjust the interval for the **frontmost** window's run.
     func setInterval(_ seconds: Double) {
-        hostingState?.slideshowSeconds = seconds
-        if window != nil { scheduleTick(every: seconds) }
+        setInterval(seconds, windowID: resolveTargetWindowID())
     }
 
-    /// Convenience that records `reason=user_toggle`. Kept so legacy
-    /// callers (and the MCP `set_slideshow(on:false)` path) can stop
-    /// without needing to know the reason taxonomy.
+    /// Per-window interval setter (multi_window.mdx §7).
+    func setInterval(_ seconds: Double, windowID: Int) {
+        guard let run = runs[windowID] else { return }
+        run.hostingState?.slideshowSeconds = seconds
+        if run.window != nil { scheduleTick(windowID: windowID, every: seconds) }
+    }
+
+    /// Convenience that records `reason=user_toggle` on the frontmost
+    /// window. Kept so legacy callers (and the MCP
+    /// `set_slideshow(on:false)` path) can stop without needing to
+    /// know the reason taxonomy or the window id.
     func stop() {
-        stop(reason: "user_toggle", source: "key:S")
+        stop(windowID: resolveTargetWindowID(),
+             reason: "user_toggle",
+             source: "key:S")
     }
 
-    /// Tear down the slideshow. `reason` is recorded in the
-    /// `app=slideshow.stop` audit line; pass `end_of_list` when the
-    /// caller has detected the no-wrap end-of-list condition, otherwise
-    /// `user_toggle`. `source` is only used when a paired
-    /// `tool=slideshow.toggle on=false` line is emitted (i.e. when the
-    /// user explicitly hit a stop UI). End-of-list stops are silent on
-    /// the `tool=` surface.
+    /// Frontmost-window stop with an explicit reason / source.
     func stop(reason: String, source: String) {
+        stop(windowID: resolveTargetWindowID(), reason: reason, source: source)
+    }
+
+    /// Tear down the slideshow for one specific window. `reason` is
+    /// recorded in the `app=slideshow.stop` audit line; pass
+    /// `end_of_list` when the caller has detected the no-wrap
+    /// end-of-list condition, otherwise `user_toggle`. `source` is
+    /// only used when a paired `tool=slideshow.toggle on=false` line
+    /// is emitted (i.e. when the user explicitly hit a stop UI).
+    /// End-of-list stops are silent on the `tool=` surface.
+    ///
+    /// multi_window.mdx §7 — only the named window's run is torn
+    /// down. Other windows' runs are unaffected.
+    func stop(windowID: Int, reason: String, source: String) {
         let _trace = PerformanceLog.shared.start(
             "Slideshow.Stop",
-            extra: [("reason", reason), ("source", source)]
+            extra: [
+                ("reason", reason),
+                ("source", source),
+                ("window_id", String(windowID)),
+            ]
         )
         defer { _trace.finish() }
-        countdownTimer?.invalidate()
-        countdownTimer = nil
-        nextAdvanceAt = nil
+        guard var run = runs[windowID] else { return }
+        run.countdownTimer?.invalidate()
+        run.countdownTimer = nil
+        run.nextAdvanceAt = nil
 
-        let runWasActive = window != nil
-        let corr = runCorr
-        let elapsed = runWasActive ? Date().timeIntervalSince(runStart) : 0
-        let advances = advanceCount
+        let runWasActive = run.window != nil
+        let corr = run.runCorr
+        let elapsed = runWasActive ? Date().timeIntervalSince(run.runStart) : 0
+        let advances = run.advanceCount
 
-        window?.close()
-        window = nil
-        hostingState?.isSlideshowRunning = false
-        hostingState?.slideshowRemaining = 0
-        hostingState = nil
-        let interval = appState?.settings.slideshow.interval_seconds ?? 0
-        appState = nil
-        runCorr = ""
-        runStart = .distantPast
-        advanceCount = 0
+        run.window?.close()
+        run.window = nil
+        run.hostingState?.isSlideshowRunning = false
+        run.hostingState?.slideshowRemaining = 0
+        run.hostingState = nil
+        let interval = run.appState?.settings.slideshow.interval_seconds ?? 0
+        run.appState = nil
+        runs.removeValue(forKey: windowID)
+
+        // multi_window.mdx §7.1 / §7.4 — drop the per-window in-memory
+        // running flag. The persisted `wasRunningOnQuit` is updated by
+        // the quit-time flush, not here, so a manual stop mid-session
+        // still records "was not running on quit" at next launch.
+        if let windowState = WindowRegistry.shared.window(id: windowID) {
+            windowState.slideshow.isRunning = false
+            windowState.slideshow.isPaused = false
+        }
 
         guard runWasActive else { return }
 
@@ -191,24 +269,28 @@ final class SlideshowController {
 
     /// Re-arm the countdown for a full `seconds` interval. Used after
     /// each advance and when the user dials a new interval.
-    private func scheduleTick(every seconds: Double) {
-        countdownTimer?.invalidate()
-        guard seconds > 0 else { return }
-        nextAdvanceAt = Date().addingTimeInterval(seconds)
-        hostingState?.slideshowRemaining = seconds
+    private func scheduleTick(windowID: Int, every seconds: Double) {
+        guard var run = runs[windowID] else { return }
+        run.countdownTimer?.invalidate()
+        guard seconds > 0 else { runs[windowID] = run; return }
+        run.nextAdvanceAt = Date().addingTimeInterval(seconds)
+        run.hostingState?.slideshowRemaining = seconds
         // Tick at 10 Hz so the countdown number ticks smoothly.
         let t = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.tickCountdown() }
+            Task { @MainActor in self?.tickCountdown(windowID: windowID) }
         }
         RunLoop.main.add(t, forMode: .common)
-        countdownTimer = t
+        run.countdownTimer = t
+        runs[windowID] = run
     }
 
-    private func tickCountdown() {
-        guard let state = hostingState, let target = nextAdvanceAt else { return }
+    private func tickCountdown(windowID: Int) {
+        guard let run = runs[windowID],
+              let state = run.hostingState,
+              let target = run.nextAdvanceAt else { return }
         let remaining = target.timeIntervalSinceNow
         if remaining <= 0 {
-            advance()
+            advance(windowID: windowID)
         } else {
             state.slideshowRemaining = remaining
         }
@@ -234,10 +316,15 @@ final class SlideshowController {
     /// filter through `IncludeStateController.effectiveState` so a
     /// folder-level `.exclude` override is honored even if the row's
     /// `passesFilter` flag predates the override.
-    private func advance() {
-        let _trace = PerformanceLog.shared.start("Slideshow.Advance")
+    private func advance(windowID: Int) {
+        let _trace = PerformanceLog.shared.start(
+            "Slideshow.Advance",
+            extra: [("window_id", String(windowID))]
+        )
         defer { _trace.finish() }
-        guard let appState, let state = hostingState else { return }
+        guard var run = runs[windowID],
+              let appState = run.appState,
+              let state = run.hostingState else { return }
         let ordered = appState.orderedNavigationFiles
         let walkerRoots = appState.walkerRoots
         let files: [String] = walkerRoots.isEmpty
@@ -251,7 +338,7 @@ final class SlideshowController {
         // §10.3 — every in-scope file got carved out. Stop with a
         // distinct reason so the audit log records the cause.
         if files.isEmpty {
-            stop(reason: "no_in_scope_files", source: "")
+            stop(windowID: windowID, reason: "no_in_scope_files", source: "")
             return
         }
 
@@ -276,15 +363,25 @@ final class SlideshowController {
             nextIdx = 0
         }
 
-        guard let target = nextIdx else {
+        guard let targetIdx = nextIdx else {
             // slideshow.mdx §7.7 — auto-stop at end of list, loop off.
-            stop(reason: "end_of_list", source: "")
+            stop(windowID: windowID, reason: "end_of_list", source: "")
             return
         }
 
-        let toPath = files[target]
+        let toPath = files[targetIdx]
         appState.selectedFile = toPath
-        advanceCount += 1
+        run.advanceCount += 1
+        runs[windowID] = run
+
+        // multi_window.mdx §7.1 — mirror the advance into the
+        // WindowState so the next quit-time flush records the correct
+        // `currentIndex` and the audit log can later prove which
+        // window did the advance.
+        if let windowState = WindowRegistry.shared.window(id: windowID) {
+            windowState.slideshow.currentIndex = targetIdx
+            windowState.slideshow.lastAdvancedAt = Date()
+        }
 
         MCPAuditLogger.shared.logSlideshowAdvance(
             from: fromPath,
@@ -292,7 +389,7 @@ final class SlideshowController {
             interval: interval,
             zoomMode: zoomModeLabel(state.zoomMode),
             wrap: wrapped,
-            corr: runCorr
+            corr: run.runCorr
         )
 
         // slideshow.mdx §4.7 — mid-show interval edits apply to the
@@ -302,7 +399,7 @@ final class SlideshowController {
         if abs(interval - state.slideshowSeconds) > 0.0001 {
             state.slideshowSeconds = interval
         }
-        scheduleTick(every: state.slideshowSeconds)
+        scheduleTick(windowID: windowID, every: state.slideshowSeconds)
     }
 
     /// Short label used in the audit log so a grep on `zoom_mode=fit`
@@ -330,6 +427,7 @@ final class SlideshowController {
 private struct SlideshowRoot: View {
     @Bindable var state: AppState
     @Bindable var viewer: ViewerState
+    let windowID: Int
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
@@ -341,7 +439,11 @@ private struct SlideshowRoot: View {
         .toolbar {
             ToolbarItem {
                 Button {
-                    SlideshowController.shared.stop()
+                    SlideshowController.shared.stop(
+                        windowID: windowID,
+                        reason: "user_toggle",
+                        source: "menu:slideshow_toolbar"
+                    )
                 } label: {
                     Image(systemName: "stop.fill")
                 }
@@ -355,7 +457,7 @@ private struct SlideshowRoot: View {
                             .monospacedDigit()
                     }
                     .onChange(of: viewer.slideshowSeconds) { _, new in
-                        SlideshowController.shared.setInterval(new)
+                        SlideshowController.shared.setInterval(new, windowID: windowID)
                     }
                 }
             }

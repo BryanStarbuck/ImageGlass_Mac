@@ -1,0 +1,2193 @@
+---
+title: Use Case — Open Files From Disk (Finder, `open`, Drag, Services, AppleEvents)
+description: Product and engineering specification for the macOS "open these files in ImageGlass_Mac" entry points. Covers every native channel — Finder double-click, Finder right-click → Open With, the `open` shell command, drag-and-drop onto the app icon / Dock tile, the Services menu, NSWorkspace requests from other apps, and the underlying `kAEOpenDocuments` AppleEvent. The headline rule: each open-files request the OS delivers as a single AppleEvent counts as one batch, and each batch opens exactly one new window with a freshly allocated `window_id` (per multi_window.mdx §1.2). The new window's directory/filename panel is an ad-hoc list that contains only the files in that batch — never any other window's root directories, never any other batch's files. Next / Previous and Slideshow inside the ad-hoc window cycle through only the batch. Pins the on-disk shape (`mode: ad_hoc`, `ad_hoc_files:` block in `directories_window_<N>.yaml`), the AppleEvent / NSApplicationDelegate plumbing, the file-type gate (image, SVG, video), and the persistence-on-quit story. Canonical worked example (§9): a Finder selection of 20 mixed JPEG / PNG / SVG / MP4 files opens window 4 with those exact 20 files, the viewer auto-loads file 1, ⌘→ cycles 1 → 20 → wraps, and slideshow cycles the same 20.
+---
+
+# Use Case — Open Files From Disk (Finder, `open`, Drag, Services, AppleEvents)
+
+ImageGlass_Mac is the user's image viewer. The most basic and most
+common way the user reaches it is *not* the app icon — it is the
+operating system delivering files **to** the app: a Finder
+double-click on a JPEG, an `open ~/Pictures/snap.png` from a Terminal,
+a drag of twenty files onto the Dock icon, a "Show All Images" from
+the Services menu. Every one of those paths is a macOS-native
+open-files event, and every one of them must land in ImageGlass_Mac
+the same way: as a **batch** that opens a **new window** whose file
+panel contains **only** the files in that batch.
+
+This spec pins down:
+
+* **Product behavior** — what the user sees when they double-click
+  one file or twenty files, what window appears, what the file panel
+  contains, what the viewer loads first, what ⌘→ / ⌘← do, what
+  Slideshow does, and what survives a quit-and-relaunch.
+* **Entry points** — every macOS-native channel the OS uses to ask
+  the app to open files, including Finder, the `open` shell command,
+  `NSWorkspace.shared.open(_:withApplicationAt:configuration:
+  completionHandler:)`, the Services menu, drag-and-drop on the app
+  icon and the Dock tile, and the raw `kAEOpenDocuments` AppleEvent
+  underlying all of them.
+* **Batch → new window** — the headline rule: each AppleEvent
+  delivered by LaunchServices is one batch and produces exactly one
+  new ImageGlass_Mac window (with a freshly allocated `window_id`,
+  per [multi_window.mdx §1.2](./multi_window.mdx#12-window-number-allocation)).
+* **The ad-hoc file list** — the new `mode: ad_hoc` shape in
+  `directories_window_<N>.yaml` and how it differs from the
+  scope-driven `mode: scoped` shape from
+  [list_of_files.mdx §3A.2](../list_of_files.mdx#3a2-schema). An
+  ad-hoc window pins a frozen list of file paths, not a directory
+  to walk.
+* **Cycling rules** — Next / Previous (⌘→ / ⌘←, also the configured
+  navigation hotkey) cycle through only the batch. Slideshow cycles
+  the same set. The window's own scope is the universe.
+* **Engineering plumbing** — the `NSApplicationDelegate` hooks,
+  AppleEvent registration, batch coalescing, file-type filtering,
+  rejection of non-supported files, and the precise place this
+  flow ties into the `WindowRegistry` / `WindowState` machinery
+  from [multi_window.mdx §4](./multi_window.mdx#4-the-in-memory-mirror).
+
+This is the user-facing companion to:
+
+* [Multi-Window State](./multi_window.mdx) — every window-creation
+  rule, the `WindowRegistry`, `WindowState`, frontmost-window
+  retarget rule, `directories_window_<N>.yaml`, `settings_window_<N>.yaml`,
+  and the `app=window.open` audit log line. This spec **extends**
+  that file with a new `source` value (`open_files`) and a new
+  per-window `mode` value (`ad_hoc`).
+* [File List Panel](../list_of_files.mdx) §3A — the engineering
+  spec for the file-tree panel, `directories.yaml`, the
+  in-memory tree model, and the file-kind filter. The ad-hoc
+  shape in this spec is rendered by the same panel; only the
+  source of the file list changes.
+* [MCP File Panel Tour](./mcp_file.mdx) — the per-call walkthrough
+  of the MCP surface. The auto-select-first-image rule from
+  [mcp_file.mdx §10](./mcp_file.mdx#10-auto-select-first-image-when-viewer-is-empty)
+  applies unchanged when a new ad-hoc window opens.
+* [Slideshow](./slideshow.mdx) — the slideshow runtime; ad-hoc
+  windows use the same `SlideshowState` from
+  [multi_window.mdx §7.1](./multi_window.mdx#71-slideshowstate),
+  with the order list seeded from `ad_hoc_files` instead of the
+  scope-resolved file list.
+* [Error Handling](../error_handling.mdx) §4.2 — the `log.log`
+  record format. New `app=open_files.*` lines are introduced in
+  §13.
+
+This spec does **not** invent any new MCP tools. The
+`mcp__imageglass__open_files_from_disk` tool is **not** a goal:
+the open-files flow is OS-driven, and the MCP surface only
+observes the result (via `list_windows`, `get_window`,
+`list_directories`, etc.).
+
+---
+
+## 0. Common Preconditions
+
+These hold for every scenario unless a scenario explicitly overrides
+them.
+
+* The app is installed at `/Applications/ImageGlass_Mac.app`, signed
+  with the Developer ID certificate, notarized, and stapled.
+* The app's `Info.plist` declares the supported document types so
+  LaunchServices knows to route files of the right UTIs to it. The
+  declaration block is fixed in §4.1.
+* `~/T/_imageglass/` exists (per
+  [multi_window.mdx §3](./multi_window.mdx#3-on-disk-file-layout)),
+  containing at least `settings.yaml`. If the app has never run
+  before, the first open-files event triggers the bootstrap from
+  [local_storage.mdx §3.2](../local_storage.mdx#32-bootstrap-on-first-launch)
+  before the new window is created.
+* The user has at least one display attached.
+* The MCP server is reachable (but is not required for the
+  open-files flow itself — the flow is a pure OS / AppKit path).
+* "Verify" still means `cat` the named file, look at the named
+  pixel region on screen, or read the named log line. Each verify
+  step is a check a human or an XCUITest run can perform.
+
+---
+
+# Part 1 — Product Specification
+
+This half of the spec is written by product management for product
+management. It pins down **what the user sees** and **what the user
+can rely on**, not how the code achieves it. The engineering half
+(Part 2, starting at §11) is the implementation contract.
+
+## 1. The Open-Files Mental Model
+
+### 1.1 The one-sentence rule
+
+> Whenever the macOS operating system asks ImageGlass_Mac to open a
+> set of files, the app opens one new window whose directory /
+> filename panel contains exactly that set of files, and the viewer
+> loads the first file in the set.
+
+That sentence is the spec. The rest of this document is the
+fine-grained behavior — entry points, file types, cycling, persistence
+— required to make that sentence true under every channel the OS
+exposes.
+
+### 1.2 Vocabulary
+
+* **Open-files request** — a single macOS LaunchServices event that
+  carries a list of one or more file URLs and the message "open
+  these in this app." In Cocoa terms this is the
+  `application(_:open:)` callback on `NSApplicationDelegate`
+  (Sequoia / macOS 15) and the underlying `kAEOpenDocuments`
+  AppleEvent (`'aevt'` / `'odoc'`).
+* **Batch** — the **set of file URLs in one open-files request**.
+  A Finder selection of 20 files opened with ⌘O sends one batch
+  of 20. Twenty consecutive `open` shell commands send 20 batches
+  of 1.
+* **Batch size** — the number of URLs in the batch. Always ≥ 1.
+* **Supported file** — a file whose UTI conforms to one of the
+  three categories the app handles: `public.image`,
+  `public.svg-image`, or `public.movie` (full list in §4.2).
+* **Unsupported file** — any other file. Unsupported files are
+  dropped from the batch with a status-bar message; see §6.5.
+* **Ad-hoc window** — a window whose `directories_window_<N>.yaml`
+  has `mode: ad_hoc` and a pinned `ad_hoc_files:` list. Created
+  by an open-files request.
+* **Scoped window** — a window whose `directories_window_<N>.yaml`
+  has `mode: scoped` and a `root_directories:` list. Created by
+  ⌘N, by Reopen Closed Window, or by `mcp__imageglass__open_window`.
+  This is the model spec'd in [multi_window.mdx](./multi_window.mdx).
+* **Frontmost window** — same definition as
+  [multi_window.mdx §1.1](./multi_window.mdx#11-vocabulary). The
+  open-files flow does **not** retarget the frontmost window; it
+  always creates a new one.
+
+### 1.3 What the user sees, in one paragraph
+
+The user selects five JPEGs and an MP4 in Finder, presses ⌘O.
+ImageGlass_Mac jumps to the foreground (or launches if not
+running). A brand-new window appears, freshly numbered. Its
+left-side file panel lists exactly those six files — file
+basenames only, in the order Finder delivered them. The viewer
+loads the first JPEG. ⌘→ moves to the second JPEG; ⌘→ four more
+times reaches the MP4 (Space starts playback). ⌘→ again wraps
+to the first JPEG. The user can hit F5 to slideshow through the
+same six files. Other ImageGlass_Mac windows that were already
+open are untouched — their directories, filters, slideshows,
+and cursors are exactly where they were a moment ago. The user
+quits. Relaunch: the ad-hoc window restores with the same six
+files in the same order.
+
+## 2. The Entry Points
+
+Every channel below is an open-files request that resolves to the
+same `application(_:open:)` callback. The user-visible difference
+is only **how the user invokes it**. The post-callback behavior
+(§3 onward) is identical for all of them.
+
+### 2.1 Finder double-click on one file
+
+The user opens a Finder window, navigates to `~/Pictures/foo.jpg`,
+and double-clicks. LaunchServices consults `Info.plist`, sees
+ImageGlass_Mac claims `public.image` as a viewer (or the user has
+set ImageGlass_Mac as the default for `.jpg` via Finder → Get Info
+→ Open With → Change All), and sends one batch of one URL to the
+app.
+
+* Batch size: 1.
+* Source label in the audit log: `source=finder_double_click`.
+
+### 2.2 Finder multi-select + Open
+
+The user ⌘-clicks (or Shift-clicks) 20 files in Finder, then
+chooses File → Open (⌘O), or double-clicks the selection, or
+right-clicks → Open. LaunchServices sends **one** batch of 20
+URLs.
+
+* Batch size: N.
+* Source label: `source=finder_multi_select`.
+
+### 2.3 Finder right-click → Open With → ImageGlass_Mac
+
+The user selects one or many files, right-clicks, chooses
+**Open With → ImageGlass_Mac**. Behaves identically to §2.1 / §2.2;
+the only difference is that ImageGlass_Mac was selected explicitly
+rather than via the default-app resolution.
+
+* Batch size: 1 or N.
+* Source label: `source=finder_open_with`.
+
+### 2.4 The `open` shell command
+
+The user runs:
+
+```sh
+open ~/Pictures/foo.jpg
+open ~/Pictures/foo.jpg ~/Pictures/bar.png
+open -a ImageGlass_Mac.app ~/Pictures/*.jpg
+```
+
+The first form opens one file in the default app (which may be
+ImageGlass_Mac if the user set it that way). The second opens
+two. The third explicitly targets ImageGlass_Mac for every shell-
+expanded JPEG. In every case the `open` command translates the
+arguments into one `kAEOpenDocuments` AppleEvent with the URL
+list.
+
+* Batch size: as many URLs as `open` received.
+* Source label: `source=open_cli`.
+
+#### 2.4.1 The reuse-vs-new-window flag
+
+`open` accepts `-n` ("open a new instance") and `-F` ("open
+fresh"). The spec is the same regardless: every `open` invocation
+that reaches ImageGlass_Mac as one AppleEvent is one batch. The
+`-n` flag asks LaunchServices to spawn a second app instance;
+that is a different process, not a different window of the same
+process. ImageGlass_Mac does **not** support multi-instance —
+see §5.4 — so `-n` is mapped to the same single-instance + new
+window behavior as the default.
+
+### 2.5 Drag-and-drop onto the app icon
+
+The user drags one or many files onto `/Applications/ImageGlass_Mac.app`
+(in Finder), or onto the Dock tile if ImageGlass_Mac is in the
+Dock. LaunchServices delivers one batch covering the dragged
+items.
+
+* Batch size: 1 or N.
+* Source label: `source=drag_to_app` for icon-drop;
+  `source=drag_to_dock` for Dock-tile drop.
+
+### 2.6 Drag-and-drop into an already-running window
+
+The user drags files from Finder **into the file panel** (or the
+viewer canvas) of an already-running ImageGlass_Mac window. This
+is **not** an open-files request — it is an in-app drop
+([list_of_files.mdx §3A.7](../list_of_files.mdx#3a7-drag-and-drop-into-the-panel)
+covers the contract). It does **not** open a new window. It is
+called out here only to disambiguate: dragging onto the *app icon*
+opens a new window; dragging into an existing window's panel
+mutates that window.
+
+### 2.7 The Services menu
+
+When ImageGlass_Mac is installed, macOS adds a Services entry
+("Open in ImageGlass_Mac") for the three supported UTI categories.
+The user selects files anywhere (Finder, Mail, Photos, a web
+browser preview, etc.), opens the Services submenu in the
+application menu, and chooses **Services → Open in ImageGlass_Mac**.
+macOS converts the selected items into file URLs and sends one
+AppleEvent batch.
+
+* Batch size: 1 or N.
+* Source label: `source=services_menu`.
+
+### 2.8 `NSWorkspace.open(_:withApplicationAt:configuration:)`
+
+Third-party apps (or our own scripts) can ask the workspace to
+open URLs in ImageGlass_Mac:
+
+```swift
+let cfg = NSWorkspace.OpenConfiguration()
+NSWorkspace.shared.open([url1, url2],
+  withApplicationAt: URL(fileURLWithPath: "/Applications/ImageGlass_Mac.app"),
+  configuration: cfg)
+```
+
+This becomes one AppleEvent at our end.
+
+* Batch size: as supplied by the caller.
+* Source label: `source=nsworkspace_api`.
+
+### 2.9 The raw AppleEvent (`'aevt'` / `'odoc'`)
+
+A script (AppleScript, JXA, Swift `NSAppleEventDescriptor`) can
+send the event directly:
+
+```applescript
+tell application "ImageGlass_Mac"
+  open {POSIX file "/Users/me/Pictures/foo.jpg"}
+end tell
+```
+
+Same path; same behavior.
+
+* Batch size: as supplied.
+* Source label: `source=apple_event_script`.
+
+### 2.10 Reopen via "Recent Items" / Dock right-click → Recent
+
+The macOS-managed "Recent Items" menu (Dock right-click on the app
+tile, or Apple menu → Recent Items) shows files the user has
+opened recently. Selecting one fires an open-files request with
+batch size 1.
+
+* Batch size: 1.
+* Source label: `source=recent_items`.
+
+The Recent Items list itself is managed by macOS, not by us. We
+contribute to it via `NSDocumentController.sharedDocumentController.
+noteNewRecentDocumentURL(_:)` (§12.3).
+
+### 2.11 Channels that are *not* open-files
+
+To make the boundary explicit, these are **not** open-files
+requests and are out of scope for this spec:
+
+* **⌘N inside the running app** — creates an empty scoped window
+  (per [multi_window.mdx §5.1](./multi_window.mdx#51-new-image-window-n)).
+* **Window → Reopen Closed Window → Window N** — restores a
+  previously-numbered window (per
+  [multi_window.mdx §5.2](./multi_window.mdx#52-reopen-closed-window-)).
+* **MCP `mcp__imageglass__open_window`** — creates an empty scoped
+  window or reopens by ID (per
+  [multi_window.mdx §6.4](./multi_window.mdx#64-new-tools-for-window-management)).
+* **MCP `mcp__imageglass__add_directory`** — mutates the frontmost
+  scoped window (per
+  [multi_window.mdx §6.1](./multi_window.mdx#61-tools-that-retarget-the-frontmost-window)).
+* **Drag into a panel of an already-running window** — §2.6.
+* **Copy-paste an image from the clipboard into the viewer** — an
+  in-app paste, not an open-files request. The viewer creates a
+  temporary file and shows it in the **frontmost** window. Spec
+  in [actions.mdx](./actions.mdx); not covered here.
+
+The product invariant is: **only an open-files request creates an
+ad-hoc window**.
+
+## 3. The Headline Rule — Batch Equals New Window
+
+> One AppleEvent open-files batch → one freshly allocated `window_id`
+> → one new `NSWindow` → one new `directories_window_<N>.yaml` with
+> `mode: ad_hoc` and the batch's URLs pinned in `ad_hoc_files:`.
+
+This rule has three sub-rules the user can rely on.
+
+### 3.1 Existing windows are never mutated
+
+An open-files request **never** modifies any existing
+`directories_window_<K>.yaml` (for any K ≠ the new N). A user who
+has window 1 mid-slideshow over the JFK/UX hierarchy and window 2
+hand-stepping through family pictures can double-click a screenshot
+in Finder; the resulting window 3 opens beside windows 1 and 2 and
+those windows are bit-for-bit unchanged on disk.
+
+This is the key contrast with the MCP retarget rule from
+[multi_window.mdx §6](./multi_window.mdx#6-the-frontmost-window-is-the-implicit-mcp-target):
+MCP calls retarget the frontmost; OS open-files requests never
+retarget anything — they always create.
+
+### 3.2 The new window's file list is *only* the batch
+
+The new window's file panel shows exactly the URLs in the batch
+(after the supported-file filter from §4.2 drops any non-image /
+non-SVG / non-video entries). It does **not** show:
+
+* Other images in the same parent directory.
+* Other ImageGlass_Mac windows' contents.
+* The user's "Open Recent" list.
+* A directory walk of the parent of any opened file.
+
+The file panel for an ad-hoc window is a **flat, pinned list**.
+Its rendering is the **strip view** mode of the file panel (see
+[list_of_files.mdx §4.5](../list_of_files.mdx#45-view-modes))
+by default, switchable to grid or details by the standard panel
+controls. The **tree view** is *available* but renders a single
+synthetic root labeled `Opened files (N)` with the batch as flat
+children — there is no parent-directory hierarchy because the
+batch may span multiple unrelated directories.
+
+### 3.3 The viewer auto-loads the first file
+
+When the new window finishes drawing, the viewer canvas loads the
+first supported file in the batch (in the order the AppleEvent
+delivered them — see §4.3 for the ordering rule). This is the
+[mcp_file.mdx §10 auto-select-first-image rule](./mcp_file.mdx#10-auto-select-first-image-when-viewer-is-empty)
+applied to ad-hoc windows.
+
+If the batch contains only one file, the file is the auto-load
+target and remains the only item in the panel. If the batch
+contains zero supported files after filtering (e.g. the user
+opened ten `.docx` files), see §6.6 — the new window is *not*
+created.
+
+## 4. What Counts as a File We Can Open
+
+### 4.1 The `Info.plist` declaration
+
+The product claim "ImageGlass_Mac opens images, SVG, and video"
+is materialized by the `CFBundleDocumentTypes` and
+`UTExportedTypeDeclarations` keys in `Info.plist`. The shape is
+declarative — once declared, LaunchServices does the file-type
+routing for us, and the Finder "Open With" submenu shows
+ImageGlass_Mac for matching files automatically.
+
+The product invariant is: any file whose UTI conforms to one of
+the three category UTIs in §4.2 is acceptable; anything else is
+rejected at the §6.5 supported-file filter.
+
+The full `Info.plist` block lives in §11.2; this section
+describes the **policy** of what is declared, not the schema.
+
+### 4.2 The three supported categories
+
+The three accept categories, in the same order they appear in
+`Info.plist` and the same order the file panel groups them when
+rendering a mixed batch:
+
+1. **`public.image`** — JPEG, PNG, HEIC, HEIF, TIFF, BMP, GIF,
+   ICO, ICNS, AVIF, JXL, WebP, RAW (CR2/CR3/NEF/ARW/DNG and the
+   rest of the system RAW pipeline), PSD (flattened). The full
+   list is the union of UTIs that conform to `public.image`
+   that the system's ImageIO can decode in macOS 14+, listed
+   explicitly in `Info.plist` so LaunchServices' routing is
+   deterministic.
+2. **`public.svg-image`** — SVG static and animated. Handled by
+   the SVG preview surface ([../svg.mdx](../svg.mdx)).
+3. **`public.movie`** — MP4, MOV, M4V, AVI (when QuickTime can
+   decode), WebM (when AVFoundation can decode), HEVC. Handled by
+   the AVKit preview surface ([../videos.mdx](../videos.mdx)).
+   Playback does **not** auto-start (see §5.2).
+
+A file whose UTI does not conform to any of the three is
+**unsupported** for the open-files flow. The supported-file
+filter in §6.5 drops it.
+
+### 4.3 The order of files inside the batch
+
+The order in which files appear in the file panel is the **order
+in which the AppleEvent delivered them**. The AppleEvent ordering
+rule, set by LaunchServices, is:
+
+* **Finder selection** — the order is Finder's current visible
+  sort order of the parent directory. If Finder is sorted by name
+  ascending, the batch is alphabetical; if sorted by date, it is
+  date-ordered.
+* **`open` shell command** — the order of the command-line
+  arguments left-to-right. `open b.jpg a.jpg` delivers `b.jpg`
+  first.
+* **Drag-and-drop onto the app icon** — the order in which the
+  Finder collected the dragged items (which is approximately the
+  order the user clicked them, then ⌘-extended the selection).
+* **NSWorkspace API / AppleEvent script** — the order supplied
+  by the caller.
+* **Services menu** — the order Finder (or the source app) had
+  selected.
+
+The product invariant is: **we use the OS-delivered order
+verbatim, without re-sorting**. The user can re-sort the panel
+afterward by clicking the panel's column header (per
+[list_of_files.mdx §4.7](../list_of_files.mdx#47-sort-order)),
+but the on-disk `ad_hoc_files:` list preserves the original
+OS order so the panel can be reset.
+
+### 4.4 Duplicate URLs in the batch
+
+If the OS-delivered batch contains the same URL twice (rare,
+but a script can construct it), the second occurrence is
+**dropped silently**. The `ad_hoc_files:` list contains the URL
+once.
+
+### 4.5 Symbolic links and aliases
+
+A symlink to a supported file is treated as a supported file at
+its **resolved** path. The on-disk `ad_hoc_files:` entry records
+both the original URL the AppleEvent supplied and the resolved
+path; the file panel labels the row with the link's basename.
+
+A Finder alias (`com.apple.alias-file`) is resolved by the
+AppleEvent layer before we see it; the URL we receive is already
+the target. No special handling required from us.
+
+## 5. The New Window — Detailed Behavior
+
+### 5.1 Geometry and panels of the freshly opened window
+
+When an open-files request creates window N:
+
+* The window opens at the **last position the user moved an
+  ad-hoc window to** (per `settings.yaml`
+  `ad_hoc.default_frame`), or — on first ever ad-hoc — at the
+  screen's center at 1280 × 800 pt.
+* The panel layout starts from the **Browser** preset
+  ([panels.mdx](../panels.mdx) §7.2): file panel docked left,
+  viewer center, toolbar top, status bar bottom. The user can
+  switch to any other preset; the choice is persisted per window.
+* Window title: `Opened files — N items` if N > 1, or the
+  basename of the single file if N = 1.
+* The window becomes the key window (`makeKeyAndOrderFront`); the
+  `WindowRegistry` updates `frontmostWindowID` to the new N.
+
+### 5.2 The viewer loads the first file
+
+* If the first file is `.image` → ImageIO decodes; Metal canvas
+  renders fit-to-window (or in the user's saved
+  `viewer.default_zoom_mode`).
+* If the first file is `.svg` → SVG canvas renders.
+* If the first file is `.video` → AVKit canvas swaps in; first
+  frame shows; **playback does not auto-start**, matching the
+  same rule from
+  [mcp_file.mdx §2 / §2.1](./mcp_file.mdx#2-select-a-file--image--svg--video-all-load-in-the-viewer).
+  The user presses Space to start.
+
+If the batch contains a mix of categories, the auto-load target
+is still the first file in OS-delivered order regardless of
+category. No category-priority reordering happens.
+
+### 5.3 The cycling rules
+
+The window's "universe of files" is exactly the `ad_hoc_files:`
+list. The Next / Previous behavior:
+
+* **⌘→ (Next)** — advance the viewer to the next file in the
+  list. Wraps from end to start.
+* **⌘← (Previous)** — back up to the previous file. Wraps from
+  start to end.
+* **Arrow keys when the panel has focus** — same effect: the
+  selection moves up/down the flat list, and the viewer loads
+  the newly selected file.
+* **Mouse click on a panel row** — selects that row; the viewer
+  loads it.
+
+The "wrap at ends" toggle from
+[multi_window.mdx §3.2 `navigation.loop_at_ends`](./multi_window.mdx#32-settings_window_nyaml)
+applies per window. For ad-hoc windows it defaults to `true`
+(wrapping), because the batch is finite and the user typically
+wants to cycle. For scoped windows the default remains `false`
+(per the existing setting).
+
+### 5.4 Slideshow over the batch
+
+Pressing F5 (or Slideshow → Start) starts a slideshow whose
+**order is the `ad_hoc_files:` list**, advancing every
+`slideshow.interval` seconds (default 5, see
+[settings.mdx](../settings.mdx) §4).
+
+* When `slideshow.random_order` is `false`, slideshow walks the
+  batch top-to-bottom and wraps at the end.
+* When `slideshow.random_order` is `true`, the slideshow seeds a
+  random permutation of `ad_hoc_files:` once and walks that. The
+  seed is recorded in `settings_window_<N>.yaml`
+  `slideshow.order_seed` so the order survives a pause/resume
+  but not a quit (per
+  [multi_window.mdx §7.4](./multi_window.mdx#74-slideshow-does-not-survive-quit-per-window)).
+
+If the batch has only one file, F5 still "starts" a slideshow
+but it has nothing to advance to. The viewer holds on the one
+file and the slideshow indicator shows; the user pressing F5
+again stops.
+
+### 5.5 The "hide other windows" reminder
+
+The application-level `slideshow.hide_main_in_slideshow` setting
+([settings.mdx](../settings.mdx) §4) applies to ad-hoc windows
+too: when slideshow is running in window N, other windows of the
+same app fade per the existing rule. This is preserved verbatim
+from the scoped-window slideshow behavior.
+
+### 5.6 What can the user do with the file panel?
+
+Most file-panel actions work normally in an ad-hoc window:
+
+* **Sort** — clicking a column header re-sorts the panel
+  visually. The on-disk `ad_hoc_files:` is preserved verbatim;
+  only the rendering order changes. Per-window sort is recorded
+  per
+  [multi_window.mdx §2.1 `sort_order`](./multi_window.mdx#21-per-window-state).
+* **View mode toggle** — strip / grid / details. Tree view
+  renders the synthetic `Opened files (N)` root.
+* **Right-click on a row → Reveal in Finder** — works.
+* **Right-click → Copy Path** — works.
+* **Drag a row out of the panel** — works.
+
+These actions do **not** work the same way in an ad-hoc window:
+
+* **MCP `add_directory` / `update_directory_filter` /
+  `set_global_filter`** — the frontmost-window retarget rule
+  from
+  [multi_window.mdx §6](./multi_window.mdx#6-the-frontmost-window-is-the-implicit-mcp-target)
+  still applies, but the call lands on an ad-hoc window and the
+  ad-hoc window has no `root_directories:` to mutate. The
+  response is `ok=false err=ad_hoc_window_no_roots` with a
+  message telling the caller to switch to a scoped window
+  (via `focus_window(window_id)` or ⌘\`) before retrying.
+  See §10.4 for the full table.
+* **The Directories menu's "Add Directory…" item** — when the
+  frontmost window is ad-hoc, the menu item is **disabled** and
+  carries a tooltip explaining why. Adding a directory to an
+  ad-hoc window would silently convert it to a scoped window;
+  the user must explicitly convert via §5.7.
+* **Drag a new file from Finder into the panel** — this is
+  allowed but the semantics are documented carefully in §5.8.
+
+### 5.7 Converting an ad-hoc window to a scoped window
+
+The user can convert an ad-hoc window to a scoped window via
+**File → Convert to Directory-Backed Window…**. The dialog asks:
+"Use the parent directory of the first file as the root?" with
+options:
+
+* Use parent directory.
+* Pick a different directory.
+* Cancel.
+
+Choosing one of the first two switches the window's `mode` from
+`ad_hoc` to `scoped`, clears `ad_hoc_files:`, populates
+`root_directories:` with the chosen directory, and triggers a
+walk. The viewer keeps the same current file if that file is
+still in the new walked tree; otherwise it falls back to the
+first file (per the
+[mcp_file.mdx §10](./mcp_file.mdx#10-auto-select-first-image-when-viewer-is-empty)
+auto-select rule).
+
+This is the **only** way to broaden an ad-hoc window. It is
+deliberately a user action with confirmation, not an implicit
+side effect.
+
+### 5.8 Dragging additional files into an ad-hoc window
+
+A user may drag more files from Finder into the ad-hoc window's
+panel (or canvas). The behavior:
+
+* Each dropped file that is supported and not already in the
+  batch is **appended** to `ad_hoc_files:`.
+* The window title updates to `Opened files — M items` where M
+  is the new size.
+* Unsupported files are dropped with a status-bar message.
+* Duplicates (same URL already pinned) are dropped silently.
+* The viewer does not change selection.
+
+This is a deliberate exception to "the batch is fixed" — once
+the window exists, the user can grow its pinned list. The
+ad-hoc window cannot be **shrunk** by dragging out; that is a
+non-goal (a future "Remove from list" right-click is a
+candidate).
+
+### 5.9 Persistence and restore
+
+The ad-hoc window's `settings_window_<N>.yaml` and
+`directories_window_<N>.yaml` are written immediately on creation
+(per
+[multi_window.mdx §5.1](./multi_window.mdx#51-new-image-window-n)
+applied to ad-hoc) and updated on every mutation.
+
+On clean quit:
+
+* `session.was_open_on_quit: true` — if the window is open at
+  quit time.
+* `ad_hoc_files:` preserved verbatim.
+* `mode: ad_hoc` preserved.
+* Slideshow state follows the per-window
+  `was_running_on_quit` rule from
+  [multi_window.mdx §7.4](./multi_window.mdx#74-slideshow-does-not-survive-quit-per-window).
+
+On relaunch:
+
+* The window is resurrected per
+  [multi_window.mdx §1.4](./multi_window.mdx#14-first-launch-baseline).
+* The file panel re-renders the `ad_hoc_files:` list.
+* The viewer reopens the saved `session.selection.current_file`.
+* If any of the pinned files no longer exists, they are shown in
+  the panel **greyed out with a "missing" badge**, are skipped by
+  ⌘→ / ⌘← and by slideshow, and a single status-bar message
+  reads "3 of 20 files are missing." The product does **not**
+  silently delete missing entries from `ad_hoc_files:`; the user
+  may restore them externally (move a file back, reconnect an
+  external drive), and the next time the panel refreshes the
+  missing badges go away.
+
+## 6. Edge Cases and Failure Modes (Product Level)
+
+### 6.1 The app is not running
+
+The first open-files request after a cold start does the full
+bootstrap: app launches, `WindowRegistry` loads any previously-
+remembered windows that had `was_open_on_quit: true`, and **then**
+the new ad-hoc window is created on top of them as the key window.
+
+The user clicks the file in Finder; ImageGlass_Mac bounces into
+the Dock; one or more previously-remembered windows appear (if
+the user had any), and the ad-hoc window appears in front of
+them. The viewer in the ad-hoc window loads the file.
+
+Time from click to viewer-shows-image is bounded by:
+
+* The app launch (~300 ms cold on Apple Silicon).
+* The bootstrap of the `WindowRegistry` for any windows that had
+  `was_open_on_quit: true`.
+* The auto-select rule loading the first file.
+
+The bootstrap is **non-blocking** for the ad-hoc window: even if
+window 1's saved root is a slow network mount that takes 20s to
+walk, the ad-hoc window appears immediately and the viewer
+loads. The walk continues in the background.
+
+### 6.2 The app is running, no windows are open
+
+The user had every window closed (per
+[multi_window.mdx §1.3](./multi_window.mdx#13-window-lifecycle)).
+An open-files request arrives. The new ad-hoc window is created
+and becomes the only key window. This is the only path that
+opens a window without the user explicitly choosing ⌘N — and it
+is the correct path, because the user **did** explicitly ask for
+something (the open).
+
+### 6.3 The app is running with windows open
+
+The new ad-hoc window appears in front of all existing windows.
+Existing windows stay where they were. Slideshow in window 1
+keeps running. The MCP `frontmost_window_id` shifts to the new
+ad-hoc window.
+
+### 6.4 Two open-files requests arrive back-to-back
+
+The user runs:
+
+```sh
+open ~/Pictures/a.jpg
+open ~/Pictures/b.jpg
+```
+
+Two AppleEvents. Two batches. Two new ad-hoc windows. The user
+sees window N appear, then a moment later window N+1 appears in
+front of window N. Both windows persist as independent ad-hoc
+windows.
+
+This is by design: "two `open` invocations = two batches" is the
+only rule the OS can give us, and it matches user intent (each
+`open` is a separate user action).
+
+If the user wants both files in one window: `open a.jpg b.jpg`
+(one invocation, batch of two).
+
+### 6.5 The batch contains some unsupported files
+
+The user opens 5 JPEGs, a `.zip`, and a `.docx`. The batch has 7
+URLs; only 5 are supported. Behavior:
+
+* `ad_hoc_files:` contains 5 entries.
+* The window opens; the viewer loads the first JPEG.
+* The status bar shows a single transient message:
+  `2 files were skipped (unsupported type).`
+* The audit log records both `app=open_files.accept` (×5) and
+  `app=open_files.reject reason=unsupported_uti` (×2) lines.
+
+### 6.6 The batch contains zero supported files
+
+The user opens 5 `.zip` files. Every URL is unsupported.
+
+* **No window is created.** Creating an empty ad-hoc window
+  would be a useless surprise.
+* The app bounces in the Dock (the standard "I got the event")
+  feedback, then shows a system notification:
+  `ImageGlass_Mac doesn't open these file types.`
+* If the app was not running before, it shuts down again rather
+  than staying in the Dock with no windows. (Configurable —
+  `open_files.stay_running_on_zero_match` defaults to `false`.)
+* The audit log records `app=open_files.reject_batch
+  reason=no_supported_files batch_size=5`.
+
+### 6.7 The batch contains files that do not exist
+
+A script sends an AppleEvent with `/Users/x/missing.jpg`.
+LaunchServices delivers the URL anyway. We try to resolve the URL
+to a readable file; if it fails, the URL is dropped from the
+batch with `app=open_files.reject reason=not_found path=…`.
+
+If after this filtering the batch is empty, §6.6 applies. If at
+least one file survives, the window opens normally with the
+survivors.
+
+### 6.8 The batch contains a directory
+
+A user runs `open ~/Pictures/`. LaunchServices sends a URL whose
+target is a directory. The product behavior for directory URLs is
+**not** "open them as ad-hoc files" (there is nothing to open) —
+it is "open them as a scoped window with the directory as the
+root."
+
+The flow:
+
+* `app=open_files.directory path=~/Pictures/` is logged.
+* A new window is allocated, but with `mode: scoped` and one
+  entry in `root_directories:` pointing at the directory.
+* The walker starts; the auto-select rule loads the first file
+  in the resolved list.
+
+This is the only product departure from "open-files → ad-hoc."
+It is the correct behavior because a directory is not a file
+and the only sensible viewer experience for "open a directory"
+is "browse that directory."
+
+If the batch is a **mix** of files and directories, each
+directory becomes a separate scoped window and each file batch
+(grouping the file URLs together) becomes one ad-hoc window.
+The total number of new windows is `(# of directories) +
+(0 or 1 for the file group)`.
+
+### 6.9 The file is a security-scoped URL
+
+If the calling channel supplies a security-scoped bookmark (rare;
+some sandboxed app calling `NSWorkspace.open` on a file outside
+its container), we accept it normally and store the resolved
+path in `ad_hoc_files:`. We do **not** persist the security-
+scoped bookmark itself across launches because the bookmark
+belongs to the calling app, not to us; on relaunch the file may
+be inaccessible and §5.9's "missing" badge applies.
+
+### 6.10 The file is on a network volume / external drive
+
+Accepted. The file panel shows it normally. If the volume
+disappears (drive unplugged) while the window is open, the file
+goes to "missing" state per §5.9; if it comes back, the panel
+refresh restores it.
+
+### 6.11 The file is over 4 GB (very large image / video)
+
+Accepted. ImageIO and AVFoundation handle the loading on
+background threads; the file panel shows a progress indicator on
+the row while the viewer decodes. The product does not impose a
+size limit at the open-files boundary.
+
+### 6.12 The user opens the same file twice in separate batches
+
+Two `open` invocations on the same file → two ad-hoc windows,
+each pinning the one file. This is allowed by design; the user
+may want two side-by-side viewers of the same image at different
+zoom levels.
+
+### 6.13 The batch is enormous (1,000 files)
+
+Accepted. The file panel renders the list virtually
+([list_of_files.mdx §4.4](../list_of_files.mdx#44-virtualization))
+so the panel stays responsive. The viewer loads only file 1; the
+others sit pinned on disk and load on-demand.
+
+The on-disk `ad_hoc_files:` block stays compact (one path per
+line). At 1,000 paths of ~80 bytes each, the YAML is ~80 KB —
+well under any concern for the existing atomic-rename pipeline.
+
+## 7. The Quick Open and Quick Selection Stories
+
+### 7.1 "I just want to see this one image"
+
+The 95th-percentile case. The user double-clicks `foo.jpg` in
+Finder. Result: one ad-hoc window, one file pinned, viewer
+loaded, `Cmd+W` closes the window and the user is done. Total
+user actions: 2 (open, close). Total ad-hoc windows ever
+remembered: 1 unless the user explicitly forgot it.
+
+The window persists on disk after close (per
+[multi_window.mdx §1.3 close-vs-retire](./multi_window.mdx#13-window-lifecycle))
+so the user could reopen it later from Window → Reopen Closed
+Window. For users who find this clutter, the setting
+`ad_hoc.auto_retire_on_close` (default `false`) flips the close
+action into an immediate retire.
+
+### 7.2 "Twenty photos, I want to flip through them"
+
+The 5th-percentile case. The user multi-selects 20 photos in
+Finder, ⌘O. Result: one ad-hoc window with 20 pinned files.
+Viewer loads file 1. ⌘→ steps through. Optionally F5 for a
+hands-free slideshow. ⌘Q quits, or ⌘W closes.
+
+### 7.3 "I want to compare this image to one in a different window"
+
+Out of scope as a *direct* product feature, but the multi-window
+model makes it natural: open the second image in Finder
+(→ second ad-hoc window), arrange the two windows side-by-side
+manually, ⌘\` between them. Cross-window selection sync is a
+non-goal (per
+[multi_window.mdx §16](./multi_window.mdx#16-non-goals-v1)).
+
+### 7.4 "I want all images in this directory"
+
+The user opens the **directory** instead of the files. §6.8
+applies — a scoped window, not an ad-hoc one.
+
+## 8. The Default-App Story
+
+A user who likes ImageGlass_Mac will, sooner or later, set it as
+the default app for one or more image types. macOS provides two
+paths:
+
+* **Finder → Get Info → Open With → Change All** for a single
+  extension at a time.
+* **System Settings → Privacy & Security → Default Apps** (macOS
+  15+) for bulk changes.
+
+ImageGlass_Mac does not need any special handling here — the
+`Info.plist` declaration is what makes the option appear. The
+product responsibility is to **handle being the default app
+gracefully**: when the user is opening dozens of files a day,
+the per-file ad-hoc-window behavior is exactly right; the
+Recent Items list (§2.10) gives the user back the files that
+matter; closing an ad-hoc window is `⌘W` (one keystroke); and
+the persisted ad-hoc YAMLs are easy to retire in bulk if they
+become cluttered (Window → Forget Closed Window, or
+`mcp__imageglass__retire_window`).
+
+## 9. Canonical Use Cases
+
+These are the worked examples the engineering side of this spec
+is designed against. Each is a sequence of user actions with a
+verify step that proves the behavior.
+
+### 9.1 Use case A — Finder double-click on one JPEG (app not running)
+
+#### Preconditions
+
+* `~/T/_imageglass/` exists but the app is not running.
+* `~/Pictures/snap.jpg` exists.
+* ImageGlass_Mac is the default app for `public.jpeg` (the user
+  set it via Get Info → Open With → Change All).
+
+#### Steps
+
+1. In Finder, double-click `~/Pictures/snap.jpg`.
+
+#### Expected result
+
+* ImageGlass_Mac launches (Dock bounce, then steady).
+* `WindowRegistry` bootstraps; any previously-remembered windows
+  with `was_open_on_quit: true` resurrect.
+* `WindowRegistry.allocateNextWindowID()` returns the next
+  number, say N. `next_window_id` advances to N+1 in
+  `settings.yaml`.
+* `settings_window_<N>.yaml` is written with `window_id: N`,
+  `mode_hint: ad_hoc`, and the v1 defaults.
+* `directories_window_<N>.yaml` is written with:
+
+  ```yaml
+  schema_version: 1
+  window_id: N
+  mode: ad_hoc
+  opened_via: finder_double_click
+  opened_at: 2026-06-05T...
+  ad_hoc_files:
+    - path: /Users/<you>/Pictures/snap.jpg
+      uti: public.jpeg
+  root_directories: []
+  ```
+
+* The new window opens, key, with the file panel on the left
+  showing one row `snap.jpg`.
+* The viewer loads `snap.jpg`.
+* Window title: `snap.jpg`.
+
+#### Verify
+
+```sh
+ls ~/T/_imageglass/directories_window_*.yaml
+# the new N appears
+cat ~/T/_imageglass/directories_window_<N>.yaml
+# matches the block above
+grep "window_id=<N>" ~/T/_imageglass/logs/log.log
+# contains:
+# app=open_files.accept window_id=N path=…/snap.jpg uti=public.jpeg
+# app=window.open window_id=N source=open_files mode=ad_hoc count=1
+# app=window.activate window_id=N
+```
+
+### 9.2 Use case B — Finder multi-select, 20 files, app running
+
+#### Preconditions
+
+* The app is running with one open scoped window, window 1,
+  driving a slideshow over `~/BGit/work/into_Work/StarbuckLabs/JFK/UX/`.
+* `~/Pictures/family_event/` contains 24 files: 18 JPEGs, 1 PNG,
+  1 SVG, 2 MP4s, 1 README.txt, 1 .DS_Store.
+
+#### Steps
+
+1. In Finder, navigate to `~/Pictures/family_event/`.
+2. Sort by Date Created (descending).
+3. Select all 24 files (⌘A).
+4. Press ⌘O.
+
+#### Expected result
+
+* LaunchServices delivers one AppleEvent with 24 URLs in
+  descending-date order.
+* The supported-file filter (§4.2) drops the README and the
+  .DS_Store; 22 URLs remain (18 JPEG + 1 PNG + 1 SVG + 2 MP4).
+* `WindowRegistry.allocateNextWindowID()` returns 2.
+* `settings_window_2.yaml` is written.
+* `directories_window_2.yaml` is written:
+
+  ```yaml
+  schema_version: 1
+  window_id: 2
+  mode: ad_hoc
+  opened_via: finder_multi_select
+  opened_at: 2026-06-05T...
+  ad_hoc_files:
+    - path: /Users/<you>/Pictures/family_event/2026-06-04_party_001.jpg
+      uti: public.jpeg
+    - path: /Users/<you>/Pictures/family_event/2026-06-04_party_002.jpg
+      uti: public.jpeg
+    # ... 22 entries total, in OS-delivered order ...
+    - path: /Users/<you>/Pictures/family_event/clip_a.mp4
+      uti: public.mpeg-4
+  root_directories: []
+  ```
+
+* Window 2 opens in front of window 1; the viewer in window 2
+  loads the first file (the most-recent JPEG, because Finder
+  was sorted descending).
+* Window 1's slideshow keeps running in the background. Its
+  `directories_window_1.yaml` is **unchanged**.
+* The status bar in window 2 reads
+  `2 files were skipped (unsupported type)`.
+
+#### Verify
+
+```sh
+cat ~/T/_imageglass/directories_window_1.yaml
+# unchanged (still scoped, JFK/UX root)
+
+cat ~/T/_imageglass/directories_window_2.yaml
+# mode: ad_hoc, 22 ad_hoc_files entries
+
+grep "window_id=2" ~/T/_imageglass/logs/log.log
+# app=open_files.accept window_id=2 count=22
+# app=open_files.reject reason=unsupported_uti path=…/README.txt
+# app=open_files.reject reason=unsupported_uti path=…/.DS_Store
+# app=window.open window_id=2 source=open_files mode=ad_hoc count=22
+# app=window.activate window_id=2
+```
+
+### 9.3 Use case C — Cycle ⌘→ through the batch, wrap at end
+
+#### Preconditions
+
+* Use case B has just finished; window 2 is the ad-hoc window
+  with 22 pinned files, viewer loaded on file 1.
+
+#### Steps
+
+1. Press ⌘→ 21 times.
+
+#### Expected result
+
+* The viewer steps through files 2, 3, …, 22 in order.
+* After the 21st press, the viewer is on file 22.
+
+2. Press ⌘→ one more time.
+
+#### Expected result
+
+* The viewer wraps to file 1.
+* The audit log records `app=window.cycle window_id=2
+  from_index=21 to_index=0 wrap=true`.
+
+#### Verify
+
+* On screen: the file panel highlights the matching row at each
+  step; the viewer matches.
+* On disk: `cat directories_window_2.yaml | grep -c "  - path:"`
+  is still 22. The `ad_hoc_files:` list is **not mutated by
+  cycling**.
+
+### 9.4 Use case D — Slideshow over the batch
+
+#### Preconditions
+
+* Use case B / C finished; window 2 is the ad-hoc window with
+  22 pinned files; viewer on file 1.
+
+#### Steps
+
+1. Press F5.
+
+#### Expected result
+
+* `WindowState[2].slideshow.isRunning = true`.
+* The viewer advances every 5 seconds (or the user's
+  `slideshow.interval`).
+* The slideshow walks files 1 → 22 → 1 → 22 → ...
+* If `slideshow.random_order` is `true`, the order is a fixed
+  permutation seeded once at start and recorded as
+  `slideshow.order_seed` in `settings_window_2.yaml`.
+
+2. Wait 5 minutes (the slideshow makes 60 ticks at 5s interval).
+3. Press F5 to stop.
+
+#### Verify
+
+* `WindowState[2].slideshow.isRunning == false`.
+* The viewer holds on the file it was on when F5 was pressed.
+* The audit log records `app=slideshow.start window_id=2 order=
+  in_order|random count=22` and `app=slideshow.stop window_id=2
+  ticks=60`.
+
+### 9.5 Use case E — Quit, relaunch, files still there
+
+#### Preconditions
+
+* Use case B / C / D finished; window 1 (scoped) and window 2
+  (ad-hoc, 22 files) are both open. Slideshow is off.
+
+#### Steps
+
+1. ⌘Q.
+
+#### Expected result on disk
+
+* `settings_window_1.yaml`: `session.was_open_on_quit: true`,
+  selection at the last slideshow image (if window 1 was
+  slideshowing) or the last manually-selected file.
+* `settings_window_2.yaml`: `session.was_open_on_quit: true`,
+  `session.selection.current_file` at whatever ad-hoc file the
+  user was last on.
+* `directories_window_2.yaml`: unchanged from §9.2 — same 22
+  entries, same `mode: ad_hoc`, same `opened_at`.
+
+2. Relaunch.
+
+#### Expected result
+
+* Both windows resurrect.
+* Window 1 restores per
+  [multi_window.mdx §9.9](./multi_window.mdx#99-step-8--quit-and-relaunch).
+* Window 2 restores: the file panel shows the same 22 files in
+  the same order, the viewer reopens on the saved cursor file.
+
+3. Press ⌘→.
+
+#### Expected result
+
+* The viewer steps to the next ad-hoc file. The cycle is exactly
+  the same as before quit; `ad_hoc_files:` is the universe.
+
+#### Verify
+
+```sh
+cat ~/T/_imageglass/directories_window_2.yaml
+# still mode: ad_hoc, same 22 entries, same opened_at
+```
+
+### 9.6 Use case F — `open` shell command with a glob
+
+#### Preconditions
+
+* The app is running with windows 1 and 2 from §9.5.
+* `~/Pictures/screenshots/` contains 8 PNGs.
+
+#### Steps
+
+1. From Terminal:
+
+   ```sh
+   open ~/Pictures/screenshots/*.png
+   ```
+
+#### Expected result
+
+* The shell expands the glob to 8 PNG paths and passes them to
+  `open`, which sends one AppleEvent with 8 URLs.
+* The new window 3 opens, ad-hoc, with 8 pinned PNGs.
+* Windows 1 and 2 are untouched.
+* `frontmostWindowID = 3`.
+
+#### Verify
+
+```sh
+cat ~/T/_imageglass/directories_window_3.yaml
+# mode: ad_hoc, 8 ad_hoc_files entries, opened_via: open_cli
+```
+
+### 9.7 Use case G — One unsupported file makes the batch empty
+
+#### Preconditions
+
+* The app is running with windows 1, 2, 3 from §9.6.
+
+#### Steps
+
+1. From Terminal:
+
+   ```sh
+   open ~/Downloads/document.pdf
+   ```
+
+   (PDF is **not** in our supported categories — it is
+   `com.adobe.pdf`, not a `public.image` / `public.svg-image` /
+   `public.movie`.)
+
+#### Expected result
+
+* No new window is created.
+* The app may bounce in the Dock briefly to acknowledge the
+  event.
+* A system notification appears: `ImageGlass_Mac doesn't open
+  these file types.`
+* Windows 1, 2, 3 are untouched; `frontmostWindowID` is whatever
+  it was.
+
+#### Verify
+
+```sh
+grep "open_files.reject_batch" ~/T/_imageglass/logs/log.log | tail -1
+# app=open_files.reject_batch reason=no_supported_files batch_size=1
+ls ~/T/_imageglass/directories_window_*.yaml
+# still windows 1, 2, 3 (no window 4)
+```
+
+### 9.8 Use case H — Open a directory
+
+#### Preconditions
+
+* The app is running with windows 1, 2, 3 from §9.6.
+
+#### Steps
+
+1. From Terminal:
+
+   ```sh
+   open ~/Pictures/family_event/
+   ```
+
+   Note the trailing slash and the lack of a file extension — this
+   is a directory URL.
+
+#### Expected result
+
+* The new window 4 opens as a **scoped** window (per §6.8) with
+  one entry in `root_directories:` pointing at
+  `~/Pictures/family_event/`.
+* The walker enumerates the directory and the panel populates
+  with the 22 supported files.
+* The viewer auto-loads the first file.
+
+#### Verify
+
+```sh
+cat ~/T/_imageglass/directories_window_4.yaml
+# mode: scoped
+# root_directories:
+#   - path: /Users/<you>/Pictures/family_event/
+#     filter: { items: [] }
+```
+
+This is the only case where an open-files request produces a
+scoped window. The user can tell because the file panel shows
+the directory walk (with subdirectories collapsing in tree view)
+rather than the flat ad-hoc list.
+
+### 9.9 Use case I — Two `open` invocations in a row
+
+#### Preconditions
+
+* The app is running.
+
+#### Steps
+
+1. From Terminal:
+
+   ```sh
+   open ~/Pictures/a.jpg
+   open ~/Pictures/b.jpg
+   ```
+
+#### Expected result
+
+* Two AppleEvents. Two new ad-hoc windows, one with `a.jpg` and
+  one with `b.jpg`.
+* The audit log records two separate `app=window.open
+  source=open_files` lines.
+
+#### Verify
+
+```sh
+grep "source=open_files" ~/T/_imageglass/logs/log.log | tail -2
+# both lines present, different window_id
+```
+
+### 9.10 Use case J — Single `open` with two arguments
+
+#### Preconditions
+
+* Same as J… er, same as §9.9.
+
+#### Steps
+
+1. From Terminal:
+
+   ```sh
+   open ~/Pictures/a.jpg ~/Pictures/b.jpg
+   ```
+
+#### Expected result
+
+* One AppleEvent with 2 URLs. **One** new ad-hoc window
+  with both files pinned.
+
+#### Verify
+
+```sh
+cat ~/T/_imageglass/directories_window_<N>.yaml
+# mode: ad_hoc, ad_hoc_files has 2 entries
+```
+
+The §9.9 vs §9.10 contrast is the single best illustration of
+the headline rule: **one AppleEvent = one window**, regardless
+of how many files.
+
+## 10. The Interaction With MCP
+
+The MCP server is unchanged by this spec. Open-files requests
+arrive through LaunchServices and never touch the MCP server.
+The user-facing consequences:
+
+### 10.1 `list_windows` includes ad-hoc windows
+
+`mcp__imageglass__list_windows` returns every non-retired
+window, including ad-hoc. Each entry adds a `mode` field:
+
+```json
+[
+  { "window_id": 1, "name": "UX design slideshow",
+    "is_open": true, "is_frontmost": false,
+    "mode": "scoped", "root_count": 1, "file_count": 1832 },
+  { "window_id": 4, "name": null,
+    "is_open": true, "is_frontmost": true,
+    "mode": "ad_hoc", "root_count": 0, "file_count": 22,
+    "opened_via": "finder_multi_select",
+    "opened_at": "2026-06-05T14:02:11Z" }
+]
+```
+
+### 10.2 `get_window` discloses the pinned list
+
+`mcp__imageglass__get_window(window_id: 4)` returns
+`mode: "ad_hoc"`, `ad_hoc_files: [...]`, and (for symmetry with
+scoped windows) an empty `root_directories: []`.
+
+### 10.3 `select_file` works in ad-hoc windows
+
+`mcp__imageglass__select_file(path, window_id?)` works on
+ad-hoc windows **iff the path is in the window's
+`ad_hoc_files:` list**. If the path is not pinned, the call
+returns `ok=false err=path_not_in_ad_hoc_window`. This is the
+deliberate non-symmetry with scoped windows (where the call
+fails with `path_outside_scope` for non-pinned roots).
+
+### 10.4 Tools that require a scoped window
+
+The mutating tools listed below operate on `root_directories:`
+or filters. When the resolved target window is ad-hoc, the
+call returns the error in the table.
+
+| MCP tool | Error on ad-hoc target |
+| --- | --- |
+| `add_directory` | `err=ad_hoc_window_no_roots` |
+| `remove_directory` | `err=ad_hoc_window_no_roots` |
+| `clear_directories` | `err=ad_hoc_window_no_roots` |
+| `set_global_filter` | `err=ad_hoc_window_no_roots` |
+| `update_directory_filter` | `err=ad_hoc_window_no_roots` |
+| `set_active_scope` | `err=ad_hoc_window_no_scopes` |
+
+The error message includes the window_id, the mode, and the
+recommendation: "Use `mcp__imageglass__open_window` to create a
+scoped window, or convert this window via the Convert to
+Directory-Backed Window… menu."
+
+### 10.5 The frontmost-window retarget rule still applies
+
+If an MCP `add_directory` call arrives while the frontmost
+window is an ad-hoc window 4, the call **retargets window 4**
+per [multi_window.mdx §6](./multi_window.mdx#6-the-frontmost-window-is-the-implicit-mcp-target),
+then fails with the §10.4 error. It does **not** silently fall
+through to a different window. The user must focus a scoped
+window first (⌘\` or `focus_window(window_id)`) and retry.
+
+This is deliberate: silently retargeting to a different window
+would surprise the user, and the user can always re-focus.
+
+### 10.6 The `open_files` flow does not log to the MCP audit log as a tool call
+
+Since the open-files flow does not go through MCP, the audit
+log lines for it are `app=open_files.*`, not `tool=mcp.*`.
+The `corr=` field is omitted (no MCP correlation ID), but the
+`window_id` field is present so the lifecycle can still be
+followed alongside MCP activity. See §13.
+
+---
+
+# Part 2 — Engineering Specification
+
+This half of the spec is written by engineering for engineering.
+It pins down **how the product behavior in Part 1 is implemented**
+— the exact Swift surface, the AppleEvent registration, the
+batch coalescing, the file-kind filter, the `ad_hoc` YAML
+schema, the persistence pipeline, and the failure handling.
+
+## 11. The App Bootstrap
+
+### 11.1 `NSApplicationDelegate` shape
+
+```swift
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+
+    // Called for every open-files request from LaunchServices.
+    func application(_ application: NSApplication, open urls: [URL]) {
+        OpenFilesCoordinator.shared.handle(
+            urls: urls,
+            source: .finderOrLaunchServices  // resolved more precisely in §12.2
+        )
+    }
+
+    // Optional Sequoia / macOS 15+ hook for richer context.
+    func application(_ application: NSApplication,
+                     openURLContexts urls: Set<UIOpenURLContext>) {
+        // Not the path used by macOS desktop; included for completeness.
+    }
+
+    // Legacy pre-macOS 11 hook — still wired so very old AppKit paths
+    // route to the same coordinator.
+    func application(_ sender: NSApplication, openFiles filenames: [String]) {
+        let urls = filenames.map { URL(fileURLWithPath: $0) }
+        OpenFilesCoordinator.shared.handle(
+            urls: urls,
+            source: .legacyOpenFiles
+        )
+        sender.reply(toOpenOrPrint: .success)
+    }
+}
+```
+
+The two important contracts the AppKit runtime requires of us:
+
+* `application(_:open:)` must be called for every batch. It is
+  the only callback for the `kAEOpenDocuments` event.
+* The callback must complete **synchronously** for the purpose
+  of `replyToOpenOrPrint`, but the actual window construction
+  may be dispatched. The coordinator handles the dispatch.
+
+### 11.2 The `Info.plist` document-type declaration
+
+```xml
+<key>CFBundleDocumentTypes</key>
+<array>
+  <dict>
+    <key>CFBundleTypeName</key>
+    <string>Image</string>
+    <key>CFBundleTypeRole</key>
+    <string>Viewer</string>
+    <key>LSHandlerRank</key>
+    <string>Alternate</string>
+    <key>LSItemContentTypes</key>
+    <array>
+      <string>public.image</string>
+      <string>public.jpeg</string>
+      <string>public.png</string>
+      <string>public.tiff</string>
+      <string>public.heic</string>
+      <string>public.heif</string>
+      <string>public.heif-standard</string>
+      <string>public.avif</string>
+      <string>public.jpeg-2000</string>
+      <string>public.jpeg-xl</string>
+      <string>com.compuserve.gif</string>
+      <string>com.microsoft.bmp</string>
+      <string>com.microsoft.ico</string>
+      <string>com.apple.icns</string>
+      <string>org.webmproject.webp</string>
+      <string>com.adobe.photoshop-image</string>
+      <string>public.camera-raw-image</string>
+      <!-- specific RAW UTIs as needed -->
+    </array>
+  </dict>
+  <dict>
+    <key>CFBundleTypeName</key>
+    <string>SVG</string>
+    <key>CFBundleTypeRole</key>
+    <string>Viewer</string>
+    <key>LSHandlerRank</key>
+    <string>Alternate</string>
+    <key>LSItemContentTypes</key>
+    <array>
+      <string>public.svg-image</string>
+    </array>
+  </dict>
+  <dict>
+    <key>CFBundleTypeName</key>
+    <string>Video</string>
+    <key>CFBundleTypeRole</key>
+    <string>Viewer</string>
+    <key>LSHandlerRank</key>
+    <string>Alternate</string>
+    <key>LSItemContentTypes</key>
+    <array>
+      <string>public.movie</string>
+      <string>public.mpeg-4</string>
+      <string>com.apple.quicktime-movie</string>
+      <string>public.avi</string>
+      <string>com.microsoft.windows-media-wmv</string>
+      <string>org.webmproject.webm</string>
+      <string>public.mpeg</string>
+    </array>
+  </dict>
+</array>
+```
+
+Notes:
+
+* `LSHandlerRank = Alternate` means we are an option in
+  "Open With," not the default. The user opts in by Get Info →
+  Open With → Change All. Setting `Default` here would steal
+  associations from Preview.app on install — bad UX.
+* The category UTI (`public.image`) plus specific UTIs both
+  appear so LaunchServices' Finder integration is fully
+  populated even for users on older macOS versions where
+  category-only declarations had spotty behavior.
+
+### 11.3 AppleEvent registration
+
+In modern Cocoa (macOS 11+) `application(_:open:)` is wired
+automatically. We do **not** call
+`NSAppleEventManager.shared.setEventHandler(_:andSelector:
+forEventClass:andEventID:)` for `kAEOpenDocuments` — that
+would short-circuit the framework path.
+
+We **do** register a handler for two specific helper events:
+
+* `kAEReopenApplication` (`'rapp'`) — sent when the user
+  clicks the Dock icon while the app is already running. We
+  use the default behavior (reopen the most-recently-active
+  window) plus a hook to log `app=open_files.reopen_app`.
+* `kAEOpenContents` (`'ocon'`) — Sequoia introduced this for
+  text snippets and similar; we ignore it.
+
+## 12. The `OpenFilesCoordinator`
+
+### 12.1 Shape
+
+```swift
+@MainActor
+final class OpenFilesCoordinator {
+    static let shared = OpenFilesCoordinator()
+
+    enum BatchSource: String {
+        case finderDoubleClick = "finder_double_click"
+        case finderMultiSelect  = "finder_multi_select"
+        case finderOpenWith     = "finder_open_with"
+        case openCLI            = "open_cli"
+        case dragToApp          = "drag_to_app"
+        case dragToDock         = "drag_to_dock"
+        case servicesMenu       = "services_menu"
+        case nsworkspaceAPI     = "nsworkspace_api"
+        case appleEventScript   = "apple_event_script"
+        case recentItems        = "recent_items"
+        case legacyOpenFiles    = "legacy_openFiles"
+        case finderOrLaunchServices = "finder_or_launchservices"  // when finer source cannot be resolved
+    }
+
+    func handle(urls: [URL], source: BatchSource) {
+        // §12.4 batch processing pipeline
+    }
+}
+```
+
+The coordinator is a singleton because the AppleEvent callback
+is a single entry point.
+
+### 12.2 Resolving the source label
+
+The AppleEvent itself does **not** carry a "this came from
+Finder" tag. To distinguish sources we look at the optional
+parameters AppleEvent carries:
+
+* `keySearchText` / `keyAEPropData` — populated by some
+  channels.
+* The sender bundle ID — available via
+  `NSAppleEventDescriptor.currentEvent()?
+  .attributeDescriptor(forKeyword: keySenderPIDAttr)`
+  resolved to the bundle ID via `NSRunningApplication`.
+
+The resolution table:
+
+| Sender bundle ID | Inferred source |
+| --- | --- |
+| `com.apple.finder` | `finder_double_click` if `urls.count == 1`, else `finder_multi_select` |
+| `com.apple.dock` | `dragToDock` if drag, `recentItems` if menu |
+| `com.apple.Terminal` / iTerm2 / WezTerm / Ghostty | `open_cli` (assumed; the `open` binary is the actual sender but it has no bundle ID — it is a CLI tool) |
+| anything else | `nsworkspaceAPI` if the calling app used the workspace API, else `apple_event_script` |
+| not resolvable | `finder_or_launchservices` |
+
+This resolution is **best effort**. The labels are for the
+audit log only; product behavior does not depend on them.
+
+### 12.3 The Recent-Items contribution
+
+After every successful batch, the coordinator calls:
+
+```swift
+for url in acceptedURLs {
+    NSDocumentController.shared.noteNewRecentDocumentURL(url)
+}
+```
+
+This populates the macOS-managed Recent Items list (Apple menu →
+Recent Items, Dock right-click → Recent). We do not maintain our
+own list for this purpose — the system list is the source of
+truth.
+
+### 12.4 The batch processing pipeline
+
+```swift
+func handle(urls: [URL], source: BatchSource) {
+    let corrID = UUID().uuidString.prefix(8)
+    log("app=open_files.received source=\(source.rawValue) batch_size=\(urls.count) corr=\(corrID)")
+
+    // Step 1: split files from directories.
+    var fileURLs: [URL] = []
+    var directoryURLs: [URL] = []
+    for url in urls {
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) else {
+            log("app=open_files.reject reason=not_found path=\(url.path) corr=\(corrID)")
+            continue
+        }
+        if isDir.boolValue {
+            directoryURLs.append(url)
+        } else {
+            fileURLs.append(url)
+        }
+    }
+
+    // Step 2: filter the file URLs by UTI.
+    let accepted = fileURLs.filter { isSupportedFile($0, corrID: corrID) }
+    let dedup = uniquePreservingOrder(accepted)
+
+    // Step 3: directories become one scoped window each.
+    for dirURL in directoryURLs {
+        WindowRegistry.shared.openScopedWindow(rootDirectory: dirURL,
+                                               source: source,
+                                               corrID: corrID)
+    }
+
+    // Step 4: the file group, if non-empty, becomes one ad-hoc window.
+    if !dedup.isEmpty {
+        WindowRegistry.shared.openAdHocWindow(files: dedup,
+                                              source: source,
+                                              corrID: corrID)
+    } else if directoryURLs.isEmpty {
+        // Nothing supported in the entire batch.
+        log("app=open_files.reject_batch reason=no_supported_files batch_size=\(urls.count) corr=\(corrID)")
+        notifyUserNoSupportedFiles()
+        if NSApp.windows.isEmpty && !AppSettings.shared.openFiles.stayRunningOnZeroMatch {
+            NSApp.terminate(nil)
+        }
+    }
+}
+```
+
+### 12.5 The UTI filter
+
+```swift
+private let acceptCategoryUTIs: [UTType] = [
+    .image,           // public.image
+    .svg,             // public.svg-image
+    .movie            // public.movie
+]
+
+func isSupportedFile(_ url: URL, corrID: String) -> Bool {
+    guard let uti = try? url.resourceValues(forKeys: [.typeIdentifierKey])
+            .typeIdentifier,
+          let type = UTType(uti) else {
+        log("app=open_files.reject reason=unknown_uti path=\(url.path) corr=\(corrID)")
+        return false
+    }
+    let ok = acceptCategoryUTIs.contains(where: { type.conforms(to: $0) })
+    if ok {
+        log("app=open_files.accept path=\(url.path) uti=\(uti) corr=\(corrID)")
+    } else {
+        log("app=open_files.reject reason=unsupported_uti path=\(url.path) uti=\(uti) corr=\(corrID)")
+    }
+    return ok
+}
+```
+
+`UTType(_:)` returns nil for files with no UTI (e.g. a file
+named `weird.xyz` with no system mapping). We treat that as
+unsupported.
+
+### 12.6 Deduplication
+
+```swift
+func uniquePreservingOrder(_ urls: [URL]) -> [URL] {
+    var seen = Set<URL>()
+    var out: [URL] = []
+    for url in urls {
+        let canonical = url.resolvingSymlinksInPath().standardized
+        if seen.insert(canonical).inserted {
+            out.append(url)  // preserve the original URL for display
+        }
+    }
+    return out
+}
+```
+
+The dedup key is the resolved symlink-free path; the kept URL
+is the original (so display paths reflect what the OS gave us).
+
+### 12.7 Batch coalescing — there is none
+
+The coordinator does **not** coalesce two AppleEvents into one
+batch even if they arrive within milliseconds. Coalescing would
+violate §6.4's "two `open` calls → two windows" contract. The
+OS already gives us the right grain: one AppleEvent = one
+batch.
+
+## 13. `WindowRegistry` Additions
+
+### 13.1 `openAdHocWindow`
+
+```swift
+extension WindowRegistry {
+
+    func openAdHocWindow(files: [URL],
+                         source: OpenFilesCoordinator.BatchSource,
+                         corrID: String) {
+        let id = allocateNextWindowID()
+        let state = WindowState(windowID: id)
+        state.directories.mode = .adHoc
+        state.directories.adHocFiles = files.map { AdHocEntry(
+            path: $0.path,
+            uti: (try? $0.resourceValues(forKeys: [.typeIdentifierKey])
+                       .typeIdentifier) ?? ""
+        ) }
+        state.directories.openedVia = source.rawValue
+        state.directories.openedAt = Date()
+        state.directories.rootDirectories = []
+
+        // Immediate disk write (synchronous, no debounce) so a crash
+        // before the next mutation does not lose the window.
+        SettingsStore.shared.writeImmediately(windowID: id, state: state.settings)
+        DirectoriesStore.shared.writeImmediately(windowID: id, directories: state.directories)
+
+        // Create the NSWindow and apply layout.
+        let window = WindowFactory.makeBrowserWindow(for: state)
+        state.window = window
+        windows[id] = state
+        window.makeKeyAndOrderFront(nil)
+        frontmostWindowID = id
+
+        // Auto-select first file (mcp_file.mdx §10 rule).
+        if let first = files.first {
+            state.viewer.load(url: first)
+            state.settings.session.selection.currentFile = first.path
+        }
+
+        log("app=window.open window_id=\(id) source=open_files mode=ad_hoc count=\(files.count) corr=\(corrID)")
+        log("app=window.activate window_id=\(id) corr=\(corrID)")
+    }
+
+    func openScopedWindow(rootDirectory: URL,
+                          source: OpenFilesCoordinator.BatchSource,
+                          corrID: String) {
+        let id = allocateNextWindowID()
+        let state = WindowState(windowID: id)
+        state.directories.mode = .scoped
+        state.directories.rootDirectories = [
+            RootDirectory(path: rootDirectory.path, filter: .empty)
+        ]
+        state.directories.openedVia = source.rawValue
+        state.directories.openedAt = Date()
+
+        SettingsStore.shared.writeImmediately(windowID: id, state: state.settings)
+        DirectoriesStore.shared.writeImmediately(windowID: id, directories: state.directories)
+
+        let window = WindowFactory.makeBrowserWindow(for: state)
+        state.window = window
+        windows[id] = state
+        window.makeKeyAndOrderFront(nil)
+        frontmostWindowID = id
+
+        // Kick the walker; auto-select fires when the walk's first result lands.
+        DirectoryTreeWalker.shared.startWalk(rootDirectory, windowID: id)
+
+        log("app=window.open window_id=\(id) source=open_files mode=scoped path=\(rootDirectory.path) corr=\(corrID)")
+        log("app=window.activate window_id=\(id) corr=\(corrID)")
+    }
+}
+```
+
+### 13.2 `DirectoriesFile` schema additions
+
+The existing `DirectoriesFile` from
+[list_of_files.mdx §3A.2](../list_of_files.mdx#3a2-schema):
+
+```swift
+struct DirectoriesFile: Codable {
+    var schemaVersion: Int
+    var windowID: Int                                 // added by multi_window.mdx
+    var rootDirectories: [RootDirectory]
+
+    // New in this spec:
+    var mode: Mode = .scoped
+    var adHocFiles: [AdHocEntry]? = nil
+    var openedVia: String? = nil
+    var openedAt: Date? = nil
+
+    enum Mode: String, Codable {
+        case scoped
+        case adHoc = "ad_hoc"
+    }
+}
+
+struct AdHocEntry: Codable {
+    var path: String
+    var uti: String
+    var resolvedPath: String?  // present only when path is a symlink
+}
+```
+
+The YAML serialization preserves field order: `schema_version`,
+`window_id`, `mode`, then either `root_directories` (scoped) or
+`ad_hoc_files` + `opened_via` + `opened_at` (ad-hoc). A
+scoped-window YAML omits the ad-hoc fields entirely; an ad-hoc
+YAML keeps `root_directories: []` for forward-compat with
+tooling that always reads both.
+
+### 13.3 Migration
+
+A pre-this-spec `directories_window_<N>.yaml` lacks `mode:`. The
+loader treats absent `mode` as `mode: scoped` (the old default).
+No file rewrite is needed; the field is added the next time the
+window's directories are mutated.
+
+## 14. The File Panel Rendering of an Ad-Hoc Window
+
+### 14.1 The flat-list view
+
+The `FileListViewModel` (already in
+[code/Sources/ImageGlass/FileList/FileListViewModel.swift](../../code/Sources/ImageGlass/FileList/FileListViewModel.swift))
+gains a branch:
+
+```swift
+extension FileListViewModel {
+    func reload(for state: WindowState) {
+        switch state.directories.mode {
+        case .scoped:
+            // existing path: take root_directories, run walker, build tree
+            self.items = buildScopedItems(from: state.directories.rootDirectories)
+        case .adHoc:
+            // new path: take ad_hoc_files verbatim
+            self.items = state.directories.adHocFiles!.map {
+                FileListItem(url: URL(fileURLWithPath: $0.path),
+                             uti: UTType($0.uti) ?? .data,
+                             source: .pinned)
+            }
+        }
+    }
+}
+```
+
+### 14.2 The tree view of an ad-hoc window
+
+When the user switches to tree view, the panel renders a
+single synthetic top-level node:
+
+```
+▾ Opened files (22)
+   001.jpg
+   002.jpg
+   …
+   clip_a.mp4
+```
+
+The expand/collapse state of the synthetic root is persisted in
+`session.directory_panel.expanded_paths` per
+[multi_window.mdx §3.2](./multi_window.mdx#32-settings_window_nyaml).
+The synthetic root is keyed as the literal path
+`<ad_hoc_root:N>` (with the window ID interpolated) so two
+ad-hoc windows do not share expanded state.
+
+### 14.3 Sort-order override
+
+The default render order is "as in `ad_hoc_files:`." Clicking a
+column header (Name, Date, Size) re-sorts the visible list but
+does not mutate the on-disk order. Choosing "Sort → Reset to
+Original Order" restores the OS-delivered order.
+
+### 14.4 Missing files
+
+A file in `ad_hoc_files:` whose path no longer exists at panel
+refresh time is rendered:
+
+* Italic grey text.
+* A "missing" SF Symbol badge (`exclamationmark.triangle`).
+* Disabled for double-click and arrow-key selection.
+
+The status bar accumulates a count: `3 of 22 files are missing`.
+
+A periodic refresh (every 30 seconds; configurable) re-checks
+missing files; restored files transition back to normal
+rendering on the next refresh.
+
+## 15. The Viewer Wiring
+
+### 15.1 Cycling indexes the `ad_hoc_files:` list
+
+The existing `ViewerState.nextFile()` / `previousFile()` already
+take a "universe of files" from the `FileListViewModel`. The
+only adaptation:
+
+```swift
+extension ViewerState {
+    func nextFile(in state: WindowState) -> URL? {
+        let universe: [URL]
+        switch state.directories.mode {
+        case .scoped:
+            universe = state.viewer.scopedFileList  // existing path
+        case .adHoc:
+            universe = state.directories.adHocFiles!.map {
+                URL(fileURLWithPath: $0.path)
+            }
+        }
+        guard !universe.isEmpty else { return nil }
+        let nextIdx = (currentIndex + 1) % universe.count
+        return universe[nextIdx]
+    }
+    // similar for previousFile, with - 1 + count to handle wrap
+}
+```
+
+The `loop_at_ends` setting governs whether wrapping happens; for
+ad-hoc the default is `true`, for scoped `false`.
+
+### 15.2 Slideshow seeding
+
+`SlideshowState.order` (per
+[multi_window.mdx §7.1](./multi_window.mdx#71-slideshowstate))
+is seeded from the same universe:
+
+```swift
+func startSlideshow(in state: WindowState) {
+    let universe = currentUniverse(for: state)  // §15.1 helper
+    let order: [Int]
+    if AppSettings.shared.slideshow.randomOrder {
+        order = universe.indices.shuffled(using: &rng)
+        state.settings.slideshow.orderSeed = rng.lastSeed
+    } else {
+        order = Array(universe.indices)
+    }
+    state.slideshow.order = order
+    state.slideshow.isRunning = true
+    state.slideshow.timer = makeTimer(in: state)
+}
+```
+
+Missing files (§14.4) are filtered out of the universe before
+shuffling so the slideshow does not advance to a non-loadable
+URL.
+
+## 16. Persistence Pipeline Additions
+
+### 16.1 Immediate-write on ad-hoc creation
+
+Unlike the existing 200 ms debounce for `directories_window_<N>.yaml`
+writes (per
+[multi_window.mdx §11.1](./multi_window.mdx#111-per-window-write-coalescing)),
+the **initial creation** of an ad-hoc window writes the YAML
+synchronously before the `NSWindow` is shown. This guarantees
+that even a crash between window-show and the next mutation
+leaves the on-disk state consistent.
+
+### 16.2 No debounce on mid-batch growth
+
+When the user drags additional files into an ad-hoc window (§5.8),
+each append is a mutation and goes through the normal 200 ms
+debounce.
+
+### 16.3 Quit-time flush
+
+The existing
+[multi_window.mdx §11.2](./multi_window.mdx#112-quit-time-flush)
+quit-time flush applies. Ad-hoc windows participate equally —
+their `was_open_on_quit`, `selection.current_file`, and
+`slideshow.was_running_on_quit` are written like any other
+window.
+
+## 17. The Audit Log
+
+Every line is the
+[multi_window.mdx §13](./multi_window.mdx#13-the-mcp-audit-log)
+format with the new `app=open_files.*` event family.
+
+### 17.1 New `app=open_files.*` events
+
+| Event | Line shape |
+| --- | --- |
+| `open_files.received` | `app=open_files.received source=<finder_double_click\|...> batch_size=<N> corr=<id>` |
+| `open_files.accept` | `app=open_files.accept path=<p> uti=<uti> corr=<id>` |
+| `open_files.reject` | `app=open_files.reject reason=<unsupported_uti\|unknown_uti\|not_found> path=<p> [uti=<uti>] corr=<id>` |
+| `open_files.reject_batch` | `app=open_files.reject_batch reason=no_supported_files batch_size=<N> corr=<id>` |
+| `open_files.directory` | `app=open_files.directory path=<p> corr=<id>` |
+| `open_files.reopen_app` | `app=open_files.reopen_app` (Dock click on running app) |
+
+### 17.2 The cycle and slideshow events
+
+Reused verbatim from
+[multi_window.mdx §13](./multi_window.mdx#13-the-mcp-audit-log)
+with `window_id=<N>` always present. Plus two new:
+
+| Event | Line shape |
+| --- | --- |
+| `window.cycle` | `app=window.cycle window_id=<N> from_index=<i> to_index=<j> wrap=<bool>` |
+| `slideshow.start` | `app=slideshow.start window_id=<N> order=<in_order\|random> count=<N>` |
+| `slideshow.stop` | `app=slideshow.stop window_id=<N> ticks=<N>` |
+
+### 17.3 Grep recipes
+
+```sh
+# every open-files request, by source
+grep "app=open_files.received" ~/T/_imageglass/logs/log.log
+
+# every ad-hoc window ever created
+grep "source=open_files mode=ad_hoc" ~/T/_imageglass/logs/log.log
+
+# why batch N was rejected — get its corr= id from the received line,
+# then grep all open_files.* events with that id
+grep "corr=ab12cd34" ~/T/_imageglass/logs/log.log
+```
+
+## 18. Failure Modes (Engineering Level)
+
+### 18.1 `application(_:open:)` called with an empty URL array
+
+Should never happen, but defensive code logs
+`app=open_files.received batch_size=0` and returns immediately.
+No window is created.
+
+### 18.2 `WindowRegistry.allocateNextWindowID()` fails
+
+The registry is in-memory; failure is unrecoverable. The
+coordinator catches and logs `app=open_files.allocation_failed
+reason=<msg>` and aborts the batch. The user sees no window;
+the previous app state is unchanged.
+
+### 18.3 The YAML write fails
+
+The synchronous initial-write goes through the existing temp-
+file + atomic-rename pipeline
+([local_storage.mdx §6](../local_storage.mdx#6-atomicity-and-concurrency)).
+A failure (e.g. `~/T/_imageglass/` is read-only) raises an
+error sheet at the new window and the window is **not** added
+to the registry. The user must fix the directory permissions
+and retry the open.
+
+### 18.4 The viewer cannot decode the first file
+
+The auto-select rule loaded the first file, but ImageIO /
+AVFoundation returns an error. The viewer shows the existing
+"unsupported / corrupted" placeholder
+([../error_handling.mdx](../error_handling.mdx)) and the panel
+selection advances to the second file. The first file stays in
+`ad_hoc_files:` (it may decode in a future macOS update) but
+is rendered with the corrupted badge.
+
+### 18.5 The AppleEvent arrives during termination
+
+If the user has just hit ⌘Q and is mid-flush when an
+AppleEvent arrives, the coordinator queues the batch and
+delivers it after `applicationDidFinishLaunching` of the next
+launch (this can happen because LaunchServices may re-launch
+the app to deliver an event that arrived after termination
+started). The queue is a single slot — multiple queued
+batches collapse to "process each batch in order at next
+launch."
+
+### 18.6 Bundle re-registration after install / update
+
+After an install or self-update, `LaunchServices` may need to
+re-index the bundle for `Info.plist` changes to take effect.
+We do not call `LSRegisterURL` proactively — the installer (or
+the user dragging the new bundle in) triggers the system's
+re-index. Until that completes, "Open With" may show the old
+type list. This is a known macOS quirk and is **not** worked
+around in code; the install docs mention it.
+
+## 19. Acceptance
+
+A run of the §9 canonical use cases passes when **all of**:
+
+* §9.1 — Finder double-click on one JPEG (cold start) creates a
+  brand-new ad-hoc window with one pinned file; the viewer
+  loads it. Verified by `cat directories_window_<N>.yaml`
+  showing `mode: ad_hoc` and one entry.
+* §9.2 — Finder multi-select of 24 files (22 supported + 2
+  unsupported) opens one ad-hoc window with 22 pinned files;
+  windows 1 (scoped slideshow) and any other windows are
+  unchanged on disk; the status bar reports the skipped files.
+* §9.3 — ⌘→ 21 times steps through files 2…22; the 22nd press
+  wraps to file 1. `ad_hoc_files:` is unchanged on disk
+  throughout.
+* §9.4 — F5 starts a slideshow whose order is the pinned list
+  (or a fixed permutation if `random_order` is on); the
+  audit log records start with the right count.
+* §9.5 — ⌘Q + relaunch restores the ad-hoc window with the
+  same 22 pinned files, the same `opened_at`, and the saved
+  cursor file.
+* §9.6 — `open ~/Pictures/screenshots/*.png` creates one new
+  ad-hoc window with 8 pinned PNGs.
+* §9.7 — `open ~/Downloads/document.pdf` creates **no** new
+  window; the audit log records
+  `app=open_files.reject_batch reason=no_supported_files`;
+  existing windows are untouched.
+* §9.8 — `open ~/Pictures/family_event/` creates a **scoped**
+  window 4 with the directory as a root; the walker populates
+  the panel.
+* §9.9 — Two `open` invocations produce two ad-hoc windows.
+* §9.10 — One `open` invocation with two arguments produces
+  one ad-hoc window with two pinned files.
+* The audit log contains `app=open_files.*` lines tied by
+  `corr=` to each batch, and the §17.1 events fire in the
+  documented order.
+* MCP `list_windows` reports each ad-hoc window with
+  `mode: "ad_hoc"` and the correct `file_count`; `get_window`
+  on an ad-hoc target returns the pinned `ad_hoc_files:` list;
+  `add_directory` against an ad-hoc target returns
+  `err=ad_hoc_window_no_roots`.
+
+If any step fails, the matching `log.log` line is the first
+place to look — `grep "corr=<id>" log.log` returns the entire
+trace of the offending batch from `received` to the final
+`window.activate`.
+
+---
+
+## 20. Non-Goals (v1)
+
+These are explicitly out of scope for the v1 open-files
+implementation; each is a candidate for a later version.
+
+* **Coalescing two AppleEvents into one window.** Even if two
+  `open` calls arrive within 50 ms, they remain two batches and
+  two windows. The OS grain is the contract.
+* **Adding a "Reuse current window" mode.** A user who wants a
+  one-window-per-app experience can use the
+  `ad_hoc.replace_in_frontmost_if_ad_hoc` flag in a future
+  spec; v1 always creates a new window.
+* **A `mcp__imageglass__open_files_from_disk` MCP tool.** The
+  OS already has every channel covered; duplicating them on
+  MCP is unnecessary, and the existing
+  `mcp__imageglass__open_window` plus
+  `mcp__imageglass__add_directory` cover the scripted-creation
+  case.
+* **Auto-promote ad-hoc → scoped.** The §5.7 "Convert to
+  Directory-Backed Window…" command is the only path. Adding
+  files via drag (§5.8) keeps the window ad-hoc.
+* **Per-window default-app override.** "Always open with
+  ImageGlass_Mac in window 3" is not a thing; the default-app
+  story is system-wide.
+* **Shrinking an ad-hoc window by drag-out.** v1 only grows the
+  list (§5.8). Removing entries is a future right-click
+  action.
+* **Multi-process / multi-instance.** Even with `open -n`, a
+  single ImageGlass_Mac process handles all batches via
+  multiple windows. Spawning a second app instance is
+  explicitly disallowed.
+* **A "Open in new tab" flow.** macOS native tabs are accepted
+  if the user merges windows manually
+  ([multi_window.mdx §16](./multi_window.mdx#16-non-goals-v1)),
+  but the open-files flow never auto-tabs into an existing
+  window.

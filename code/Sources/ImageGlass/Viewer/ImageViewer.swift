@@ -31,13 +31,9 @@ struct ImageViewer: View {
                         if state.crop.isActive { state.crop.cancel(); return .handled }
                         return .ignored
                     }
-                    // slideshow.mdx §1 / §3 / §5 — bare `S` toggles the
-                    // slideshow on or off. Focus-aware via onKeyPress
-                    // (text fields keep `s` for typing) and modifier-
-                    // gated so `⌘S` (Save), `⇧⌘S` (Save As), `⌥⌘S`
-                    // (View ▸ Toggle Slideshow menu shortcut) pass
-                    // through to their menu items untouched.
-                    .onKeyPress("s", phases: .down) { handleSlideshowKey($0) }
+                    // slideshow.mdx §1 / §3 / §5 — bare `S` lives in
+                    // ImageGlassHotkeysModifier so it fires from the
+                    // file tree too.
                     .onKeyPress("g") {
                         if state.crop.isActive { state.crop.cycleGrid(); return .handled }
                         return .ignored
@@ -145,21 +141,6 @@ struct ImageViewer: View {
             SlideshowController.shared.toggle(appState: state, source: "key:Space")
             return .handled
         }
-    }
-
-    /// slideshow.mdx §1 / §3 / §5 — the bare `S` key. `onKeyPress` is
-    /// only delivered when the viewer is the first responder; text
-    /// fields, search fields, and `WKWebView` text inputs keep `s` for
-    /// typing because they consume the key-down before the focusable
-    /// canvas sees it. Any of ⌘/⌥/⌃ on `S` falls through to
-    /// `keyboardShortcut` so the menu items (Save, Save As, Toggle
-    /// Slideshow) keep their bindings.
-    private func handleSlideshowKey(_ press: KeyPress) -> KeyPress.Result {
-        if state.crop.isActive { return .ignored }
-        let blocking: EventModifiers = [.command, .option, .control]
-        if !press.modifiers.intersection(blocking).isEmpty { return .ignored }
-        SlideshowController.shared.toggle(appState: state, source: "key:S")
-        return .handled
     }
 
     /// Empty-viewer placeholder per `docs/use_cases/mcp_file.mdx` §9.2:
