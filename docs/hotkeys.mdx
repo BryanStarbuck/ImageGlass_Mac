@@ -1,0 +1,406 @@
+---
+title: Hotkeys and Keyboard Shortcuts
+description: Product specification for the single-key and chord keyboard shortcuts of ImageGlass_Mac — file-list navigation, folder-tree traversal, zoom modes, panning, and the Zoom to Width mode.
+---
+
+# Hotkeys and Keyboard Shortcuts
+
+> **Document type:** Product specification.
+> **Audience:** Engineering (implementation) and Product (key choices,
+> conflict resolution).
+> **Owners:** PM for key bindings and discoverability; CTO for the
+> SwiftUI `.keyboardShortcut` + AppKit `NSResponder.keyDown` wiring and
+> first-responder routing.
+> **Status:** v1 spec for the Mac-native fork. Complements
+> [`menus.mdx`](./menus.mdx) (which owns chorded `⌘`-prefixed
+> shortcuts on menu items) and [`dir_ui.mdx`](./dir_ui.mdx) (which owns
+> the Directory Panel selection model).
+
+---
+
+## 1. Purpose
+
+This document specifies the **single-key and lightly-modified keyboard
+shortcuts** of ImageGlass_Mac that are *not* attached to a menu-bar
+item. These are the fast, in-flow keys a user presses while looking at
+an image or scrolling the file list — the kind of muscle-memory keys
+that make an image viewer feel quick.
+
+The menu bar in `menus.mdx` owns the canonical `⌘`-prefixed shortcuts.
+This document owns the unmodified letter keys (`C`, `N`, `Z`, `W`) and
+the arrow-key navigation model. Where the two overlap, this document
+is the source of truth for the bare-letter binding and `menus.mdx` is
+the source of truth for the menu-bar twin.
+
+---
+
+## 2. Design Principles
+
+1. **Single-letter keys are reserved for high-frequency, viewer-local
+   actions.** Letter keys (no `⌘`) only fire when the **viewer** or
+   the **Directory Panel** has focus, never when a text field or
+   search field is active.
+2. **Arrows do the same thing regardless of which panel has focus**,
+   as long as that panel is one of {Directory Panel, Viewer}. Tree
+   traversal and viewer advancement are the same action — the resolved
+   file list is one model, navigated through one set of arrow keys.
+3. **Modifiers add scrolling, not new actions.** `⌃` plus an arrow
+   pans the visible image; the bare arrow advances the selection.
+4. **Every binding here is also reachable through a menu or the
+   command palette.** Discoverability is preserved — a user who has
+   not memorized `W` can still reach Zoom to Width through View ▸
+   Zoom to Width.
+5. **No conflict with system-reserved shortcuts.** Bare letters never
+   reach the system; `⌃`-arrow combinations are checked against macOS
+   Spaces and Mission Control bindings and resolved in favor of the
+   image viewer only while a viewer/panel has focus.
+
+---
+
+## 3. Focus Contexts
+
+Hotkey routing depends on which UI surface has the keyboard focus.
+Three contexts matter:
+
+| Context | What "focus" means | Which hotkeys in this doc apply |
+| --- | --- | --- |
+| **Viewer focus** | The main image canvas (`MTKView`) is the first responder. This is the default after launching the app or clicking the image. | All of them. |
+| **Directory Panel focus** | The Directory Panel tree (`OutlineGroup` / `NSOutlineView`) is the first responder. This is the state after the user clicks a row or presses `⌘1`. | All arrow-key bindings (§4). The zoom-letter bindings (§5) still fire because they target the linked viewer; the panel does not eat them. |
+| **Text-field focus** | A search field, rename field, or settings text field is first responder. | **None** of the bindings in this doc. Letters type into the field; arrows move the text cursor. |
+
+The first-responder check is done in a single dispatcher that wraps
+the AppKit key-equivalent path; see §8 for the implementation note.
+
+---
+
+## 4. Arrow-Key Navigation
+
+The four arrow keys drive a unified model: **navigate the resolved
+file list**. That list is rendered both as the Directory Panel tree
+(`dir_ui.mdx`) and as the viewer's current selection — moving in one
+moves the other.
+
+The semantics are designed to match the **Finder column view** mental
+model: up/down moves the cursor within the current level; left/right
+moves between levels (collapse / expand a folder, or step out / in).
+
+### 4.1 Bare Arrow Keys
+
+| Key | Selection state | Behavior |
+| --- | --- | --- |
+| **↑** | Any | Move the selection **up one row** in the resolved file list. The tree is traversed in display order: a collapsed folder is a single row; an expanded folder's children are walked depth-first. If the selection is already on the first row, the key is a no-op (audible beep is suppressed). |
+| **↓** | Any | Move the selection **down one row**, same traversal order. Wrapping is off by default — at the last row, the key is a no-op. Settings ▸ Navigation ▸ *Wrap at ends* can enable wrap. |
+| **←** | Selection is a **folder**, expanded | **Collapse** the folder. The folder row stays selected. |
+| **←** | Selection is a **folder**, collapsed | Move selection to the **parent folder**. |
+| **←** | Selection is a **file** | Move selection to the **parent folder** of that file. The folder row becomes selected; the viewer keeps showing the file the user was on until a new file is chosen. |
+| **→** | Selection is a **folder**, collapsed | **Expand** the folder. The folder row stays selected. |
+| **→** | Selection is a **folder**, expanded | Move selection to the **first child** of the folder. If the first child is a file, the viewer loads that file. If the first child is a sub-folder, that sub-folder becomes selected and remains collapsed. |
+| **→** | Selection is a **file** | No-op. Files have no children. (Reserved for future use — e.g., entering a multi-frame image's frame list.) |
+
+### 4.2 Behavioral Notes
+
+* **Up/down always advances the viewer.** Whether focus is on the
+  Directory Panel or the viewer, pressing `↓` makes the next image
+  load. This is the single most-pressed key in the app and must feel
+  instantaneous (see §10 for the performance budget).
+* **Left/right only changes the viewer when crossing into a new
+  file.** Collapsing or expanding a folder, or moving to a folder row,
+  does **not** change which image is displayed. The viewer holds the
+  last-viewed file until the user picks a new one.
+* **Folder selection without a file shown.** When the user lands on a
+  folder row that does not auto-load any file, the viewer shows a
+  small folder-summary placeholder ("12 images, 3 sub-folders"). The
+  status bar gives the same count.
+* **Recursive vs. shallow folders.** The traversal in §4.1 walks only
+  the **resolved** file list — i.e., the list Local Storage has
+  already filtered through inclusion / exclusion criteria. A folder
+  marked shallow (see `local_storage.mdx`) exposes only its own files;
+  pressing `→` on it never enters its sub-folders.
+* **Multi-select.** Holding `⇧` while pressing `↑` or `↓` extends the
+  selection in the Directory Panel (standard Mac behavior) but does
+  **not** advance the viewer until the user releases `⇧`. The viewer
+  then loads the most-recently-added file in the selection.
+
+### 4.3 Arrow Keys With `⌃` (Page-Pan)
+
+`⌃` plus an arrow key **pans the visible image** instead of advancing
+selection. This is the keyboard equivalent of scrolling a long image
+that does not fit in the viewer — most useful in **Zoom to Width**
+mode (§6) on tall UI mockups, screenshots, and infographics.
+
+| Key | Behavior |
+| --- | --- |
+| **⌃ ↓** | Scroll the visible viewport **down by 15%** of the viewport height. |
+| **⌃ ↑** | Scroll the visible viewport **up by 15%** of the viewport height. |
+| **⌃ →** | Scroll the visible viewport **right by 15%** of the viewport width. |
+| **⌃ ←** | Scroll the visible viewport **left by 15%** of the viewport width. |
+
+* Repeated taps stack: ten taps of `⌃ ↓` scrolls ~150% of a viewport,
+  i.e., reads about one and a half pages.
+* Holding the arrow key (key-repeat) continues to scroll smoothly at
+  the system key-repeat rate.
+* When the image fully fits the viewport (no overflow on the scrolled
+  axis), `⌃`-arrow is a no-op on that axis.
+* `⌃ ↓` and `⌃ ↑` never advance to the next/previous image — they
+  scroll within the current image only. The bare arrow keys are the
+  way to move between files.
+
+---
+
+## 5. Zoom Hotkeys (Bare Letters)
+
+The bare-letter zoom keys are the muscle-memory surface for the
+viewer. They are deliberately short — single keys — because they are
+the most-used viewer commands after arrow navigation.
+
+| Key | Action | Notes |
+| --- | --- | --- |
+| **`+`** / **`=`** | **Zoom In by 20%.** | Multiplicative — each press multiplies the current zoom factor by `1.20`. `=` is the unshifted twin of `+` so the user does not need `⇧`. |
+| **`-`** | **Zoom Out by 20%.** | Each press divides the current zoom factor by `1.20`. |
+| **`C`** | **Center.** | Re-centers the image inside the viewport without changing the current zoom factor. Useful after `⌃`-arrow panning or after dragging the image off-center with the mouse. |
+| **`N`** | **Normalize.** | Resets to the user's *default zoom mode*. The default is **Zoom to Fit** unless the user has changed it in Settings ▸ Viewer ▸ *Default zoom on open*; setting that to *Actual size (100%)* makes `N` snap to 100% instead. `N` is a one-press way to undo any ad-hoc zooming. |
+| **`Z`** | **Zoom to Fit.** | Explicit fit-to-screen, regardless of the default zoom mode. The image scales so the longer dimension exactly fits the viewport; the other dimension may have letterboxing. |
+| **`W`** | **Zoom to Width.** | Switches to the new Zoom to Width mode (§6). The image is rescaled so its width exactly matches the viewport width, and the viewport scrolls to the top of the image. |
+| **`F`** | (Reserved) | Reserved for *Zoom to Fill* (the cover-style mode) in v2. v1 does not bind `F`. |
+
+### 5.1 Mode vs. One-Shot
+
+`Z`, `W`, and `N` set a **zoom mode** that persists until the user
+zooms manually or switches mode. `+`, `-`, and `C` are one-shot
+adjustments that put the viewer into a **custom-zoom** state. The
+status bar shows the current mode (*Fit*, *Width*, *Actual*, *Custom*)
+and the current percent.
+
+### 5.2 Interaction With the Mouse
+
+* Mouse-wheel zoom (when bound to zoom in Settings ▸ Viewer ▸ *Mouse
+  wheel*) uses the same 20% multiplicative step.
+* Magnify gesture (`MagnifyGesture` on the trackpad) is **smooth** —
+  it does not snap to 20%. The status bar shows the resulting
+  arbitrary percent.
+* Pressing any bare-letter zoom key after smooth-magnifying overrides
+  the gesture's zoom factor and switches back to the named mode.
+
+---
+
+## 6. Zoom to Width Mode (New)
+
+**Zoom to Width** is a new fork-specific zoom mode tailored to **tall
+images that the user wants to read top-to-bottom**: UI page mockups,
+long screenshots, web-page captures, infographics, vertical comics,
+and product-design exports.
+
+### 6.1 Behavior
+
+1. The image is rescaled so its **width equals the viewport width**
+   (minus any insets defined by the toolbar and panels).
+2. The viewport's vertical scroll position is set to the **top** of
+   the image (offset `0`).
+3. The viewport is allowed to scroll **vertically** as the user pans
+   downward — this is the natural reading motion. If the rescaled
+   image is also wider than expected (e.g., the user has resized the
+   window narrower than the image's natural aspect), horizontal
+   scrolling is also permitted.
+4. The zoom mode persists across image changes — pressing `↓` to load
+   the next image keeps Zoom to Width active, rescales the new image
+   to viewport width, and scrolls to the top.
+
+### 6.2 Why Top of Image
+
+Most tall mockups have a header / hero at the top. Starting the view
+there matches the user's intent to read the image in document order.
+Zoom to Fit's "centered" default is wrong for this workflow because
+it puts the middle of a long mockup in the middle of the screen,
+forcing the user to scroll up before they can read.
+
+### 6.3 Pairing With `⌃`-Arrow
+
+Zoom to Width is designed to be used with **`⌃ ↓`** and **`⌃ ↑`**:
+
+* `W` → enter Zoom to Width; viewport at top.
+* `⌃ ↓` repeatedly → scroll down by 15% of viewport per press; read
+  the mockup section by section.
+* Hold `⌃ ↓` → smooth continuous scroll for a long page.
+* `↓` (bare) → advance to the **next image**, which re-enters Zoom to
+  Width at the top of that next image.
+
+This sequence — `W`, then `⌃ ↓ ⌃ ↓ ⌃ ↓ …`, then `↓` — is the
+canonical "read a folder of tall mockups" flow.
+
+### 6.4 Menu Surface
+
+Zoom to Width appears in the **View** menu (`menus.mdx` §4.4)
+alongside the existing zoom items. The full View ▸ Zoom group is, in
+v1 with Zoom to Width added:
+
+| Item | Shortcut | Notes |
+| --- | --- | --- |
+| Actual Size | ⌘ 0 | 100% zoom. Same as upstream. |
+| Zoom In | ⌘ + | One step of 20% zoom-in. Bare `+` / `=` is the in-viewer twin. |
+| Zoom Out | ⌘ - | One step of 20% zoom-out. Bare `-` is the in-viewer twin. |
+| Zoom to Fit | ⌘ 9 | Fits the longer dimension. Bare `Z` is the in-viewer twin. |
+| Zoom to Fill | ⇧ ⌘ 9 | Covers the viewport (crops on the shorter dimension). |
+| **Zoom to Width** **(new)** | **`W`** *(bare)* / ⌥ ⌘ 9 *(menu twin)* | Fit image width to viewport width; scroll to top. |
+| Lock Zoom | ⌃ ⌘ L | Toggle — keep the current zoom across image changes. |
+
+The bare `W` is the canonical shortcut shown on the menu item; the
+`⌥ ⌘ 9` chord is the menu-friendly twin so the binding works even
+when a text field happens to be focused.
+
+### 6.5 State Persistence
+
+The user's last-used zoom mode (Fit, Fill, Width, Actual, Custom) is
+remembered in `UserDefaults` under `viewer.lastZoomMode`. On relaunch,
+if Settings ▸ Viewer ▸ *Default zoom on open* is set to *Restore last
+mode*, the app reopens in the same zoom mode the user was last in,
+including Zoom to Width.
+
+---
+
+## 7. Full Hotkey Reference
+
+This is the canonical at-a-glance list. Bindings appear once per
+function; menu-bar twins are listed in the *Menu shortcut* column.
+
+| Hotkey | Action | Menu shortcut twin |
+| --- | --- | --- |
+| **↑** | Previous row in resolved file list | Go ▸ Previous Image (←) |
+| **↓** | Next row in resolved file list | Go ▸ Next Image (→) |
+| **←** | Collapse folder / go to parent | Panel ▸ Collapse Selected Subtree (⌥ ←) |
+| **→** | Expand folder / step into first child | Panel ▸ Expand Selected Subtree (⌥ →) |
+| **⌃ ↑** | Pan up 15% of viewport | — |
+| **⌃ ↓** | Pan down 15% of viewport | — |
+| **⌃ ←** | Pan left 15% of viewport | — |
+| **⌃ →** | Pan right 15% of viewport | — |
+| **`+`** / **`=`** | Zoom in 20% | View ▸ Zoom In (⌘ +) |
+| **`-`** | Zoom out 20% | View ▸ Zoom Out (⌘ -) |
+| **`C`** | Center image in viewport | View ▸ Center *(menu item, no shortcut)* |
+| **`N`** | Normalize to default zoom mode | View ▸ Normalize Zoom *(menu item, no shortcut)* |
+| **`Z`** | Zoom to Fit | View ▸ Zoom to Fit (⌘ 9) |
+| **`W`** | Zoom to Width | View ▸ Zoom to Width (⌥ ⌘ 9) |
+| **␣** (Space) | Toggle slideshow | View ▸ Slideshow |
+| **⌫** | Move selected file to Trash | Edit ▸ Delete |
+
+The full list of `⌘`-prefixed shortcuts (menu chords) is owned by
+`menus.mdx` §4 and §7.
+
+---
+
+## 8. Implementation Notes
+
+### 8.1 Routing
+
+All bindings in this document are routed through a single
+`KeyEquivalentDispatcher` that sits between the AppKit
+`NSResponder.performKeyEquivalent(with:)` path and the SwiftUI
+`.keyboardShortcut` modifier:
+
+* Bare letters (`C`, `N`, `Z`, `W`, `+`, `=`, `-`) are dispatched
+  **only** when the first responder is the viewer or the Directory
+  Panel. The dispatcher consults the responder chain on every key
+  event.
+* Arrow keys with no modifier are dispatched to the file-list
+  navigation handler regardless of which of those two surfaces has
+  focus, because both surfaces share the same selection model.
+* `⌃`-arrow combinations are dispatched to the viewer's pan handler
+  only when the viewer has focus *and* the current image overflows
+  the viewport on the relevant axis.
+
+### 8.2 SwiftUI + AppKit Split
+
+* The viewer canvas is `MTKView`-backed (AppKit). It implements
+  `NSResponder.keyDown(with:)` to handle the bare-letter zoom keys and
+  the `⌃`-arrow pan keys.
+* The Directory Panel is `OutlineGroup` in SwiftUI for v1, with the
+  arrow-key handling implemented through `.onKeyPress(.upArrow)` /
+  `.downArrow` / `.leftArrow` / `.rightArrow` modifiers (macOS 14+).
+* When focus is on either surface and the user presses an arrow,
+  selection mutates through the shared `FileListSelectionModel`
+  observable object so the viewer and panel stay in lockstep.
+
+### 8.3 Conflict With System and Menu Bindings
+
+`W` is unusually short and could collide with menu items that take
+`⌘ W` (Close Window). The dispatcher distinguishes:
+
+* `⌘ W` → Close Window (handled by AppKit menu validation, owned by
+  `menus.mdx`).
+* Bare `W` (no modifier) → Zoom to Width.
+* `⇧ W` → No binding. Falls through to text input if a field has
+  focus.
+
+This pattern (bare-letter wins, `⌘`-modified routes to the menu)
+applies uniformly to `C`, `N`, `Z`, `W`, `+`, `-`.
+
+### 8.4 Performance Budget
+
+* `↓` → next image must produce the **first frame** of the next
+  image within **80 ms** on Apple Silicon for images up to 50 MP,
+  using the prefetched-thumbnail-first then full-decode strategy
+  defined in `list_of_files.mdx`. Anything slower than that feels
+  laggy in the muscle-memory loop.
+* `W` → entering Zoom to Width is a `CATransaction`-grouped layout
+  pass; it must complete in one frame (≤ 16 ms at 60 Hz).
+* `⌃ ↓` panning at 60 Hz key-repeat is delivered at 15% of viewport
+  per tick; the `CAScrollLayer` content offset animation is disabled
+  (instantaneous) so the pan tracks the keypress rate without
+  damping.
+
+---
+
+## 9. Settings Hooks
+
+The following Settings ▸ Viewer / Settings ▸ Navigation fields
+influence the behavior in this document. None of them rebind keys in
+v1 (rebinding is a v2 feature, see `menus.mdx` §9).
+
+| Settings field | Effect |
+| --- | --- |
+| Viewer ▸ *Default zoom on open* | Determines what `N` snaps to: `Zoom to Fit` (default), `Actual size`, or `Restore last mode`. |
+| Viewer ▸ *Zoom step (percent)* | Overrides the 20% multiplicative step for `+` and `-`. Range 5%–50%. |
+| Viewer ▸ *Pan step (percent of viewport)* | Overrides the 15% pan step for `⌃`-arrow keys. Range 5%–50%. |
+| Viewer ▸ *Zoom to Width: scroll target* | `Top` (default) / `Center` / `Last viewed`. Most users want Top; the option exists for the rare workflow that wants to resume reading. |
+| Navigation ▸ *Wrap at ends* | When on, `↓` on the last file wraps to the first; `↑` on the first wraps to the last. Off by default. |
+| Navigation ▸ *Arrow keys move focus to viewer after selection* | When on, pressing `↓` in the Directory Panel also moves first responder to the viewer so zoom letters work without a second click. On by default. |
+
+All fields persist in `settings.json` under `viewer.*` and
+`navigation.*` and are exposed to MCP via the standard settings tool
+surface (see `settings.mdx`).
+
+---
+
+## 10. Acceptance Criteria for v1
+
+The hotkey surface is considered v1-complete when:
+
+1. Every binding in §7 fires the listed action in the listed focus
+   context and is a no-op outside that context (verified by an
+   XCUITest matrix).
+2. `↓` on a folder of 1,000 mid-size JPEGs advances the viewer in
+   under 80 ms median, measured on an M-class Mac.
+3. `W` rescales any image taller than the viewport so its width fits
+   the viewport width and scrolls to offset 0 in a single frame.
+4. `⌃ ↓` scrolls the viewport down by exactly 15% of viewport height
+   per keypress and a hold scrolls smoothly at the system key-repeat
+   rate.
+5. View ▸ Zoom to Width appears in the menu with the `⌥ ⌘ 9` chord,
+   and the menu item's enabled state is `true` whenever an image is
+   loaded.
+6. Help ▸ Keyboard Shortcuts… lists every binding in §7 alongside
+   every `⌘`-chord from `menus.mdx`, pulled from the same source of
+   truth that wires the dispatcher.
+
+---
+
+## 11. Non-Goals (v1)
+
+* **Rebindable hotkeys.** The bindings in this document are fixed in
+  v1. Settings ▸ Keybindings is the v2 surface that will let the user
+  swap `Z` and `W`, change the zoom step, or assign hotkeys to MCP
+  tools.
+* **Vim-style chords.** No `gg` / `G` / `:` style multi-key chords.
+  Mac users do not expect them in an image viewer.
+* **Per-scope hotkeys.** Hotkeys are global to the app; they do not
+  change with the active scope.
+* **Gamepad / remote-control bindings.** Out of scope until there is
+  a credible Mac Catalyst path.

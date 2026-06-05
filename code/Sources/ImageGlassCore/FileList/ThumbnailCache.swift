@@ -128,6 +128,19 @@ public actor ThumbnailCache {
 
     /// Generate a CGImage thumbnail via ImageIO. Spec §4.2.
     public static func generateImageIO(url: URL, maxSide: Int) -> CGImage? {
+        // Skip files we know aren't real image bytes (Git LFS pointers,
+        // cloud-storage placeholders, broken symlinks, …). Feeding them
+        // to ImageIO produces a useless empty thumbnail that then gets
+        // baked into the on-disk cache and re-served until the user
+        // notices and purges. The diagnoser logs a tagged line so the
+        // file panel's silent fall-back to the system icon is traceable.
+        let dx = LoadDiagnostics.diagnose(url: url)
+        if dx != .ok {
+            ErrorLog.log("skip thumbnail [\(dx.tag)] \(url.path)",
+                         class: "ThumbnailCache")
+            LoadDiagnostics.requestDownloadIfPossible(url: url)
+            return nil
+        }
         let opts: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceCreateThumbnailWithTransform:   true,

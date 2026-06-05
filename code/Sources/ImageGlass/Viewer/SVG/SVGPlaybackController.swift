@@ -75,12 +75,31 @@ public final class SVGPlaybackController {
         loadError = nil
         currentURL = url
 
+        // Pre-flight: catch Git LFS pointers, iCloud / Dropbox placeholders,
+        // broken symlinks, and permission issues with a user-actionable
+        // message instead of rendering a tiny text file as an empty SVG.
+        let pre = LoadDiagnostics.diagnose(url: url)
+        if pre != .ok {
+            loadError = pre.userMessage
+            ErrorLog.log("SVG preflight rejected [\(pre.tag)] \(url.path)",
+                         class: "SVGPlaybackController")
+            LoadDiagnostics.requestDownloadIfPossible(url: url)
+            currentData = nil
+            return .empty
+        }
+
         let data: Data
         do {
             data = try Data(contentsOf: url)
         } catch {
-            loadError = "Could not read \(url.lastPathComponent): \(error.localizedDescription)"
-            ErrorLog.log("SVG load failed", error: error,
+            // Fall back through the same diagnoser so iCloud / Dropbox
+            // placeholders that raced past the pre-check still produce
+            // the right message.
+            let post = LoadDiagnostics.diagnoseAfterDecodeFailure(
+                url: url,
+                decoderHint: "Could not read \(url.lastPathComponent): \(error.localizedDescription)")
+            loadError = post.userMessage
+            ErrorLog.log("SVG load failed [\(post.tag)]", error: error,
                          class: "SVGPlaybackController")
             currentData = nil
             return .empty

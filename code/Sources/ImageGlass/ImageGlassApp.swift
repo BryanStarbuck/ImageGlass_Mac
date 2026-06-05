@@ -285,18 +285,22 @@ struct ImageGlassApp: App {
         guard panel.runModal() == .OK else { return }
         for url in panel.urls {
             do {
-                let (_, already) = try DirectoriesStore.shared.addRoot(path: url.path)
+                let (canonical, already) = try DirectoriesStore.shared.addRoot(path: url.path)
                 if !already {
                     let corr = MCPAuditLogger.newCorrelationId()
                     MCPAuditLogger.shared.logDirectoryToolCall(
                         toolName: "add_directory",
-                        path: url.path,
+                        path: canonical.path,
                         client: "gui",
                         corr: corr,
                         ok: true
                     )
+                    // Pass the canonical URL — the same key the YAML stores
+                    // — so `reloadDirectoriesFromDisk` does not later see the
+                    // walker's raw-URL entry as "missing from the YAML" and
+                    // remove it. See docs/use_cases/add_dir_of_images.md §6.6.
                     DirectoryTreeWalker.shared.scheduleWalk(
-                        root: url,
+                        root: canonical,
                         filter: .empty,
                         corr: corr
                     )

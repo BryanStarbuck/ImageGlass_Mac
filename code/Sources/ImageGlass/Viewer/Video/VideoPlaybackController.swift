@@ -88,6 +88,19 @@ public final class VideoPlaybackController {
         loadError = nil
         currentURL = url
 
+        // Pre-flight: catch Git LFS pointers, iCloud / Dropbox placeholders,
+        // broken symlinks, and permission denials before handing the URL
+        // to AVFoundation, which would otherwise report a generic "the
+        // file is not playable" verdict that the user can't act on.
+        let pre = LoadDiagnostics.diagnose(url: url)
+        if pre != .ok {
+            loadError = pre.userMessage
+            ErrorLog.log("video preflight rejected [\(pre.tag)] \(url.path)",
+                         class: "VideoPlaybackController")
+            LoadDiagnostics.requestDownloadIfPossible(url: url)
+            return
+        }
+
         // MKV / WebM require the optional plugin (docs/videos.mdx §9).
         if VideoFormats.requiresPlugin(url), !settings.mkvSupportEnabled {
             loadError = VideoError.pluginRequired(url).errorDescription
@@ -102,7 +115,15 @@ public final class VideoPlaybackController {
             // Swift 6's async asset loading API. Available since macOS 13.
             let isPlayable = try await asset.load(.isPlayable)
             guard isPlayable else {
-                loadError = VideoError.unplayable(url).errorDescription
+                // AVFoundation says "not playable." Re-run the diagnoser
+                // in case the file changed underneath us (e.g. a cloud
+                // provider evicted it between the preflight and now).
+                let post = LoadDiagnostics.diagnoseAfterDecodeFailure(
+                    url: url,
+                    decoderHint: VideoError.unplayable(url).errorDescription)
+                loadError = post.userMessage
+                ErrorLog.log("video reported unplayable [\(post.tag)] \(url.path)",
+                             class: "VideoPlaybackController")
                 return
             }
             let duration = try await asset.load(.duration)

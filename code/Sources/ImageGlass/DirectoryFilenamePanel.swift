@@ -465,17 +465,19 @@ struct DirectoryFilenamePanel: View {
         for url in panel.urls {
             let corr = MCPAuditLogger.newCorrelationId()
             do {
-                let (_, already) = try DirectoriesStore.shared.addRoot(path: url.path)
+                let (canonical, already) = try DirectoriesStore.shared.addRoot(path: url.path)
                 if !already {
                     MCPAuditLogger.shared.logDirectoryToolCall(
                         toolName: "add_directory",
-                        path: url.path,
+                        path: canonical.path,
                         client: "gui",
                         corr: corr,
                         ok: true
                     )
+                    // Walker key must equal the canonical YAML path — see
+                    // docs/use_cases/add_dir_of_images.md §6.6.
                     DirectoryTreeWalker.shared.scheduleWalk(
-                        root: url,
+                        root: canonical,
                         filter: .empty,
                         corr: corr
                     )
