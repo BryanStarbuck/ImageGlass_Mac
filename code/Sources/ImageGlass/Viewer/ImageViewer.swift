@@ -211,11 +211,17 @@ struct ImageViewer: View {
         // Allow Shift (so `+` reaches us as Shift-`=`), but not ⌘/⌥/⌃.
         let blocking: EventModifiers = [.command, .option, .control]
         if !press.modifiers.intersection(blocking).isEmpty { return .ignored }
+        let step = state.settings.viewer.zoom_step_percent
+        let lastRaw = UserDefaults.standard.string(forKey: ViewerState.lastZoomModeKey)
+        let last = lastRaw.flatMap(ZoomMode.init(rawValue:))
         switch action {
-        case .zoomIn:    viewer.zoomIn()
-        case .zoomOut:   viewer.zoomOut()
+        case .zoomIn:    viewer.zoomIn(stepPercent: step)
+        case .zoomOut:   viewer.zoomOut(stepPercent: step)
         case .center:    viewer.centerImage()
-        case .normalize: viewer.normalizeZoom()
+        case .normalize: viewer.normalizeZoom(
+            mode: state.settings.viewer.default_zoom_on_open,
+            lastMode: last
+        )
         case .fit:       viewer.zoomToFit()
         case .width:     viewer.zoomToWidth()
         }

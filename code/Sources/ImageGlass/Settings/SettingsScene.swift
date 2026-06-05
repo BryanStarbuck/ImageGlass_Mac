@@ -376,6 +376,32 @@ private struct SlideshowSettingsView: View {
             state.settings.slideshow.interval_seconds = 600
         }
     }
+
+    /// slideshow.mdx §4.5 — drag and stepper events fire many onChange
+    /// callbacks per second. We coalesce them so only the settle value
+    /// hits the audit log and the on-disk settings file. 300 ms is the
+    /// debounce spec'd in §4.4.
+    private func scheduleIntervalAudit(_ new: Double) {
+        intervalDebounce?.cancel()
+        intervalDebounce = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(300))
+            if Task.isCancelled { return }
+            let settled = state.settings.slideshow.interval_seconds
+            let prior = lastAuditedInterval
+            // Tolerate float jitter from the slider — only audit on a
+            // visible change.
+            if abs(settled - prior) <= 0.0001 { return }
+            lastAuditedInterval = settled
+            MCPAuditLogger.shared.logSettingsWrite(
+                key: "slideshow.interval_seconds",
+                old: String(format: "%.1f", prior),
+                new: String(format: "%.1f", settled),
+                source: "gui:settings",
+                corr: MCPAuditLogger.newCorrelationId()
+            )
+            _ = new // silence unused-warning when settled equals binding
+        }
+    }
 }
 
 // MARK: - Edit
