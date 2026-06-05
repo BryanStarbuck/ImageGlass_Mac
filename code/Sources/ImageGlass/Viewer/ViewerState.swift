@@ -55,6 +55,12 @@ public final class ViewerState {
     public var isAnimated: Bool = false
     public var isAnimationPaused: Bool = false
 
+    /// Non-nil when the selected file is set but couldn't be displayed
+    /// (Git LFS placeholder, unreadable, corrupt/unsupported encoding).
+    /// Drives the on-canvas error card so the user sees *why* instead of a
+    /// blank gray canvas.
+    public var loadError: String? = nil
+
     // Hover state for the color picker overlay (image-pixel coordinates).
     public var hoverPixel: CGPoint? = nil
     public var hoverColor: RGBA? = nil

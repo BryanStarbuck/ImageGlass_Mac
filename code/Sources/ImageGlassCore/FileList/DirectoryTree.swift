@@ -36,15 +36,32 @@ public enum FileKind: String, Sendable, Codable {
     /// on disk).
     public static func classify(path: String) -> FileKind? {
         let url = URL(fileURLWithPath: path)
+        let ext = url.pathExtension.lowercased()
+        // Hard deny first. `.ts` (TypeScript) otherwise resolves to
+        // `public.mpeg-2-transport-stream` → `.video`, so node_modules and
+        // HTML-export folders flood the tree with code files wearing a film
+        // icon. These extensions are never design assets we preview.
+        if Self.nonMediaExtensions.contains(ext) { return nil }
         if let resolved = try? url.resourceValues(forKeys: [.contentTypeKey]).contentType {
             if let k = classify(uti: resolved) { return k }
         }
-        let ext = url.pathExtension.lowercased()
         if let uti = UTType(filenameExtension: ext) {
             if let k = classify(uti: uti) { return k }
         }
         return Self.fallbackByExtension(ext)
     }
+
+    /// Extensions that are never previewable design assets — code, text,
+    /// data, fonts, sourcemaps. Excluded before UTType lookup so e.g. `.ts`
+    /// isn't mistaken for MPEG transport-stream video.
+    static let nonMediaExtensions: Set<String> = [
+        "ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs", "json", "map",
+        "css", "scss", "sass", "less", "html", "htm", "xml", "yml", "yaml",
+        "md", "markdown", "txt", "csv", "log", "lock",
+        "woff", "woff2", "ttf", "otf", "eot",
+        "wasm", "node", "d", "sh", "py", "rb", "go", "rs", "swift", "c", "h",
+        "cpp", "java", "kt", "php", "sql", "env", "gitignore", "npmignore"
+    ]
 
     private static func fallbackByExtension(_ ext: String) -> FileKind? {
         switch ext {

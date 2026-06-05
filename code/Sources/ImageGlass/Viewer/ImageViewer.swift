@@ -70,6 +70,13 @@ struct ImageViewer: View {
                     )
                 }
             }
+
+            // On-canvas error card — replaces the blank gray when a file is
+            // selected but can't be displayed (Git LFS placeholder, etc.).
+            if state.selectedFile != nil, let err = viewer.loadError {
+                loadErrorCard(err)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         // Canvas background behind the image — the design's page-gray
@@ -172,6 +179,36 @@ struct ImageViewer: View {
                 .foregroundStyle(.secondary)
         }
     }
+
+    /// Centered card shown when a file is selected but couldn't be displayed.
+    /// Names the reason (e.g. Git LFS placeholder) so the user can act
+    /// instead of staring at a blank canvas.
+    private func loadErrorCard(_ message: String) -> some View {
+        VStack(spacing: 12) {
+            Image(systemName: "exclamationmark.triangle")
+                .font(.system(size: 40, weight: .light))
+                .foregroundStyle(.secondary)
+            Text("Can't display this image")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(IG.textC)
+            Text(message)
+                .font(.system(size: 13))
+                .foregroundStyle(IG.text2C)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 340)
+            if let path = state.selectedFile {
+                Text((path as NSString).lastPathComponent)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(IG.text3C)
+                    .lineLimit(1).truncationMode(.middle)
+                    .frame(maxWidth: 340)
+            }
+        }
+        .padding(24)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(IG.glassLineC, lineWidth: 0.5))
+        .shadow(color: .black.opacity(0.18), radius: 16, y: 8)
+    }
 }
 
 // MARK: - Media kind dispatch
@@ -187,10 +224,17 @@ private struct MediaCanvasDispatcher: View {
     let path: String
 
     var body: some View {
-        // Bryan: temporarily route every selection through the static
-        // image canvas. The SVG and video canvases are disabled for
-        // now; restoring them is a switch back to `MediaKind.detect`.
-        CanvasHost(state: state, viewer: viewer)
+        // Route each selection to the right canvas: SVGs render through
+        // SVGCanvasView (WKWebView / NSImage), videos through VideoCanvasView
+        // (AVKit), everything else through the static image canvas.
+        switch MediaKind.detect(path: path) {
+        case .svg:
+            SVGCanvasView(state: state, controller: state.svg, path: path)
+        case .video:
+            VideoCanvasView(state: state, controller: state.video, path: path)
+        case .image:
+            CanvasHost(state: state, viewer: viewer)
+        }
     }
 }
 
@@ -247,6 +291,14 @@ private struct CanvasHost: NSViewRepresentable {
             }
             v.setImage(path: resolvedPath)
             v.toolTip = resolvedPath
+            // Surface load failures on the canvas. If a file is selected but
+            // produced no image (Git LFS placeholder, unreadable, corrupt),
+            // compute the actionable reason for the on-canvas error card.
+            let failed = (v.sourceImage == nil && v.frameSource == nil)
+            let reason = (failed && resolvedPath != nil)
+                ? FrameSource.failureReason(forPath: resolvedPath!)
+                : nil
+            Task { @MainActor in viewer.loadError = reason }
             // ViewerState carries the user's current zoom/pan across
             // image changes via SwiftUI. That breaks the "every new
             // image opens fit-to-window, centered" contract — a previous

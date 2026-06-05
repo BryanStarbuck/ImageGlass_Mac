@@ -45,3 +45,9 @@ build/
 dist/
 *.dmg
 *.app/
+
+# Local agent + working notes (not part of the project)
+.claude/
+design_prompt.md
+new_docs.md
+task.md

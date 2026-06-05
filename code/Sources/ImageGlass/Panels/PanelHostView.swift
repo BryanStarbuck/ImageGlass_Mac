@@ -181,7 +181,14 @@ struct PanelHostView<Center: View>: View {
     // MARK: - Group lookup
 
     private func group(at position: DockPosition) -> TabGroup? {
-        model.layout.groups.first { $0.position == position }
+        guard var g = model.layout.groups.first(where: { $0.position == position })
+        else { return nil }
+        // Drop panels rendered as inline chrome (file panel) so the dock
+        // never shows a duplicate of the inline left column.
+        g.panelIDs.removeAll { FloatingPanelController.inlineSuppressedIDs.contains($0) }
+        if g.panelIDs.isEmpty { return nil }
+        if g.activeIndex >= g.panelIDs.count { g.activeIndex = 0 }
+        return g
     }
 
     // MARK: - Render
@@ -229,18 +236,25 @@ final class FloatingPanelController {
     private weak var appState: AppState?
     private weak var model: PanelLayoutModel?
 
+    /// Panels rendered as inline chrome elsewhere (the file panel lives in
+    /// ContentView's left column). They must never be materialized by the
+    /// panel system — docked or floating — or the window shows a duplicate.
+    static let inlineSuppressedIDs: Set<String> = ["file_panel"]
+
     func reconcile(model: PanelLayoutModel, appState: AppState) {
         self.appState = appState
         self.model = model
         let liveIDs = Set(model.layout.floating.map { $0.id })
+            .subtracting(Self.inlineSuppressedIDs)
 
-        // Close windows for panels that are no longer floating.
+        // Close windows for panels that are no longer floating (or suppressed).
         for (id, panel) in windows where !liveIDs.contains(id) {
             panel.close()
             windows.removeValue(forKey: id)
         }
         // Open windows for newly floating panels.
-        for f in model.layout.floating where windows[f.id] == nil {
+        for f in model.layout.floating
+        where windows[f.id] == nil && !Self.inlineSuppressedIDs.contains(f.id) {
             present(floating: f, model: model, appState: appState)
         }
     }

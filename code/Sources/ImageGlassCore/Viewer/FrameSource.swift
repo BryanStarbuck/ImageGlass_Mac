@@ -70,6 +70,24 @@ public final class FrameSource: @unchecked Sendable {
         return head.hasPrefix("version https://git-lfs.github.com/spec/")
     }
 
+    /// Human-readable reason a file at `path` can't be displayed, for the
+    /// on-canvas error card. Returns the most actionable cause. Call only
+    /// after a load has actually failed.
+    public static func failureReason(forPath path: String) -> String {
+        let url = URL(fileURLWithPath: path)
+        if isGitLFSPointer(at: url) {
+            return "This is a Git LFS placeholder, not the image itself. Run `git lfs pull` in the source repo to download the real files."
+        }
+        if !FileManager.default.isReadableFile(atPath: path) {
+            return "Can't read this file (permission or sandbox). Re-add the folder via Directories ▸ Add Directory… so macOS grants access."
+        }
+        let size = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int) ?? nil
+        if let size, size == 0 {
+            return "This file is empty (0 bytes)."
+        }
+        return "Couldn't display this image — unsupported or corrupt encoding (e.g. CMYK / progressive JPEG, or a non-image file with an image extension)."
+    }
+
     public static func load(data: Data) -> FrameSource? {
         let opts: [CFString: Any] = [kCGImageSourceShouldCache: false]
         guard let src = CGImageSourceCreateWithData(data as CFData, opts as CFDictionary) else {
