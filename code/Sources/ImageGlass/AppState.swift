@@ -245,6 +245,15 @@ public final class AppState {
     /// write (temp-file + rename) replaces the inode, which would break a
     /// kqueue watcher on the file's old file descriptor.
     private var directoriesFileWatcher: FileWatcher?
+    /// Last successfully reconciled `directories.yaml` snapshot. The
+    /// kqueue watcher on the app-support directory fires on every write
+    /// to that directory — including the walker's own audit-log writes,
+    /// which can happen thousands of times per second during a deep
+    /// walk. Without this guard, each FSEvent triggers a full reload +
+    /// a spurious `scheduleWalk` for every root whose previous walk
+    /// hasn't yet committed to `walker.roots`, stacking dozens of
+    /// concurrent walks of the same cloud-backed directory.
+    private var lastReconciledDirectoriesFile: DirectoriesFile?
     /// Token for the `NSDistributedNotificationCenter` subscription that gives
     /// the MCP server an immediate push channel into this process. Complements
     /// the kqueue watcher — whichever fires first wins; the other is a no-op
@@ -435,6 +444,28 @@ public final class AppState {
         isRestoringSelection = true
         selectedFile = newWindow.selectedFile
         isRestoringSelection = wasRestoring
+
+        // 4. Hydrate the file-panel expand/collapse state from the new
+        //    window's persisted YAML, then install the persist-on-change
+        //    callback so subsequent mouse / keyboard toggles flush back
+        //    to `settings_window_<N>.yaml#session.directory_panel`.
+        //    Clear the callback first so `loadExpansionMap` (which
+        //    rewrites the sets) cannot trigger a save against the
+        //    *outgoing* window via a stale closure.
+        treeNav.onPersistRequested = nil
+        treeNav.loadExpansionMap(
+            newWindow.settings.session.directoryPanel.expandedPaths
+        )
+        treeNav.onPersistRequested = { [weak self, weak newWindow] in
+            guard let self, let win = newWindow else { return }
+            let snapshot = self.treeNav.expansionMap
+            do {
+                try win.persistDirectoryPanelExpansion(snapshot)
+            } catch {
+                ErrorLog.log("persistDirectoryPanelExpansion failed",
+                             error: error, class: String(describing: Self.self))
+            }
+        }
     }
 
     /// Read the persisted last-previewed file from UserDefaults and,
@@ -948,7 +979,12 @@ public final class AppState {
     /// Write this process's PID to `heartbeat.txt`. The MCP server reads
     /// the PID and probes liveness via `kill(pid, 0)` to populate the
     /// `app_running` field in write-tool responses.
-    private func writeHeartbeat() {
+    ///
+    /// `nonisolated` because it touches no `AppState` instance state —
+    /// only `AppPaths` statics and `ProcessInfo` — and shouldn't pull
+    /// disk I/O onto the main actor every 30 s. Lets the Timer closure
+    /// call it without an actor hop.
+    nonisolated private func writeHeartbeat() {
         let url = AppPaths.macAppSupportDir.appendingPathComponent("heartbeat.txt")
         let pid = "\(ProcessInfo.processInfo.processIdentifier)"
         try? pid.data(using: .utf8)?.write(to: url, options: .atomic)
@@ -975,6 +1011,14 @@ public final class AppState {
     /// (MCP-driven) include-state change paints the column immediately.
     private func reloadDirectoriesFromDisk() {
         let file = (try? DirectoriesStore.shared.load()) ?? DirectoriesFile()
+        // Bail out if the YAML's content is identical to the last
+        // reconciled snapshot. The directory watcher fires on every log
+        // write under app-support; reconciling on each one was the root
+        // cause of the multi-walk pile-up reported in the perf log.
+        if let prev = lastReconciledDirectoriesFile, prev == file {
+            return
+        }
+        lastReconciledDirectoriesFile = file
         directoriesRootCount = file.roots.count
         let current = DirectoryTreeWalker.shared.snapshot()
         var currentByPath: [URL: RootDirectory] = [:]

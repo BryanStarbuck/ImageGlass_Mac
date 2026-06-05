@@ -48,6 +48,15 @@ public final class DirectoryTreeWalker: @unchecked Sendable {
     /// root, satisfying §10.3.
     private var inflight: [URL: Task<Void, Never>] = [:]
 
+    /// Filter that the in-flight walk for each root is using. Lets
+    /// `scheduleWalk` short-circuit when a duplicate request lands with
+    /// the same root+filter — without this guard, FSEvents-driven
+    /// `reloadDirectoriesFromDisk` calls can schedule dozens of
+    /// concurrent walks on the same cloud-backed root while the first
+    /// walk is still running, because the walker's `roots` map isn't
+    /// populated until the walk finishes.
+    private var inflightFilter: [URL: RootFilter] = [:]
+
     public init(
         store: DirectoriesStore = .shared,
         logger: MCPAuditLogger = .shared
@@ -66,7 +75,18 @@ public final class DirectoryTreeWalker: @unchecked Sendable {
         defer { _trace.finish() }
         queue.async { [weak self] in
             guard let self else { return }
+            // Coalesce: if a walk is already running for this root with
+            // the same filter, do nothing. The in-flight walk's eventual
+            // `roots[root]=…` write satisfies the same contract this
+            // call would have. Without this guard a chatty caller (e.g.
+            // `reloadDirectoriesFromDisk` reacting to FSEvents triggered
+            // by the walker's own audit-log writes) stacks dozens of
+            // concurrent walks of the same cloud-backed root.
+            if self.inflight[root] != nil, self.inflightFilter[root] == filter {
+                return
+            }
             self.inflight[root]?.cancel()
+            self.inflightFilter[root] = filter
             let task = Task.detached(priority: .utility) { [weak self] in
                 guard let self else { return }
                 await self.runWalk(root: root, filter: filter, corr: corr)
@@ -84,6 +104,7 @@ public final class DirectoryTreeWalker: @unchecked Sendable {
             guard let self else { return }
             self.inflight[path]?.cancel()
             self.inflight[path] = nil
+            self.inflightFilter[path] = nil
             self.roots[path] = nil
             NotificationCenter.default.post(
                 name: Self.didChangeNotification, object: path
@@ -179,14 +200,19 @@ public final class DirectoryTreeWalker: @unchecked Sendable {
                 tree: result.tree
             )
             self.inflight[root] = nil
+            self.inflightFilter[root] = nil
         }
         try? store.setLastWalked(path: root, at: Date())
 
-        // Per-node log: one line per directory and file added to the tree.
-        // Written after the walk so concurrent root walks don't interleave.
-        if let tree = result.tree {
-            traverseAndLog(tree, at: root, corr: corr)
-        } else {
+        // The walker used to emit one `app=tree.node …` line per
+        // directory and file (50k+ writes on a real-world root), and
+        // those lines were ≥95% of `log.log`'s byte volume. The
+        // walk-summary `app=directory.walk` line below already carries
+        // the file count, so v1 drops per-node lines entirely. If a
+        // future debugging session needs them, gate them behind a
+        // dedicated `igconfig.json` debug flag — do not turn them back
+        // on unconditionally.
+        if result.tree == nil {
             logger.logTreeWalkFailed(path: root.path, corr: corr)
         }
 
@@ -213,25 +239,6 @@ public final class DirectoryTreeWalker: @unchecked Sendable {
                 object: first,
                 userInfo: ["corr": corr]
             )
-        }
-    }
-
-    /// Depth-first traversal of the built tree, emitting one `tree.node`
-    /// log line per node. `url` is the full absolute path of `node`.
-    /// All file nodes are logged (both visible and filter-hidden) so the
-    /// log reflects what the walker found on disk, not just what the
-    /// current filter exposes.
-    private func traverseAndLog(_ node: DirectoryNode, at url: URL, corr: String) {
-        let _trace = PerformanceLog.shared.start("Tree.Traverse.Log", extra: [("path", url.path)])
-        defer { _trace.finish() }
-        switch node {
-        case .directory(_, let children):
-            logger.logTreeNode(type: "directory", path: url.path, corr: corr)
-            for child in children {
-                traverseAndLog(child, at: url.appendingPathComponent(child.name), corr: corr)
-            }
-        case .file(_, let kind, _):
-            logger.logTreeNode(type: kind.rawValue, path: url.path, corr: corr)
         }
     }
 
@@ -272,6 +279,14 @@ public final class DirectoryTreeWalker: @unchecked Sendable {
         )
         defer { _outer.finish() }
 
+        // If the surrounding task has been cancelled — e.g. `scheduleWalk`
+        // was invoked again for this root and the old task is now stale —
+        // bail immediately instead of doing minutes of cloud-backed I/O
+        // that will be thrown away.
+        if Task.isCancelled {
+            return WalkResult(tree: nil, fileCount: 0, firstImage: nil)
+        }
+
         let fm = FileManager.default
         var isDir: ObjCBool = false
         guard fm.fileExists(atPath: root.path, isDirectory: &isDir), isDir.boolValue else {
@@ -294,7 +309,10 @@ public final class DirectoryTreeWalker: @unchecked Sendable {
         let sorted = contents.sorted { $0.lastPathComponent < $1.lastPathComponent }
 
         // Partition: top-level files are handled inline (cheap), top-level
-        // subdirectories fan out one task each.
+        // subdirectories fan out one task each. `contentsOfDirectory`
+        // already cached `.isDirectoryKey` on each URL, so a stat per
+        // child is avoided — important on cloud-backed roots where each
+        // stat may be a network round-trip.
         struct ChildSlot: Sendable {
             let index: Int
             let entry: URL
@@ -303,9 +321,8 @@ public final class DirectoryTreeWalker: @unchecked Sendable {
         var slots: [ChildSlot] = []
         slots.reserveCapacity(sorted.count)
         for (i, entry) in sorted.enumerated() {
-            var childIsDir: ObjCBool = false
-            fm.fileExists(atPath: entry.path, isDirectory: &childIsDir)
-            slots.append(ChildSlot(index: i, entry: entry, isDir: childIsDir.boolValue))
+            let isDir = (try? entry.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+            slots.append(ChildSlot(index: i, entry: entry, isDir: isDir))
         }
 
         var children: [DirectoryNode?] = Array(repeating: nil, count: sorted.count)
@@ -387,14 +404,28 @@ public final class DirectoryTreeWalker: @unchecked Sendable {
         }
     }
 
+    /// Threshold (ms) above which a single-directory walk emits a perf
+    /// log event. Below the threshold we emit nothing: the parent
+    /// `DirectoryWalk.Parallel` / `DirectoryWalk.Run` trace already
+    /// covers the total wallclock, and per-directory tracing on a deep
+    /// tree (e.g. a Dropbox-synced Photos library) generates millions
+    /// of lines per walk — 75% of a real-world 1.36 GB perf log.
+    /// Matches `docs/performance.mdx` §6.9 ("Do not wrap tiny
+    /// synchronous functions … >100 µs").
+    private static let singleDirSlowThresholdNs: UInt64 = 50_000_000  // 50 ms
+
     private static func walkDir(
         at url: URL,
         filter: RootFilter,
         fileCount: inout Int,
         firstImage: inout URL?
     ) -> DirectoryNode? {
-        let _trace = PerformanceLog.shared.start("DirectoryWalk.SingleDir", extra: [("path", url.path)])
-        defer { _trace.finish() }
+        let started = DispatchTime.now()
+        // Check cooperative cancellation once per directory. If the
+        // owning task was cancelled (e.g. a newer `scheduleWalk`
+        // superseded this one), stop descending instead of finishing
+        // a multi-minute walk whose result will be discarded.
+        if Task.isCancelled { return nil }
         let fm = FileManager.default
         var isDir: ObjCBool = false
         guard fm.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue else {
@@ -414,9 +445,10 @@ public final class DirectoryTreeWalker: @unchecked Sendable {
         let sorted = contents.sorted { $0.lastPathComponent < $1.lastPathComponent }
         var children: [DirectoryNode] = []
         for entry in sorted {
-            var childIsDir: ObjCBool = false
-            fm.fileExists(atPath: entry.path, isDirectory: &childIsDir)
-            if childIsDir.boolValue {
+            // `contentsOfDirectory` cached `.isDirectoryKey` above; read
+            // it from the URL instead of doing a fresh stat per child.
+            let isDir = (try? entry.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+            if isDir {
                 if let sub = walkDir(at: entry, filter: filter, fileCount: &fileCount, firstImage: &firstImage) {
                     children.append(sub)
                 }
@@ -435,6 +467,16 @@ public final class DirectoryTreeWalker: @unchecked Sendable {
                     }
                 }
             }
+        }
+        let elapsedNs = DispatchTime.now().uptimeNanoseconds &- started.uptimeNanoseconds
+        if elapsedNs >= singleDirSlowThresholdNs {
+            PerformanceLog.shared.event(
+                "DirectoryWalk.SingleDir",
+                extra: [
+                    ("path", url.path),
+                    ("elapsed_ms", String(elapsedNs / 1_000_000)),
+                ]
+            )
         }
         return .directory(name: url.lastPathComponent, children: children)
     }

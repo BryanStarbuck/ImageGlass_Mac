@@ -33,6 +33,13 @@ public final class TreeNavigator {
     /// viewer's image stable while the cursor is on a folder row.
     public var activeRow: String? = nil
 
+    /// Invoked after any state change to `explicitlyExpanded` or
+    /// `explicitlyCollapsed` so the bound `WindowState` can flush the
+    /// new map to `settings_window_<N>.yaml#session.directory_panel.expanded_paths`.
+    /// `AppState.bindToFrontmostWindow(_:)` installs this; nil during
+    /// tests / before the first window bind.
+    public var onPersistRequested: (@MainActor () -> Void)?
+
     public init() {}
 
     public func isExpanded(folderPath: String, depth: Int) -> Bool {
@@ -49,6 +56,7 @@ public final class TreeNavigator {
             explicitlyCollapsed.insert(folderPath)
             explicitlyExpanded.remove(folderPath)
         }
+        onPersistRequested?()
     }
 
     public func toggle(_ folderPath: String, depth: Int) {
@@ -60,14 +68,44 @@ public final class TreeNavigator {
     /// `path` is visible. Called when the viewer selects a file (e.g.
     /// MCP `select_file`, drag-drop) so the panel reveals it.
     public func revealAncestors(of path: String) {
+        var changed = false
         var p = (path as NSString).deletingLastPathComponent
         while !p.isEmpty, p != "/" {
-            explicitlyExpanded.insert(p)
-            explicitlyCollapsed.remove(p)
+            if !explicitlyExpanded.contains(p) || explicitlyCollapsed.contains(p) {
+                explicitlyExpanded.insert(p)
+                explicitlyCollapsed.remove(p)
+                changed = true
+            }
             let parent = (p as NSString).deletingLastPathComponent
             if parent == p { break }
             p = parent
         }
+        if changed { onPersistRequested?() }
+    }
+
+    /// Path → expansion-state map for round-tripping with
+    /// `WindowScopedSettings.session.directoryPanel.expandedPaths`.
+    /// `true` means explicitly expanded; `false` means explicitly
+    /// collapsed. Paths absent from the map fall back to the
+    /// depth-based default in `isExpanded(folderPath:depth:)`.
+    public var expansionMap: [String: Bool] {
+        var m: [String: Bool] = [:]
+        for p in explicitlyExpanded { m[p] = true }
+        for p in explicitlyCollapsed { m[p] = false }
+        return m
+    }
+
+    /// Replace the in-memory expansion sets with the persisted map.
+    /// Does **not** trigger `onPersistRequested` — this is the
+    /// load-from-disk path and would otherwise echo back to disk.
+    public func loadExpansionMap(_ map: [String: Bool]) {
+        var ex: Set<String> = []
+        var co: Set<String> = []
+        for (k, v) in map {
+            if v { ex.insert(k) } else { co.insert(k) }
+        }
+        explicitlyExpanded = ex
+        explicitlyCollapsed = co
     }
 }
 

@@ -124,6 +124,19 @@ public final class WindowState {
         }
     }
 
+    /// Snapshot the file panel's expand/collapse map (from
+    /// `TreeNavigator.expansionMap`) into
+    /// `session.directory_panel.expanded_paths` and flush. Called from
+    /// `AppState`'s `onPersistRequested` hook whenever the user toggles
+    /// a folder (mouse, arrow keys) or `revealAncestors` opens a chain
+    /// for a newly-selected file.
+    public func persistDirectoryPanelExpansion(_ map: [String: Bool]) throws {
+        try settingsStore.mutate { s in
+            s.session.directoryPanel.expandedPaths = map
+            self.settings.session.directoryPanel.expandedPaths = map
+        }
+    }
+
     public func rename(_ newName: String?) throws {
         try settingsStore.mutate { s in
             s.windowName = newName

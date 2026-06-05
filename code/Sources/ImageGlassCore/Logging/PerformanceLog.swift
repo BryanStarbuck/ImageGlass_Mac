@@ -28,10 +28,11 @@ import os
 ///   * Per-action instance counters live in a single dictionary guarded
 ///     by `lock`. Increments are serialized so the counter monotonically
 ///     ascends without races.
-///   * File appends are also serialized through `lock` so concurrent
-///     calls from multiple actors do not interleave bytes.
-///   * The writer never throws. Failures fall through to `ErrorLog` and
-///     the trace is dropped.
+///   * File appends are dispatched through a shared `LogSink`, which
+///     formats on the calling thread and writes on a serial utility-QoS
+///     background queue. The main thread never blocks on disk I/O.
+///   * The writer never throws. Failures are emitted to stderr by the
+///     sink and the trace is dropped.
 public final class PerformanceLog: @unchecked Sendable {
 
     public static let shared = PerformanceLog()
@@ -61,6 +62,7 @@ public final class PerformanceLog: @unchecked Sendable {
     private let lock = NSLock()
     private let dateFormatter: ISO8601DateFormatter
     private let signposter: OSSignposter
+    private let sink: LogSink
 
     public init(overrideLogFile: URL? = nil) {
         self.overrideLogFile = overrideLogFile
@@ -72,11 +74,28 @@ public final class PerformanceLog: @unchecked Sendable {
             subsystem: "org.imageglass.mac",
             category: "performance"
         )
+        // Tests pass `overrideLogFile:` and read the file immediately;
+        // honour that contract with synchronous writes on the test path.
+        // The production singleton (`shared`) gets the async fast path.
+        let isTest = overrideLogFile != nil
+        let captured = overrideLogFile
+        self.sink = LogSink(
+            label: "org.imageglass.mac.performancelog",
+            url: { captured ?? AppPaths.macPerformanceLogFile },
+            synchronous: isTest
+        )
     }
 
     /// Resolve the path the writer will append to.
     public var logFileURL: URL {
         overrideLogFile ?? AppPaths.macPerformanceLogFile
+    }
+
+    /// Block until queued writes have flushed. Production code calls
+    /// this at shutdown so an in-flight `phase=finish` line lands
+    /// before the process exits.
+    public func flush() {
+        sink.flush()
     }
 
     // MARK: - Public API
@@ -221,40 +240,7 @@ public final class PerformanceLog: @unchecked Sendable {
             ErrorLog.log("failed to encode performance line", class: "PerformanceLog")
             return
         }
-        lock.lock()
-        defer { lock.unlock() }
-        let url = logFileURL
-        let fm = FileManager.default
-        do {
-            try fm.createDirectory(
-                at: url.deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
-        } catch {
-            ErrorLog.log(
-                "could not create performance log parent dir \(url.deletingLastPathComponent().path)",
-                error: error, class: "PerformanceLog"
-            )
-            return
-        }
-        if !fm.fileExists(atPath: url.path) {
-            do {
-                try data.write(to: url, options: .atomic)
-            } catch {
-                ErrorLog.log("failed to create performance log at \(url.path)",
-                             error: error, class: "PerformanceLog")
-            }
-            return
-        }
-        do {
-            let handle = try FileHandle(forWritingTo: url)
-            defer { try? handle.close() }
-            try handle.seekToEnd()
-            try handle.write(contentsOf: data)
-        } catch {
-            ErrorLog.log("failed to append to performance log at \(url.path)",
-                         error: error, class: "PerformanceLog")
-        }
+        sink.write(data)
     }
 
     // MARK: - Formatting

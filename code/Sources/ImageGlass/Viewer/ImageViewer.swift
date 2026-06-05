@@ -46,6 +46,13 @@ struct ImageViewer: View {
                     .onChange(of: state.selectedFile) { _, path in
                         // Refresh crop selection on image change (spec §2.7).
                         state.crop.bind(activeImage: nil, path: path)
+                        // `viewer.loadError` is image-canvas state. Clear it
+                        // on any selection change so a prior image's error
+                        // never lingers as a full-frame overlay on top of
+                        // the next file — which previously covered SVGs
+                        // and videos whenever the user clicked from a
+                        // failed image to a working SVG / video.
+                        viewer.loadError = nil
                     }
                 if let cropOverlay { cropOverlay() }
                 if state.crop.isActive {
@@ -54,6 +61,16 @@ struct ImageViewer: View {
             } else {
                 emptyState
                     .onDrop(of: [.fileURL], delegate: FileDropDelegate(state: state))
+                    .focusable()
+                    .focusEffectDisabled()
+                    // hotkeys.mdx §4 + §5 — even with no file selected,
+                    // the bare-letter bindings (S for slideshow, N / P
+                    // for next / previous) must still work when focus
+                    // is in the viewer pane. Without this attachment
+                    // the empty-state view swallowed the keystrokes
+                    // and only the Cmd+Option menu shortcut worked.
+                    .imageGlassHotkeys(state: state, viewer: viewer)
+                    .onKeyPress(.space) { handleSpace() }
             }
 
             VStack(alignment: .leading, spacing: 6) {
@@ -76,7 +93,13 @@ struct ImageViewer: View {
 
             // On-canvas error card — replaces the blank gray when a file is
             // selected but can't be displayed (Git LFS placeholder, etc.).
-            if state.selectedFile != nil, let err = viewer.loadError {
+            // Image-canvas state only: SVG and video have their own
+            // ContentUnavailableView. Gating on `.image` keeps a stale or
+            // racing `viewer.loadError` from covering an SVG / video canvas
+            // that loaded fine.
+            if let path = state.selectedFile,
+               MediaKind.detect(path: path) == .image,
+               let err = viewer.loadError {
                 loadErrorCard(err)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
@@ -98,6 +121,33 @@ struct ImageViewer: View {
             if case .active = phase { pokeControls() }
         }
         .onChange(of: state.selectedFile) { _, _ in pokeControls() }
+        // slideshow.mdx §6 — countdown badge overlays the top-right of
+        // the main viewer while a slideshow run is active in this
+        // window. The slideshow no longer opens a new NSWindow; it
+        // takes over the current viewer in place.
+        .overlay(alignment: .topTrailing) {
+            if viewer.isSlideshowRunning {
+                slideshowCountdownBadge
+                    .padding(14)
+            }
+        }
+    }
+
+    /// Countdown badge shown in the top-right corner while a slideshow
+    /// run is active in this window. Ticks at 10 Hz via
+    /// `viewer.slideshowRemaining`.
+    private var slideshowCountdownBadge: some View {
+        let remaining = max(0, viewer.slideshowRemaining)
+        return HStack(spacing: 6) {
+            Image(systemName: "timer")
+            Text(String(format: "%0.1fs", remaining))
+                .monospacedDigit()
+        }
+        .font(.system(.callout, design: .monospaced))
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(.ultraThinMaterial, in: Capsule())
+        .overlay(Capsule().strokeBorder(Color.primary.opacity(0.1)))
     }
 
     // MARK: - Auto-hiding controls

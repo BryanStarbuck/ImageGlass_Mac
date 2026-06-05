@@ -14,8 +14,13 @@ import Foundation
 /// ts=<ISO8601-ms> app=startup msg="layout=Browser scope=default"
 /// ```
 ///
-/// The writer is process-wide (`shared`) and serializes appends behind an
-/// internal lock so concurrent MCP calls do not interleave lines.
+/// The writer is process-wide (`shared`). Lines are formatted on the
+/// caller's thread and the actual disk write is dispatched onto a
+/// background `LogSink` queue, so even tight loops in the MCP server
+/// never stall waiting on the file system. Tests that read the log
+/// file immediately after a call construct their own logger with
+/// `overrideLogFile:` — that path forces synchronous writes so the
+/// file is up to date by the time the test inspects it.
 public final class MCPAuditLogger: @unchecked Sendable {
 
     public static let shared = MCPAuditLogger()
@@ -24,20 +29,38 @@ public final class MCPAuditLogger: @unchecked Sendable {
     /// `MacScopeStore` tests so they can write to a temp directory).
     public var overrideLogFile: URL?
 
-    private let lock = NSLock()
     private let dateFormatter: ISO8601DateFormatter
+    private let sink: LogSink
 
     public init(overrideLogFile: URL? = nil) {
         self.overrideLogFile = overrideLogFile
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         self.dateFormatter = f
+        // Tests construct with `overrideLogFile:` and then read the
+        // file immediately; honour that contract with synchronous
+        // writes. The production singleton (`shared`) leaves
+        // `overrideLogFile` nil and gets the fast async path.
+        let isTest = overrideLogFile != nil
+        let captured = overrideLogFile
+        self.sink = LogSink(
+            label: "org.imageglass.mac.auditlog",
+            url: { captured ?? AppPaths.macLogFile },
+            synchronous: isTest
+        )
     }
 
     /// Resolve the file path the writer will append to. Honors
     /// `overrideLogFile` (for tests), otherwise the spec-mandated path.
     public var logFileURL: URL {
         overrideLogFile ?? AppPaths.macLogFile
+    }
+
+    /// Block until queued writes have flushed. Production code calls
+    /// this at shutdown so an in-flight `phase=finish` line lands
+    /// before the process exits.
+    public func flush() {
+        sink.flush()
     }
 
     /// Generate a short correlation id (8 hex chars) so a paired
@@ -54,20 +77,12 @@ public final class MCPAuditLogger: @unchecked Sendable {
     /// given so the line stays human-readable (`tool=…` first, then
     /// `name=…`, then everything else).
     public func log(_ pairs: [(String, String)]) {
-        var line = "ts=\(dateFormatter.string(from: Date()))"
-        for (k, v) in pairs {
-            line += " "
-            line += k
-            line += "="
-            line += format(value: v)
-        }
-        line += "\n"
-        guard let data = line.data(using: .utf8) else {
+        guard let data = renderLine(pairs).data(using: .utf8) else {
             ErrorLog.log("failed to encode audit log line as UTF-8",
                          class: "MCPAuditLogger")
             return
         }
-        appendData(data)
+        sink.write(data)
     }
 
     /// Convenience for a successful MCP call. Records
@@ -298,19 +313,6 @@ public final class MCPAuditLogger: @unchecked Sendable {
         ])
     }
 
-    /// `app=tree.node type=<type> path=<full_path> corr=<corr>` — one line
-    /// per node added to the in-memory tree during a walk. `type` is
-    /// `directory`, `image`, `svg`, or `video`. Written after the walk
-    /// completes so concurrent root walks don't interleave their node lines.
-    public func logTreeNode(type: String, path: String, corr: String) {
-        log([
-            ("app", "tree.node"),
-            ("type", type),
-            ("path", path),
-            ("corr", corr),
-        ])
-    }
-
     /// `app=tree.walk_failed path=<path> corr=<corr>` — emitted when
     /// `walkSync` returns a nil tree, meaning the root path did not exist
     /// or was not a directory at walk time.
@@ -322,50 +324,17 @@ public final class MCPAuditLogger: @unchecked Sendable {
         ])
     }
 
-    // MARK: - File I/O
-
-    private func appendData(_ data: Data) {
-        lock.lock()
-        defer { lock.unlock() }
-        let url = logFileURL
-        let fm = FileManager.default
-        do {
-            try fm.createDirectory(
-                at: url.deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
-        } catch {
-            // If the parent directory cannot be created (sandbox, read-only
-            // volume) the log line is silently dropped — the writer must
-            // never throw, because MCP tool callers treat logging as a
-            // best-effort audit trail rather than part of the call's
-            // correctness contract.
-            ErrorLog.log("could not create audit log parent directory \(url.deletingLastPathComponent().path)",
-                         error: error,
-                         class: "MCPAuditLogger")
-            return
+    /// Render one key=value record into a newline-terminated line.
+    internal func renderLine(_ pairs: [(String, String)]) -> String {
+        var line = "ts=\(dateFormatter.string(from: Date()))"
+        for (k, v) in pairs {
+            line += " "
+            line += k
+            line += "="
+            line += format(value: v)
         }
-        if !fm.fileExists(atPath: url.path) {
-            do {
-                try data.write(to: url, options: .atomic)
-            } catch {
-                ErrorLog.log("failed to create audit log at \(url.path)",
-                             error: error,
-                             class: "MCPAuditLogger")
-            }
-            return
-        }
-        do {
-            let handle = try FileHandle(forWritingTo: url)
-            defer { try? handle.close() }
-            try handle.seekToEnd()
-            try handle.write(contentsOf: data)
-        } catch {
-            ErrorLog.log("failed to append to audit log at \(url.path)",
-                         error: error,
-                         class: "MCPAuditLogger")
-            return
-        }
+        line += "\n"
+        return line
     }
 
     /// Quote a value if it contains whitespace or `=` so the grep-able

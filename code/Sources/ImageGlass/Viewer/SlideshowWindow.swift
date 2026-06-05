@@ -2,9 +2,10 @@ import AppKit
 import SwiftUI
 import ImageGlassCore
 
-/// A separate window that walks through `state.resolvedFiles` on a timer.
-/// The viewer state inside the slideshow is independent (its own zoom +
-/// view settings) so toggling things doesn't disturb the main window.
+/// Slideshow controller. The slideshow runs **in place** on the target
+/// window's existing viewer: a tick timer advances `selectedFile` through
+/// the navigation list and the main `ImageViewer` shows a countdown badge.
+/// Toggling slideshow does **not** spawn a separate NSWindow.
 ///
 /// Contract spelled out in `docs/use_cases/slideshow.mdx` —
 ///   * §1–§3: `S` (and `⌥⌘S`) toggle this controller via `toggle()`.
@@ -27,10 +28,12 @@ final class SlideshowController {
     /// their own per-window YAML on quit.
     private struct Run {
         let windowID: Int
-        var window: NSWindow?
+        /// The window's existing viewer state — the slideshow does not
+        /// own a separate ViewerState; it mutates the per-window viewer
+        /// that the main ImageViewer is already rendering against.
+        weak var viewer: ViewerState?
+        weak var appState: AppState?
         var countdownTimer: Timer?
-        var hostingState: ViewerState?
-        var appState: AppState?
         var nextAdvanceAt: Date?
         var runCorr: String = ""
         var runStart: Date = .distantPast
@@ -60,6 +63,15 @@ final class SlideshowController {
             ?? 1
     }
 
+    /// Pick the ViewerState to drive: prefer the per-window
+    /// `WindowState.viewer` (so multi-window slideshow runs are
+    /// independent), fall back to `appState.viewer` (the frontmost
+    /// window's mirror) when the registry has no matching window yet —
+    /// happens during early bootstrap and in tests.
+    private func viewerFor(windowID: Int, appState: AppState) -> ViewerState {
+        WindowRegistry.shared.window(id: windowID)?.viewer ?? appState.viewer
+    }
+
     private init() {}
 
     /// `slideshow.mdx` §1–§3 — single entry point for every UI surface
@@ -86,10 +98,10 @@ final class SlideshowController {
         }
     }
 
-    /// Open the slideshow window and start advancing. The empty-list
-    /// guard surfaces a `tool=slideshow.toggle ok=false
-    /// err=no_files_available` audit line so external observers see
-    /// the attempted toggle and the reason it produced nothing
+    /// Start slideshow mode on the target window's existing viewer. The
+    /// empty-list guard surfaces a `tool=slideshow.toggle ok=false
+    /// err=no_files_available` audit line so external observers see the
+    /// attempted toggle and the reason it produced nothing
     /// (slideshow.mdx §8.4).
     ///
     /// multi_window.mdx §7 — per-window. `windowID` is the window the
@@ -108,10 +120,10 @@ final class SlideshowController {
         )
         defer { _trace.finish() }
         // Idempotent restart for the *same* window: if a previous run
-        // is still up in this window, tear it down so we don't end up
-        // with two slideshow windows for one. The stop here records
-        // `reason=user_toggle` because the new start is itself driven
-        // by the user. Other windows' runs are untouched (§7.3).
+        // is still active in this window, tear it down so we don't end
+        // up with two slideshow timers for one window. The stop here
+        // records `reason=user_toggle` because the new start is itself
+        // driven by the user. Other windows' runs are untouched (§7.3).
         if isRunning(windowID: target) {
             stop(windowID: target, reason: "user_toggle", source: source)
         }
@@ -132,25 +144,17 @@ final class SlideshowController {
             return
         }
 
-        let viewerState = ViewerState()
-        viewerState.zoomMode = .fit
-        viewerState.slideshowSeconds = seconds
-        viewerState.slideshowRemaining = seconds
-        viewerState.isSlideshowRunning = true
-
-        let root = SlideshowRoot(state: appState, viewer: viewerState, windowID: target)
-        let hosting = NSHostingController(rootView: root)
-        let win = NSWindow(contentViewController: hosting)
-        win.title = "ImageGlass Slideshow — Window \(target)"
-        win.styleMask = [.titled, .closable, .resizable, .fullSizeContentView]
-        win.titlebarAppearsTransparent = true
-        win.setContentSize(NSSize(width: 960, height: 720))
-        win.center()
-        win.makeKeyAndOrderFront(nil)
+        // Mutate the per-window viewer the main ImageViewer is
+        // already rendering against. The countdown badge overlay in
+        // `ImageViewer` reads these fields and shows itself while
+        // `isSlideshowRunning == true`.
+        let viewer = viewerFor(windowID: target, appState: appState)
+        viewer.slideshowSeconds = seconds
+        viewer.slideshowRemaining = seconds
+        viewer.isSlideshowRunning = true
 
         var run = Run(windowID: target)
-        run.window = win
-        run.hostingState = viewerState
+        run.viewer = viewer
         run.appState = appState
         run.runCorr = corr
         run.runStart = Date()
@@ -181,8 +185,8 @@ final class SlideshowController {
     /// Per-window interval setter (multi_window.mdx §7).
     func setInterval(_ seconds: Double, windowID: Int) {
         guard let run = runs[windowID] else { return }
-        run.hostingState?.slideshowSeconds = seconds
-        if run.window != nil { scheduleTick(windowID: windowID, every: seconds) }
+        run.viewer?.slideshowSeconds = seconds
+        scheduleTick(windowID: windowID, every: seconds)
     }
 
     /// Convenience that records `reason=user_toggle` on the frontmost
@@ -225,16 +229,13 @@ final class SlideshowController {
         run.countdownTimer = nil
         run.nextAdvanceAt = nil
 
-        let runWasActive = run.window != nil
         let corr = run.runCorr
-        let elapsed = runWasActive ? Date().timeIntervalSince(run.runStart) : 0
+        let elapsed = Date().timeIntervalSince(run.runStart)
         let advances = run.advanceCount
 
-        run.window?.close()
-        run.window = nil
-        run.hostingState?.isSlideshowRunning = false
-        run.hostingState?.slideshowRemaining = 0
-        run.hostingState = nil
+        run.viewer?.isSlideshowRunning = false
+        run.viewer?.slideshowRemaining = 0
+        run.viewer = nil
         let interval = run.appState?.settings.slideshow.interval_seconds ?? 0
         run.appState = nil
         runs.removeValue(forKey: windowID)
@@ -247,8 +248,6 @@ final class SlideshowController {
             windowState.slideshow.isRunning = false
             windowState.slideshow.isPaused = false
         }
-
-        guard runWasActive else { return }
 
         // User-initiated stops write a paired toggle line so the
         // session looks symmetric in the log; end-of-list auto-stops
@@ -274,7 +273,7 @@ final class SlideshowController {
         run.countdownTimer?.invalidate()
         guard seconds > 0 else { runs[windowID] = run; return }
         run.nextAdvanceAt = Date().addingTimeInterval(seconds)
-        run.hostingState?.slideshowRemaining = seconds
+        run.viewer?.slideshowRemaining = seconds
         // Tick at 10 Hz so the countdown number ticks smoothly.
         let t = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.tickCountdown(windowID: windowID) }
@@ -286,13 +285,13 @@ final class SlideshowController {
 
     private func tickCountdown(windowID: Int) {
         guard let run = runs[windowID],
-              let state = run.hostingState,
+              let viewer = run.viewer,
               let target = run.nextAdvanceAt else { return }
         let remaining = target.timeIntervalSinceNow
         if remaining <= 0 {
             advance(windowID: windowID)
         } else {
-            state.slideshowRemaining = remaining
+            viewer.slideshowRemaining = remaining
         }
     }
 
@@ -324,7 +323,7 @@ final class SlideshowController {
         defer { _trace.finish() }
         guard var run = runs[windowID],
               let appState = run.appState,
-              let state = run.hostingState else { return }
+              let viewer = run.viewer else { return }
         let ordered = appState.orderedNavigationFiles
         let walkerRoots = appState.walkerRoots
         let files: [String] = walkerRoots.isEmpty
@@ -387,7 +386,7 @@ final class SlideshowController {
             from: fromPath,
             to: toPath,
             interval: interval,
-            zoomMode: zoomModeLabel(state.zoomMode),
+            zoomMode: zoomModeLabel(viewer.zoomMode),
             wrap: wrapped,
             corr: run.runCorr
         )
@@ -396,10 +395,10 @@ final class SlideshowController {
         // next interval, not the current countdown. Re-read the
         // setting here so the GUI slider / text field updates take
         // effect at the next advance boundary.
-        if abs(interval - state.slideshowSeconds) > 0.0001 {
-            state.slideshowSeconds = interval
+        if abs(interval - viewer.slideshowSeconds) > 0.0001 {
+            viewer.slideshowSeconds = interval
         }
-        scheduleTick(windowID: windowID, every: state.slideshowSeconds)
+        scheduleTick(windowID: windowID, every: viewer.slideshowSeconds)
     }
 
     /// Short label used in the audit log so a grep on `zoom_mode=fit`
@@ -421,62 +420,5 @@ final class SlideshowController {
         }
         let relative = IncludePath.relative(absolutePath: path, root: root.path)
         return root.effectiveState(for: relative) == .include
-    }
-}
-
-private struct SlideshowRoot: View {
-    @Bindable var state: AppState
-    @Bindable var viewer: ViewerState
-    let windowID: Int
-
-    var body: some View {
-        ZStack(alignment: .topTrailing) {
-            ImageViewer(state: state, viewer: viewer)
-                .background(Color.black)
-            countdownBadge
-                .padding(14)
-        }
-        .toolbar {
-            ToolbarItem {
-                Button {
-                    SlideshowController.shared.stop(
-                        windowID: windowID,
-                        reason: "user_toggle",
-                        source: "menu:slideshow_toolbar"
-                    )
-                } label: {
-                    Image(systemName: "stop.fill")
-                }
-                .help("Stop slideshow")
-            }
-            ToolbarItem {
-                HStack {
-                    Image(systemName: "timer")
-                    Stepper(value: $viewer.slideshowSeconds, in: 1...60, step: 1) {
-                        Text("\(Int(viewer.slideshowSeconds))s")
-                            .monospacedDigit()
-                    }
-                    .onChange(of: viewer.slideshowSeconds) { _, new in
-                        SlideshowController.shared.setInterval(new, windowID: windowID)
-                    }
-                }
-            }
-        }
-    }
-
-    /// Spec: "Slideshow ... with configurable countdown timers." The badge
-    /// shows seconds remaining until the next slide, ticking at 10 Hz.
-    private var countdownBadge: some View {
-        let remaining = max(0, viewer.slideshowRemaining)
-        return HStack(spacing: 6) {
-            Image(systemName: "timer")
-            Text(String(format: "%0.1fs", remaining))
-                .monospacedDigit()
-        }
-        .font(.system(.callout, design: .monospaced))
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
-        .background(.ultraThinMaterial, in: Capsule())
-        .overlay(Capsule().strokeBorder(Color.primary.opacity(0.1)))
     }
 }

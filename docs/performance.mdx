@@ -314,7 +314,7 @@ analyzer has a stable vocabulary.
 |--------|-------|
 | `DirectoryWalk.Schedule` | The non-isolated `scheduleWalk` hop onto the actor. |
 | `DirectoryWalk.Run` | The actual recursive walk for one root. |
-| `DirectoryWalk.SingleDir` | `walkDir` for one directory (one node in the tree). Useful for finding hot subdirectories. |
+| `DirectoryWalk.SingleDir` | `walkDir` for one directory (one node in the tree). Useful for finding hot subdirectories. **Emitted as a `phase=event` line only when the single-directory wallclock is ≥ 50 ms**; under-threshold dirs emit nothing, because the parent `DirectoryWalk.Parallel` / `DirectoryWalk.Run` trace already covers their wallclock and per-dir tracing on a 50k-node tree was 75% of a real-world perf log. |
 | `DirectoryWalk.Parallel` | The new `TaskGroup`-based walk (see §7). |
 | `DirectoryWalk.Refilter` | `refilter(root:filter:)` for one root. |
 | `DirectoryWalk.RefilterAll` | `refilterAll(filter:)` for every known root. |

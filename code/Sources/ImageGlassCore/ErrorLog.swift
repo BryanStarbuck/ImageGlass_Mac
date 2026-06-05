@@ -17,8 +17,10 @@
 // can isolate either stream (`grep '^\['` for errors, `grep '^ts='` for
 // audit records).
 //
-// The writer is serialized through a private utility-QoS dispatch queue so
-// concurrent callers from multiple actors do not interleave bytes on disk.
+// The writer is serialized through a shared `LogSink` so the caller's
+// thread (often the main thread) returns as soon as the line is formatted
+// — the actual `write(2)` lands on a background utility queue. The sink
+// also self-rotates the file at 10 MB.
 
 import Foundation
 
@@ -50,9 +52,8 @@ public enum ErrorLog {
         let classPart = className.map { " [\($0)]" } ?? ""
         let errorPart = error.map { " error=\(String(reflecting: $0))" } ?? ""
         let entry = "[\(timestamp)] [\(file):\(line)] [\(function)]\(classPart) \(message)\(errorPart)\n"
-
-        Self.queue.async {
-            Self.append(entry)
+        if let data = entry.data(using: .utf8) {
+            sink.write(data)
         }
     }
 
@@ -63,11 +64,18 @@ public enum ErrorLog {
         return AppPaths.macLogFile
     }
 
+    /// Block until queued entries have flushed. Production code calls
+    /// this at shutdown so a fatal error landing right before exit is
+    /// not lost.
+    public static func flush() {
+        sink.flush()
+    }
+
     // MARK: - Internals
 
-    private static let queue = DispatchQueue(
+    private static let sink = LogSink(
         label: "org.imageglass.mac.errorlog",
-        qos: .utility
+        url: { AppPaths.macLogFile }
     )
 
     private static let timestampFormatter: ISO8601DateFormatter = {
@@ -75,40 +83,4 @@ public enum ErrorLog {
         f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return f
     }()
-
-    private static func append(_ entry: String) {
-        let url = AppPaths.macLogFile
-        let dir = url.deletingLastPathComponent()
-
-        // Ensure the parent directory exists. Failures here cannot themselves
-        // call ErrorLog (we'd recurse), so fall back to stderr.
-        do {
-            try FileManager.default.createDirectory(
-                at: dir,
-                withIntermediateDirectories: true
-            )
-        } catch {
-            FileHandle.standardError.write(
-                Data("ErrorLog: cannot create \(dir.path): \(error)\n".utf8)
-            )
-            return
-        }
-
-        guard let data = entry.data(using: .utf8) else { return }
-
-        if !FileManager.default.fileExists(atPath: url.path) {
-            FileManager.default.createFile(atPath: url.path, contents: nil)
-        }
-
-        do {
-            let handle = try FileHandle(forWritingTo: url)
-            defer { try? handle.close() }
-            try handle.seekToEnd()
-            try handle.write(contentsOf: data)
-        } catch {
-            FileHandle.standardError.write(
-                Data("ErrorLog: cannot append to \(url.path): \(error)\n".utf8)
-            )
-        }
-    }
 }
