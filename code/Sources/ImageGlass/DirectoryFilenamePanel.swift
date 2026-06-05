@@ -26,17 +26,14 @@ import ImageGlassCore
 struct DirectoryFilenamePanel: View {
     @Bindable var state: AppState
 
+    /// Live filter over filenames (design: filepanel.jsx search field).
+    @State private var searchText: String = ""
+
     var body: some View {
         VStack(spacing: 0) {
             header
-            Divider()
+            Divider().overlay(IG.sidebarLineC)
             Group {
-                // mcp_file.mdx §1.3 / §9.2 — the empty state is only
-                // shown when *no* root is registered. If
-                // `directories.yaml` has roots but the walker has not
-                // finished its first pass, render the root rows up
-                // front with a "walking…" indicator so the column is
-                // never blank between launch and walk-completion.
                 if storedRootCount == 0 && state.resolvedFiles.isEmpty {
                     emptyState
                 } else {
@@ -47,13 +44,18 @@ struct DirectoryFilenamePanel: View {
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            Divider().overlay(IG.sidebarLineC)
+            footer
         }
-        // The chrome already gives the panel a background, but the
-        // SwiftUI HStack will hide the column if every child returns
-        // an "ideal width = 0" view. Force a visible background so
-        // the bar is *always* drawn, even when the list is empty.
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color(NSColor.windowBackgroundColor))
+        .background(IG.sidebarC)
+    }
+
+    /// Case-insensitive filename match against the search field.
+    private func matchesSearch(_ path: String) -> Bool {
+        searchText.isEmpty
+            || (path as NSString).lastPathComponent
+                .range(of: searchText, options: .caseInsensitive) != nil
     }
 
     /// `directories.yaml` root count. Reads from `state.directoriesRootCount`
@@ -67,28 +69,36 @@ struct DirectoryFilenamePanel: View {
     // MARK: - Header (toolbar)
 
     private var header: some View {
-        HStack(spacing: 8) {
-            // The legacy multi-scope picker. Hidden when no named scopes
-            // exist (the directory tree panel can run scope-free).
-            if !state.availableScopes.isEmpty {
-                Picker("Scope", selection: $state.activeScopeName) {
-                    ForEach(state.availableScopes, id: \.self) { name in
-                        Text(name).tag(name)
+        VStack(spacing: 8) {
+            HStack(spacing: 8) {
+                Text("FILES")
+                    .font(.system(size: 11, weight: .bold))
+                    .kerning(0.6)
+                    .foregroundStyle(IG.text3C)
+                Spacer()
+                // mcp_file.mdx §10.5 — refresh; spinner while walking.
+                Button {
+                    if !state.walkerRoots.isEmpty {
+                        refreshAllWalkerRoots()
+                    } else {
+                        Task { await state.reevaluateActive() }
                     }
+                } label: {
+                    ZStack {
+                        Image(systemName: "arrow.clockwise")
+                            .opacity(state.isWalking ? 0 : 1)
+                        if state.isWalking { ProgressView().controlSize(.small) }
+                    }
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(IG.text2C)
                 }
-                .pickerStyle(.menu)
-                .labelsHidden()
-                .onChange(of: state.activeScopeName) { _, new in
-                    Task { await state.activate(scopeNamed: new) }
-                }
-            } else {
-                Text("Files")
-                    .font(.headline)
-                    .foregroundStyle(.secondary)
+                .buttonStyle(.plain)
+                .disabled(state.isWalking)
+                .help(state.walkerRoots.isEmpty ? "Re-evaluate scope"
+                      : "Re-walk every root in directories.yaml")
             }
 
-            Spacer()
-
+            // Segmented List / Tree control (design: filepanel.jsx Seg).
             Picker("View", selection: $state.panelViewMode) {
                 ForEach(AppState.PanelViewMode.allCases) { mode in
                     Text(mode.label).tag(mode)
@@ -96,52 +106,91 @@ struct DirectoryFilenamePanel: View {
             }
             .pickerStyle(.segmented)
             .labelsHidden()
-            .frame(width: 110)
             .onChange(of: state.panelViewMode) { _, mode in
-                // mcp_file.mdx §3.4 — the GUI tree-toggle records a
-                // log line under `client=gui` (no `mcp.` prefix) so
-                // human-driven mode changes are audit-traceable.
                 MCPAuditLogger.shared.log([
                     ("tool", "panel.set_view_mode"),
                     ("mode", mode.rawValue),
                     ("client", "gui"),
                     ("ok", "true"),
                 ])
-                MCPNotificationBus.shared.emitViewModeChanged(
-                    mode: mode.rawValue
-                )
+                MCPNotificationBus.shared.emitViewModeChanged(mode: mode.rawValue)
             }
 
-            // mcp_file.mdx §10.5 — the refresh button spins while a
-            // background walk is in flight. ZStack so the icon and the
-            // ProgressView swap in place without shifting the toolbar.
-            // When there are walker roots, refresh re-walks every one
-            // (the Stage E behavior). Otherwise it falls back to the
-            // legacy scope re-evaluation.
-            Button {
-                if !state.walkerRoots.isEmpty {
-                    refreshAllWalkerRoots()
-                } else {
-                    Task { await state.reevaluateActive() }
-                }
-            } label: {
-                ZStack {
-                    Image(systemName: "arrow.clockwise")
-                        .opacity(state.isWalking ? 0 : 1)
-                    if state.isWalking {
-                        ProgressView()
-                            .controlSize(.small)
+            // Search field.
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 12))
+                    .foregroundStyle(IG.text3C)
+                TextField("Filter files", text: $searchText)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 12.5))
+                    .foregroundStyle(IG.textC)
+                if !searchText.isEmpty {
+                    Button { searchText = "" } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 12))
+                            .foregroundStyle(IG.text3C)
                     }
+                    .buttonStyle(.plain)
                 }
             }
-            .help(state.walkerRoots.isEmpty
-                  ? "Re-evaluate scope"
-                  : "Re-walk every root in directories.yaml")
-            .buttonStyle(.borderless)
-            .disabled(state.isWalking)
+            .padding(.horizontal, 8)
+            .frame(height: 26)
+            .background(IG.fieldC, in: RoundedRectangle(cornerRadius: 7))
+            .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(IG.glassLineC, lineWidth: 0.5))
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
+        .padding(.horizontal, 12)
+        .padding(.top, 10)
+        .padding(.bottom, 8)
+    }
+
+    // MARK: - Footer (design: filepanel.jsx)
+
+    private var footer: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Circle().fill(IG.mcpGreenC).frame(width: 6, height: 6)
+                Text("\(visibleFileCount) files")
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .foregroundStyle(IG.textC)
+                if let evaluatedAt = state.lastEvaluated {
+                    Text("· evaluated \(relativeAge(evaluatedAt))")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(IG.text3C)
+                }
+                Spacer(minLength: 0)
+            }
+            HStack(spacing: 5) {
+                Image(systemName: "sparkle")
+                    .font(.system(size: 10))
+                    .foregroundStyle(IG.accentC)
+                Text("Scope: \(scopeLabel)")
+                    .font(.system(size: 11))
+                    .foregroundStyle(IG.text3C)
+                    .lineLimit(1).truncationMode(.middle)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+    }
+
+    private var visibleFileCount: Int {
+        state.walkerRoots.isEmpty
+            ? state.resolvedFiles.filter(matchesSearch).count
+            : Self.flattenVisible(state.walkerRoots).filter(matchesSearch).count
+    }
+
+    private var scopeLabel: String {
+        if !state.activeScopeName.isEmpty { return state.activeScopeName }
+        if let first = state.walkerRoots.first { return first.path.lastPathComponent }
+        return "default"
+    }
+
+    private func relativeAge(_ date: Date) -> String {
+        let f = RelativeDateTimeFormatter()
+        f.unitsStyle = .abbreviated
+        return f.localizedString(for: date, relativeTo: Date())
     }
 
     // MARK: - Empty state (mcp_file.mdx §9.2)
@@ -173,22 +222,110 @@ struct DirectoryFilenamePanel: View {
     /// Falls back to `state.resolvedFiles` when the walker has no
     /// roots (legacy multi-scope path).
     private var listView: some View {
-        let files: [String] = state.walkerRoots.isEmpty
+        let files: [String] = (state.walkerRoots.isEmpty
             ? state.resolvedFiles
-            : Self.flattenVisible(state.walkerRoots)
-        return List(selection: $state.selectedFile) {
-            ForEach(files, id: \.self) { path in
-                HStack(spacing: 6) {
-                    Image(systemName: iconForPath(path))
-                        .foregroundStyle(.secondary)
-                    Text(displayName(for: path))
-                        .lineLimit(1)
-                        .truncationMode(.middle)
+            : Self.flattenVisible(state.walkerRoots)).filter(matchesSearch)
+        // Group flat files by their parent folder, preserving folder order,
+        // so List mode shows folder headers (and the ↑/↓ folder-jump has a
+        // visible structure to land on).
+        var order: [String] = []
+        var groups: [String: [String]] = [:]
+        for f in files {
+            let dir = (f as NSString).deletingLastPathComponent
+            if groups[dir] == nil { order.append(dir) }
+            groups[dir, default: []].append(f)
+        }
+        let activeFolder = state.selectedFile.map { ($0 as NSString).deletingLastPathComponent }
+        return ScrollView {
+            LazyVStack(alignment: .leading, spacing: 2, pinnedViews: [.sectionHeaders]) {
+                ForEach(order, id: \.self) { folder in
+                    Section(header: folderHeader(folder,
+                                                 count: groups[folder]?.count ?? 0,
+                                                 active: folder == activeFolder)) {
+                        ForEach(groups[folder] ?? [], id: \.self) { path in
+                            designRow(name: displayName(for: path),
+                                      icon: iconForPath(path),
+                                      isDir: false,
+                                      depth: 1,
+                                      selected: state.selectedFile == path)
+                                .contentShape(Rectangle())
+                                .onTapGesture { state.selectedFile = path }
+                        }
+                    }
                 }
-                .tag(path as String?)
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 8)
+        }
+    }
+
+    /// Folder group header for List mode. Highlights (accent tint) the folder
+    /// that holds the current image, so "which folder is active" is obvious.
+    private func folderHeader(_ folder: String, count: Int, active: Bool) -> some View {
+        HStack(spacing: 7) {
+            Image(systemName: "folder.fill")
+                .font(.system(size: 12))
+                .foregroundStyle(IG.accentC)
+            Text(folderLabel(folder))
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(active ? IG.accentC : IG.text2C)
+                .lineLimit(1).truncationMode(.head)
+            Spacer(minLength: 4)
+            Text("\(count)")
+                .font(.system(size: 10.5).monospacedDigit())
+                .foregroundStyle(IG.text3C)
+        }
+        .padding(.horizontal, 8)
+        .frame(height: 26)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(active ? IG.accentC.opacity(0.12) : IG.sidebarC,
+                    in: RoundedRectangle(cornerRadius: 6))
+    }
+
+    /// Folder path shortened relative to its registered root (e.g.
+    /// "jfk-social / feed-page"), so headers stay readable in a narrow column.
+    private func folderLabel(_ folder: String) -> String {
+        for root in state.walkerRoots {
+            let rp = root.path.path
+            if folder == rp { return root.path.lastPathComponent }
+            if folder.hasPrefix(rp + "/") {
+                let rel = String(folder.dropFirst(rp.count + 1))
+                return root.path.lastPathComponent + " / " + rel.replacingOccurrences(of: "/", with: " / ")
             }
         }
-        .listStyle(.sidebar)
+        return (folder as NSString).lastPathComponent
+    }
+
+    // MARK: - Design row + pure-SwiftUI tree
+
+    /// One styled row (design: filepanel.jsx). Accent fill when selected.
+    private func designRow(name: String, icon: String, isDir: Bool,
+                           depth: Int, selected: Bool,
+                           expanded: Bool? = nil) -> some View {
+        HStack(spacing: 7) {
+            if let expanded {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(selected ? Color.white : IG.text3C)
+                    .rotationEffect(.degrees(expanded ? 90 : 0))
+                    .frame(width: 12)
+            }
+            Image(systemName: isDir ? "folder.fill" : icon)
+                .font(.system(size: 13))
+                .foregroundStyle(selected ? Color.white
+                                 : (isDir ? IG.accentC : IG.text2C))
+                .frame(width: 16)
+            Text(name)
+                .font(.system(size: 12.5, weight: isDir ? .semibold : .regular))
+                .foregroundStyle(selected ? Color.white : IG.textC)
+                .lineLimit(1).truncationMode(.middle)
+            Spacer(minLength: 0)
+        }
+        .padding(.leading, CGFloat(depth) * 14)
+        .padding(.horizontal, 8)
+        .frame(height: isDir ? 28 : 30)
+        .background(selected ? IG.selC : Color.clear,
+                    in: RoundedRectangle(cornerRadius: 6))
     }
 
     // MARK: - Tree
@@ -221,10 +358,25 @@ struct DirectoryFilenamePanel: View {
     }
 
     private var walkerTreeView: some View {
-        // docs/list_of_files.mdx §3D.5 — the renderer is selected at
-        // runtime from the View ▸ Tree View submenu. The walker / data
-        // layer is untouched on a swap.
-        SelectableTreeRenderer(state: state, useYellowBackground: false)
+        // Pure-SwiftUI recursive outline (design: filepanel.jsx Tree). The
+        // inline panel renders this directly rather than the runtime-selected
+        // SelectableTreeRenderer, so it never depends on the AppKit
+        // NSOutlineView path. Roots default expanded.
+        let roots: [NodeView] = state.walkerRoots.compactMap { root in
+            guard let tree = root.tree else { return nil }
+            return Self.buildView(node: tree, parentPath: root.path)
+        }
+        return ScrollView {
+            LazyVStack(spacing: 2) {
+                ForEach(roots) { root in
+                    DesignTreeNode(node: root, depth: 0,
+                                   selected: $state.selectedFile,
+                                   matches: matchesSearch)
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 8)
+        }
     }
 
     /// Legacy code path: when `directories.yaml` is empty but the

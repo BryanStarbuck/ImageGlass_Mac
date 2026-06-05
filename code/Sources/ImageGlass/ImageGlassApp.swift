@@ -197,6 +197,34 @@ struct ImageGlassApp: App {
                 addDirectoryFromPathPrompt()
             }
             .keyboardShortcut("d", modifiers: [.command, .option, .control])
+
+            Divider()
+
+            // Live list of every registered root in directories.yaml. Each
+            // root is a submenu with its full path, Reveal, and Remove.
+            Menu("Registered Directories (\(state.walkerRoots.count))") {
+                if state.walkerRoots.isEmpty {
+                    Button("None — use Add Directory…") {}.disabled(true)
+                } else {
+                    ForEach(state.walkerRoots, id: \.path) { root in
+                        Menu(root.path.lastPathComponent) {
+                            Button(root.path.path) {}.disabled(true)
+                            Divider()
+                            Button("Reveal in Finder") {
+                                NSWorkspace.shared.activateFileViewerSelecting([root.path])
+                            }
+                            Button("Remove") {
+                                removeDirectory(root.path)
+                            }
+                        }
+                    }
+                    Divider()
+                    Button("Remove All Directories") {
+                        clearAllDirectories()
+                    }
+                }
+            }
+
             Divider()
             Button("Refresh All") {
                 refreshAllDirectories()
@@ -207,6 +235,40 @@ struct ImageGlassApp: App {
             }
             .keyboardShortcut("o", modifiers: [.command, .option])
             .disabled(state.selectedFile == nil)
+        }
+    }
+
+    /// Remove one registered root from `directories.yaml` and the live
+    /// walker. The walker's change notification refreshes `walkerRoots`.
+    private func removeDirectory(_ url: URL) {
+        let corr = MCPAuditLogger.newCorrelationId()
+        do {
+            if try DirectoriesStore.shared.removeRoot(path: url.path) {
+                DirectoryTreeWalker.shared.removeRoot(path: url)
+                MCPAuditLogger.shared.logDirectoryToolCall(
+                    toolName: "remove_directory", path: url.path,
+                    client: "gui", corr: corr, ok: true
+                )
+            }
+        } catch {
+            ErrorLog.log("Directories.removeDirectory failed",
+                         error: error, class: "ImageGlassApp")
+        }
+    }
+
+    /// Remove every registered root (equivalent to MCP `clear_directories`).
+    private func clearAllDirectories() {
+        let roots = state.walkerRoots.map(\.path)
+        do {
+            try DirectoriesStore.shared.clearAll()
+            for url in roots { DirectoryTreeWalker.shared.removeRoot(path: url) }
+            MCPAuditLogger.shared.logDirectoryToolCall(
+                toolName: "clear_directories", path: nil,
+                client: "gui", corr: MCPAuditLogger.newCorrelationId(), ok: true
+            )
+        } catch {
+            ErrorLog.log("Directories.clearAllDirectories failed",
+                         error: error, class: "ImageGlassApp")
         }
     }
 

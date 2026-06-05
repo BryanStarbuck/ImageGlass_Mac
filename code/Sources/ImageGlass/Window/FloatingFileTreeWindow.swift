@@ -122,10 +122,21 @@ struct FileTreeFloatingView: View {
 
     @Bindable var state: AppState
 
+    /// Bright-yellow only for the *detached* floating window (spec §3C.3).
+    /// When embedded inline in the main window's left column this is `false`,
+    /// so the panel uses the design's neutral sidebar material instead.
+    var useYellowBackground: Bool = false
+
     /// `#FFFF00` — the spec's bright yellow (§3C.3). Applied as a
     /// `.background` so it composes correctly with the SwiftUI `List`
     /// row chrome.
     private static let brightYellow = Color(red: 1.0, green: 1.0, blue: 0.0)
+
+    /// Panel/list fill: yellow for the floating window, neutral sidebar inline.
+    private var panelBackground: Color { useYellowBackground ? Self.brightYellow : IG.sidebarC }
+    /// Row fill: yellow for the floating window, clear inline (so List
+    /// selection highlight shows through).
+    private var rowBackground: Color { useYellowBackground ? Self.brightYellow : Color.clear }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -142,7 +153,7 @@ struct FileTreeFloatingView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Self.brightYellow)
+        .background(panelBackground)
     }
 
     // MARK: - List half (top)
@@ -168,14 +179,14 @@ struct FileTreeFloatingView: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .contentShape(Rectangle())
-                .listRowBackground(Self.brightYellow)
+                .listRowBackground(rowBackground)
                 .tag(path as String?)
                 .onTapGesture { state.selectedFile = path }
             }
         }
         .listStyle(.plain)
         .scrollContentBackground(.hidden)
-        .background(Self.brightYellow)
+        .background(panelBackground)
     }
 
     // MARK: - Tree half (bottom)
@@ -194,7 +205,7 @@ struct FileTreeFloatingView: View {
         // same renderer the inline panel does (View ▸ Tree View
         // submenu). `useYellowBackground=true` keeps §3C.3's bright-
         // yellow contract through the renderer swap.
-        SelectableTreeRenderer(state: state, useYellowBackground: true)
+        SelectableTreeRenderer(state: state, useYellowBackground: useYellowBackground)
     }
 
     private var legacyTreeSection: some View {
@@ -214,7 +225,7 @@ struct FileTreeFloatingView: View {
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .contentShape(Rectangle())
-                    .listRowBackground(Self.brightYellow)
+                    .listRowBackground(rowBackground)
                     .tag(node.fullPath ?? "" as String?)
                     .onTapGesture {
                         if let path = node.fullPath, !node.isDirectory {
@@ -226,7 +237,7 @@ struct FileTreeFloatingView: View {
         }
         .listStyle(.plain)
         .scrollContentBackground(.hidden)
-        .background(Self.brightYellow)
+        .background(panelBackground)
     }
 
     private func rootHeader(_ root: RootDirectory) -> some View {

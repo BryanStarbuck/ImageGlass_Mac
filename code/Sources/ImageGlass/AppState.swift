@@ -935,31 +935,75 @@ public final class AppState {
 
     // MARK: - Selection navigation
 
-    /// Move selection to the previous file in `resolvedFiles`.
+    /// The ordered list arrow-key navigation walks. When the file tree is
+    /// driven by `directories.yaml` (walker roots), this is the flattened
+    /// depth-first **folder order** — exactly the order the tree shows — so
+    /// Up/Down/Left/Right step through images in folder order. Falls back to
+    /// the scope's `resolvedFiles` when there are no walker roots.
+    public var orderedNavigationFiles: [String] {
+        walkerRoots.isEmpty
+            ? resolvedFiles
+            : DirectoryFilenamePanel.flattenVisible(walkerRoots)
+    }
+
+    /// Move selection to the previous file in folder order.
     public func selectPrevious(wrap: Bool = true) {
-        guard !resolvedFiles.isEmpty else { return }
+        let files = orderedNavigationFiles
+        guard !files.isEmpty else { return }
         guard let current = selectedFile,
-              let idx = resolvedFiles.firstIndex(of: current) else {
-            selectedFile = resolvedFiles.first; return
+              let idx = files.firstIndex(of: current) else {
+            selectedFile = files.first; return
         }
         if idx > 0 {
-            selectedFile = resolvedFiles[idx - 1]
+            selectedFile = files[idx - 1]
         } else if wrap {
-            selectedFile = resolvedFiles.last
+            selectedFile = files.last
         }
     }
 
-    /// Move selection to the next file in `resolvedFiles`.
+    /// Move selection to the next file in folder order.
     public func selectNext(wrap: Bool = true) {
-        guard !resolvedFiles.isEmpty else { return }
+        let files = orderedNavigationFiles
+        guard !files.isEmpty else { return }
         guard let current = selectedFile,
-              let idx = resolvedFiles.firstIndex(of: current) else {
-            selectedFile = resolvedFiles.first; return
+              let idx = files.firstIndex(of: current) else {
+            selectedFile = files.first; return
         }
-        if idx < resolvedFiles.count - 1 {
-            selectedFile = resolvedFiles[idx + 1]
+        if idx < files.count - 1 {
+            selectedFile = files[idx + 1]
         } else if wrap {
-            selectedFile = resolvedFiles.first
+            selectedFile = files.first
+        }
+    }
+
+    /// Jump to the first image of the previous folder (Up arrow). "Folder"
+    /// is the parent directory of each image, in folder order. Lets the user
+    /// skip whole subprojects/pages instead of stepping image-by-image.
+    public func selectPreviousFolder(wrap: Bool = true) { jumpFolder(-1, wrap: wrap) }
+
+    /// Jump to the first image of the next folder (Down arrow).
+    public func selectNextFolder(wrap: Bool = true) { jumpFolder(1, wrap: wrap) }
+
+    private func jumpFolder(_ direction: Int, wrap: Bool) {
+        let files = orderedNavigationFiles
+        guard !files.isEmpty else { return }
+        // Distinct parent folders, in first-seen (folder) order.
+        var folders: [String] = []
+        var seen = Set<String>()
+        for f in files {
+            let dir = (f as NSString).deletingLastPathComponent
+            if seen.insert(dir).inserted { folders.append(dir) }
+        }
+        guard !folders.isEmpty else { return }
+        let currentFolder = selectedFile.map { ($0 as NSString).deletingLastPathComponent }
+        let curIdx = currentFolder.flatMap { folders.firstIndex(of: $0) } ?? 0
+        var target = curIdx + direction
+        if target < 0 { target = wrap ? folders.count - 1 : 0 }
+        if target >= folders.count { target = wrap ? 0 : folders.count - 1 }
+        let targetFolder = folders[target]
+        // Select the first image in that folder.
+        if let first = files.first(where: { ($0 as NSString).deletingLastPathComponent == targetFolder }) {
+            selectedFile = first
         }
     }
 

@@ -11,12 +11,11 @@ import ImageGlassCore
 /// callbacks that read/write that observable.
 final class ImageCanvasView: NSView {
 
-    /// Bright cyan — debug background so we can see immediately
-    /// whether the canvas is mounted in the window, vs. being
-    /// covered, vs. being given zero size by a layout bug. Used by
-    /// both the layer background and the `draw(_:)` fill so it shows
-    /// up regardless of which path is active.
-    static let debugBackgroundColor = NSColor(red: 0.0, green: 1.0, blue: 1.0, alpha: 1.0)
+    /// Neutral canvas background behind the image — a soft, page-neutral
+    /// gray that adapts to light / dark appearance (like Preview.app's
+    /// canvas). Used by both the layer background and the `draw(_:)` fill
+    /// so the surface is consistent regardless of which path is active.
+    static let debugBackgroundColor = IG.canvas
 
     // Inputs
     private(set) var sourceImage: NSImage?

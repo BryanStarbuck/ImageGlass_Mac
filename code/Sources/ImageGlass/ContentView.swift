@@ -14,43 +14,26 @@ struct ContentView: View {
 
     var body: some View {
         PanelHostView(state: state, model: state.panelLayout) {
-            VStack(spacing: 0) {
-                HStack(spacing: 0) {
-                    // docs/list_of_files.mdx §3C — the same yellow
-                    // file-list / file-tree the detached floating
-                    // window renders, also embedded inside the main
-                    // app window so the bright-yellow surface is
-                    // visible without a separate window.
-                    //
-                    // Layout hardening (Bryan reported the column
-                    // disappearing on multi-monitor restore): the
-                    // outer ZStack paints yellow unconditionally so
-                    // the column is visible even if SwiftUI's HStack
-                    // squeezes the inner FileTreeFloatingView during
-                    // the screen-change transition. `minWidth ==
-                    // idealWidth == maxWidth == 360` plus
-                    // `layoutPriority(1)` lock the column at exactly
-                    // 360pt — SwiftUI gives the flexible image
-                    // viewer everything else and can't take any of
-                    // this column's space.
-                    ZStack {
-                        Color(red: 1.0, green: 1.0, blue: 0.0)
-                            .ignoresSafeArea(edges: .vertical)
-                        FileTreeFloatingView(state: state)
-                    }
-                    .frame(minWidth: 360, idealWidth: 360, maxWidth: 360)
+            // Left: design file panel inline. It MUST win width against the
+            // viewer: the AppKit NSViewRepresentable canvas is greedy and
+            // otherwise squeezes a fixed-width sibling to zero. `fixedSize` +
+            // `layoutPriority` lock the 300pt column.
+            HStack(spacing: 0) {
+                DirectoryFilenamePanel(state: state)
+                    .frame(width: 300)
                     .layoutPriority(1)
+                Divider().overlay(IG.sidebarLineC)
+                VStack(spacing: 0) {
+                    ImageViewer(state: state, viewer: state.viewer)
+                    statusBar
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .layoutPriority(0)
+                .clipped()   // AppKit canvas must not overdraw the panel column.
+                if state.crop.isActive {
                     Divider()
-                    VStack(spacing: 0) {
-                        ImageViewer(state: state, viewer: state.viewer)
-                        statusBar
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    if state.crop.isActive {
-                        Divider()
-                        CropPanelView(controller: state.crop)
-                            .background(.regularMaterial)
-                    }
+                    CropPanelView(controller: state.crop)
+                        .background(.regularMaterial)
                 }
             }
         }
@@ -66,15 +49,27 @@ struct ContentView: View {
             // Drain any Finder-supplied file URLs that arrived before SwiftUI
             // mounted (cold-launch Open With).
             AboutAppDelegate.registerListenerAndFlush()
-            // docs/list_of_files.mdx §3C.1 — default-on. Open the
-            // detached floating File Tree window automatically on
-            // every cold launch. Idempotent: a relaunch into a hot
-            // window just brings the cached one forward.
-            FloatingFileTreeWindowController.shared.show(state: state)
-            // Companion floating image-only window — mirrors the
-            // current selection so two displays can show the same
-            // image at once. Title flips to "Second: <filename>".
-            SecondViewerWindowController.shared.show(state: state)
+            // The detached floating File Tree and the Second Viewer are now
+            // opt-in (menu: View ▸ Show Floating File Tree / Show Second
+            // Viewer). Auto-spawning extra windows on every cold launch just
+            // clutters the screen.
+
+            // These panels are rendered as inline chrome (the file panel in
+            // the left column, the native window toolbar, and the slim status
+            // bar at the bottom of the viewer). Hide the PanelHostView-docked
+            // copies so the window isn't doubled with blank/redundant strips.
+            // Clear the settings flags first so `reconcilePanelsWithSettings`
+            // (which runs inside bootstrap and re-shows panels whose
+            // `show_*` flag is true) does not undo the hides below.
+            state.settings.layout.show_toolbar = false
+            state.settings.layout.show_status_bar = false
+            for id in [BuiltInPanelCatalog.filePanel.id,
+                       BuiltInPanelCatalog.toolbar.id,
+                       BuiltInPanelCatalog.statusBar.id] {
+                if state.panelLayout.layout.isVisible(id) {
+                    state.panelLayout.hidePanel(id)
+                }
+            }
         }
         .onAppear {
             state.themeStore.updateSystemColorScheme(SystemColorScheme(systemColorScheme))
@@ -119,32 +114,32 @@ struct ContentView: View {
         return "ImageGlass"
     }
 
+    // MARK: - Status bar (design: app.jsx)
+
     private var statusBar: some View {
-        HStack(spacing: 12) {
-            Text("\(state.resolvedFiles.count) files")
-                .foregroundStyle(.secondary)
-            if let evaluatedAt = state.lastEvaluated {
-                Text("· evaluated \(relative(evaluatedAt))")
-                    .foregroundStyle(.secondary)
-            }
-            Spacer()
+        HStack(spacing: 8) {
             if let path = state.selectedFile {
+                Image(systemName: "photo")
+                    .font(.system(size: 11))
+                    .foregroundStyle(IG.text3C)
+                Text((path as NSString).lastPathComponent)
+                    .fontWeight(.semibold)
+                    .foregroundStyle(IG.textC)
+                    .fixedSize()
                 Text(path)
                     .lineLimit(1)
                     .truncationMode(.middle)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(IG.text3C)
+            } else {
+                Text("No selection").foregroundStyle(IG.text3C)
             }
+            Spacer(minLength: 0)
         }
-        .font(.system(.caption, design: .monospaced))
-        .padding(.horizontal, 10)
-        .padding(.vertical, 4)
-        .background(.bar)
-    }
-
-    private func relative(_ date: Date) -> String {
-        let f = RelativeDateTimeFormatter()
-        f.unitsStyle = .abbreviated
-        return f.localizedString(for: date, relativeTo: Date())
+        .font(.system(size: 11.5))
+        .padding(.horizontal, 12)
+        .frame(height: 26)
+        .background(IG.toolbarC)
+        .overlay(alignment: .top) { Divider().overlay(IG.lineC) }
     }
 
     /// Propagate the appearance mode to `NSApp` so AppKit-owned chrome

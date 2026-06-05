@@ -72,14 +72,36 @@ struct ImageViewer: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        // Bright cyan debug background — matches
-        // `ImageCanvasView.debugBackgroundColor`. If the user sees
-        // cyan with no image, the SwiftUI container is on screen but
-        // either the canvas didn't load (Bug 1 — selectedFile not
-        // propagating) or the file failed to decode. If they see no
-        // cyan at all, the viewer is being covered or sized to zero
-        // by a panel-host layout problem.
-        .background(Color(red: 0.0, green: 1.0, blue: 1.0))
+        // Canvas background behind the image — the design's page-gray
+        // (`IG.canvas`), adapting to light / dark so the image reads cleanly.
+        .background(IG.canvasC)
+        // Floating glass zoom cluster (design: canvas.jsx), bottom-center,
+        // auto-hiding when the pointer is idle. Only while an image is shown.
+        .overlay(alignment: .bottom) {
+            if state.selectedFile != nil {
+                ViewerZoomControls(viewer: viewer, visible: controlsVisible)
+                    .padding(.bottom, 22)
+                    .onHover { hovering in if hovering { pokeControls() } }
+            }
+        }
+        .onContinuousHover { phase in
+            if case .active = phase { pokeControls() }
+        }
+        .onChange(of: state.selectedFile) { _, _ in pokeControls() }
+    }
+
+    // MARK: - Auto-hiding controls
+
+    @State private var controlsVisible = true
+    @State private var hideTask: Task<Void, Never>?
+
+    private func pokeControls() {
+        controlsVisible = true
+        hideTask?.cancel()
+        hideTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(2.2))
+            if !Task.isCancelled { controlsVisible = false }
+        }
     }
 
     /// Spacebar. videos.mdx §11.2 / svg.mdx §10.2 — focus-context rule:
@@ -127,10 +149,14 @@ struct ImageViewer: View {
             case (true,  .down):  state.crop.grow(dw: 0, dh:  mag); return .handled
             }
         }
+        // Left/Right step image-by-image (spec menus.mdx). Up/Down jump
+        // folder-to-folder — to the first image of the prev/next folder —
+        // so the user can skip whole subprojects/pages in a meeting.
         switch dir {
-        case .left:  state.selectPrevious(); return .handled
-        case .right: state.selectNext();     return .handled
-        default: return .ignored
+        case .left:  state.selectPrevious();       return .handled
+        case .right: state.selectNext();           return .handled
+        case .up:    state.selectPreviousFolder(); return .handled
+        case .down:  state.selectNextFolder();     return .handled
         }
     }
 

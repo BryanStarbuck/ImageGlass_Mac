@@ -155,12 +155,22 @@ public final class FileListViewModel {
 
     // MARK: - Tree
 
-    /// Rebuild a per-source tree for Tree mode. Spec §2.5.
+    /// Cached Tree-mode result. `buildTree()` is called from
+    /// `FileListTreeView.body`, i.e. on every redraw — re-walking the whole
+    /// visible set each time stutters with hundreds of files. The tree only
+    /// depends on `visibleEntries` + `sourceDirectories`, both of which funnel
+    /// through `rebuildVisible()`/`update()`, so invalidate there.
+    @ObservationIgnored private var cachedTree: [FileListTreeNode]?
+
+    /// Rebuild a per-source tree for Tree mode. Spec §2.5. Cached — see above.
     public func buildTree() -> [FileListTreeNode] {
-        FileListTreeBuilder.build(
+        if let cachedTree { return cachedTree }
+        let tree = FileListTreeBuilder.build(
             entries: visibleEntries,
             sourceDirectories: sourceDirectories
         )
+        cachedTree = tree
+        return tree
     }
 
     // MARK: - Private
@@ -182,6 +192,7 @@ public final class FileListViewModel {
     }
 
     private func rebuildVisible() {
+        cachedTree = nil   // visible set is changing — drop the Tree-mode cache.
         let sorted = FileListSorter.sort(entries, by: sortDescriptor)
         let filtered = FileListSorter.filter(sorted, text: filterText)
         visibleEntries = filtered

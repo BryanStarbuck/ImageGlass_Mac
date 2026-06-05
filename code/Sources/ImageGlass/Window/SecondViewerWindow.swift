@@ -110,7 +110,7 @@ struct SecondViewerContentView: View {
     var body: some View {
         SecondImageCanvasHost(path: resolvedPath)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(Color(red: 0.0, green: 1.0, blue: 1.0))
+            .background(Color(nsColor: .underPageBackgroundColor))
             .onChange(of: state.selectedFile, initial: true) { _, _ in
                 SecondViewerWindowController.shared.updateTitle(for: state.selectedFile)
             }
