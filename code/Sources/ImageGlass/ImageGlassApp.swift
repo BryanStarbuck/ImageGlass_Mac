@@ -404,6 +404,14 @@ struct ImageGlassApp: App {
                 .keyboardShortcut("-", modifiers: [.command])
             Button("Actual Size") { state.viewer.zoomToActual() }
                 .keyboardShortcut("0", modifiers: [.command])
+            Button("Zoom to Fit") { state.viewer.zoomToFit() }
+                .keyboardShortcut("9", modifiers: [.command])
+            // hotkeys.mdx §6.4 — fit width to viewport, scroll to top.
+            // Bare `W` is the in-viewer twin; this chord is the menu
+            // surface so the action also works when a text field has
+            // focus.
+            Button("Zoom to Width") { state.viewer.zoomToWidth() }
+                .keyboardShortcut("9", modifiers: [.command, .option])
             Divider()
             Button("Rotate 90° CW")  { state.viewer.rotateClockwise() }
                 .keyboardShortcut("r", modifiers: [.command, .shift])
@@ -455,17 +463,18 @@ struct ImageGlassApp: App {
                 WindowModes.fitWindowToImage(path: state.selectedFile)
             }
             Divider()
-            // Slideshow start/stop. videos.mdx §11.2 moves the
-            // unconditional shortcut to ⌥⌘S so `Space` / `S` are free
-            // for the Video / SVG menus' focus-context bindings.
-            Button("Start Slideshow") {
-                SlideshowController.shared.start(
-                    appState: state,
-                    seconds: state.viewer.slideshowSeconds
-                )
+            // Slideshow toggle. slideshow.mdx §1 / §3 / §10.1 — `⌥⌘S` is
+            // the unconditional, focus-context-free menu shortcut. The
+            // bare `S` key (handled in ImageViewer) is the focus-aware
+            // viewer hotkey. Both call `SlideshowController.toggle`,
+            // which reads the interval live from
+            // `settings.slideshow.interval_seconds`.
+            Button(SlideshowController.shared.isRunning
+                   ? "Stop Slideshow"
+                   : "Start Slideshow") {
+                SlideshowController.shared.toggle(appState: state, source: "menu:View")
             }
             .keyboardShortcut("s", modifiers: [.command, .option])
-            Button("Stop Slideshow") { SlideshowController.shared.stop() }
         }
         CommandMenu("Navigate") {
             Button("Previous Image") { state.selectPrevious() }

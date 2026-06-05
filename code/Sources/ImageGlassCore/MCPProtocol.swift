@@ -49,13 +49,70 @@ public enum MCP {
         public let protocolVersion: String
         public let capabilities: Capabilities
         public let serverInfo: ServerInfo
+        /// Free-text operational manual the client (Claude Code) is
+        /// invited to feed into the LLM system prompt. Spec
+        /// `docs/use_cases/mcp_and_filters_on_dirs.mdx` §7.3. Optional
+        /// in v1 so clients that pre-date the field still see a valid
+        /// envelope.
+        public let instructions: String?
+
+        public init(
+            protocolVersion: String,
+            capabilities: Capabilities,
+            serverInfo: ServerInfo,
+            instructions: String? = nil
+        ) {
+            self.protocolVersion = protocolVersion
+            self.capabilities = capabilities
+            self.serverInfo = serverInfo
+            self.instructions = instructions
+        }
 
         public struct Capabilities: Codable, Sendable {
             public let tools: ToolsCap
+            /// `resources` capability — advertised so clients enumerate
+            /// `resources/list` and find the `imageglass-mcp://manual`
+            /// entry (spec §7.5). Optional for back-compat.
+            public let resources: ResourcesCap?
+
+            public init(tools: ToolsCap, resources: ResourcesCap? = nil) {
+                self.tools = tools
+                self.resources = resources
+            }
+
             public struct ToolsCap: Codable, Sendable {
                 public let listChanged: Bool
+                public init(listChanged: Bool) { self.listChanged = listChanged }
+            }
+            public struct ResourcesCap: Codable, Sendable {
+                public let listChanged: Bool
+                public let subscribe: Bool
+                public init(listChanged: Bool = false, subscribe: Bool = false) {
+                    self.listChanged = listChanged
+                    self.subscribe = subscribe
+                }
             }
         }
+    }
+
+    /// One row returned by `resources/list`. Spec §7.5.
+    public struct ResourceDescriptor: Codable, Sendable {
+        public let uri: String
+        public let name: String
+        public let description: String
+        public let mimeType: String
+
+        public init(uri: String, name: String, description: String, mimeType: String) {
+            self.uri = uri
+            self.name = name
+            self.description = description
+            self.mimeType = mimeType
+        }
+    }
+
+    public struct ListResourcesResult: Codable, Sendable {
+        public let resources: [ResourceDescriptor]
+        public init(resources: [ResourceDescriptor]) { self.resources = resources }
     }
 
     public struct ListToolsResult: Codable, Sendable {

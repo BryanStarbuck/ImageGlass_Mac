@@ -154,10 +154,11 @@ image-specific copy items.
 | Show Toolbar | — | Toggle. |
 | Customize Toolbar… | — | Standard AppKit customization sheet. |
 | — | | |
-| Actual Size | ⌘ 0 | 100% zoom. |
-| Zoom In | ⌘ + | |
-| Zoom Out | ⌘ - | |
-| Zoom to Fit | ⌘ 9 | |
+| Actual Size | ⌘ 0 | 100% zoom. Bare `N` (in-viewer) snaps to the user's default mode — see `hotkeys.mdx` §5. |
+| Zoom In | ⌘ + | Bare `+` / `=` is the in-viewer twin. |
+| Zoom Out | ⌘ - | Bare `-` is the in-viewer twin. |
+| Zoom to Fit | ⌘ 9 | Bare `Z` is the in-viewer twin. |
+| Zoom to Width **(new)** | ⌥ ⌘ 9 | Fit image width to viewport width, scroll to top. Bare `W` is the in-viewer twin. See `hotkeys.mdx` §6. |
 | Zoom to Fill | ⇧ ⌘ 9 | |
 | Lock Zoom | ⌃ ⌘ L | Toggle. |
 | — | | |
@@ -390,7 +391,13 @@ in v1:
 | Shortcut | Owner |
 | --- | --- |
 | `⌘ 0` | View ▸ Actual Size |
+| `⌘ 9` | View ▸ Zoom to Fit |
+| `⌥ ⌘ 9` | View ▸ Zoom to Width |
+| `⇧ ⌘ 9` | View ▸ Zoom to Fill |
 | `⇧ ⌘ 0` | Panel ▸ Show All Panels |
+| Bare `W` / `Z` / `N` / `C` / `+` / `-` | Viewer hotkeys — owned by `hotkeys.mdx` §5 |
+| Bare `↑` `↓` `←` `→` | Tree navigation — owned by `hotkeys.mdx` §4 |
+| `⌃` + arrow | Viewport pan (15%) — owned by `hotkeys.mdx` §4.3 |
 | `⌘ R` | Scope ▸ Re-evaluate Scope |
 | `⌘ ⇧ R` | Go ▸ Random Image |
 | `⌃ ⌘ R` | (reserved — no binding) |

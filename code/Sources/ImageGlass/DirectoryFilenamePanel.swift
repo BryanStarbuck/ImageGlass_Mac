@@ -370,6 +370,7 @@ struct DirectoryFilenamePanel: View {
             LazyVStack(spacing: 2) {
                 ForEach(roots) { root in
                     DesignTreeNode(node: root, depth: 0,
+                                   nav: state.treeNav,
                                    selected: $state.selectedFile,
                                    matches: matchesSearch)
                 }

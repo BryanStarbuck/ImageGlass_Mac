@@ -1,0 +1,968 @@
+---
+title: Use Case — Slideshow Mode (S key + Settings interval)
+description: Scenario-by-scenario specification for slideshow mode. Pressing `S` (no modifier) on the main viewer toggles slideshow on or off; while running, the controller advances to the next image after the configured interval, re-applies the slideshow zoom mode to every advanced image, and loops at the end of the file list. The interval is sourced from `settings.slideshow.interval_seconds` (default 4.0 s) and is editable in two places that share the same binding — a horizontal slider AND an editable text box — inside Settings (⌘,) ▸ Slideshow ▸ Timing. Each scenario lists ordered user actions, the expected on-screen and on-disk result, and an explicit verify step that proves the slideshow advanced, looped, re-zoomed, and persisted correctly. Every state change is journaled to `log.log` so an external observer can replay the session.
+---
+
+# Use Case — Slideshow Mode
+
+This page is a **scenario-by-scenario specification** for the
+slideshow feature of ImageGlass_Mac. It is written as a sequence of
+user actions: *press this key, then this, then this*, and at each
+step it spells out the on-screen, on-disk, and in-state result so a
+human (or an XCUITest run) can verify the step actually worked.
+
+It is the user-facing companion to:
+
+* [Hotkeys](./hotkeys.mdx) §7 — keyboard map; `S` is the
+  no-modifier slideshow toggle introduced here.
+* [Settings](../settings.mdx) §4.6 (Slideshow) — the `slideshow.*`
+  JSON keys this scenario reads and mutates, especially
+  `slideshow.interval_seconds`.
+* [Panels](../panels.mdx) §7.5 — the *Slideshow* layout preset
+  the controller switches to when slideshow starts.
+* [Videos](../videos.mdx) §11.2 — the focus-context rule that
+  keeps `Space` bound to *Play / Pause* when a video is current
+  and falls back to *Slideshow* when an image is current. `S` is
+  the **unconditional, focus-context-free** toggle introduced here;
+  it does not displace the existing `Space` or `⌥⌘S` bindings.
+* [Error Handling](../error_handling.mdx) §4.2 — the `log.log`
+  record format every entry in this scenario must produce.
+
+Nothing in this spec changes the slideshow window's rendering
+pipeline, the `SlideshowController` actor model, or the
+`SlideshowSettings` JSON schema. It adds:
+
+1. A no-modifier `S` toggle on the main viewer.
+2. An "appropriate zoom mode" rule that re-applies the slideshow
+   zoom to **every** image the controller advances to, not just
+   the first.
+3. A side-by-side **Slider + editable number field** in
+   Settings ▸ Slideshow ▸ Timing for the interval, replacing the
+   slider-only row in the current Settings scene.
+
+---
+
+## 0. Common Preconditions
+
+These hold for every scenario unless a scenario explicitly overrides
+them.
+
+* The app is installed, signed, and at least one previous launch has
+  happened (so `~/Library/Application Support/ImageGlass_Mac/`
+  exists with `settings.json` and the `logs/` directory).
+* At least one root directory in `directories.yaml` has been walked
+  and contains ≥ 3 image files whose `kind == .image`. The reference
+  fixture is `~/Pictures/tour/` (the same fixture used by
+  [`mcp_file.mdx`](./mcp_file.mdx) §0), with images sorted
+  depth-first lexicographically:
+
+  ```
+  tour/beach/001.jpg
+  tour/beach/002.jpg
+  tour/beach/notes_old.png
+  tour/mountains/peak.heic
+  tour/mountains/peak.jpg
+  ```
+
+  Five `.image` files in deterministic order. The non-media file
+  `tour/README.txt` never enters the list (built-in file-kind
+  filter, [list_of_files.mdx §3A.3](../list_of_files.mdx#3a3-built-in-file-kind-filter)).
+* The viewer is the focused window. The status bar reads `5 files`,
+  `001.jpg` is selected, and the viewer canvas shows that image.
+  The panel may be in any view mode; this spec does not depend on
+  panel layout.
+* `settings.json` is at its defaults for the `slideshow.*` block —
+  in particular `interval_seconds = 4.0` and `loop = true`.
+  Scenario 4 mutates `interval_seconds`; scenario 7 mutates `loop`.
+* "Verify" means: read the named file with `cat`, read the named
+  pixel region on screen, observe the named in-memory field, or
+  read the named log line. Each verify step is a check a human or
+  an XCUITest run can perform.
+
+Two related shortcuts continue to work alongside the new `S`
+binding, and are NOT redefined by this spec:
+
+| Existing shortcut | Action | Owner spec |
+| --- | --- | --- |
+| `⌥⌘S` | View ▸ Start Slideshow (unconditional, menu-driven) | [videos.mdx §11.2](../videos.mdx#112-resolution) |
+| `Space` | View ▸ Slideshow when the file list is focused and the current file is an image; Video ▸ Play/Pause when a video is current; SVG ▸ Play/Pause when an animated SVG is current. | [videos.mdx §11.2](../videos.mdx#112-resolution), [svg.mdx §11](../svg.mdx#11-keymap-summary) |
+| `S` *(this spec)* | Toggle slideshow — unconditional from the main viewer scene, focus-aware (suppressed when a text field is first responder). | This file. |
+
+The three are independent. `S` is the **quick toggle**: one key,
+no modifier, no menu walk. `⌥⌘S` is the **menu-bound shortcut**
+power users expect to find under View. `Space` is the
+**context-sensitive shortcut** that gives way to video and SVG
+playback when those kinds are current.
+
+---
+
+## 1. First-Time Slideshow Start — `S` Toggles On
+
+### 1.1 Preconditions
+
+* §0 holds verbatim. The viewer shows `001.jpg`. The status bar
+  reads `5 files`. No slideshow window is open.
+
+### 1.2 Actions, in order
+
+1. With the main viewer focused (no text field is first
+   responder), press `S` once.
+
+### 1.3 Expected result
+
+* `SlideshowController.shared.isRunning` flips from `false` to
+  `true`.
+* The controller reads `settings.slideshow.interval_seconds` (4.0)
+  as the **interval** for the run, and `viewer.slideshowSeconds`
+  is updated to that same value so the in-window stepper and the
+  countdown overlay observe the live source of truth.
+* The controller opens the slideshow window (per
+  [Slideshow Window](../panels.mdx#75-slideshow-controlcmd5)),
+  switching the layout to the *Slideshow* preset. The main window
+  is hidden if `settings.layout.hide_main_in_slideshow == true`
+  (default).
+* The slideshow window's viewer canvas loads `001.jpg`. The
+  canvas re-applies the **slideshow zoom mode** — `.fit` (Zoom
+  to Fit) by default, the same `ViewerState.zoomMode = .fit`
+  already set in `SlideshowController.start`. The image is
+  rendered scaled-to-fit on the Metal canvas, centered, with no
+  pan offset.
+* The countdown overlay reads `4.0s` and starts ticking down at
+  10 Hz toward the next advance.
+* The main viewer (if still visible) shows its inert state — no
+  countdown, no zoom change. The slideshow's `ViewerState` is a
+  separate instance so the main window's zoom / pan / rotation
+  are untouched.
+
+### 1.4 Verify
+
+* On screen: a new window titled `ImageGlass Slideshow` is key.
+  Its canvas shows `001.jpg` fit-to-window, centered, on the
+  configured slideshow background (default black). A countdown
+  badge in the top-right reads a value between `4.0s` and `0.0s`.
+* In state:
+  * `SlideshowController.shared.isRunning == true`.
+  * The slideshow window's `ViewerState.zoomMode == .fit`.
+  * The slideshow window's `ViewerState.slideshowSeconds == 4.0`.
+  * The main window's `ViewerState` is unchanged from before
+    the press (same `zoomMode`, same `panOffset`).
+* On disk:
+
+  ```sh
+  tail -n 1 ~/Library/Application\ Support/ImageGlass_Mac/logs/log.log
+  ```
+
+  contains a line of the form
+
+  ```
+  ts=… tool=slideshow.toggle on=true interval=4.0 source=key:S corr=… ok=true
+  ```
+
+  The `source=key:S` field is the audit fingerprint of the `S`
+  binding; menu-driven starts (`⌥⌘S`) record `source=menu:View`,
+  and MCP-driven starts record `source=mcp:set_slideshow`. The
+  three sources share a common log shape so a debugger can
+  collate them.
+
+---
+
+## 2. Slideshow Advance — Next Image After the Interval
+
+### 2.1 Preconditions
+
+* Scenario 1 completed. The slideshow is running, showing `001.jpg`,
+  with `interval_seconds = 4.0`.
+
+### 2.2 Actions, in order
+
+1. Wait. Do not press any key, do not move the mouse.
+2. After ≥ 4 seconds (one full interval), observe.
+
+### 2.3 Expected result
+
+* Exactly at the wall-clock interval boundary
+  (`startInstant + 4.0 s`, within ≤ 50 ms scheduler jitter), the
+  controller advances `AppState.selectedFile` to the next item in
+  `resolvedFiles` (`002.jpg`).
+* The slideshow window's `ImageCanvasView` reloads with `002.jpg`.
+* The canvas re-applies the slideshow zoom mode (`.fit`) — see
+  §6 for the exact rule. Even if scenario 2.5 had panned or
+  zoomed the prior image, the new image is presented fit-to-window
+  again.
+* The countdown overlay snaps back to `4.0s` and begins counting
+  down toward the *next* advance.
+* The status bar (inside the slideshow window) updates to
+  `002.jpg` and the file metadata.
+
+### 2.4 Verify
+
+* On screen: at ~4 s the displayed image visibly changes from
+  `001.jpg` to `002.jpg`. The countdown re-arms to `4.0s`.
+* In state:
+  * `AppState.selectedFile` is now the URL of `002.jpg`.
+  * The slideshow's `ViewerState.zoomMode == .fit` (unchanged
+    — but verifiably re-applied; see §6).
+  * The slideshow's `ViewerState.panOffset == .zero` (any prior
+    user pan was cleared by the zoom-mode reset).
+* On disk:
+
+  ```sh
+  grep "app=slideshow.advance" ~/Library/Application\ Support/ImageGlass_Mac/logs/log.log | tail -n 1
+  ```
+
+  reads
+
+  ```
+  ts=… app=slideshow.advance from=…/001.jpg to=…/002.jpg interval=4.0 zoom_mode=fit corr=…
+  ```
+
+  The `interval=` field records the interval that was *just
+  elapsed* (4.0), not the next-advance budget. `zoom_mode=fit`
+  records the zoom mode the new image is rendered in — proof
+  that §6 fired.
+
+### 2.5 Continues — successive advances
+
+The controller continues to advance once per interval:
+`002.jpg → notes_old.png → peak.heic → peak.jpg → …`. After
+`peak.jpg`, the loop behavior of scenario 7 takes over.
+
+---
+
+## 3. Slideshow Stop — `S` Toggles Off
+
+### 3.1 Preconditions
+
+* Scenario 2 completed, or scenario 1 just completed. A slideshow
+  is currently running.
+
+### 3.2 Actions, in order
+
+1. With the slideshow window focused (or the main viewer; `S` is
+   bound on both), press `S` once.
+
+### 3.3 Expected result
+
+* `SlideshowController.shared.stop()` is called.
+* `isRunning` flips to `false`. The advance timer is invalidated.
+* The slideshow window closes; the main window returns to key
+  status. The main window's layout is restored to whatever preset
+  was active before slideshow started.
+* `AppState.selectedFile` retains whatever image was on screen at
+  stop time. **The main viewer's canvas is not reloaded** and the
+  main viewer's `ViewerState.zoomMode` is unchanged (no surprise
+  zoom snap).
+* The countdown overlay disappears.
+
+### 3.4 Verify
+
+* On screen: the slideshow window is gone. The main viewer is key
+  and shows the file that was on screen at stop time.
+* In state:
+  * `SlideshowController.shared.isRunning == false`.
+  * The main window's `ViewerState.zoomMode` equals its
+    pre-slideshow value (unchanged).
+  * `AppState.selectedFile` equals the last file the slideshow
+    displayed.
+* On disk:
+
+  ```
+  ts=… tool=slideshow.toggle on=false interval=4.0 source=key:S corr=… ok=true
+  ts=… app=slideshow.stop reason=user_toggle advances=N elapsed_s=… corr=…
+  ```
+
+  `advances=N` is the count of successful advances during the run
+  (4 if scenarios 1 → 2 → 2.5 ran end-to-end). `elapsed_s=` is the
+  wall-clock duration from start to stop, used to verify the
+  ~4 s/interval pacing in §11.
+
+---
+
+## 4. Change Interval From Settings — Slider + Editable Number Field
+
+This is the only place a user adjusts the interval persistently.
+The Settings panel exposes the value with two controls that share
+**one** binding: a horizontal slider for coarse change, and an
+editable text field with stepper for exact entry.
+
+### 4.1 Layout — what the row looks like
+
+The Slideshow tab's Timing section, top row:
+
+```
+Interval (s)   [───────●──────────]   [  4.0 ▾ ]   s
+                slider (1…600)         text field
+                                      (stepper)
+```
+
+Three on-screen widgets bound to **one** model field —
+`settings.slideshow.interval_seconds`:
+
+* A `Slider` with `in: 1...600`.
+* A `TextField` with a `Stepper` that increments/decrements by
+  `0.5` seconds and accepts direct numeric entry.
+* A static label `s` for unit.
+
+The slider's thumb position and the text field's number stay in
+sync to four significant digits at all times.
+
+### 4.2 Preconditions
+
+* §0 holds. The slideshow is **not** running (scenario 3 has run,
+  or §0 is fresh). `settings.slideshow.interval_seconds == 4.0`.
+* The user opens Settings via `⌘,` (or App ▸ Settings…). The
+  Slideshow tab is the active tab (or the user clicks the
+  *Slideshow* tab — `play.rectangle` icon).
+
+### 4.3 Actions, in order
+
+1. Drag the **slider** thumb from its current position (≈ 4 s)
+   rightward until the text field reads `12.0`. Release the
+   mouse.
+2. Click into the **text field**. Use Cmd-A to select the
+   contents, type `7`, press Return.
+3. Click the stepper's up arrow twice (each click increments
+   by 0.5).
+4. Press `⌘W` to close the Settings window (or click red traffic
+   light).
+
+### 4.4 Expected result
+
+After step 1 (slider drag):
+
+* The text field updates **live** to track the slider —
+  `4.0 → 5.5 → 7.2 → … → 12.0` as the thumb moves.
+* `settings.slideshow.interval_seconds == 12.0` after release.
+* The change is **debounced 300 ms** then written to
+  `settings.json` atomically (write to a `.tmp` then rename).
+
+After step 2 (typed value):
+
+* The slider thumb snaps to the `7.0` position.
+* `settings.slideshow.interval_seconds == 7.0`.
+* After the 300 ms debounce, `settings.json` is rewritten.
+
+After step 3 (stepper +0.5 × 2):
+
+* The text field reads `8.0`. The slider thumb shifts
+  accordingly.
+* `settings.slideshow.interval_seconds == 8.0`. Written to
+  disk after debounce.
+
+After step 4 (close):
+
+* No additional writes happen — the value was already on disk.
+* The Slideshow tab's state survives a relaunch of the app.
+
+### 4.5 Verify
+
+* On screen: the slider thumb, the text field, and the stepper
+  arrows always agree. There is no flash of an old value when
+  any one widget updates.
+* On disk, after step 1:
+
+  ```sh
+  grep '"interval_seconds"' ~/Library/Application\ Support/ImageGlass_Mac/settings.json
+  ```
+
+  reads `"interval_seconds": 12.0`.
+
+* On disk, after step 3:
+
+  ```sh
+  grep '"interval_seconds"' ~/Library/Application\ Support/ImageGlass_Mac/settings.json
+  ```
+
+  reads `"interval_seconds": 8.0`.
+
+* On disk: `log.log` contains, for each finalized write,
+
+  ```
+  ts=… app=settings.write key=slideshow.interval_seconds old=4.0 new=12.0 source=gui:settings corr=…
+  ts=… app=settings.write key=slideshow.interval_seconds old=12.0 new=7.0 source=gui:settings corr=…
+  ts=… app=settings.write key=slideshow.interval_seconds old=7.0 new=8.0 source=gui:settings corr=…
+  ```
+
+  Live drag does **not** produce a log line per thumb tick; only
+  the debounced settle-value does.
+
+### 4.6 Bounds and input validation
+
+* The slider's range is `1.0 … 600.0` seconds, matching the
+  existing slider in `SettingsScene.swift` and the
+  [settings.mdx §4.6](../settings.mdx#46-slideshow) contract.
+* The text field accepts any non-negative number entered. On
+  commit (Return / blur / stepper), the value is clamped to
+  `[1.0, 600.0]`. Values below 1.0 snap to 1.0; values above
+  600.0 snap to 600.0; non-numeric input (e.g. `abc`) snaps back
+  to the prior value and a one-line audit record is written
+  with `ok=false err=invalid_input`.
+* The stepper increment is `0.5 s`. Holding the up/down arrow
+  repeats at the system-standard auto-repeat rate.
+* Zero and negatives are not representable through the GUI.
+  `SettingsValidation.swift` already coerces
+  `interval_seconds <= 0` to `5.0` on load — that path is the
+  safety net for hand-edited `settings.json`, not the GUI.
+
+### 4.7 Mid-show changes
+
+If the slideshow is **running** while the user opens Settings and
+adjusts the slider / text field, the change applies on the **next**
+interval boundary, not the current one:
+
+* The controller observes the live `settings.slideshow.interval_seconds`
+  field.
+* The current countdown continues with the old interval until it
+  hits zero and advances.
+* The new countdown that follows the advance uses the new
+  interval.
+
+This avoids visually jarring mid-countdown snaps (e.g. dragging
+the slider from 4 s to 30 s mid-countdown shouldn't extend the
+currently-displayed slide; the user is editing the *next* slide's
+budget).
+
+### 4.8 Verify mid-show change
+
+* Preconditions: slideshow running with `interval_seconds = 4.0`.
+* Action: at ~`startInstant + 1.5 s`, with 2.5 s remaining on the
+  countdown, drag the slider to 10.0.
+* Expected: the countdown continues from 2.5 → 0, advances, then
+  re-arms to 10.0 — visible jump in the countdown badge at the
+  advance boundary. `settings.slideshow.interval_seconds == 10.0`
+  after the 300 ms debounce.
+
+---
+
+## 5. `S` Is Focus-Aware — Suppressed in Text Inputs
+
+A single-key, unmodified shortcut would steal `s` from anyone
+typing in a text field. The binding is therefore **focus-aware**:
+it fires only when the first responder is **not** a text input.
+
+### 5.1 The rule, exact
+
+`S` (no modifier) triggers `SlideshowController.toggle()` only if
+**all** of these hold:
+
+1. The key-down event arrives at the main viewer scene
+   (`ImageGlassApp.Scene`'s key-event responder chain).
+2. The current first responder is not an `NSTextField`,
+   `NSTextView`, `NSSearchField`, `WKWebView`, or anything that
+   reports `acceptsFirstResponder == true && isEditable == true`
+   for text input.
+3. There is no modifier pressed (`event.modifierFlags &
+   .deviceIndependentFlagsMask` contains none of
+   `.command / .option / .control / .shift`).
+4. The key code matches `S` (`kVK_ANSI_S`).
+
+Conditions 3 + 4 keep the existing `⌘S` (Save), `⇧⌘S` (Save As),
+and `⌥⌘S` (View ▸ Start Slideshow) bindings untouched —
+they take precedence because they carry modifiers and are
+registered as menu-key equivalents, which the responder chain
+checks first.
+
+### 5.2 Preconditions
+
+* §0 holds. The user is **not** in a text input.
+
+### 5.3 Actions, in order
+
+1. Click into a Settings text field (scenario 4 has a
+   "interval seconds" text field — use that, with Settings open
+   on the Slideshow tab).
+2. Type `s`.
+
+### 5.4 Expected result
+
+* The character `s` is inserted at the cursor in the text field.
+* No slideshow is started.
+* No `slideshow.toggle` log line is written.
+* `SlideshowController.shared.isRunning` is unchanged.
+
+### 5.5 Verify
+
+* On screen: the text field now contains the prior interval
+  value with `s` appended (e.g. `4.0s`). The value is invalid;
+  on Return / blur the input-validation path of §4.6 snaps it
+  back. While editing, no slideshow window opens.
+* On disk: no new `slideshow.toggle` line in `log.log`.
+* In state: `SlideshowController.shared.isRunning == false`
+  (assuming preconditions).
+
+### 5.6 Verify the opposite — `S` outside text
+
+* Click the slideshow tab body (not a field) to remove the field
+  as first responder. Press `S`. Slideshow starts. This is just
+  scenario 1 re-run from inside Settings to prove §5's rule fires
+  only when text input is active, not whenever Settings is open.
+
+---
+
+## 6. Appropriate Zoom Mode — Re-Applied on Every Advance
+
+This is the core visual rule the user asked for: every image the
+slideshow advances to is presented in the **slideshow zoom mode**,
+regardless of what the user did to the previous image during its
+on-screen window.
+
+### 6.1 The rule
+
+Each time the controller advances:
+
+1. The next file's `URL` is selected.
+2. The slideshow window's `ViewerState.zoomMode` is set to the
+   **slideshow zoom mode** — `.fit` (Zoom to Fit) for v1.
+3. The slideshow window's `ViewerState.panOffset` is reset to
+   `.zero`.
+4. The slideshow window's `ViewerState.rotationQuarterTurns`,
+   `flipHorizontal`, `flipVertical` are reset to defaults.
+5. The slideshow window's `ViewerState.lockedZoom` is reset to
+   `1.0` (no effect while `zoomMode == .fit`; matters if a
+   future user-issued zoom in scenario 6.5 promoted the mode to
+   `.lock`).
+6. The canvas reload draws the new image fit-to-window.
+
+`Zoom to Fit` is the default because it preserves aspect ratio,
+centers the image, and matches the existing `SlideshowController`
+behavior (`viewerState.zoomMode = .fit` on `start`). The reset
+extends that one-time start setting to **every advance**.
+
+### 6.2 The knob
+
+A future settings key (`slideshow.zoom_mode`, see
+[settings.mdx §4.6](../settings.mdx#46-slideshow)) can override
+the default. For v1 the value is hard-coded to `.fit`. If/when
+the knob lands, the controller reads it on every advance — no
+restart required.
+
+### 6.3 Preconditions
+
+* Scenarios 1 + 2 completed. The slideshow is running, showing
+  `002.jpg`, with interval `4.0`.
+
+### 6.4 Actions, in order
+
+1. While `002.jpg` is on screen, press `+` three times in the
+   slideshow window to zoom in. This promotes
+   `ViewerState.zoomMode` to `.lock` with `lockedZoom ≈ 1.728`
+   (`1.2³`) per [hotkeys.mdx §5](../hotkeys.mdx#5-zoom-and-window-controls).
+2. Press `→` once to pan right by 15% of the viewport
+   ([hotkeys.mdx §4.3](../hotkeys.mdx#43-pan)).
+3. Wait until the next advance fires (~ 4 s after `002.jpg` was
+   loaded).
+
+### 6.5 Expected result
+
+* At the advance boundary the controller swaps in `notes_old.png`.
+* The slideshow window's `ViewerState.zoomMode` is **forced back
+  to `.fit`**.
+* `panOffset` is **reset to `.zero`**.
+* `lockedZoom` is reset to `1.0`.
+* `notes_old.png` is drawn fit-to-window, centered.
+* The user's manual zoom-in + pan from §6.4 are **discarded** —
+  they applied only to the displayed instance of `002.jpg`, not
+  to any subsequent image.
+
+### 6.6 Verify
+
+* On screen: `notes_old.png` is rendered fit-to-window with no
+  pan offset; the user's prior zoom-in / pan are gone.
+* In state, immediately after the advance:
+  * `slideshowViewerState.zoomMode == .fit`
+  * `slideshowViewerState.panOffset == .zero`
+  * `slideshowViewerState.lockedZoom == 1.0`
+  * `slideshowViewerState.rotationQuarterTurns == 0`
+* On disk: the `slideshow.advance` log line reads
+  `zoom_mode=fit`, regardless of any prior `lock` mode the user
+  set:
+
+  ```
+  ts=… app=slideshow.advance from=…/002.jpg to=…/notes_old.png interval=4.0 zoom_mode=fit corr=…
+  ```
+
+### 6.7 What is NOT reset
+
+* `settings.slideshow.*` keys (the source of truth) are
+  untouched.
+* The main viewer's `ViewerState` is untouched (the slideshow
+  has its own `ViewerState` instance, per scenario 3.3).
+* `colorChannel`, `colorFormat`, `showColorPicker` — color
+  inspection options carry across advances. Resetting these
+  would be surprising for a user comparing color across many
+  images.
+* `smoothInterpolation` — the user's choice of sharp vs. smooth
+  scaling is preserved across advances.
+
+---
+
+## 7. End of List — Loop or Stop
+
+### 7.1 Preconditions
+
+* Scenarios 1 → 2.5 → 6 ran end-to-end. The slideshow has
+  advanced past every file in the list and is currently showing
+  `peak.jpg` (the last file in depth-first lexicographic order).
+* `settings.slideshow.loop == true` (the default).
+
+### 7.2 Actions, in order
+
+1. Wait for the next interval to elapse.
+
+### 7.3 Expected result — loop ON
+
+* The controller wraps. `AppState.selectNext(wrap: true)` returns
+  the first file (`001.jpg`).
+* `001.jpg` is loaded with the slideshow zoom mode re-applied
+  (§6).
+* The countdown re-arms.
+* The slideshow continues to run indefinitely until the user
+  presses `S` (or quits).
+
+### 7.4 Verify — loop ON
+
+* On screen: at the interval boundary `peak.jpg` is replaced by
+  `001.jpg`.
+* On disk:
+
+  ```
+  ts=… app=slideshow.advance from=…/peak.jpg to=…/001.jpg interval=4.0 zoom_mode=fit wrap=true corr=…
+  ```
+
+  The `wrap=true` field is the audit fingerprint of the loop —
+  external tests can detect "the slideshow wrapped exactly once"
+  by counting `wrap=true` records.
+
+### 7.5 Preconditions for loop OFF
+
+* Open Settings ▸ Slideshow ▸ Timing. Uncheck `Loop`. Close
+  Settings. `settings.slideshow.loop == false`.
+
+### 7.6 Actions, in order
+
+1. Press `S` to start a fresh slideshow from `001.jpg`.
+2. Wait through the full run: `001.jpg → 002.jpg → notes_old.png
+   → peak.heic → peak.jpg`. Five advances.
+3. Wait for the sixth interval boundary.
+
+### 7.7 Expected result — loop OFF
+
+* After `peak.jpg`'s on-screen window completes, the controller
+  does **not** wrap.
+* `SlideshowController.shared.stop()` is called automatically.
+  The slideshow window closes, the main window returns. The
+  selected file in the main viewer is `peak.jpg`.
+
+### 7.8 Verify — loop OFF
+
+* On screen: the slideshow window closes on its own after the
+  last image's interval elapses; the main window returns.
+* On disk:
+
+  ```
+  ts=… app=slideshow.advance from=…/peak.heic to=…/peak.jpg interval=4.0 zoom_mode=fit corr=…
+  ts=… app=slideshow.stop reason=end_of_list advances=4 elapsed_s=20.x corr=…
+  ```
+
+  `reason=end_of_list` differentiates a list-exhaust stop from
+  a user toggle (`reason=user_toggle` per scenario 3).
+
+---
+
+## 8. Empty File List — `S` Is a No-Op
+
+### 8.1 Preconditions
+
+* `directories.yaml` has `root_directories: []` (per
+  [mcp_file.mdx §9](./mcp_file.mdx#9-no-image-previewed--empty-viewer-state)).
+  The status bar reads `0 files`. The viewer shows the
+  `No image previewed` empty state.
+
+### 8.2 Actions, in order
+
+1. Press `S`.
+
+### 8.3 Expected result
+
+* `SlideshowController.shared.start(...)` early-returns because
+  `appState.resolvedFiles.isEmpty == true` (the existing guard
+  in `SlideshowController.start`).
+* No slideshow window opens.
+* No state changes — `isRunning` remains `false`.
+* A `tool=slideshow.toggle` audit line is still written, with
+  `ok=false err=no_files_available`, so external observers see
+  the user's attempt and the reason it produced nothing.
+
+### 8.4 Verify
+
+* On screen: no new window. The viewer remains in `No image
+  previewed`.
+* On disk:
+
+  ```
+  ts=… tool=slideshow.toggle on=true interval=4.0 source=key:S ok=false err=no_files_available
+  ```
+
+  No `slideshow.advance` lines follow.
+
+---
+
+## 9. Single-Image File List — `S` Behavior
+
+When the list has exactly one image, the loop semantic of §7
+still applies, but it reduces to re-loading the same file on
+every interval boundary. The controller fires advance events —
+this is intentional, so the re-apply-zoom rule of §6 runs and
+any user-applied zoom/pan to the displayed file is reset every
+interval.
+
+### 9.1 Preconditions
+
+* `directories.yaml` has one root containing exactly one image,
+  `solo.jpg`. The status bar reads `1 file`. The viewer shows
+  `solo.jpg`.
+* `settings.slideshow.loop == true` (default).
+
+### 9.2 Actions, in order
+
+1. Press `S`. Slideshow starts on `solo.jpg`.
+2. Press `+` twice to zoom in.
+3. Wait for the next interval boundary.
+
+### 9.3 Expected result
+
+* `selectNext(wrap: true)` returns `solo.jpg` again (one-item
+  list, wrap on).
+* The controller still treats this as an advance: `slideshow.advance`
+  log line is written with `from == to == solo.jpg`.
+* The slideshow's `ViewerState` is reset per §6 — the user's
+  zoom-in is discarded, the image is re-rendered fit-to-window.
+
+### 9.4 Verify
+
+* On screen: `solo.jpg` is briefly redrawn fit-to-window at the
+  interval boundary, undoing the manual zoom.
+* On disk: one `slideshow.advance` line per interval, with
+  `from=…/solo.jpg to=…/solo.jpg`.
+
+If `loop == false` with a one-file list, the slideshow stops
+after the first interval — same `reason=end_of_list` audit.
+
+---
+
+## 10. Interaction With Existing Shortcuts
+
+The new `S` binding sits alongside two existing slideshow-related
+shortcuts. This scenario verifies they continue to work without
+conflict.
+
+### 10.1 `⌥⌘S` — menu-bound, unconditional
+
+1. From §0 state, open the menu: **View ▸ Start Slideshow**.
+   Verify the shortcut shown next to the menu item reads `⌥⌘S`.
+2. Press `⌥⌘S`. Slideshow starts. `log.log` records
+   `source=menu:View`.
+3. Press `⌥⌘S` again. Menu reads **Stop Slideshow** (the same
+   toggle item, label flipped). Slideshow stops.
+
+### 10.2 `Space` — context-sensitive, image-only fallback
+
+Per [videos.mdx §11.2](../videos.mdx#112-resolution),
+`Space` is bound to *Video ▸ Play/Pause* when a video is
+current and the *Slideshow toggle* otherwise:
+
+1. From §0 state (no slideshow running, image current), press
+   `Space`. Slideshow starts. Same result as `S`. `log.log`
+   records `source=key:Space`.
+2. Press `Space` again. Slideshow stops.
+3. Add a video file (`clip.mp4`) to the list. Select it. Press
+   `Space`. Video plays (NOT slideshow start). This is the
+   focus-context rule, unchanged.
+
+`S` has **no** focus-context: pressing `S` with `clip.mp4`
+selected still toggles slideshow on (and the slideshow window
+opens, loads `clip.mp4` if it is the next item, and the canvas
+treats it per [videos.mdx §3](../videos.mdx) — videos in a
+slideshow play through without advance until they complete,
+then the controller resumes the interval timer).
+
+### 10.3 `⌘S` — Save (unrelated; must not trigger slideshow)
+
+1. From §0 state, press `⌘S`. The Save action runs (per
+   [hotkeys.mdx](../hotkeys.mdx#7-system-shortcuts) — currently
+   a no-op stub if no edits are pending). Slideshow does **not**
+   start. `log.log` has no `slideshow.toggle` line for this
+   press.
+
+### 10.4 `⇧⌘S` — Save As (unrelated; must not trigger slideshow)
+
+1. Press `⇧⌘S`. Save-As opens. Slideshow does **not** start.
+
+### 10.5 Verify
+
+* `log.log` after the §10.1–10.4 sequence contains:
+
+  ```
+  ts=… tool=slideshow.toggle on=true  source=menu:View   …
+  ts=… tool=slideshow.toggle on=false source=menu:View   …
+  ts=… tool=slideshow.toggle on=true  source=key:Space   …
+  ts=… tool=slideshow.toggle on=false source=key:Space   …
+  ```
+
+  No `slideshow.toggle` line is associated with the `⌘S` or
+  `⇧⌘S` presses. Grep proves it:
+
+  ```sh
+  grep "source=key:cmd+s\|source=key:cmd+shift+s" log.log | wc -l   # 0
+  ```
+
+---
+
+## 11. Pacing — Drift and Stability
+
+The interval is wall-clock-based, not "interval-from-last-tick"-based,
+so a slow image-decode does not silently extend the run. The
+acceptance bar is: over a 10-advance run, the wall-clock time
+from start to the 10th advance is within ±200 ms of `10 ×
+interval_seconds`.
+
+### 11.1 Preconditions
+
+* `interval_seconds = 4.0`.
+* `~/Pictures/tour/` extended to ≥ 12 image files (so the
+  5-file fixture wraps without affecting the measurement).
+
+### 11.2 Actions, in order
+
+1. Note `startInstant`.
+2. Press `S`. Slideshow starts.
+3. Let it run for 11 advances (so 10 measured intervals).
+4. Press `S` to stop. Note `stopInstant`.
+
+### 11.3 Expected result
+
+* `stopInstant − startInstant` is in the range
+  `[10 × 4.0 − 0.2, 10 × 4.0 + 0.2] = [39.8 s, 40.2 s]`.
+
+### 11.4 Verify
+
+* `log.log` contains the `app=slideshow.stop` line with
+  `elapsed_s=` between 39.8 and 40.2.
+* `log.log` contains 10 `slideshow.advance` lines (or 11 if
+  the §7 loop boundary fired; the count is exact and
+  acceptance-testable).
+
+---
+
+## 12. MCP Parity — `set_slideshow` Mirrors The S-Key Toggle
+
+The MCP server already exposes `set_slideshow(on: Bool, interval:
+Double?)` (charter pinned in
+[mcp.mdx](../mcp.mdx#56-gui-actions)). It calls the same
+`SlideshowController.toggle()` entry point the `S` key calls, so
+the user-facing rule is: anything `S` can do, MCP can do, and
+vice versa.
+
+### 12.1 Verify parity
+
+* From Claude Code:
+
+  ```
+  set_slideshow(on=true)
+  ```
+
+  Verify: same on-screen result as pressing `S` (scenario 1).
+  `log.log` differs only in `source=mcp:set_slideshow`.
+
+* From Claude Code:
+
+  ```
+  set_slideshow(on=true, interval=2.5)
+  ```
+
+  Verify: slideshow starts with `interval_seconds=2.5` for this
+  run **without** persisting to `settings.json` (the optional
+  `interval` argument is a *one-shot override*, not a setting
+  write). The audit line records
+  `interval=2.5 persisted=false`. Closing the slideshow
+  reverts the next manual start to the on-disk value (4.0).
+
+* From Claude Code:
+
+  ```
+  set_slideshow(on=false)
+  ```
+
+  Same on-screen result as pressing `S` to stop. `log.log`
+  records `source=mcp:set_slideshow`.
+
+### 12.2 Persistent interval changes from MCP
+
+* The `set_setting(key="slideshow.interval_seconds", value=10.0)`
+  MCP call updates the setting and writes `settings.json`.
+  Verify: the slider and text field in the open Settings window
+  observe the change live (the binding is to the same model
+  field), and the next manual `S` press starts the slideshow
+  with `interval_seconds=10.0`.
+
+---
+
+## 13. End-to-End Acceptance
+
+A run of this spec passes when **all of**:
+
+* §1 — pressing `S` with a non-empty file list starts the
+  slideshow, opens the slideshow window, applies the slideshow
+  zoom mode (`.fit`), and reads `interval_seconds` from
+  `settings.json`. `slideshow.toggle on=true source=key:S` is
+  in `log.log`.
+* §2 — exactly at `start + interval_seconds` (±50 ms), the
+  controller advances to the next image and re-arms the
+  countdown. A `slideshow.advance` line is written with
+  `zoom_mode=fit`.
+* §3 — pressing `S` while running stops the slideshow, closes
+  the slideshow window, leaves `AppState.selectedFile` on the
+  last-displayed image, and leaves the main viewer's
+  `ViewerState` untouched. `slideshow.toggle on=false` is in
+  `log.log`.
+* §4 — Settings ▸ Slideshow ▸ Timing exposes a **Slider** and an
+  **editable text field with stepper** that share the same
+  `settings.slideshow.interval_seconds` binding. Edits in
+  either control update the other live. Debounced writes land
+  in `settings.json`; only settle-values are journaled. The
+  field clamps to `[1.0, 600.0]` and snaps non-numeric input
+  back to the prior value with `ok=false err=invalid_input`.
+* §4.7 — a mid-show interval change applies on the **next**
+  advance, not the current countdown.
+* §5 — `S` is focus-aware: it does NOT fire while a text input
+  is first responder. `⌘S`, `⇧⌘S`, `⌥⌘S` (modifier presence)
+  are unaffected.
+* §6 — every advance re-applies the slideshow zoom mode and
+  resets pan / rotation / flip / lockedZoom on the slideshow's
+  `ViewerState`. Manual zoom or pan applied to one image is
+  **discarded** on the next advance. The `slideshow.advance`
+  line records `zoom_mode=fit` proof.
+* §7 — at end of list, `loop=true` wraps to file #1 (advance
+  line carries `wrap=true`); `loop=false` stops automatically
+  (`slideshow.stop reason=end_of_list`).
+* §8 — pressing `S` with an empty file list is a no-op: no
+  window opens, `isRunning` stays `false`, one
+  `slideshow.toggle on=true ok=false err=no_files_available`
+  audit line is written.
+* §9 — a one-image list still produces advance events that run
+  the §6 zoom-reset on the single image.
+* §10 — `⌥⌘S` (menu), `Space` (context-sensitive), `⌘S` /
+  `⇧⌘S` (Save / Save As) continue to work without conflict.
+  `source=` fields in `log.log` distinguish the three slideshow
+  trigger paths.
+* §11 — over 10 advances, wall-clock elapsed is within ±200 ms
+  of `10 × interval_seconds`.
+* §12 — MCP `set_slideshow` produces results identical to the
+  `S` key, differentiated only by `source=mcp:set_slideshow`
+  in `log.log`. A one-shot `interval` argument runs without
+  persisting; a `set_setting` call persists.
+
+If any step fails, the failing line in `log.log` (with its `corr=`
+correlation id) is the first place to look — `grep corr=<id>
+log.log` returns the audit line(s) interleaved with the matching
+error record, reproducing the call in full.

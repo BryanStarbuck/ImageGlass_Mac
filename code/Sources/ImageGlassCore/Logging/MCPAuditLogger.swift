@@ -189,6 +189,95 @@ public final class MCPAuditLogger: @unchecked Sendable {
         ])
     }
 
+    /// `tool=slideshow.toggle on=<bool> interval=<sec> source=<id> corr=<corr> ok=<bool> [err=…]`
+    /// — see slideshow.mdx §1.4 / §3.4 / §8.4. `source` is one of
+    /// `key:S`, `key:Space`, `menu:View`, `mcp:set_slideshow`, so an
+    /// external auditor can trace which surface drove the toggle.
+    public func logSlideshowToggle(
+        on: Bool,
+        interval: Double,
+        source: String,
+        corr: String,
+        ok: Bool,
+        err: String? = nil
+    ) {
+        var pairs: [(String, String)] = [
+            ("tool", "slideshow.toggle"),
+            ("on", on ? "true" : "false"),
+            ("interval", String(format: "%.1f", interval)),
+            ("source", source),
+            ("corr", corr),
+            ("ok", ok ? "true" : "false"),
+        ]
+        if let err { pairs.append(("err", err)) }
+        log(pairs)
+    }
+
+    /// `app=slideshow.advance from=<path> to=<path> interval=<sec>
+    /// zoom_mode=<mode> [wrap=true] corr=<corr>` — emitted on every
+    /// successful advance. See slideshow.mdx §2.4 / §6.6 / §7.4.
+    public func logSlideshowAdvance(
+        from: String,
+        to: String,
+        interval: Double,
+        zoomMode: String,
+        wrap: Bool,
+        corr: String
+    ) {
+        var pairs: [(String, String)] = [
+            ("app", "slideshow.advance"),
+            ("from", from),
+            ("to", to),
+            ("interval", String(format: "%.1f", interval)),
+            ("zoom_mode", zoomMode),
+        ]
+        if wrap { pairs.append(("wrap", "true")) }
+        pairs.append(("corr", corr))
+        log(pairs)
+    }
+
+    /// `app=slideshow.stop reason=<reason> advances=<n> elapsed_s=<n.n>
+    /// corr=<corr>` — emitted exactly once per slideshow run. Reasons:
+    /// `user_toggle` (S key, Space, menu, or MCP off-call),
+    /// `end_of_list` (loop=false reached the end),
+    /// `no_files_available` (start was attempted with an empty list,
+    /// paired only with the matching toggle line of the same `corr`).
+    public func logSlideshowStop(
+        reason: String,
+        advances: Int,
+        elapsedSeconds: Double,
+        corr: String
+    ) {
+        log([
+            ("app", "slideshow.stop"),
+            ("reason", reason),
+            ("advances", String(advances)),
+            ("elapsed_s", String(format: "%.1f", elapsedSeconds)),
+            ("corr", corr),
+        ])
+    }
+
+    /// `app=settings.write key=<dotted-key> old=<value> new=<value>
+    /// source=<id> corr=<corr>` — settle-only audit per
+    /// slideshow.mdx §4.5. Live slider drags are debounced; only the
+    /// final committed value reaches this line.
+    public func logSettingsWrite(
+        key: String,
+        old: String,
+        new: String,
+        source: String,
+        corr: String
+    ) {
+        log([
+            ("app", "settings.write"),
+            ("key", key),
+            ("old", old),
+            ("new", new),
+            ("source", source),
+            ("corr", corr),
+        ])
+    }
+
     /// `app=startup msg="layout=Browser directories=<n>"` — see §1.3.
     public func logStartup(layout: String, directoryCount: Int) {
         log([

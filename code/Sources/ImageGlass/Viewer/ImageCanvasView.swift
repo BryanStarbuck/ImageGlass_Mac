@@ -43,6 +43,40 @@ final class ImageCanvasView: NSView {
     var zoomMode: ZoomMode = .auto    { didSet { needsDisplay = true } }
     var lockedZoom: CGFloat = 1.0     { didSet { needsDisplay = true } }
     var panOffset: CGSize = .zero     { didSet { needsDisplay = true } }
+    // Reads `dy` as a fraction of viewport height: 0.15 → pan down by 15%.
+    // `dx` is a fraction of viewport width. macOS y-axis is bottom-up
+    // (isFlipped=false), so a positive request "down" subtracts from
+    // panOffset.height. Returns the resulting (clamped) pan offset.
+    @discardableResult
+    func panByFraction(dx: CGFloat, dy: CGFloat) -> CGSize {
+        let vw = bounds.width
+        let vh = bounds.height
+        guard vw > 0, vh > 0 else { return panOffset }
+        let new = CGSize(
+            width:  panOffset.width  + dx * vw,
+            height: panOffset.height - dy * vh
+        )
+        panOffset = new
+        onUserTransform?(panOffset, lockedZoom, zoomMode)
+        return panOffset
+    }
+
+    /// Snap pan so the **top** of the rendered image touches the top of
+    /// the viewport. Used by Zoom to Width to start the user at the top
+    /// of a tall mockup. hotkeys.mdx §6.1.
+    func scrollToTopOfImage() {
+        let drawn = rotatedImageSize
+        guard drawn.width > 0, drawn.height > 0,
+              bounds.width > 0, bounds.height > 0 else { return }
+        let scale = currentScale
+        let drawnHeight = drawn.height * scale
+        // displayRect Y = (viewport.height - drawnHeight)/2 + panOffset.height
+        // Want the rect's top edge (Y + drawnHeight) at viewport.height ⇒
+        // panOffset.height = (viewport.height - drawnHeight)/2.
+        let target = (bounds.height - drawnHeight) / 2
+        panOffset = CGSize(width: 0, height: target)
+        onUserTransform?(panOffset, lockedZoom, zoomMode)
+    }
     var rotationQuarterTurns: Int = 0 { didSet { needsDisplay = true } }
     var flipHorizontal: Bool = false  { didSet { needsDisplay = true } }
     var flipVertical: Bool = false    { didSet { needsDisplay = true } }

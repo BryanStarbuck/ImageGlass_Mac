@@ -342,4 +342,69 @@ final class DirectoriesMCPToolsTests: XCTestCase {
                       "PNG variant of the marker stays visible per cookbook row")
         XCTAssertFalse(f.evaluate(filename: "frame_DM_1.jpg"))
     }
+
+    // mcp_and_filters_on_dirs.mdx §3.5 Example A — hero override.
+    // A higher-priority positive (`hero_dn_logo.png`) wins over a
+    // lower-priority negative (`*_dn_*`). Other `_dn_` files stay
+    // excluded; non-`_dn_` files stay included via the §7.0 fallback.
+    func testPriorityHeroOverridesNegateCarveOut() {
+        let f = RootFilter(items: [
+            RootFilterItem(pattern: "*_dn_*", kind: .glob, negate: true, priority: 0),
+            RootFilterItem(pattern: "hero_dn_logo.png", kind: .glob, negate: false, priority: 10),
+        ])
+        XCTAssertTrue(f.evaluate(filename: "hero_dn_logo.png"),
+                      "high-priority include overrides low-priority exclude")
+        XCTAssertFalse(f.evaluate(filename: "card_dn_thumb.jpg"),
+                       "exclude still wins for files only matched by it")
+        XCTAssertTrue(f.evaluate(filename: "peak.jpg"),
+                      "unrelated file passes via the fallback rule")
+    }
+
+    // mcp_and_filters_on_dirs.mdx §3.5 Example B — multi-tier stack.
+    func testPriorityMultipleTiers() {
+        let f = RootFilter(items: [
+            RootFilterItem(pattern: "*_HERO_*", kind: .glob, negate: false, priority: 20),
+            RootFilterItem(pattern: "*.jpg",    kind: .glob, negate: false, priority: 10),
+            RootFilterItem(pattern: "*_DRAFT_*", kind: .glob, negate: true, priority: 0),
+        ])
+        XCTAssertTrue(f.evaluate(filename: "shoot_HERO_001.dng"),
+                      "tier 20 include wins")
+        XCTAssertTrue(f.evaluate(filename: "shoot_002.jpg"),
+                      "tier 10 jpg include wins after tier 20 abstains")
+        // shoot_003.dng: higher tiers (HERO@20, jpg@10) are overrides
+        // and abstain when they don't match. The lowest tier (0) has
+        // only the DRAFT negate item — positives.isEmpty there — so
+        // its no-match branch INCLUDES the file. This is the §3.3
+        // override-vs-narrow split that lets exception positives at
+        // priority > 0 not turn the filter into "only show matching."
+        XCTAssertTrue(f.evaluate(filename: "shoot_003.dng"),
+                      "higher-priority positives abstain (override-only); lowest tier (negate-only) includes")
+        XCTAssertFalse(f.evaluate(filename: "shoot_001_DRAFT_.png"),
+                       "tier 0 negative excludes after higher tiers abstain")
+    }
+
+    // mcp_and_filters_on_dirs.mdx §3.6 — backwards compat: items without
+    // an explicit priority all sit at priority 0; behavior must be
+    // identical to the pre-priority engine.
+    func testPriorityDefaultZeroPreservesLegacyBehavior() {
+        let f = RootFilter(items: [
+            RootFilterItem(pattern: "*.png", kind: .glob),
+            RootFilterItem(pattern: "*_old*", kind: .glob, negate: true),
+        ])
+        XCTAssertTrue(f.evaluate(filename: "image.png"))
+        XCTAssertFalse(f.evaluate(filename: "notes_old.png"),
+                       "tier-0 negative still vetoes tier-0 positive")
+        XCTAssertFalse(f.evaluate(filename: "raw.jpg"),
+                       "non-matching extension still excluded under match:any")
+    }
+
+    // mcp_and_filters_on_dirs.mdx §3.2 — priority is clamped to
+    // -1000…1000 on construction, so the resolver does not OOM on a
+    // malicious LLM that sends Int.max.
+    func testPriorityIsClampedAtConstruction() {
+        let hi = RootFilterItem(pattern: "x", priority: 999_999)
+        let lo = RootFilterItem(pattern: "y", priority: -999_999)
+        XCTAssertEqual(hi.priority, 1000)
+        XCTAssertEqual(lo.priority, -1000)
+    }
 }

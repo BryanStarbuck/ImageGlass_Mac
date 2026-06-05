@@ -22,15 +22,32 @@ struct ImageViewer: View {
                     .onDrop(of: [.fileURL], delegate: FileDropDelegate(state: state))
                     .focusable()
                     .focusEffectDisabled()
-                    .onKeyPress(.leftArrow)  { handleArrow(.left)  }
-                    .onKeyPress(.rightArrow) { handleArrow(.right) }
-                    .onKeyPress(.upArrow)    { handleArrow(.up)    }
-                    .onKeyPress(.downArrow)  { handleArrow(.down)  }
+                    .onKeyPress(.leftArrow,  phases: .down) { handleArrow(.left,  $0) }
+                    .onKeyPress(.rightArrow, phases: .down) { handleArrow(.right, $0) }
+                    .onKeyPress(.upArrow,    phases: .down) { handleArrow(.up,    $0) }
+                    .onKeyPress(.downArrow,  phases: .down) { handleArrow(.down,  $0) }
                     .onKeyPress(.space)      { handleSpace() }
                     .onKeyPress(.escape) {
                         if state.crop.isActive { state.crop.cancel(); return .handled }
                         return .ignored
                     }
+                    // hotkeys.mdx §5 — bare-letter zoom hotkeys. Only fire
+                    // when no modifier is held so ⌘C / ⌘W keep their menu
+                    // bindings (Copy, Close Window).
+                    .onKeyPress("c", phases: .down) { handleZoomKey($0, action: .center) }
+                    .onKeyPress("n", phases: .down) { handleZoomKey($0, action: .normalize) }
+                    .onKeyPress("z", phases: .down) { handleZoomKey($0, action: .fit) }
+                    .onKeyPress("w", phases: .down) { handleZoomKey($0, action: .width) }
+                    .onKeyPress("=", phases: .down) { handleZoomKey($0, action: .zoomIn) }
+                    .onKeyPress("+", phases: .down) { handleZoomKey($0, action: .zoomIn) }
+                    .onKeyPress("-", phases: .down) { handleZoomKey($0, action: .zoomOut) }
+                    // slideshow.mdx §1 / §3 / §5 — bare `S` toggles the
+                    // slideshow on or off. Focus-aware via onKeyPress
+                    // (text fields keep `s` for typing) and modifier-
+                    // gated so `⌘S` (Save), `⇧⌘S` (Save As), `⌥⌘S`
+                    // (View ▸ Toggle Slideshow menu shortcut) pass
+                    // through to their menu items untouched.
+                    .onKeyPress("s", phases: .down) { handleSlideshowKey($0) }
                     .onKeyPress("g") {
                         if state.crop.isActive { state.crop.cycleGrid(); return .handled }
                         return .ignored
@@ -111,13 +128,16 @@ struct ImageViewer: View {
         }
     }
 
-    /// Spacebar. videos.mdx §11.2 / svg.mdx §10.2 — focus-context rule:
-    /// when the current file is a video, Space toggles play/pause; when
-    /// it is an animated SVG, Space toggles SVG animation; otherwise
-    /// fall back to the existing image-canvas behavior (zoom to actual).
+    /// Spacebar. videos.mdx §11.2 / svg.mdx §10.2 / slideshow.mdx §10.2
+    /// — focus-context rule: when the current file is a video, Space
+    /// toggles play/pause; when it is an animated SVG, Space toggles
+    /// SVG animation; otherwise (image, or no selection yet) Space
+    /// falls back to the slideshow toggle so it stays useful as the
+    /// upstream-ImageGlass Space-starts-slideshow shortcut.
     private func handleSpace() -> KeyPress.Result {
         guard let path = state.selectedFile else {
-            viewer.zoomToActual(); return .handled
+            SlideshowController.shared.toggle(appState: state, source: "key:Space")
+            return .handled
         }
         switch MediaKind.detect(path: path) {
         case .video:
@@ -128,20 +148,24 @@ struct ImageViewer: View {
                 state.svg.playPauseToggle()
                 return .handled
             }
-            return .ignored
+            // Static SVGs share the image fallback.
+            SlideshowController.shared.toggle(appState: state, source: "key:Space")
+            return .handled
         case .image:
-            viewer.zoomToActual()
+            SlideshowController.shared.toggle(appState: state, source: "key:Space")
             return .handled
         }
     }
 
-    /// Arrow-key handler. When the crop tool is active, arrows nudge /
-    /// grow the selection per docs/crop.mdx §2.4. Otherwise they
-    /// navigate to prev / next image.
+    /// Arrow-key handler. Behavior depends on the modifier:
+    /// * Crop active — preserved from docs/crop.mdx §2.4 (nudge / grow).
+    /// * `⌃` held — pan the viewer by 15% of viewport (hotkeys.mdx §4.3).
+    /// * Bare — tree navigation: ↑/↓ step through visible rows, ←
+    ///   collapses/parents, → expands/steps-in (hotkeys.mdx §4.1).
     private enum ArrowDir { case left, right, up, down }
-    private func handleArrow(_ dir: ArrowDir) -> KeyPress.Result {
+    private func handleArrow(_ dir: ArrowDir, _ press: KeyPress) -> KeyPress.Result {
         if state.crop.isActive {
-            let mods = NSEvent.modifierFlags
+            let mods = press.modifiers
             let shift = mods.contains(.shift)
             let cmd = mods.contains(.command)
             let mag: CGFloat = shift ? 10 : 1
@@ -156,15 +180,61 @@ struct ImageViewer: View {
             case (true,  .down):  state.crop.grow(dw: 0, dh:  mag); return .handled
             }
         }
-        // Left/Right step image-by-image (spec menus.mdx). Up/Down jump
-        // folder-to-folder — to the first image of the prev/next folder —
-        // so the user can skip whole subprojects/pages in a meeting.
-        switch dir {
-        case .left:  state.selectPrevious();       return .handled
-        case .right: state.selectNext();           return .handled
-        case .up:    state.selectPreviousFolder(); return .handled
-        case .down:  state.selectNextFolder();     return .handled
+        // ⌃-arrow → viewport pan. hotkeys.mdx §4.3. Step is read from
+        // Settings ▸ Viewer ▸ Pan step (percent of viewport).
+        if press.modifiers.contains(.control) {
+            let step = CGFloat(max(state.settings.viewer.pan_step_percent, 1) / 100.0)
+            switch dir {
+            case .left:  viewer.requestPan(dx: -step, dy:  0); return .handled
+            case .right: viewer.requestPan(dx:  step, dy:  0); return .handled
+            case .up:    viewer.requestPan(dx:  0,    dy: -step); return .handled
+            case .down:  viewer.requestPan(dx:  0,    dy:  step); return .handled
+            }
         }
+        // Bare arrows: walk the visible tree (mix of folders + files).
+        // hotkeys.mdx §4.1.
+        switch dir {
+        case .left:  state.arrowLeft();  return .handled
+        case .right: state.arrowRight(); return .handled
+        case .up:    state.arrowUp();    return .handled
+        case .down:  state.arrowDown();  return .handled
+        }
+    }
+
+    /// Bare-letter zoom hotkeys. hotkeys.mdx §5. Returns `.ignored`
+    /// (so `⌘C` etc. still route to menu items) whenever a modifier
+    /// other than Shift is held.
+    private enum ZoomKey { case zoomIn, zoomOut, center, normalize, fit, width }
+    private func handleZoomKey(_ press: KeyPress, action: ZoomKey) -> KeyPress.Result {
+        // Crop overlay owns most letter keys — let them through.
+        guard !state.crop.isActive else { return .ignored }
+        // Allow Shift (so `+` reaches us as Shift-`=`), but not ⌘/⌥/⌃.
+        let blocking: EventModifiers = [.command, .option, .control]
+        if !press.modifiers.intersection(blocking).isEmpty { return .ignored }
+        switch action {
+        case .zoomIn:    viewer.zoomIn()
+        case .zoomOut:   viewer.zoomOut()
+        case .center:    viewer.centerImage()
+        case .normalize: viewer.normalizeZoom()
+        case .fit:       viewer.zoomToFit()
+        case .width:     viewer.zoomToWidth()
+        }
+        return .handled
+    }
+
+    /// slideshow.mdx §1 / §3 / §5 — the bare `S` key. `onKeyPress` is
+    /// only delivered when the viewer is the first responder; text
+    /// fields, search fields, and `WKWebView` text inputs keep `s` for
+    /// typing because they consume the key-down before the focusable
+    /// canvas sees it. Any of ⌘/⌥/⌃ on `S` falls through to
+    /// `keyboardShortcut` so the menu items (Save, Save As, Toggle
+    /// Slideshow) keep their bindings.
+    private func handleSlideshowKey(_ press: KeyPress) -> KeyPress.Result {
+        if state.crop.isActive { return .ignored }
+        let blocking: EventModifiers = [.command, .option, .control]
+        if !press.modifiers.intersection(blocking).isEmpty { return .ignored }
+        SlideshowController.shared.toggle(appState: state, source: "key:S")
+        return .handled
     }
 
     /// Empty-viewer placeholder per `docs/use_cases/mcp_file.mdx` §9.2:
@@ -327,6 +397,24 @@ private struct CanvasHost: NSViewRepresentable {
         v.showColorPicker = viewer.showColorPicker
         v.currentFrameIndex = viewer.currentFrameIndex
         v.isAnimationPaused = viewer.isAnimationPaused
+
+        // hotkeys.mdx §6.1 — Zoom to Width snaps the viewer to the top of
+        // the image. Consume the pending flag here (the canvas has the
+        // viewport size, ViewerState does not). Defer the clear to the
+        // next runloop tick so this updateNSView pass does not mutate the
+        // observable mid-render.
+        if viewer.pendingScrollToTop {
+            v.scrollToTopOfImage()
+            Task { @MainActor in viewer.pendingScrollToTop = false }
+        }
+
+        // hotkeys.mdx §4.3 — ⌃-arrow pan, expressed as fractions of the
+        // viewport. The canvas converts to points using its own bounds.
+        let pend = viewer.pendingPanFraction
+        if pend != .zero {
+            v.panByFraction(dx: pend.width, dy: pend.height)
+            Task { @MainActor in viewer.pendingPanFraction = .zero }
+        }
     }
 }
 

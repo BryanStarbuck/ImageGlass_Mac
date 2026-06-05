@@ -28,6 +28,24 @@ public enum UpdateCadence: String, Codable, CaseIterable, Sendable {
     case never, daily, weekly, monthly
 }
 
+/// `hotkeys.mdx` §6.5 / §9 — where Zoom to Width parks the vertical
+/// scroll position when the user enters the mode. `top` is the only
+/// active value in v1; the other two are reserved.
+public enum ZoomToWidthScroll: String, Codable, CaseIterable, Sendable {
+    case top
+    case center
+    case lastViewed = "last_viewed"
+}
+
+/// `hotkeys.mdx` §5 / §6 / §9 — what the `N` (Normalize) hotkey snaps to
+/// at app launch and on every "reset" press. Also drives the initial
+/// zoom applied to a freshly opened image.
+public enum DefaultZoomOnOpen: String, Codable, CaseIterable, Sendable {
+    case fit          // Zoom to Fit (default — fits longer dimension)
+    case actual       // Actual Size (100%)
+    case restoreLast = "restore_last"  // Re-enter the user's last-used mode
+}
+
 /// Spec §4.3 — `viewer.zoom_mode`. Distinct from the legacy `ZoomMode` in
 /// `ZoomMath.swift` because the spec adds `oneToOne` and uses different
 /// labels for the existing cases.
@@ -272,6 +290,21 @@ public struct ViewerSettings: Codable, Equatable, Sendable {
     public var cache_max_dim: Int
     public var cache_max_mb: Double
     public var huge_image_threshold: Int
+    // hotkeys.mdx §9 — knobs the bare-letter / arrow hotkeys consult.
+    /// Multiplicative zoom step for `+` / `-` and ⌘+/⌘-, expressed as a
+    /// percent. 20 ⇒ each press scales by ×1.20.
+    public var zoom_step_percent: Double
+    /// Per-press pan step for ⌃-arrow, as a percent of viewport width
+    /// (left/right) or height (up/down).
+    public var pan_step_percent: Double
+    /// What `N` (Normalize) and the initial zoom on a new image snap to.
+    public var default_zoom_on_open: DefaultZoomOnOpen
+    /// When true, ↑ on the first visible row wraps to the last, and ↓
+    /// on the last row wraps to the first. Off per spec default.
+    public var wrap_at_ends: Bool
+    /// `Zoom to Width: scroll target`. v1 always honors `top`; `center`
+    /// and `lastViewed` are reserved.
+    public var zoom_to_width_scroll: ZoomToWidthScroll
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self), d = ViewerSettings()
@@ -298,6 +331,11 @@ public struct ViewerSettings: Codable, Equatable, Sendable {
         cache_max_dim = try c.decodeIfPresent(Int.self, forKey: .cache_max_dim) ?? d.cache_max_dim
         cache_max_mb = try c.decodeIfPresent(Double.self, forKey: .cache_max_mb) ?? d.cache_max_mb
         huge_image_threshold = try c.decodeIfPresent(Int.self, forKey: .huge_image_threshold) ?? d.huge_image_threshold
+        zoom_step_percent = try c.decodeIfPresent(Double.self, forKey: .zoom_step_percent) ?? d.zoom_step_percent
+        pan_step_percent = try c.decodeIfPresent(Double.self, forKey: .pan_step_percent) ?? d.pan_step_percent
+        default_zoom_on_open = try c.decodeIfPresent(DefaultZoomOnOpen.self, forKey: .default_zoom_on_open) ?? d.default_zoom_on_open
+        wrap_at_ends = try c.decodeIfPresent(Bool.self, forKey: .wrap_at_ends) ?? d.wrap_at_ends
+        zoom_to_width_scroll = try c.decodeIfPresent(ZoomToWidthScroll.self, forKey: .zoom_to_width_scroll) ?? d.zoom_to_width_scroll
     }
 
     public init(
@@ -323,7 +361,12 @@ public struct ViewerSettings: Codable, Equatable, Sendable {
         cache_image_count: Int = 1,
         cache_max_dim: Int = 8000,
         cache_max_mb: Double = 100,
-        huge_image_threshold: Int = 16000
+        huge_image_threshold: Int = 16000,
+        zoom_step_percent: Double = 20,
+        pan_step_percent: Double = 15,
+        default_zoom_on_open: DefaultZoomOnOpen = .fit,
+        wrap_at_ends: Bool = false,
+        zoom_to_width_scroll: ZoomToWidthScroll = .top
     ) {
         self.zoom_mode = zoom_mode
         self.zoom_lock_percent = zoom_lock_percent
@@ -348,6 +391,11 @@ public struct ViewerSettings: Codable, Equatable, Sendable {
         self.cache_max_dim = cache_max_dim
         self.cache_max_mb = cache_max_mb
         self.huge_image_threshold = huge_image_threshold
+        self.zoom_step_percent = zoom_step_percent
+        self.pan_step_percent = pan_step_percent
+        self.default_zoom_on_open = default_zoom_on_open
+        self.wrap_at_ends = wrap_at_ends
+        self.zoom_to_width_scroll = zoom_to_width_scroll
     }
 }
 

@@ -286,13 +286,49 @@ private struct LayoutSettingsView: View {
 private struct SlideshowSettingsView: View {
     @Bindable var state: AppState
 
+    /// Last-audited value, used to compute the `old=` field on the
+    /// `app=settings.write` line. Initialized to the on-disk value
+    /// when the view appears; updated only after each debounce
+    /// settles. This is what makes the §4.5 contract "only settle
+    /// values land in log.log" hold even when the slider is dragged
+    /// continuously.
+    @State private var lastAuditedInterval: Double = -1
+    @State private var intervalDebounce: Task<Void, Never>? = nil
+
     var body: some View {
         Form {
             Section("Timing") {
-                HStack {
-                    Text("Interval (s)")
+                // slideshow.mdx §4.1 — a Slider for coarse change AND an
+                // editable TextField with a Stepper for exact entry,
+                // both bound to the same `slideshow.interval_seconds`
+                // field so they stay in lockstep. The TextField clamps
+                // to [1, 600] on commit (§4.6); the stepper increments
+                // by 0.5 s per click.
+                HStack(spacing: 8) {
+                    Text("Interval")
+                        .frame(width: 70, alignment: .leading)
                     Slider(value: $state.settings.slideshow.interval_seconds, in: 1...600)
-                    Text(String(format: "%.1f", state.settings.slideshow.interval_seconds)).monospacedDigit()
+                    TextField(
+                        "",
+                        value: $state.settings.slideshow.interval_seconds,
+                        format: .number.precision(.fractionLength(1))
+                    )
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 60)
+                    .multilineTextAlignment(.trailing)
+                    .monospacedDigit()
+                    .onSubmit {
+                        clampInterval()
+                    }
+                    Stepper(
+                        "",
+                        value: $state.settings.slideshow.interval_seconds,
+                        in: 1...600,
+                        step: 0.5
+                    )
+                    .labelsHidden()
+                    Text("s")
+                        .foregroundStyle(.secondary)
                 }
                 Toggle("Use random interval", isOn: $state.settings.slideshow.use_random_interval)
                 if state.settings.slideshow.use_random_interval {
@@ -306,6 +342,14 @@ private struct SlideshowSettingsView: View {
                 Toggle("Loop", isOn: $state.settings.slideshow.loop)
                 Toggle("Fullscreen", isOn: $state.settings.slideshow.fullscreen)
             }
+            .onAppear {
+                if lastAuditedInterval < 0 {
+                    lastAuditedInterval = state.settings.slideshow.interval_seconds
+                }
+            }
+            .onChange(of: state.settings.slideshow.interval_seconds) { _, new in
+                scheduleIntervalAudit(new)
+            }
             Section("Display") {
                 Toggle("Show countdown", isOn: $state.settings.slideshow.show_countdown)
                 Toggle("Hide main window during slideshow", isOn: $state.settings.slideshow.hide_main_window)
@@ -317,6 +361,20 @@ private struct SlideshowSettingsView: View {
             }
         }
         .formStyle(.grouped)
+    }
+
+    /// slideshow.mdx §4.6 — typed input is clamped to the supported
+    /// range on commit. Non-numeric strings can't reach this binding
+    /// (SwiftUI's `.number` formatter rejects them and reverts the
+    /// field to the prior value automatically), so the only check we
+    /// need is range.
+    private func clampInterval() {
+        let v = state.settings.slideshow.interval_seconds
+        if v < 1 {
+            state.settings.slideshow.interval_seconds = 1
+        } else if v > 600 {
+            state.settings.slideshow.interval_seconds = 600
+        }
     }
 }
 

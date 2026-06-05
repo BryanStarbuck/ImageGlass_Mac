@@ -64,6 +64,12 @@ public enum DirectoriesYAML {
                     if it.negate {
                         out += "          negate: true\n"
                     }
+                    // `priority: 0` is the default; only emit when
+                    // non-default to keep `schema_version: 1` files
+                    // byte-identical (spec §3.6 lazy-upgrade).
+                    if it.priority != 0 {
+                        out += "          priority: \(it.priority)\n"
+                    }
                 }
             }
             if let walked = r.lastWalked {
@@ -236,6 +242,14 @@ public enum DirectoriesYAML {
             if let k = RootFilterItem.ItemKind(rawValue: value) { it.kind = k }
         case "negate":
             it.negate = (value == "true")
+        case "priority":
+            // `mcp_and_filters_on_dirs.mdx` §3.2 — clamped to
+            // -1000…1000 by `RootFilterItem.init`. Unparseable input
+            // silently falls back to the existing priority (0 by
+            // default for new items).
+            if let p = Int(value.trimmingCharacters(in: .whitespaces)) {
+                it.priority = max(-1000, min(1000, p))
+            }
         default: break
         }
     }

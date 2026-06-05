@@ -1,0 +1,1214 @@
+---
+title: Use Case — MCP-Driven Filters on Directories
+description: Voice-driven Claude-Code → MCP → ImageGlass_Mac walk-through for adding and removing include/exclude filters against all roots, a subset of roots, or a single root; the priority-ordered positive/negative filter model that lets a high-priority include override a lower-priority exclude; the canonical `_dn_` dark-mode carve-out scenario; the Directories-menu "Hide empty directories" toggle; the MCP self-describing manual (initialize.instructions + resource + tool descriptions) backed by a plain-text source-tree file; the background-thread processing contract that keeps walks, refilters, and FS-event reactions off the main actor; the main-thread block audit; and the memory-leak guardrails. Every scenario is paired with explicit on-screen, on-disk, and `log.log` verify steps.
+---
+
+# Use Case — MCP-Driven Filters on Directories
+
+This page is the **product + engineering specification** for the
+voice-driven Claude-Code → MCP → ImageGlass_Mac filter workflow. It is
+written as the user-facing companion to:
+
+* [MCP Server Support](../mcp.mdx) — the contract this scenario
+  exercises (now extended with priorities and per-item commands; see
+  §3 and §4).
+* [Automation](../automation.mdx) §1, §3, §5 — the charter for the
+  MCP server, scope controls, and MCP-driven editing.
+* [File List Panel](../list_of_files.mdx) §3A — the engine that owns
+  `directories.yaml`, the walker, the in-memory tree, and the
+  `RootFilter` evaluator that §3 extends.
+* [Directory Panel UI](../dir_ui.mdx) — the visible UI surface; §6
+  of this spec extends its Directories menu with the new
+  "Hide empty directories" toggle.
+* [Error Handling](../error_handling.mdx) §4.2 — the `log.log`
+  record format every MCP call in this tour produces.
+* [`mcp_file.mdx`](./mcp_file.mdx) — the older directory-panel tour
+  this document builds on. Where this spec extends a behavior, it
+  cross-references the matching `mcp_file.mdx` section.
+
+Where this document **adds** behavior to the codebase (priority on
+filter items, per-item filter MCP tools, the empty-directories
+toggle, the self-describing MCP manual, the background-thread
+contract), each section calls it out explicitly and lists the
+acceptance criteria in §12.
+
+---
+
+## 0. Common Preconditions
+
+These hold for every scenario unless a scenario explicitly overrides
+them. They are a strict superset of
+[`mcp_file.mdx`](./mcp_file.mdx) §0.
+
+* The desktop app is launched and the file panel is visible (left
+  side, *Browser* preset; see [panels.mdx](../panels.mdx) §7.2).
+* The `imageglass-mcp` sidecar is registered with Claude Code and
+  reachable (stdio transport; see [mcp.mdx](../mcp.mdx) §5).
+* Local Storage layout:
+
+  ```
+  ~/Library/Application Support/ImageGlass_Mac/
+  ├── directories.yaml         # the file tree panel's root list (§3A.1)
+  ├── settings.yaml            # small UI prefs (§6.4 hide-empty toggle lives here)
+  ├── heartbeat.txt            # main app's pid, refreshed every 30 s
+  └── logs/
+      └── log.log              # every MCP call lands here
+  ```
+
+* The user prefers **voice input** through Claude Code. Voice
+  transcription is upstream of this spec — Claude Code receives the
+  transcribed text, decomposes the intent into MCP tool calls, and
+  this spec governs what happens from there.
+* "Verify" means: read the named file (`cat`), look at the named
+  on-screen state, or read the named line of `log.log`. Each verify
+  step is a check a human or an XCUITest run can perform.
+
+---
+
+## 1. The Voice-Driven Workflow
+
+The user is on a Mac with ImageGlass_Mac running. They are in
+Claude Code in a terminal. They speak into Claude Code's voice
+prompt. The text below is the **exact intent decomposition**
+Claude Code is expected to do; the spec defines the contract on
+the MCP side so any conforming LLM client follows the same chain.
+
+### 1.1 The one-shot loop
+
+```
+USER:    "Hide every file with _dn_ in the name."   ◀── voice
+  ↓
+CLAUDE-CODE: parse intent → MCP tool to call
+  ↓
+MCP-CALL:  set_global_filter(filter={ items: [
+              { pattern: "*_dn_*", kind: glob, negate: true }
+            ] })
+  ↓
+MCP-SERVER (sidecar): canonicalize → validate → atomic YAML write
+  ↓
+APP (main process): kqueue + DistributedNotification wake →
+  in-memory refilter (§3A.7) → panel re-renders
+  ↓
+USER (sees, in <250 ms): the `_dn_` files disappear from the panel
+```
+
+The contract this spec **extends** beyond
+[`mcp_file.mdx`](./mcp_file.mdx):
+
+* **Filter items now carry priority** (§3.1). The voice intent
+  *"hide every `_dn_` file, but always show `hero_dn_logo.png`"*
+  becomes two items at different priorities — without priorities
+  the user could not express that exception.
+* **Per-item filter MCP tools** (§4.2 — `add_filter_item`,
+  `remove_filter_item`, `list_filter_items`) so voice can edit
+  filters incrementally rather than re-issuing the whole filter
+  block.
+* **A per-call `targets` argument** (§4.3) so a single MCP call
+  can target *all* roots, a *subset* of roots, or a *single* root
+  by name — without forcing the LLM to issue N separate calls.
+* **A self-describing manual** (§7) the MCP server returns at
+  initialize so Claude Code knows the command surface without
+  having to be re-trained per release.
+
+### 1.2 What Claude Code does *not* have to know
+
+The contract is designed so the LLM can be terse. It does **not**
+need to know:
+
+* The canonical YAML path. The MCP server handles that.
+* How to compile a regex. The LLM picks `kind: glob`,
+  `kind: substring`, or `kind: regex` and the server normalizes /
+  validates / compiles.
+* Whether the app is running. Every MCP response carries
+  `app_running` (§4.4) so the LLM can tell the user *"I wrote the
+  YAML; the app isn't running, so you'll see the change next time
+  you launch."*
+* The recursion semantics. Every root is walked recursively by
+  default; the user-visible `.../` shorthand is stripped at the
+  MCP boundary (§10B.1 of `mcp_file.mdx`).
+
+### 1.3 What Claude Code *must* know
+
+These are the things the LLM has to internalize per call. They
+are the rules the §7 self-describing manual encodes verbatim so
+the LLM can be re-grounded between releases without re-training.
+
+* **Subtractive intent → `negate: true`.** Verbs like *hide*,
+  *exclude*, *remove*, *skip*, *carve out*, *omit*, *get rid of*
+  all map to `negate: true`. Additive intent (*show only*, *keep*,
+  *include*) maps to `negate: false`.
+* **Exception intent → priority** (§3.1). Verbs like *but*,
+  *except*, *unless*, *always*, *override* are the signal that
+  the user wants an exception, which the engine expresses as a
+  higher-priority item that overrides a lower-priority one.
+* **Scope intent → `targets`** (§4.3). *"In JFK/UX"* → single
+  target. *"Everywhere"* / *"in every directory"* → `targets:
+  "all"`. *"In JFK/UX and Screenshots"* → list of two paths.
+
+---
+
+## 2. Filter Scope — File Kinds Already in Play
+
+Per [list_of_files.mdx §3A.3](../list_of_files.mdx#3a3-built-in-file-kind-filter),
+the panel hard-wires the universe of files it will ever consider
+to three UTI families:
+
+| Kind | UTI | Examples (non-exhaustive) |
+| --- | --- | --- |
+| `.image` | `public.image` | JPEG, PNG, HEIC, HEIF, WebP, AVIF, JXL, TIFF, GIF, BMP, RAW (NEF/CR3/DNG/ARW…). |
+| `.svg` | `public.svg-image` | SVG. |
+| `.video` | `public.movie` | MP4, MOV, M4V, HEVC, AVI, MKV. |
+
+These are the only kinds the `RootFilter` ever sees. Per-root
+filters cannot **widen** the universe to include `.txt` or `.zip`;
+they can only **narrow** within the three kinds. This is a
+deliberate design choice — the panel's job is image / SVG / video
+preview, and the kind filter is the contract that makes the
+preview surfaces in [`videos.mdx`](../videos.mdx) and
+[`svg.mdx`](../svg.mdx) safe to call.
+
+### 2.1 PDF — planned for v1.1
+
+PDF is **planned** but **not in v1**. The spec calls it out so
+the engine is designed to absorb it cleanly:
+
+* `FileKind` gains a fourth case `.pdf` with UTI `com.adobe.pdf`.
+* `FileKind.classify(uti:)` and `FileKind.classify(path:)` route
+  PDFs through the same gate.
+* A new preview surface (PDFKit `PDFView`) is registered on the
+  viewer canvas, analogous to the video / SVG cases.
+* Filter items work unchanged — patterns continue to match on
+  filename.
+
+Until v1.1 ships, PDFs are dropped at
+[`FileKind.classify`](../../code/Sources/ImageGlassCore/FileList/DirectoryTree.swift)
+the same way `.txt` and `.zip` are.
+
+---
+
+## 3. The Priority-Ordered Filter Model
+
+This section **extends** the filter shape in
+[list_of_files.mdx §3A.2](../list_of_files.mdx#3a2-schema). The
+existing `match` + `items[]` + `negate` shape is preserved; one
+new optional field — **`priority`** — is added to
+`filter.items[]`.
+
+### 3.1 Why priority
+
+Today the engine combines positive items by `match: any | all`
+and treats negative items as **vetoes** that always win. That
+covers the canonical cases (§7.0.1 of `mcp_file.mdx`) but cannot
+express:
+
+> *"Exclude every `_dn_` file (because they are dark-mode
+> exports), **but always keep `hero_dn_logo.png`** because it's
+> the one dark-mode export I actually want."*
+
+Today the user would have to remove `_dn_` from the file name of
+`hero_dn_logo.png`, or remove the carve-out entirely. Neither is
+what they asked for.
+
+**Priority** makes the exception expressible as a single second
+item: a higher-priority **positive** item whose match overrides a
+lower-priority **negative** item. The engine semantics are
+deterministic and easy to debug.
+
+### 3.2 Schema addition
+
+```yaml
+schema_version: 2                       # bumped from 1 — see §3.6
+root_directories:
+  - path: /Users/bryan/Pictures/tour/beach
+    filter:
+      match: any                         # default 'any' (OR) for positives
+      items:
+        - pattern: "*_dn_*"
+          kind: glob
+          negate: true                   # exclude
+          priority: 0                    # default if omitted
+        - pattern: "hero_dn_logo.png"
+          kind: glob
+          negate: false                  # include
+          priority: 10                   # higher number wins
+    last_walked: 2026-06-05T10:18:42Z
+```
+
+| Field | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `priority` | integer | `0` | Higher = more important. Range `-1000…1000`. Items with the **same** priority combine by the rules in §3.4. Items at **different** priorities resolve highest-first. |
+
+`schema_version: 1` files load unchanged — every item is treated
+as `priority: 0` at load time. `schema_version: 2` is written on
+the first save after the engine sees a non-default priority on
+any item (lazy upgrade — files that never use priority stay at
+`1` forever; see §3.6).
+
+### 3.3 Resolution algorithm
+
+For one filename, against one root's `items[]`:
+
+1. Group items by `priority`. Call the groups `G[p_0] >
+   G[p_1] > … > G[p_k]`, highest first.
+2. Walk groups in order. The **first group whose items match the
+   filename at all** decides the file's fate:
+   * Compute `positives_matched = OR/AND` (per `match`) of the
+     positive items **in that group only**.
+   * Compute `any_negative_matched = any(items where negate ==
+     true, that match the filename, in that group only)`.
+   * Apply the §3.4 rules to derive the verdict for the group.
+   * If the verdict is `included` or `excluded`, return it.
+   * If the verdict is `abstain` (the group's items did not
+     match the filename at all), fall through to the next-lower
+     group.
+3. Higher-priority tiers that abstain (no item match) fall
+   through to the next-lower tier. A higher-priority positive
+   is a pure *override* — it only commits a verdict when it
+   actually matches; it never narrows the result set.
+4. The **lowest** priority tier also applies the §7.0
+   **narrowing rule**: if it carries positive items and none of
+   them match (and no negative matched), the file is excluded.
+   A lowest tier with only negate items (or no items) and no
+   match includes the file. This is the rule that keeps every
+   §7.0.1 cookbook row passing — a single-tier filter IS the
+   lowest tier.
+
+### 3.4 Per-group verdict rules
+
+Within a single priority group (one tier):
+
+| Positives in group | Negatives in group | Verdict for a **non-lowest** tier | Verdict for the **lowest** tier |
+| --- | --- | --- | --- |
+| 0 items | 0 items | abstain | included |
+| ≥ 1, none match | 0 items | abstain | **excluded** (§7.0 narrow) |
+| ≥ 1, none match | ≥ 1, none match | abstain | **excluded** (§7.0 narrow) |
+| ≥ 1, **match** under `match` rule | 0 items | included | included |
+| ≥ 1, **match** under `match` rule | ≥ 1, none match | included | included |
+| any | ≥ 1, **at least one matches** | excluded | excluded |
+| 0 items | ≥ 1, none match | abstain | included |
+
+The rule of thumb: **within a tier, negative wins.** Higher
+tiers are pure overrides — they end the search only when they
+match. The lowest tier additionally narrows: positives present
+but no match ⇒ excluded.
+
+### 3.5 Worked examples
+
+**Example A — `_dn_` carve-out with a hero override.** Items
+from §3.2:
+
+* `priority=10`: `hero_dn_logo.png` (include).
+* `priority=0`: `*_dn_*` (exclude).
+
+| Filename | priority=10 tier | priority=0 tier | Verdict |
+| --- | --- | --- | --- |
+| `hero_dn_logo.png` | matches positive → included | (not reached) | **included** |
+| `card_dn_thumb.jpg` | abstain (no match) | matches negative → excluded | **excluded** |
+| `peak.jpg` | abstain | abstain | falls to §7.0 special case → **included** (no positive items match, no negative either) |
+
+**Example B — multiple priorities stacked.** A photographer
+wants to: (1) prefer hand-curated `_HERO_` files always; (2)
+otherwise prefer `.jpg`; (3) otherwise show everything; (4) but
+always carve out `_DRAFT_`.
+
+* `priority=20`: `*_HERO_*` (include).
+* `priority=10`: `*.jpg` (include).
+* `priority=0`: `*_DRAFT_*` (exclude).
+
+`shoot_HERO_001.dng` → tier 20 includes. `shoot_002.jpg` → tier
+20 abstains, tier 10 includes. `shoot_003.dng` → tier 20 and
+tier 10 abstain (higher-priority positives are *overrides* and
+do not narrow); the lowest tier (priority 0) has only the
+`_DRAFT_` negate item — positives.isEmpty there — so the
+lowest tier's no-match branch includes the file. **Included.**
+`shoot_001_DRAFT_.png` → tier 20 abstains, tier 10 abstains,
+tier 0 negate matches → **excluded**.
+
+### 3.6 Backwards compatibility
+
+* Reading `schema_version: 1`: every item is loaded with
+  `priority: 0`. Behavior is **identical** to today — verified
+  by re-running the cookbook in
+  [§7.0.1 of mcp_file.mdx](./mcp_file.mdx#701-use-case--filter-item-cookbook)
+  unchanged.
+* Writing: stays at `schema_version: 1` until the engine sees a
+  non-default priority. On the first save with any item where
+  `priority != 0`, the writer bumps to `schema_version: 2` and
+  records every item's priority — including the implicit `0`s,
+  for clarity in `git diff`.
+* MCP responses: the `filter` object in `get_directory` /
+  `list_directories` output **always** includes `priority`
+  starting with the v2 surface, even when the YAML omits it.
+  This avoids ambiguity for an LLM reading the panel state.
+
+---
+
+## 4. MCP Command Surface — Bulk and Per-Item
+
+This section **extends** the MCP tool list in
+[list_of_files.mdx §3A.10](../list_of_files.mdx#3a10-mcp-tools-for-the-file-tree)
+with three new per-item filter tools and a new `targets`
+argument on the bulk tools. The existing tools are preserved
+1:1; nothing in `mcp_file.mdx` §4–§10 changes.
+
+### 4.1 Tool list (full)
+
+Tools already specified in `mcp_file.mdx` §3A.10:
+
+* `list_directories()` — no change.
+* `get_directory(path)` — no change (now returns `priority` per
+  §3.6).
+* `add_directory(path, filter?)` — no change.
+* `remove_directory(path)` — no change.
+* `clear_directories()` — no change.
+* `update_directory_filter(path, filter)` — no change.
+* `set_global_filter(filter)` — **extended** with `targets` (§4.3).
+* `reveal_directory(path)` — no change.
+* `refresh_directory(path?)` — no change.
+
+New in this spec:
+
+| Tool | Purpose |
+| --- | --- |
+| `add_filter_item(targets, item)` | Append **one item** to the filter on the targeted root(s). Idempotent: an identical item (same `pattern` + `kind` + `negate` + `priority`) is not duplicated. |
+| `remove_filter_item(targets, match)` | Remove items matching the criterion (`pattern` exact, or `id`, or a regex over `pattern`). |
+| `list_filter_items(targets?)` | Return the merged filter view across one / many / all roots, in priority order. |
+| `set_hide_empty_directories(enabled)` | Toggle the §6 hide-empty-directories preference. |
+| `get_hide_empty_directories()` | Read the toggle state. |
+
+### 4.2 Per-item tools — schemas
+
+```jsonc
+// add_filter_item
+{
+  "targets": "all",          // or single path string, or array of paths
+  "item": {
+    "pattern": "*_dn_*",
+    "kind":    "glob",        // optional, default "glob"
+    "negate":  true,          // optional, default false
+    "priority": 0             // optional, default 0
+  }
+}
+```
+
+```jsonc
+// remove_filter_item
+{
+  "targets": "all",
+  "match": {
+    "pattern": "*_dn_*"       // exact-pattern match; one of these required
+    // or "id":      "abc123"  // server-assigned stable id (§4.5)
+    // or "regex":   ".*_dn_.*"
+  }
+}
+```
+
+```jsonc
+// list_filter_items
+{
+  "targets": "all"            // optional; default "all"
+}
+// returns:
+{
+  "items_by_root": {
+    "/Users/bryan/Pictures/tour/beach": [
+      { "id": "f1a2b3", "pattern": "*_dn_*", "kind": "glob",
+        "negate": true, "priority": 0 }
+    ]
+  }
+}
+```
+
+### 4.3 The `targets` argument
+
+`targets` is the same shape on every tool that has it. It is
+how voice intents like *"in JFK/UX"*, *"in JFK/UX and
+Screenshots"*, *"everywhere"* are passed as a single MCP call
+instead of N calls.
+
+| Value | Meaning |
+| --- | --- |
+| `"all"` (string) | Apply to **every** root in `directories.yaml`. Equivalent to today's `set_global_filter` when used on the bulk tools. |
+| `"<absolute path>"` (string) | Apply to **one** root. Equivalent to today's `update_directory_filter`. The path is canonicalized at the MCP boundary; `~`, symlinks, and trailing slashes are resolved before matching. |
+| `["<path1>", "<path2>"]` (array) | Apply to **the listed** roots. Each path is canonicalized and matched against `root_directories[]`. If any listed path is not a registered root, the entire call returns `ok=false err=unknown_root` — partial application is **not** allowed (§4.6). |
+
+For bulk tools (`set_global_filter`,
+`update_directory_filter`), the existing per-tool argument
+shape is preserved for backwards compatibility, and `targets`
+is **additionally** accepted to unify the surface. When both
+forms are present the call returns
+`ok=false err=conflicting_arguments`.
+
+### 4.4 Response envelope
+
+Every MCP call from this spec returns a JSON body that includes
+at minimum:
+
+```jsonc
+{
+  "ok": true,
+  "corr": "ab12cd34",
+  "app_running": true,
+  "targets_applied": ["/Users/.../JFK/UX"],
+  // … tool-specific fields
+}
+```
+
+| Field | Notes |
+| --- | --- |
+| `corr` | 8-char correlation id. Appears in every `log.log` line related to this call so the auditor can re-stitch the chain. |
+| `app_running` | Result of the §0 heartbeat probe. `false` means the YAML was written but no live panel was updated (the change applies at next launch). |
+| `targets_applied` | The canonicalized roots the engine actually applied to. For `targets: "all"`, the array enumerates every root the engine touched. |
+
+### 4.5 Item ids
+
+The server assigns each item a **stable 6-character id** when
+it lands in `directories.yaml`. The id is the first 6 hex chars
+of `SHA1(pattern + kind.rawValue + negate + priority)`. The id
+is **stable across saves** — a re-write of the same item gets
+the same id. This lets `remove_filter_item` reference an item
+by id when the pattern is hard to express in plain text, and
+lets `list_filter_items` produce a stable identifier the LLM
+can pass back.
+
+Ids are written into YAML on save:
+
+```yaml
+items:
+  - id: a1b2c3
+    pattern: "*_dn_*"
+    kind: glob
+    negate: true
+```
+
+The `id` field is **read but optional** — files that omit it
+load fine; the engine assigns ids as soon as it touches the
+item.
+
+### 4.6 Atomicity
+
+Every multi-root mutation (`targets: "all"`, `targets: [array]`)
+is atomic across roots. The engine:
+
+1. Computes the new state for each targeted root in memory.
+2. Writes the full new `directories.yaml` once, atomically
+   (temp file + `rename(2)`).
+3. Emits one `tool=mcp.*` audit line that lists every
+   `targets_applied` path.
+4. Emits one `app=directory.refilter roots=N` line.
+
+There is **no** mode where some roots got the update and others
+did not. If any single target fails validation (unknown root,
+invalid regex, path separator in pattern), **no** root is
+modified.
+
+### 4.7 The `imageglass-mcp` sidecar and the desktop app
+
+The MCP sidecar runs as a separate OS process. The desktop app
+runs as a different process. The contract for crossing that gap
+(unchanged from
+[list_of_files.mdx §3A.1](../list_of_files.mdx#3a1-directoriesyaml)):
+
+* The sidecar writes `directories.yaml` atomically.
+* The sidecar posts a Darwin distributed notification
+  (`MCPNotificationBus.directoriesChangedNotificationName`,
+  `deliverImmediately: true`).
+* The desktop app's main process listens on that notification
+  *and* watches the directory with kqueue (`FileWatcher`, 250 ms
+  debounce) as a fallback.
+* On every change, the desktop app reads `directories.yaml`,
+  diffs against its in-memory state, and routes per the
+  reconcile table in §3A.1.
+
+Per-item tools (§4.2) re-use the same crossing — they edit
+`directories.yaml` and notify exactly like the bulk tools. The
+desktop app sees them as a normal `refilter` event because the
+diff falls into the *Root in both, filter changed* row.
+
+---
+
+## 5. Worked Scenarios — Voice → MCP Calls
+
+Each scenario is one user utterance. The contract is:
+
+1. **Voice text** — what the user says.
+2. **Intent decomposition** — how Claude Code (or any conforming
+   LLM client) breaks the utterance into structured fields.
+3. **MCP call** — the exact tool invocation.
+4. **Verify** — the on-disk + on-screen + log proof.
+
+### 5A. "Hide every file with `_dn_` in the name."
+
+**Intent decomposition.**
+
+| Voice fragment | Becomes |
+| --- | --- |
+| "Hide every file with…" | subtractive → `negate: true` |
+| "…in the name" | filename matching, not path matching (the engine default — see [mcp_file.mdx §10B.8](./mcp_file.mdx#10b8-filename-vs-path-matching--what-the-engine-compares)) |
+| "`_dn_`" | substring marker → `pattern: "*_dn_*"`, `kind: glob` |
+| (scope unspecified) | default to `targets: "all"` per §4.3 |
+| (priority unspecified) | default to `priority: 0` |
+
+**MCP call.**
+
+```
+set_global_filter(filter={
+    "items": [
+        { "pattern": "*_dn_*", "kind": "glob", "negate": true }
+    ]
+})
+```
+
+or, equivalently with the new per-item form (preferred when the
+filter already has other items the user does not want to
+clobber):
+
+```
+add_filter_item(
+    targets="all",
+    item={ "pattern": "*_dn_*", "kind": "glob", "negate": true }
+)
+```
+
+The two are not interchangeable in general:
+`set_global_filter` **replaces** the filter; `add_filter_item`
+**appends** to it. The §7 manual flags this difference loudly
+because the LLM can otherwise pick the wrong tool when the user
+says *"also exclude…"*.
+
+**Verify.**
+
+* `directories.yaml` shows the item on every root.
+* On screen: every `*_dn_*` file disappears from the panel.
+* `log.log`:
+
+  ```
+  ts=… tool=mcp.set_global_filter items=1 negate_items=1 targets=all corr=… ok=true
+  ts=… app=directory.refilter roots=<N> visible_delta=<-K> elapsed_ms=… corr=…
+  ```
+
+### 5B. "…but always keep `hero_dn_logo.png`."
+
+**Continuation of 5A.** The user follows up with the exception
+case. The §1.3 rule "*but* / *except* / *always* signals
+priority" fires.
+
+**Intent decomposition.**
+
+| Voice fragment | Becomes |
+| --- | --- |
+| "…but always keep `hero_dn_logo.png`" | exception → higher-priority `negate: false` item |
+| "always" | explicit override → `priority: 10` (the canonical "single-step-above-default" value the manual recommends) |
+| `hero_dn_logo.png` | exact filename → `pattern: "hero_dn_logo.png"`, `kind: glob` (no wildcards required) |
+
+**MCP call.**
+
+```
+add_filter_item(
+    targets="all",
+    item={
+        "pattern":  "hero_dn_logo.png",
+        "kind":     "glob",
+        "negate":   false,
+        "priority": 10
+    }
+)
+```
+
+**Verify.**
+
+* `directories.yaml` shows the new high-priority item on every
+  root, alongside the §5A item.
+* On screen: `hero_dn_logo.png` is back in the panel.
+  Every other `*_dn_*` file remains hidden.
+* `log.log`:
+
+  ```
+  ts=… tool=mcp.add_filter_item targets=all items_added=1 corr=… ok=true
+  ts=… app=directory.refilter roots=<N> visible_delta=+1 elapsed_ms=… corr=…
+  ```
+
+### 5C. "In JFK/UX only, also exclude `_WIP_` files."
+
+**Intent decomposition.**
+
+| Voice fragment | Becomes |
+| --- | --- |
+| "In JFK/UX only" | single-root targeting → `targets: "<absolute path>"` |
+| "also" | **append**, not replace → `add_filter_item` |
+| "exclude" | subtractive → `negate: true` |
+| "`_WIP_`" | substring marker → `pattern: "*_WIP_*"`, `kind: glob` |
+
+**MCP call.**
+
+```
+add_filter_item(
+    targets="~/BGit/work/into_Work/StarbuckLabs/JFK/UX",
+    item={ "pattern": "*_WIP_*", "kind": "glob", "negate": true }
+)
+```
+
+**Verify.**
+
+* `directories.yaml`: only the JFK/UX root has the new item;
+  the other roots are unchanged.
+* On screen: `*_WIP_*` files vanish under JFK/UX, are still
+  visible elsewhere.
+* `log.log`:
+
+  ```
+  ts=… tool=mcp.add_filter_item targets=/Users/…/JFK/UX items_added=1 corr=… ok=true
+  ts=… app=directory.refilter roots=1 visible_delta=<-K> elapsed_ms=… corr=…
+  ```
+
+### 5D. "Drop the `_WIP_` rule everywhere."
+
+**Intent decomposition.**
+
+| Voice fragment | Becomes |
+| --- | --- |
+| "Drop the … rule" | remove a filter item → `remove_filter_item` |
+| "`_WIP_`" | exact-pattern match against existing items → `match: { pattern: "*_WIP_*" }` |
+| "everywhere" | every root → `targets: "all"` |
+
+**MCP call.**
+
+```
+remove_filter_item(
+    targets="all",
+    match={ "pattern": "*_WIP_*" }
+)
+```
+
+**Verify.**
+
+* `directories.yaml`: the item is gone from every root that had
+  it. Roots that never had it are unchanged.
+* On screen: `*_WIP_*` files reappear under JFK/UX.
+* `log.log`:
+
+  ```
+  ts=… tool=mcp.remove_filter_item targets=all items_removed=<K> corr=… ok=true
+  ts=… app=directory.refilter roots=<N> visible_delta=+<K> elapsed_ms=… corr=…
+  ```
+
+### 5E. "Show me every filter currently active."
+
+**Intent decomposition.**
+
+| Voice fragment | Becomes |
+| --- | --- |
+| "Show me every filter" | read intent → `list_filter_items` |
+| "currently active" | every root → `targets: "all"` (default) |
+
+**MCP call.**
+
+```
+list_filter_items()
+```
+
+The MCP response carries the per-root items sorted by priority
+(highest first), with ids, so the user can follow up with a
+targeted `remove_filter_item(match={ id })`. Voice → "Now drop
+the highest-priority one for JFK/UX" → the LLM passes the id
+straight through.
+
+---
+
+## 6. Hide Empty Directories — Directories Menu Toggle
+
+The user requested an **on/off toggle** in the Directories
+menu that, when on, hides directory rows whose recursive
+descendants contain zero files with `passesFilter == true`.
+This is a UI-layer cosmetic — it does **not** delete or alter
+data, and does **not** affect what is in `directories.yaml`.
+
+### 6.1 The toggle
+
+Menu placement (extends
+[list_of_files.mdx §3A.8](../list_of_files.mdx#3a8-directories-menu-and-hotkeys)):
+
+| Menu item | Default hotkey | Action |
+| --- | --- | --- |
+| Hide Empty Directories | ⌥⌘E | Toggles the preference. Checked = on; the panel hides directory rows with zero visible descendants. |
+
+Persistence: stored in `settings.yaml` (not `directories.yaml`,
+because it's a per-user UI preference, not a per-scope rule).
+Schema:
+
+```yaml
+schema_version: 1
+ui:
+  panel:
+    hide_empty_directories: true        # default false
+```
+
+### 6.2 Rendering rule
+
+In the file tree view (`OutlineGroup`):
+
+* For each `.directory` node, compute
+  `visibleDescendantCount = recursive count of .file children
+  where passesFilter == true`.
+* If `hide_empty_directories == true` **and**
+  `visibleDescendantCount == 0`, the row is skipped.
+* The root row of a registered root directory is **always**
+  shown, even when empty. Hiding the root would make the user
+  think it had been removed. The empty-root case renders the
+  root with an inline "no files match" placeholder under it
+  (so the user sees the root is in scope but currently empty).
+
+The count is cached on the `.directory` node alongside
+`children`. When the filter is recomputed (§3A.7), the count
+is recomputed in the same in-memory traversal — no extra walk.
+
+### 6.3 MCP surface
+
+The toggle is exposed via the two tools added in §4.1:
+
+* `set_hide_empty_directories(enabled: bool)` — write.
+* `get_hide_empty_directories()` — read.
+
+Both are journaled to `log.log` like every other MCP call:
+
+```
+ts=… tool=mcp.set_hide_empty_directories enabled=true corr=… ok=true
+ts=… app=panel.refresh reason=hide_empty_changed corr=…
+```
+
+### 6.4 Voice scenario
+
+```
+USER:     "Hide all the empty folders in the panel."
+
+CLAUDE-CODE → MCP:
+  set_hide_empty_directories(enabled=true)
+
+VERIFY:
+  • settings.yaml: ui.panel.hide_empty_directories: true
+  • on screen: directory rows with no visible files collapse out of the
+    outline; root rows remain visible (per §6.2)
+  • log.log: tool=mcp.set_hide_empty_directories enabled=true corr=… ok=true
+```
+
+---
+
+## 7. The Self-Describing MCP Manual
+
+**Question the user asked:** can the MCP server hand the
+client (Claude Code) a manual of what commands exist and how
+to use them, so a voice interaction can be re-grounded without
+human re-training?
+
+**Answer: yes — confirmed.** The Model Context Protocol
+explicitly defines a field on the `initialize` response for
+this purpose, and additionally supports `resources/*` as a
+richer document surface. v1 uses **both** layers because some
+clients (notably Claude Desktop, historically) have ignored
+the `instructions` field; serving the same content as a
+resource ensures the LLM can always fetch it on demand.
+
+### 7.1 Three surfaces, one source of truth
+
+Every layer renders from a **single plain-text file** in the
+source tree (§7.4) so the manual is reviewable, diff-able, and
+version-controlled.
+
+| Layer | Where the LLM sees it | When it's useful |
+| --- | --- | --- |
+| `initialize.instructions` | Returned in the MCP `initialize` response. Clients that honor the field feed it into the model's system prompt at session start. | First-impression context. Always shown to compliant clients (Claude Code). |
+| `resources/list` + `resources/read` | Listed as a resource named `imageglass-mcp://manual`; readable by `resources/read`. | The fallback for clients that ignore `instructions`, and the on-demand re-fetch path for long sessions where the system prompt has been compacted. |
+| Tool descriptions (`tools/list`) | Each tool's `description` field. | Per-tool guidance the LLM sees on every tool call. The §4 tools all have rich descriptions today; the per-item tools added in this spec follow the same convention. |
+
+### 7.2 What the manual contains
+
+The manual is short — under 1500 words — and organized so the
+LLM can find what it needs from a partial recall. Required
+sections, in order:
+
+1. **One-line server purpose.** "ImageGlass_Mac — Mac-native
+   image viewer with MCP-driven directory and filter
+   management."
+2. **Key capabilities.** A bullet list mapping voice-style
+   intents to tool names — *"Add a directory to the panel" →
+   `add_directory`*, *"Hide files matching a pattern" →
+   `add_filter_item` (negate=true) or `set_global_filter`*,
+   etc.
+3. **Verb-to-field cookbook.** The §1.3 mappings (subtractive
+   → `negate: true`; exception → priority; scope words →
+   `targets`).
+4. **Filter priority semantics.** The §3.3 algorithm, in two
+   paragraphs the LLM can recite.
+5. **Common gotchas.**
+   * `set_global_filter` **replaces**; `add_filter_item`
+     **appends**. The LLM must read the user's verb (*also*
+     / *now only*) to pick.
+   * Patterns match the **filename**, not the path. The
+     `.../` prefix is shorthand stripped at the boundary
+     (§10B.1 of `mcp_file.mdx`).
+   * `priority` is integer. Higher wins. `0` is default.
+     Use `10` for a single-step override; reserve `100+`
+     for "this rule must always win."
+6. **Performance expectations.** Walks are background; bulk
+   refilters complete in tens of ms on a 250k-file scope;
+   MCP responses return in < 5 ms.
+7. **Failure modes.** The error codes from §3A.10 and the new
+   §4 tools, each in one line.
+
+### 7.3 Pointer in `initialize`
+
+The MCP `initialize` response carries:
+
+```jsonc
+{
+  "protocolVersion": "2025-03-26",
+  "capabilities":    { "tools": {}, "resources": {} },
+  "serverInfo": {
+    "name":    "imageglass-mcp",
+    "version": "0.2.0"
+  },
+  "instructions": "<the full content of mcp_manual.txt>"
+}
+```
+
+`instructions` is a free-text string. Token cost is the user's
+to bear, but the file is short by design (§7.2).
+
+### 7.4 The source-tree file
+
+The canonical source is one plain-text file checked into the
+repository:
+
+```
+code/Sources/ImageGlassCore/MCP/mcp_manual.txt
+```
+
+* Plain text (no markdown — the field is fed verbatim into the
+  LLM system prompt; markdown rendering is the client's
+  problem).
+* Reviewable in PRs.
+* Bundled into the `imageglass-mcp` binary via Swift Package
+  Manager **resources** (declared on the target) so the
+  sidecar can read it at startup with `Bundle.module.url(...)`.
+* Read once at startup, cached in memory; the read is the only
+  filesystem touch per session.
+
+### 7.5 Resource surface
+
+`resources/list` returns one resource:
+
+```jsonc
+{
+  "resources": [
+    {
+      "uri":      "imageglass-mcp://manual",
+      "name":     "ImageGlass MCP Manual",
+      "mimeType": "text/plain",
+      "description": "Operational manual: tools, verb cookbook, priorities."
+    }
+  ]
+}
+```
+
+`resources/read` with `uri: imageglass-mcp://manual` returns
+the same content as `initialize.instructions`. The two are
+guaranteed identical — both render from the same in-memory
+copy of `mcp_manual.txt` loaded at startup.
+
+### 7.6 Update workflow
+
+When the spec changes the MCP surface (a tool is added, a
+priority semantic shifts, a failure mode is renamed):
+
+1. The contributor edits `mcp_manual.txt` in the same PR that
+   changes the code.
+2. The PR review checklist includes "manual updated" the same
+   way it includes "tests updated."
+3. The MCP server's `serverInfo.version` is bumped (semver:
+   minor on additive changes, major on breaking).
+4. A unit test (`MCPManualTests`) reads the bundled
+   `mcp_manual.txt`, scans it for the names of every tool in
+   `MCPTools.allDescriptors()`, and fails the build if any
+   tool name does not appear in the manual. This is the
+   guard that keeps the manual from drifting.
+
+### 7.7 Confirmation back to the user
+
+The feasibility check the user explicitly requested:
+
+> *"Enable web search to see if we can go create one … Confirm
+> back to me if that is possible or if that is impossible."*
+
+**Confirmed: it is possible**, and §7.1–§7.6 above is the
+shipping design. Web search verified that:
+
+* The MCP specification defines an `instructions` field on
+  the `initialize` result, intended as exactly the "operational
+  manual" surface the user described.
+* Some clients ignore it, which is why this spec also serves
+  the same content as an MCP resource — a belt-and-suspenders
+  design.
+* Tool `description` fields are a third independent surface
+  every conforming client honors; the §4 tools already use
+  them at length.
+
+---
+
+## 8. Background-Thread Processing Contract
+
+The user's requirement, in their words: *"It can go do larger-scale
+computation. It might be that we add filters, and it's going to go
+sit there and apply the filters all the way across a very deep
+hierarchy of 7,000 images over a big directory hierarchy. That can
+happen in the background thread and not block the user interface
+thread."*
+
+This section pins that into a contract.
+
+### 8.1 What runs where
+
+| Work | Where it runs | Why |
+| --- | --- | --- |
+| MCP tool dispatch (parse, validate, write YAML, atomic save) | `Task.detached(priority: .userInitiated)` in the sidecar process | MCP calls are small; user-initiated priority matches the LLM's expectation of low-latency response. |
+| Walking a root directory (`FileManager.enumerator`, UTI lookup) | `Task.detached(priority: .utility)` on the **desktop-app** side, inside the `DirectoryTreeWalker` actor | I/O bound, latency-tolerant, must not contend with the viewer's main-actor render. |
+| Building the in-memory `DirectoryNode` tree | Same `Task.detached(priority: .utility)` as the walk | The tree-build is the second half of the walk — same task, same priority. |
+| Filter re-evaluation across all in-memory nodes (`recomputePassesFilter`) | `Task.detached(priority: .utility)` | Even on a 250 k node tree the re-eval is in-memory only; off-main keeps the 60/120 Hz frame budget intact. |
+| `FSEventStream` callback handling | The stream's dedicated dispatch queue (`DispatchQueue(label: "...fsevents", qos: .utility)`) | The system delivers events on the queue we pass in; we keep it off main. |
+| Reconcile (`FileWatcher` kqueue callback → diff `directories.yaml`) | `Task.detached(priority: .utility)` inside the watcher's dispatch source | Same reason as filter re-eval. |
+| Rendering the panel | `@MainActor` — SwiftUI / AppKit | Required by AppKit / SwiftUI. |
+| Selection + viewer load | `@MainActor` | Required. |
+| MCP audit logging | `Task.detached(priority: .utility)`, queued | `appendingFileHandle` writes are fast but we batch through a serial actor to avoid head-of-line blocking. |
+
+### 8.2 The contract, in five rules
+
+1. **No I/O on `@MainActor`.** No `FileManager.enumerator`,
+   no `Data(contentsOf:)`, no synchronous `Process.run`, no
+   `kill(2)` (yes — `appIsRunning()` belongs off main; see
+   §9.1) inside any `@MainActor` function. The compiler does
+   not enforce this; the §9 audit does.
+2. **No CPU-bound loops on `@MainActor`.** Any traversal of
+   `DirectoryNode` whose worst case exceeds 1 ms (the panel
+   has < 250 k nodes; the in-memory traversal of that is
+   ~50–100 ms) must be hopped to a `Task.detached`.
+3. **Walks are cancellable.** Every `Task.detached` started
+   by the walker honors `Task.checkCancellation()` between
+   batches. When a new MCP call obsoletes an in-flight walk
+   (e.g. user removes a root mid-walk), the walker calls
+   `Task.cancel()` and discards the partial tree.
+4. **Snapshots, not shared mutable state, cross the actor
+   line.** When the `@MainActor` panel needs the tree, it
+   asks the walker actor for a `snapshot()` of immutable
+   value types (`[RootDirectory]`). It never holds a
+   reference into the walker's internal mutable storage.
+5. **One refilter at a time per root.** A `Set<URL>` of
+   "refilter in flight" roots guards re-entry; a second
+   request for the same root cancels the first and starts a
+   new one. This is how a rapid sequence of voice commands
+   ("hide `_dn_`", "also hide `_WIP_`", "remove `_dn_`")
+   never queues up 3 stale refilters.
+
+### 8.3 Cancellation guarantees
+
+* `add_directory` followed by `remove_directory` for the same
+  path within < 500 ms cancels the still-running walk (the
+  walker discards the partial tree). One `app=directory.walk
+  status=cancelled corr=…` line is written.
+* `set_global_filter` issued twice in quick succession on the
+  same root cancels the first refilter. One
+  `app=directory.refilter status=superseded corr=…` line is
+  written for the discarded run.
+* App quit: every detached task is given 500 ms to honor
+  cancellation before the process exits. After 500 ms the
+  task is abandoned; any unflushed audit lines are lost
+  (audit lines are best-effort).
+
+### 8.4 Live MCP responses while work is in flight
+
+The user's expected feel: *"You can speak more voice commands
+while a big walk is still running, and they apply on top of
+the running state."*
+
+Per §8.3, this is automatic — the walker's snapshot is always
+the most-recent committed state, and every MCP call writes
+YAML synchronously before returning. The LLM never sees a
+"still walking, try again" failure. The longest a voice
+command can be queued behind a walk is the YAML write
+latency itself (~1 ms for atomic temp-file + rename).
+
+### 8.5 7000-file hierarchy budget
+
+The user's concrete number — 7000 images over a deep
+hierarchy — sets the latency targets the implementation must
+hit:
+
+| Operation | Target on 7000-file scope | Hard cap |
+| --- | --- | --- |
+| First walk after `add_directory` | < 1.5 s on Apple Silicon | 5 s |
+| In-memory refilter after a `set_global_filter` | < 50 ms | 200 ms |
+| FSEventStream batched callback (250 ms debounce) | < 100 ms per batch | 500 ms |
+| MCP `add_filter_item` end-to-end | < 5 ms (no walk; in-memory refilter is async after the response) | 20 ms |
+| Panel re-render after refilter | < 1 frame at 60 Hz (16 ms) | 2 frames |
+
+These are wired into the §11 test suite as performance
+gates.
+
+---
+
+## 9. Main-Thread Block Audit
+
+A guard rail: every PR that touches the file panel, MCP, or
+walker is scanned by a small lint pass that catches the
+common ways large work can sneak onto the main actor.
+
+### 9.1 The audit checks
+
+| Pattern | Rationale | How it's flagged |
+| --- | --- | --- |
+| `FileManager.default.enumerator(at:)` inside a `@MainActor` function | Synchronous filesystem walk on main | Lint rule: `@MainActor` + `enumerator(at:` → fail. |
+| `try Data(contentsOf:)` on any URL inside `@MainActor` | Blocking disk I/O on main | Lint rule. |
+| `kill(_:_:)`, `pidof`, `Process.run` on `@MainActor` | Syscalls / spawn on main | Lint rule. The existing `appIsRunning()` (which calls `kill`) lives in the sidecar process — already off the desktop-app main actor — but the rule still flags any future use on main. |
+| Any `for in` over `DirectoryNode` recursion on `@MainActor` | Likely CPU-bound traversal on main | Lint rule: walking `DirectoryNode` on main triggers a warning that points at §8.2 rule 2. |
+| `Thread.sleep` on `@MainActor` | Blocks the run loop | Lint rule. |
+| `DispatchQueue.main.sync` from non-main | Classic deadlock pattern | Lint rule. |
+
+The lint pass is a SwiftSyntax-based scanner that runs in CI
+on every PR (the same way `swift-format` does). False
+positives are rare because the targets are very specific.
+
+### 9.2 Instrumentation in production
+
+In `Debug` builds the panel installs a `MainActor` watcher
+that records the elapsed wall-clock time of every
+`@MainActor` task; tasks that exceed 16 ms (one 60 Hz frame)
+log a `app=ui.main_block elapsed_ms=… stack=…` line so a
+developer running the app can spot regressions without
+attaching a profiler.
+
+`Release` builds do **not** include the watcher — the cost
+is small but nonzero and would otherwise be paid by every
+user.
+
+### 9.3 The Instruments template
+
+Engineering ships a `.tracetemplate` under
+`code/Tools/Instruments/ImageGlass-MainActor.tracetemplate`
+that pre-configures Instruments with Time Profiler +
+Hangs + System Trace, scoped to the
+`com.starbuck.imageglass` bundle id. The
+acceptance test (§11) requires this template to find zero
+hangs > 16 ms during a five-minute scripted MCP exercise of
+the §5 scenarios.
+
+---
+
+## 10. Memory Leak Prevention
+
+### 10.1 Where leaks are most likely
+
+| Subsystem | Leak risk | Mitigation |
+| --- | --- | --- |
+| `FSEventStream` per root | If the stream is created but `FSEventStreamRelease` / `FSEventStreamInvalidate` is never called, the system buffers events indefinitely | Every `RootDirectory` owns its `FileSystemWatcher`; the watcher's `deinit` calls invalidate + release. `removeRoot` deterministically tears the watcher down. A test asserts `FileSystemWatcher.activeCount` returns to zero across add → remove. |
+| Captured `self` in `Task.detached { … }` | The task retains the actor until completion; long-running tasks pin large object graphs | All long-running tasks capture `[weak self]` and exit early on `self == nil`. |
+| Captured `self` in `FSEventStream` callbacks | Callbacks live as long as the stream | The watcher takes a weak reference to the walker actor at construction and `guard let walker = self.walker else { return }` at the top of the callback. |
+| In-memory `DirectoryNode` trees of removed roots | A SwiftUI view holding the snapshot can keep an outdated tree alive | The view model exposes only the most-recent `snapshot()`; the previous snapshot is released as soon as the new one assigns into the `@Published` property. |
+| MCP audit log file handle | A long-running sidecar accumulating a handle | The audit logger uses a single `FileHandle` opened once at startup and closed on `atexit` via `signal(SIGTERM)` / `signal(SIGINT)` handlers. The bytes-written counter is exposed for tests. |
+| Notification observers | `NotificationCenter.addObserver(forName:object:queue:using:)` leaks unless the returned token is held and removed | Every observer is held in a `[NSObjectProtocol]` on the owning object; `deinit` removes each one. |
+
+### 10.2 Continuous testing
+
+* **`xctest` leak run.** A `MemoryLeakTests.testFullCycle()`
+  test does add → walk → filter → remove on a 7000-file
+  fixture (under `code/Tests/Fixtures/`) ten times in a
+  loop and asserts:
+  * `FileSystemWatcher.activeCount == 0` after each iteration.
+  * `DirectoryTreeWalker.snapshot().isEmpty == true` after each
+    iteration.
+  * `MallocStackLogging` allocation snapshot delta is below a
+    fixed budget per iteration.
+* **`leaks(1)` in CI.** The notarization workflow runs
+  `leaks <pid>` against a launched dev build after the
+  scripted §5 voice exercise. Any leak > 4 KiB fails the build.
+
+### 10.3 Strict concurrency
+
+Swift 6's strict concurrency is enabled at the package level.
+Captures of non-`Sendable` types into `Task.detached` are a
+compile-time error, which closes most of the captured-`self`
+leak vectors. The remaining vectors are the explicit
+`unowned`/`weak` reference patterns above.
+
+---
+
+## 11. End-to-End Acceptance
+
+A run of this spec passes when **all of**:
+
+* **§1** — A voice utterance round-trips from Claude Code to
+  ImageGlass_Mac and back. The chain in §1.1 produces visible
+  panel state and matching `log.log` entries within the §8.5
+  latency budget.
+* **§2** — Only `.image`, `.svg`, and `.video` files appear
+  in any panel mode; PDFs are dropped at `FileKind.classify`
+  until v1.1 lands.
+* **§3** — `RootFilter.evaluate(filename:)` with the §3.3
+  algorithm returns the verdicts in the §3.5 worked tables
+  for every test case; the §3.6 backwards-compat case loads
+  every existing `schema_version: 1` file unchanged and the
+  §7.0.1 cookbook still passes.
+* **§4** — Every tool listed in §4.1 is callable, the
+  `targets` argument accepts the three forms in §4.3, and
+  multi-root mutations are atomic per §4.6. Item ids are
+  stable across saves (§4.5).
+* **§5A–§5E** — Each scenario produces the named YAML state,
+  on-screen state, and `log.log` entries.
+* **§6** — Toggling "Hide Empty Directories" (menu, hotkey
+  ⌥⌘E, or MCP `set_hide_empty_directories`) flips
+  `settings.yaml`'s `ui.panel.hide_empty_directories` flag,
+  re-renders the panel per §6.2, and emits the §6.3 log
+  lines.
+* **§7** — `initialize` returns `instructions` populated
+  from `mcp_manual.txt`. `resources/list` lists
+  `imageglass-mcp://manual`; `resources/read` returns the
+  identical content. `MCPManualTests` enforces every tool
+  name appears in the manual.
+* **§8** — Profiling a 7000-file scope against the §5 voice
+  exercise produces zero hangs > 16 ms (per §9.3) and meets
+  every latency target in §8.5. Cancellation events (§8.3)
+  are observable in `log.log`.
+* **§9** — The SwiftSyntax lint pass exits zero against the
+  current codebase. The `Debug`-build `MainActor` watcher
+  records no `ui.main_block` events during the §5 exercise.
+* **§10** — `MemoryLeakTests.testFullCycle()` passes;
+  `leaks(1)` in CI reports no leaks > 4 KiB.
+
+If any step fails, the failing line in `log.log` (with its
+`corr=` correlation id) is the first place to look —
+`grep corr=<id> log.log` returns the audit line(s)
+interleaved with the matching error record and reproduces
+the call in full.
+
+---
+
+## 12. New Behavior Index — What This Spec Adds
+
+For reviewers and implementers, the additions over the
+already-shipping `mcp_file.mdx` surface are concentrated
+here:
+
+| Section | Addition |
+| --- | --- |
+| §1.3 | Voice-verb → MCP-field cookbook. |
+| §3.1–§3.6 | `priority: int` field on filter items; resolution algorithm; `schema_version: 2` lazy upgrade. |
+| §4.1 | New MCP tools: `add_filter_item`, `remove_filter_item`, `list_filter_items`, `set_hide_empty_directories`, `get_hide_empty_directories`. |
+| §4.3 | New `targets` argument: `"all"` / single path / array of paths. |
+| §4.4 | Standardized response envelope (`ok`, `corr`, `app_running`, `targets_applied`). |
+| §4.5 | Stable 6-char item ids written to YAML. |
+| §4.6 | Atomicity guarantee across multi-root mutations. |
+| §6 | Hide-empty-directories toggle (menu item, hotkey ⌥⌘E, MCP tool, settings.yaml field). |
+| §7 | Self-describing MCP manual via `initialize.instructions` + resource + tool descriptions, backed by `code/Sources/ImageGlassCore/MCP/mcp_manual.txt`. |
+| §8 | Background-thread processing contract (five rules, latency budget, cancellation semantics). |
+| §9 | Main-thread block audit (SwiftSyntax lint + Debug-build watcher + Instruments template). |
+| §10 | Memory-leak prevention checklist + CI gates. |
+
+Each entry above is also called out in §11 so reviewers can
+walk the acceptance matrix top-down.

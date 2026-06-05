@@ -1,0 +1,218 @@
+ImageGlass_Mac MCP Server — Operational Manual
+================================================
+
+You are talking to the MCP server for ImageGlass_Mac, a Mac-native image
+viewer. This server drives a "directory panel" the user sees on the left
+of the viewer window. Its job: let you (the LLM) translate the user's
+intent — typed or spoken — into directory and filter changes that
+update the panel in place. The user does NOT need to open Preferences;
+every change you make lands as a write to one YAML file the server
+fronts.
+
+Authoritative documents (read on demand via resources/read):
+* imageglass-mcp://manual                — this file
+* docs/use_cases/mcp_file.mdx            — the original tour
+* docs/use_cases/mcp_and_filters_on_dirs.mdx  — the priority/voice spec
+
+
+1. Key Capabilities
+-------------------
+
+Add or remove a root directory the panel walks:
+    add_directory(path, filter?)
+    remove_directory(path)
+    clear_directories()
+    list_directories()
+    get_directory(path)
+    refresh_directory(path?)
+
+Replace a root's filter wholesale:
+    update_directory_filter(path, filter)
+    set_global_filter(filter)             — applies to every root
+
+Add or list one filter item without clobbering the others:
+    add_filter_item(targets, item)
+    list_filter_items(targets?)
+
+Open a root in Finder:
+    reveal_directory(path)
+
+Every mutating call writes directories.yaml atomically and notifies the
+running app over a Darwin distributed notification. The app's kqueue
+watcher is the fallback when the notification is missed.
+
+
+2. Verb → Field Cookbook
+------------------------
+
+The user is usually speaking. Pattern-match their verbs first, then
+their nouns. Do NOT ask the user to restate the request; if your guess
+is good (>= 80% confident) make the call.
+
+Subtractive intent (hide / exclude / skip / drop / get rid of / no longer
+show / omit / remove) → negate: true.
+
+Additive intent (show / include / keep / let through / display / only)
+→ negate: false. "Only" implies REPLACE rather than APPEND, so prefer
+set_global_filter or update_directory_filter, not add_filter_item.
+
+Exception intent (but / except / unless / always / still show / make sure
+/ override / no matter what) → a higher-priority item.
+Default new priority for "always" is 10. Reserve 100+ for "this rule
+must always win, period."
+
+Append intent (also / additionally / in addition to / on top of / one
+more rule) → add_filter_item. The other filter items stay.
+
+Replace intent (set the filter to / make the filter / change it to /
+only show) → set_global_filter or update_directory_filter.
+
+Scope intent:
+    "everywhere" / "all directories" / "globally"   → targets="all"
+    "in <path>" / "for <directory name>"            → targets="<path>"
+    "in <X> and <Y>"                                → targets=[<X>,<Y>]
+
+
+3. Filter Items and Priorities
+------------------------------
+
+A root's filter is { match, items[] }.
+    match: "any" (OR — default) or "all" (AND), applied within a tier.
+    items[]: each item is { pattern, kind, negate, priority }.
+
+Item fields:
+    pattern   string. Filename glob/substring/regex (NOT a path).
+    kind      "glob" (default), "substring", or "regex".
+    negate    bool. true=exclude on match; false=include on match.
+    priority  int. Higher = wins. Default 0. Range -1000..1000.
+
+Pattern is matched against the filename, not the full path. A leading
+".../" prefix is the documentation shorthand for "anywhere under the
+root"; the server strips it at the boundary, so you can pass it
+through or omit it.
+
+Priority resolution, in order:
+1. Group items by priority. Walk groups highest-first.
+2. The first group whose items match the filename at all decides the
+   verdict. Within that group: negative item wins over positive item;
+   positives combine by `match`.
+3. If every group abstains, fall back: any positive match means
+   included; otherwise included unless a negative matches.
+
+Use priority when the user says "but always" / "except" / "unless"
+about a specific file or pattern. One item at the default priority 0
+plus one exception item at priority 10 expresses the canonical case.
+
+
+4. Worked Examples (Voice → Call)
+---------------------------------
+
+"Hide every file with _dn_ in the name."
+    → set_global_filter(filter={ items: [
+          { pattern: "*_dn_*", kind: "glob", negate: true }
+      ]})
+
+"Now also keep hero_dn_logo.png anyway."
+    → add_filter_item(targets="all", item={
+          pattern: "hero_dn_logo.png", kind: "glob",
+          negate: false, priority: 10
+      })
+
+"In ~/BGit/.../JFK/UX, also exclude _WIP_ files."
+    → add_filter_item(
+          targets="~/BGit/work/into_Work/StarbuckLabs/JFK/UX",
+          item={ pattern: "*_WIP_*", kind: "glob", negate: true }
+      )
+
+"Show me every filter active right now."
+    → list_filter_items()
+
+"Only show JPGs."          (REPLACE intent — "only")
+    → set_global_filter(filter={ items: [
+          { pattern: "*.jpg",  kind: "glob" },
+          { pattern: "*.jpeg", kind: "glob" }
+      ]})
+
+
+5. The targets Argument
+-----------------------
+
+Where applicable, targets accepts three forms:
+    "all"               every root in directories.yaml
+    "<absolute path>"   exactly one root, by canonical path
+    ["<a>", "<b>"]      a list of canonical paths
+
+If any listed path is not a registered root, the WHOLE call fails with
+err=unknown_root. There is no partial application.
+
+
+6. Common Gotchas
+-----------------
+
+* set_global_filter REPLACES the filter on every root. If the user just
+  wants to APPEND a single rule, use add_filter_item.
+* update_directory_filter REPLACES the filter on one root. Same rule.
+* Patterns are filename-only. Patterns containing "/" (after stripping
+  the ".../" prefix) are rejected with err=path_separator_in_pattern.
+* kind: "regex" patterns are compiled eagerly; bad syntax surfaces as
+  err=invalid_regex at call time.
+* The panel only ever lists image / SVG / video files. There is no
+  filter you can write that makes a .txt or .zip visible. (PDF is
+  planned for v1.1.)
+* "Hide" of a directory row (visual, not data): use
+  set_hide_empty_directories(true) when supported.
+
+
+7. Performance and Latency
+--------------------------
+
+* MCP tool responses return in < 5 ms; the actual walk / refilter
+  runs asynchronously on the desktop side.
+* A 7,000-file directory walks in < 1.5 s on Apple Silicon.
+* In-memory refilters (any filter change) complete in tens of
+  milliseconds even on a 250k-file scope.
+* Bulk refilters never block the UI; you can issue follow-up commands
+  without waiting.
+
+
+8. Failure Modes (err= codes)
+-----------------------------
+
+path_not_found              — path argument doesn't exist or isn't a
+                              registered root.
+invalid_filter              — filter object missing required fields,
+                              or unknown match/kind value.
+invalid_regex               — kind: "regex" pattern won't compile.
+path_separator_in_pattern   — pattern still has "/" after boundary
+                              normalization.
+unknown_root                — targets includes a path no root matches.
+conflicting_arguments       — both the legacy single-path argument and
+                              a targets argument were passed.
+storage_write_failed        — directories.yaml could not be saved
+                              (permissions / disk full / RO volume).
+
+Every successful and failed call lands one line in log.log under
+~/Library/Application Support/ImageGlass_Mac/logs/. Lines carry
+corr=<8-char id> so a single call can be re-stitched across the audit
+trail and the matching app=directory.refilter or app=directory.walk
+event.
+
+
+9. Response Envelope
+--------------------
+
+Every mutating tool returns at minimum:
+
+    {
+      "ok":              true|false,
+      "corr":            "ab12cd34",
+      "app_running":     true|false,
+      "targets_applied": [ "<canonical path>", ... ]
+    }
+
+app_running=false means: directories.yaml was written, but the desktop
+app is not running, so the user will see the change on next launch.
+Always relay this to the user when you see it.
+
+
+End of manual.

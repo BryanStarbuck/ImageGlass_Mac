@@ -79,7 +79,8 @@ public enum FileKind: String, Sendable, Codable {
     }
 }
 
-/// One item in `filter.items[]` (`list_of_files.mdx` §3A.2).
+/// One item in `filter.items[]` (`list_of_files.mdx` §3A.2;
+/// `mcp_and_filters_on_dirs.mdx` §3 adds `priority`).
 public struct RootFilterItem: Sendable, Equatable, Codable {
     public enum ItemKind: String, Sendable, Codable {
         case glob, substring, regex
@@ -88,11 +89,22 @@ public struct RootFilterItem: Sendable, Equatable, Codable {
     public var pattern: String
     public var kind: ItemKind
     public var negate: Bool
+    /// Priority tier. Higher tiers decide before lower tiers
+    /// (`mcp_and_filters_on_dirs.mdx` §3.3). Default `0`. Range
+    /// `-1000…1000` (the engine clamps silently to this range to
+    /// keep the resolution algorithm O(items)).
+    public var priority: Int
 
-    public init(pattern: String, kind: ItemKind = .glob, negate: Bool = false) {
+    public init(
+        pattern: String,
+        kind: ItemKind = .glob,
+        negate: Bool = false,
+        priority: Int = 0
+    ) {
         self.pattern = pattern
         self.kind = kind
         self.negate = negate
+        self.priority = max(-1000, min(1000, priority))
     }
 }
 
@@ -121,25 +133,71 @@ public struct RootFilter: Sendable, Equatable, Codable {
     /// Evaluate the filter against a single filename. Returns `true` if
     /// the file passes (would be visible).
     ///
-    /// Semantics (mcp_file.mdx §7): negate items are exclusion overrides —
-    /// if any `negate: true` item matches the filename, the file is
-    /// excluded regardless of how positive items combine. Otherwise the
-    /// positive items are combined according to `match` (`any` ORs them,
-    /// `all` ANDs them). If only negate items are present, the file
-    /// passes unless one of them matches.
+    /// Semantics (`mcp_and_filters_on_dirs.mdx` §3.3, refined):
+    ///
+    ///   1. Group items by `priority`, walk groups highest-first.
+    ///   2. Within a tier, negative match always wins (excluded).
+    ///      Otherwise, positive match commits the verdict (included,
+    ///      per `match`). Neither matching = the tier abstains.
+    ///   3. Higher-priority tiers that abstain fall through to the
+    ///      next lower tier. They are pure **overrides** — they only
+    ///      commit a verdict when a positive or negative item
+    ///      actually matches.
+    ///   4. The **lowest** priority tier additionally applies the
+    ///      `mcp_file.mdx` §7.0 narrowing rule: if it carries
+    ///      positive items and none of them match (and no negative
+    ///      matched), the file is excluded. A lowest tier consisting
+    ///      only of negate items (or no items) and no match includes
+    ///      the file.
+    ///
+    /// This split preserves the §7.0.1 cookbook exactly when no
+    /// priorities are used (single-tier filter ⇒ lowest tier), while
+    /// allowing a high-priority positive to express "always include
+    /// this file" without forcing unrelated files to also match a
+    /// positive in order to remain visible.
     public func evaluate(filename: String) -> Bool {
         if items.isEmpty { return true }
-        for item in items where item.negate {
-            if Self.itemMatches(item, filename: filename) { return false }
+
+        // Group by priority, descending.
+        let grouped: [(Int, [RootFilterItem])] = Dictionary(grouping: items, by: { $0.priority })
+            .map { ($0.key, $0.value) }
+            .sorted(by: { $0.0 > $1.0 })
+
+        for (i, (_, tier)) in grouped.enumerated() {
+            let isLowest = (i == grouped.count - 1)
+            let positives = tier.filter { !$0.negate }
+            let negatives = tier.filter { $0.negate }
+
+            if negatives.contains(where: { Self.itemMatches($0, filename: filename) }) {
+                return false
+            }
+
+            let positiveMatched = positives.contains { Self.itemMatches($0, filename: filename) }
+            if positiveMatched {
+                switch match {
+                case .any:
+                    return true
+                case .all:
+                    if positives.allSatisfy({ Self.itemMatches($0, filename: filename) }) {
+                        return true
+                    }
+                    // Partial match under AND: this tier's override
+                    // did not fully apply. Fall through.
+                    continue
+                }
+            }
+
+            // No match in this tier.
+            if isLowest {
+                // §7.0 narrowing: positives present + none match
+                // ⇒ excluded. negate-only or empty ⇒ included.
+                return positives.isEmpty
+            }
+            // Non-lowest tier abstains — try the next-lower tier.
         }
-        let positives = items.filter { !$0.negate }
-        if positives.isEmpty { return true }
-        switch match {
-        case .any:
-            return positives.contains { Self.itemMatches($0, filename: filename) }
-        case .all:
-            return positives.allSatisfy { Self.itemMatches($0, filename: filename) }
-        }
+        // Unreachable in normal use: the lowest-tier branch above
+        // always returns. Defensive return preserves total func.
+        return true
     }
 
     private static func itemMatches(_ item: RootFilterItem, filename: String) -> Bool {

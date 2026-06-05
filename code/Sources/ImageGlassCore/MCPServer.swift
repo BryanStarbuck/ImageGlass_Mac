@@ -143,6 +143,21 @@ public final class MCPServer {
         case "tools/call":
             response = handleToolCall(request)
 
+        case "resources/list":
+            // Spec §7.5: advertise the manual as one MCP resource.
+            let result = MCP.ListResourcesResult(resources: [
+                .init(
+                    uri: MCPManual.resourceURI,
+                    name: MCPManual.resourceName,
+                    description: MCPManual.resourceDescription,
+                    mimeType: MCPManual.resourceMimeType
+                )
+            ])
+            response = .success(id: request.id, result: AnyCodable(asDict(result)))
+
+        case "resources/read":
+            response = handleResourcesRead(request)
+
         case "ping":
             // MCP ping returns an empty object as result.
             response = .success(id: request.id, result: AnyCodable([:] as [String: Any]))
@@ -177,10 +192,51 @@ public final class MCPServer {
         }
         let result = MCP.InitializeResult(
             protocolVersion: protocolVersion,
-            capabilities: .init(tools: .init(listChanged: false)),
-            serverInfo: .init(name: serverName, version: serverVersion)
+            capabilities: .init(
+                tools: .init(listChanged: false),
+                resources: .init(listChanged: false, subscribe: false)
+            ),
+            serverInfo: .init(name: serverName, version: serverVersion),
+            // Spec `mcp_and_filters_on_dirs.mdx` §7.3 — instructions
+            // gives the LLM the operational manual at handshake time.
+            // Clients that ignore the field can fetch the identical
+            // content via `resources/read` on `imageglass-mcp://manual`.
+            instructions: MCPManual.text
         )
         return .success(id: request.id, result: AnyCodable(asDict(result)))
+    }
+
+    /// Spec §7.5. `imageglass-mcp://manual` is the only resource v1
+    /// publishes; its body is the same text fed into
+    /// `initialize.instructions`.
+    private func handleResourcesRead(_ request: MCP.Request) -> MCP.Response {
+        guard let paramsDict = request.params?.asDict,
+              let uri = paramsDict["uri"] as? String, !uri.isEmpty else {
+            return .failure(
+                id: request.id,
+                code: -32602,
+                message: "Invalid params: expected { uri: string }"
+            )
+        }
+        switch uri {
+        case MCPManual.resourceURI:
+            let body: [String: Any] = [
+                "contents": [
+                    [
+                        "uri":      MCPManual.resourceURI,
+                        "mimeType": MCPManual.resourceMimeType,
+                        "text":     MCPManual.text,
+                    ] as [String: Any]
+                ]
+            ]
+            return .success(id: request.id, result: AnyCodable(body))
+        default:
+            return .failure(
+                id: request.id,
+                code: -32602,
+                message: "Unknown resource uri: \(uri)"
+            )
+        }
     }
 
     private func handleToolCall(_ request: MCP.Request) -> MCP.Response {

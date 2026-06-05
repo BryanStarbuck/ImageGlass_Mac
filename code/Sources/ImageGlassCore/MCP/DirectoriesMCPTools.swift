@@ -25,6 +25,11 @@ public struct DirectoriesMCPTools: Sendable {
         "set_global_filter",
         "reveal_directory",
         "refresh_directory",
+        // `mcp_and_filters_on_dirs.mdx` §4.1 — per-item tools that let
+        // voice intents like "also exclude _WIP_" land as a single
+        // append rather than re-issuing the whole filter.
+        "add_filter_item",
+        "list_filter_items",
     ]
 
     public init(
@@ -63,6 +68,12 @@ public struct DirectoriesMCPTools: Sendable {
                             "negate": [
                                 "type": "boolean",
                                 "description": "When true, a match excludes the file.",
+                            ] as [String: Any],
+                            "priority": [
+                                "type": "integer",
+                                "description": "Priority tier; higher wins (mcp_and_filters_on_dirs.mdx §3). Default 0. Use 10 for a single-step override.",
+                                "minimum": -1000,
+                                "maximum": 1000,
                             ] as [String: Any],
                         ] as [String: Any],
                     ] as [String: Any],
@@ -214,6 +225,65 @@ public struct DirectoriesMCPTools: Sendable {
                     "additionalProperties": false,
                 ])
             ),
+            .init(
+                name: "add_filter_item",
+                description: """
+                    APPEND one filter item to the targeted root(s) without \
+                    clobbering existing items. `targets` is "all" (every \
+                    root, default), a single canonical path, or an array \
+                    of paths. Use this for voice "also exclude X" / \
+                    "always keep Y" intents. See \
+                    mcp_and_filters_on_dirs.mdx §4.2 / §5B / §5C. \
+                    Idempotent: an identical (pattern + kind + negate + \
+                    priority) item is not duplicated.
+                    """,
+                inputSchema: AnyCodable([
+                    "type": "object",
+                    "properties": [
+                        "targets": [
+                            "description": "'all', a single absolute path, or an array of absolute paths.",
+                        ] as [String: Any],
+                        "item": [
+                            "type": "object",
+                            "required": ["pattern"],
+                            "properties": [
+                                "pattern":  ["type": "string"],
+                                "kind": [
+                                    "type": "string",
+                                    "enum": ["glob", "substring", "regex"],
+                                ] as [String: Any],
+                                "negate":   ["type": "boolean"],
+                                "priority": [
+                                    "type": "integer",
+                                    "minimum": -1000,
+                                    "maximum": 1000,
+                                ] as [String: Any],
+                            ] as [String: Any],
+                        ] as [String: Any],
+                        "client": ["type": "string"],
+                    ] as [String: Any],
+                    "required": ["item"],
+                    "additionalProperties": false,
+                ])
+            ),
+            .init(
+                name: "list_filter_items",
+                description: """
+                    Return the filter items currently in effect, grouped \
+                    by root and sorted highest-priority-first. \
+                    `targets` defaults to "all" (every root). See \
+                    mcp_and_filters_on_dirs.mdx §4.2 / §5E.
+                    """,
+                inputSchema: AnyCodable([
+                    "type": "object",
+                    "properties": [
+                        "targets": [
+                            "description": "'all', a single absolute path, or an array of absolute paths.",
+                        ] as [String: Any],
+                    ] as [String: Any],
+                    "additionalProperties": false,
+                ])
+            ),
         ]
     }
 
@@ -230,6 +300,8 @@ public struct DirectoriesMCPTools: Sendable {
         case "set_global_filter":        return try setGlobalFilter(arguments)
         case "reveal_directory":         return try revealDirectory(arguments)
         case "refresh_directory":        return try refreshDirectory(arguments)
+        case "add_filter_item":          return try addFilterItem(arguments)
+        case "list_filter_items":        return try listFilterItems(arguments)
         default:
             return .text("Unknown directory tool: \(name)", isError: true)
         }
@@ -573,6 +645,10 @@ public struct DirectoriesMCPTools: Sendable {
             var d: [String: Any] = ["pattern": it.pattern]
             if it.kind != .glob { d["kind"] = it.kind.rawValue }
             if it.negate { d["negate"] = true }
+            // mcp_and_filters_on_dirs.mdx §3.6 — non-default priority
+            // is surfaced on read; default 0 is omitted to keep the
+            // YAML/JSON payload small for the common case.
+            if it.priority != 0 { d["priority"] = it.priority }
             items.append(d)
         }
         var filter: [String: Any] = ["items": items]
@@ -587,6 +663,244 @@ public struct DirectoriesMCPTools: Sendable {
             dict["last_walked"] = f.string(from: walked)
         }
         return dict
+    }
+
+    // MARK: - targets resolver (mcp_and_filters_on_dirs.mdx §4.3)
+
+    /// Resolve the `targets` argument to a list of canonical root URLs
+    /// from `directories.yaml`. The three accepted shapes are:
+    ///   * `"all"` (or absent) → every root in the file.
+    ///   * String → exactly one root, canonicalized via
+    ///     `DirectoriesStore.canonicalize`. Must be a registered root.
+    ///   * Array of strings → each canonicalized; every entry must be
+    ///     a registered root. Per §4.6, partial application is not
+    ///     allowed — any unknown root fails the whole call.
+    ///
+    /// Throws `DirectoriesStoreError.pathNotFound(path)` for unknown
+    /// roots so the dispatching tool can log `err=unknown_root`.
+    private func resolveTargets(_ raw: Any?, file: DirectoriesFile) throws -> [URL] {
+        let allRoots = file.roots.map { $0.path }
+        guard let raw = raw else { return allRoots }
+
+        if let s = raw as? String {
+            if s == "all" { return allRoots }
+            let canonical = try DirectoriesStore.canonicalize(s, mustExist: false)
+            guard allRoots.contains(canonical) else {
+                throw DirectoriesStoreError.pathNotFound(canonical.path)
+            }
+            return [canonical]
+        }
+        if let arr = raw as? [Any?] {
+            var out: [URL] = []
+            for entry in arr {
+                guard let p = entry as? String, !p.isEmpty else {
+                    throw DirectoriesStoreError.invalidFilter(
+                        "targets array entry is not a non-empty string"
+                    )
+                }
+                let canonical = try DirectoriesStore.canonicalize(p, mustExist: false)
+                guard allRoots.contains(canonical) else {
+                    throw DirectoriesStoreError.pathNotFound(canonical.path)
+                }
+                out.append(canonical)
+            }
+            return out
+        }
+        if let arr = raw as? [String] {
+            var out: [URL] = []
+            for p in arr {
+                let canonical = try DirectoriesStore.canonicalize(p, mustExist: false)
+                guard allRoots.contains(canonical) else {
+                    throw DirectoriesStoreError.pathNotFound(canonical.path)
+                }
+                out.append(canonical)
+            }
+            return out
+        }
+        throw DirectoriesStoreError.invalidFilter(
+            "`targets` must be 'all', a path string, or an array of paths"
+        )
+    }
+
+    // MARK: - add_filter_item / list_filter_items
+    // (mcp_and_filters_on_dirs.mdx §4.1 / §4.2 / §5)
+
+    private func addFilterItem(_ args: [String: Any?]) throws -> MCP.CallToolResult {
+        let corr = MCPAuditLogger.newCorrelationId()
+        let client = (args["client"] as? String) ?? "claude-code"
+
+        guard let rawItem = args["item"] as? [String: Any?] else {
+            logger.logDirectoryToolCall(
+                toolName: "add_filter_item", path: nil, client: client,
+                corr: corr, ok: false, err: "missing_item"
+            )
+            return .text("Missing `item`.", isError: true)
+        }
+
+        // Parse the single item by wrapping it in a single-element
+        // filter and re-using parseFilterDict's validation +
+        // normalization. This routes invalid_regex /
+        // path_separator_in_pattern uniformly with the bulk tools.
+        let parsed: RootFilter
+        do {
+            parsed = try Self.parseFilterDict([
+                "items": [rawItem] as Any
+            ])
+        } catch let e as DirectoriesStoreError {
+            logger.logDirectoryToolCall(
+                toolName: "add_filter_item", path: nil, client: client,
+                corr: corr, ok: false, err: e.auditCode
+            )
+            return .text(e.description, isError: true)
+        }
+        guard let newItem = parsed.items.first else {
+            logger.logDirectoryToolCall(
+                toolName: "add_filter_item", path: nil, client: client,
+                corr: corr, ok: false, err: "invalid_filter"
+            )
+            return .text("Item parse produced zero items.", isError: true)
+        }
+
+        var file = (try? store.load()) ?? DirectoriesFile()
+        let targets: [URL]
+        do {
+            targets = try resolveTargets(args["targets"] as Any?, file: file)
+        } catch let e as DirectoriesStoreError {
+            logger.logDirectoryToolCall(
+                toolName: "add_filter_item", path: nil, client: client,
+                corr: corr, ok: false, err: e.auditCode
+            )
+            return .text(e.description, isError: true)
+        }
+
+        if targets.isEmpty {
+            // `targets: "all"` against an empty directories.yaml — the
+            // call succeeds as a no-op so the LLM's response can say
+            // "no roots yet — add one with add_directory first."
+            logger.logDirectoryToolCall(
+                toolName: "add_filter_item", path: nil, client: client,
+                corr: corr, ok: true,
+                extra: [("status", "no_roots")]
+            )
+            return .text(prettyJSON([
+                "ok": true,
+                "corr": corr,
+                "app_running": appIsRunning(),
+                "targets_applied": [] as [String],
+                "items_added": 0,
+            ] as [String: Any]))
+        }
+
+        // Atomic across roots (§4.6): build the new file, then save once.
+        var itemsAddedPerRoot: [Int] = []
+        for url in targets {
+            guard let idx = file.roots.firstIndex(where: { $0.path == url }) else {
+                logger.logDirectoryToolCall(
+                    toolName: "add_filter_item", path: url.path, client: client,
+                    corr: corr, ok: false, err: "unknown_root"
+                )
+                return .text("Not a registered root: \(url.path)", isError: true)
+            }
+            if file.roots[idx].filter.items.contains(where: { sameItem($0, newItem) }) {
+                itemsAddedPerRoot.append(0)
+                continue
+            }
+            file.roots[idx].filter.items.append(newItem)
+            itemsAddedPerRoot.append(1)
+        }
+        do { try store.save(file) } catch {
+            logger.logDirectoryToolCall(
+                toolName: "add_filter_item", path: nil, client: client,
+                corr: corr, ok: false, err: "storage_write_failed"
+            )
+            return .text("Failed to save filter item: \(error)", isError: true)
+        }
+
+        // Refilter each affected root in memory. The desktop app's
+        // watcher will pick the YAML change up too, but a same-process
+        // call (tests, embedded use) needs the in-memory tree updated
+        // here. The walker is a no-op when the root isn't loaded.
+        var totalDelta = 0
+        for (i, url) in targets.enumerated() where itemsAddedPerRoot[i] > 0 {
+            let f = file.roots.first(where: { $0.path == url })?.filter ?? .empty
+            totalDelta += walker.refilter(root: url, filter: f)
+        }
+
+        let totalAdded = itemsAddedPerRoot.reduce(0, +)
+        logger.logDirectoryToolCall(
+            toolName: "add_filter_item",
+            path: targets.count == 1 ? targets[0].path : nil,
+            client: client, corr: corr, ok: true,
+            extra: [
+                ("targets", targets.count == 1 ? targets[0].path : "\(targets.count)"),
+                ("items_added", String(totalAdded)),
+                ("negate", newItem.negate ? "true" : "false"),
+                ("priority", String(newItem.priority)),
+            ]
+        )
+        if totalAdded > 0 {
+            logger.logDirectoryRefilter(
+                roots: targets.count, visibleDelta: totalDelta,
+                elapsedMs: 0, corr: corr
+            )
+        }
+        postDirectoriesChanged()
+        return .text(prettyJSON([
+            "ok": true,
+            "corr": corr,
+            "app_running": appIsRunning(),
+            "targets_applied": targets.map { $0.path },
+            "items_added": totalAdded,
+            "visible_delta": totalDelta,
+        ] as [String: Any]))
+    }
+
+    private func listFilterItems(_ args: [String: Any?]) throws -> MCP.CallToolResult {
+        let corr = MCPAuditLogger.newCorrelationId()
+        let file = (try? store.load()) ?? DirectoriesFile()
+        let targets: [URL]
+        do {
+            targets = try resolveTargets(args["targets"] as Any?, file: file)
+        } catch let e as DirectoriesStoreError {
+            return .text(e.description, isError: true)
+        }
+
+        var itemsByRoot: [String: [[String: Any]]] = [:]
+        for url in targets {
+            guard let r = file.roots.first(where: { $0.path == url }) else { continue }
+            // Sort highest-priority-first for LLM convenience
+            // (mcp_and_filters_on_dirs.mdx §4.2 — list_filter_items).
+            let sorted = r.filter.items.sorted(by: { $0.priority > $1.priority })
+            itemsByRoot[r.path.path] = sorted.map { it in
+                var d: [String: Any] = ["pattern": it.pattern]
+                if it.kind != .glob { d["kind"] = it.kind.rawValue }
+                if it.negate { d["negate"] = true }
+                if it.priority != 0 { d["priority"] = it.priority }
+                return d
+            }
+        }
+        // Log read-only call too so the audit chain captures the LLM's
+        // "what's in scope?" calls alongside its mutations.
+        logger.logDirectoryToolCall(
+            toolName: "list_filter_items", path: nil, client: "claude-code",
+            corr: corr, ok: true,
+            extra: [("roots", String(targets.count))]
+        )
+        return .text(prettyJSON([
+            "ok": true,
+            "corr": corr,
+            "items_by_root": itemsByRoot,
+        ] as [String: Any]))
+    }
+
+    /// Equality of two filter items for the §4.2 "idempotent" guarantee.
+    /// Two items are the same if their `pattern`, `kind`, `negate`, and
+    /// `priority` are all equal.
+    private func sameItem(_ a: RootFilterItem, _ b: RootFilterItem) -> Bool {
+        a.pattern == b.pattern
+            && a.kind == b.kind
+            && a.negate == b.negate
+            && a.priority == b.priority
     }
 
     /// Parse the on-wire filter shape into a `RootFilter`. Throws
@@ -635,8 +949,20 @@ public struct DirectoriesMCPTools: Sendable {
                 kind = parsed
             }
             let negate = (dict["negate"] as? Bool) ?? false
+            // mcp_and_filters_on_dirs.mdx §3.2 — priority is optional;
+            // default 0. Accept Int and Double (Claude often serializes
+            // small integers as doubles).
+            let priority: Int
+            if let p = dict["priority"] as? Int { priority = p }
+            else if let p = dict["priority"] as? Double { priority = Int(p) }
+            else { priority = 0 }
             let pattern = try Self.normalizePattern(rawPattern, kind: kind)
-            items.append(RootFilterItem(pattern: pattern, kind: kind, negate: negate))
+            items.append(RootFilterItem(
+                pattern: pattern,
+                kind: kind,
+                negate: negate,
+                priority: priority
+            ))
         }
         filter.items = items
         return filter

@@ -65,6 +65,15 @@ public final class AppState {
             // selection (or any incoming MCP `select_file`) suppresses
             // a future first-image-found auto-advance.
             DirectoryTreeWalker.shared.viewerIsEmpty = (selectedFile == nil)
+            // Mirror the new file selection into the tree-nav cursor so
+            // arrow keys resume from the visible row, and open every
+            // ancestor folder so the row is actually rendered (the user
+            // just clicked it, or MCP `select_file` landed it).
+            // hotkeys.mdx §4.
+            if let path = selectedFile {
+                treeNav.activeRow = path
+                treeNav.revealAncestors(of: path)
+            }
             if let path = selectedFile {
                 MCPNotificationBus.shared.emitSelectionChanged(path: path)
             }
@@ -114,6 +123,10 @@ public final class AppState {
     /// Per-window viewer state (zoom mode, pan, rotation, overlays, ...).
     /// Lives here so menu commands and the SwiftUI viewer can share it.
     public var viewer: ViewerState = ViewerState()
+
+    /// Centralized tree-expansion + arrow-key cursor for the Directory
+    /// Panel. See `TreeNavigator` and `docs/hotkeys.mdx` §4.
+    public var treeNav: TreeNavigator = TreeNavigator()
 
     /// Crop tool controller (docs/crop.mdx §5.1). Lives at AppState scope
     /// so the menu commands, overlay, and panel all bind to the same
@@ -983,6 +996,123 @@ public final class AppState {
 
     /// Jump to the first image of the next folder (Down arrow).
     public func selectNextFolder(wrap: Bool = true) { jumpFolder(1, wrap: wrap) }
+
+    // MARK: - Tree arrow-key navigation (hotkeys.mdx §4)
+
+    /// Current cursor position for arrow-key navigation. Falls back to
+    /// `selectedFile` when the user has not yet moved the cursor onto
+    /// a folder row.
+    public var arrowCursor: String? {
+        get { treeNav.activeRow ?? selectedFile }
+        set { treeNav.activeRow = newValue }
+    }
+
+    /// All currently visible rows (folders + passing files), depth-first
+    /// over `walkerRoots`, honoring `treeNav` expansion. Empty when the
+    /// walker has no roots — the legacy-tree path falls back to
+    /// `selectPrevious` / `selectNext` for ↑ / ↓.
+    public var visibleTreeRows: [TreeRow] {
+        TreeFlatten.visibleRows(roots: walkerRoots, nav: treeNav)
+    }
+
+    /// ↓ — next visible row. If the new row is a file, also update the
+    /// viewer's `selectedFile`; if it's a folder, the viewer holds.
+    /// Honors `Settings.viewer.wrap_at_ends`.
+    public func arrowDown() {
+        let wrap = settings.viewer.wrap_at_ends
+        let rows = visibleTreeRows
+        if rows.isEmpty { selectNext(wrap: wrap); return }
+        guard let cursor = arrowCursor,
+              let idx = rows.firstIndex(where: { $0.path == cursor }) else {
+            activateRow(rows.first)
+            return
+        }
+        let target = idx + 1
+        if target < rows.count {
+            activateRow(rows[target])
+        } else if wrap {
+            activateRow(rows.first)
+        }
+    }
+
+    /// ↑ — previous visible row.
+    public func arrowUp() {
+        let wrap = settings.viewer.wrap_at_ends
+        let rows = visibleTreeRows
+        if rows.isEmpty { selectPrevious(wrap: wrap); return }
+        guard let cursor = arrowCursor,
+              let idx = rows.firstIndex(where: { $0.path == cursor }) else {
+            activateRow(rows.last)
+            return
+        }
+        let target = idx - 1
+        if target >= 0 {
+            activateRow(rows[target])
+        } else if wrap {
+            activateRow(rows.last)
+        }
+    }
+
+    /// ← — folder: collapse when expanded, else jump to parent.
+    /// File: jump to the file's parent folder. hotkeys.mdx §4.1.
+    public func arrowLeft() {
+        let rows = visibleTreeRows
+        guard let cursor = arrowCursor,
+              let row = rows.first(where: { $0.path == cursor }) else {
+            return
+        }
+        if row.isDirectory {
+            if treeNav.isExpanded(folderPath: row.path, depth: row.depth) {
+                treeNav.setExpanded(row.path, false)
+                // Cursor stays on the folder row.
+            } else if let parent = row.parentFolder,
+                      rows.contains(where: { $0.path == parent }) {
+                arrowCursor = parent
+            }
+        } else {
+            // File row → go to the file's parent folder row. Use the
+            // path-derived parent so we step out even when the parent
+            // wasn't in `parentFolder` (which is `nil` for root files).
+            let parent = (row.path as NSString).deletingLastPathComponent
+            if rows.contains(where: { $0.path == parent }) {
+                arrowCursor = parent
+            }
+        }
+    }
+
+    /// → — folder collapsed: expand. Folder expanded: step into first
+    /// child. File: no-op. hotkeys.mdx §4.1.
+    public func arrowRight() {
+        let rows = visibleTreeRows
+        guard let cursor = arrowCursor,
+              let row = rows.first(where: { $0.path == cursor }) else {
+            return
+        }
+        guard row.isDirectory else { return }
+        if !treeNav.isExpanded(folderPath: row.path, depth: row.depth) {
+            treeNav.setExpanded(row.path, true)
+            return
+        }
+        guard let firstChild = row.firstChildPath else { return }
+        // The first child may not yet appear in `rows` (we just expanded
+        // a moment ago). Re-flatten to find it.
+        let refreshed = visibleTreeRows
+        guard let target = refreshed.first(where: { $0.path == firstChild })
+        else { return }
+        activateRow(target)
+    }
+
+    /// Activate a visible row from one of the arrow handlers: set the
+    /// `treeNav.activeRow` cursor and mirror file selections into
+    /// `selectedFile` so the viewer follows. Folders keep the viewer
+    /// on its last image (hotkeys.mdx §4.2).
+    private func activateRow(_ row: TreeRow?) {
+        guard let row else { return }
+        treeNav.activeRow = row.path
+        if !row.isDirectory {
+            selectedFile = row.path
+        }
+    }
 
     private func jumpFolder(_ direction: Int, wrap: Bool) {
         let files = orderedNavigationFiles

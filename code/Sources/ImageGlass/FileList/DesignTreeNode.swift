@@ -5,22 +5,25 @@ import ImageGlassCore
 /// styled to the Claude Design handoff (filepanel.jsx Tree). Directories
 /// expand/collapse; files select into `state.selectedFile`. No AppKit
 /// `NSOutlineView` dependency — renders reliably inside the docked panel.
+///
+/// Expansion is owned by the shared `TreeNavigator` (via `AppState`) so
+/// the keyboard arrow keys in the viewer (hotkeys.mdx §4) can drive the
+/// same expand/collapse the user toggles with the mouse.
 struct DesignTreeNode: View {
     let node: DirectoryFilenamePanel.NodeView
     let depth: Int
+    @Bindable var nav: TreeNavigator
     @Binding var selected: String?
     let matches: (String) -> Bool
 
-    @State private var expanded: Bool
+    /// Folder-row "active cursor" highlight when the arrow keys parked
+    /// on this folder without changing the viewer's file. hotkeys.mdx §4.2.
+    private var isCursorRow: Bool {
+        nav.activeRow == (node.fullPath ?? node.id)
+    }
 
-    init(node: DirectoryFilenamePanel.NodeView, depth: Int,
-         selected: Binding<String?>, matches: @escaping (String) -> Bool) {
-        self.node = node
-        self.depth = depth
-        self._selected = selected
-        self.matches = matches
-        // Roots and first level default to expanded.
-        self._expanded = State(initialValue: depth <= 1)
+    private var expanded: Bool {
+        nav.isExpanded(folderPath: node.id, depth: depth)
     }
 
     var body: some View {
@@ -31,6 +34,7 @@ struct DesignTreeNode: View {
                     if expanded {
                         ForEach(visibleChildren) { child in
                             DesignTreeNode(node: child, depth: depth + 1,
+                                           nav: nav,
                                            selected: $selected, matches: matches)
                         }
                     }
@@ -38,12 +42,18 @@ struct DesignTreeNode: View {
             }
             // Auto-reveal: when the selected image lands inside this folder,
             // open it once so the user sees where the current image lives.
-            // One-shot — the folder stays collapsible afterward (collapsing
-            // the active folder now actually works).
+            // The TreeNavigator handles the explicit-collapse case so a
+            // collapsed folder containing the selection stays collapsed.
             .onChange(of: selected) { _, _ in
-                if containsSelected { expanded = true }
+                if containsSelected && !nav.explicitlyCollapsed.contains(node.id) {
+                    nav.setExpanded(node.id, true)
+                }
             }
-            .onAppear { if containsSelected { expanded = true } }
+            .onAppear {
+                if containsSelected && !nav.explicitlyCollapsed.contains(node.id) {
+                    nav.setExpanded(node.id, true)
+                }
+            }
         } else if matches(node.fullPath ?? node.name) {
             fileRow
         }
@@ -54,10 +64,15 @@ struct DesignTreeNode: View {
     private var directoryRow: some View {
         // `onTheSelectedPath` tints every ancestor folder of the current
         // image so the containing folder is obvious at a glance.
-        row(name: node.name, isDir: true, isSel: false,
+        row(name: node.name, isDir: true, isSel: isCursorRow,
             onPath: containsSelected, expanded: expanded)
             .contentShape(Rectangle())
-            .onTapGesture { withAnimation(.easeOut(duration: 0.12)) { expanded.toggle() } }
+            .onTapGesture {
+                withAnimation(.easeOut(duration: 0.12)) {
+                    nav.toggle(node.id, depth: depth)
+                }
+                nav.activeRow = node.id
+            }
     }
 
     private var fileRow: some View {
@@ -65,7 +80,12 @@ struct DesignTreeNode: View {
         return row(name: node.name, isDir: false, isSel: isSel,
                    onPath: false, expanded: nil)
             .contentShape(Rectangle())
-            .onTapGesture { if let p = node.fullPath { selected = p } }
+            .onTapGesture {
+                if let p = node.fullPath {
+                    selected = p
+                    nav.activeRow = p
+                }
+            }
     }
 
     /// `isSel` = this is the selected file (solid accent fill).
