@@ -9,7 +9,21 @@ import Foundation
 /// `app=directory.refilter`).
 public struct DirectoriesMCPTools: Sendable {
 
-    public let store: DirectoriesStore
+    /// Optional explicit store, used by tests to inject an isolated
+    /// `DirectoriesStore`. Production callers pass nil so that
+    /// `store` resolves to `DirectoriesStore.shared` at every call —
+    /// which the multi-window resolver (multi_window.mdx §6) routes
+    /// to the frontmost window's per-window store.
+    public let injectedStore: DirectoriesStore?
+
+    /// The store every tool method routes mutations through. When an
+    /// explicit store was injected at init time it is used unchanged;
+    /// otherwise `DirectoriesStore.shared` is resolved at access
+    /// time so multi-window retargeting takes effect.
+    public var store: DirectoriesStore {
+        injectedStore ?? .shared
+    }
+
     public let logger: MCPAuditLogger
     public let walker: DirectoryTreeWalker
 
@@ -37,11 +51,11 @@ public struct DirectoriesMCPTools: Sendable {
     ]
 
     public init(
-        store: DirectoriesStore = .shared,
+        store: DirectoriesStore? = nil,
         logger: MCPAuditLogger = .shared,
         walker: DirectoryTreeWalker = .shared
     ) {
-        self.store = store
+        self.injectedStore = store
         self.logger = logger
         self.walker = walker
     }

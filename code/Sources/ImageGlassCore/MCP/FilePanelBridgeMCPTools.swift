@@ -159,8 +159,12 @@ public struct FilePanelBridgeMCPTools {
         }
 
         try? AppPaths.ensureMacDirectories()
-        let file = AppPaths.macAppSupportDir
-            .appendingPathComponent("slideshow.txt")
+        // multi_window.mdx §6.1: retarget to the frontmost window.
+        // Bring it forward so the user sees the slideshow toggle land
+        // in the window they targeted.
+        MCPWindowTarget.bringForward()
+        let windowID = MCPWindowTarget.currentWindowID()
+        let file = AppPaths.macSlideshowHintFile(windowID: windowID)
         // Plain-text format the GUI watcher parses: one or two
         // whitespace-separated `key=value` tokens.
         var body = "on=\(on ? "true" : "false") corr=\(corr)"
@@ -168,9 +172,17 @@ public struct FilePanelBridgeMCPTools {
             body += String(format: " interval=%.1f", i)
         }
         body += "\n"
-        try? body.data(using: .utf8)?.write(to: file, options: .atomic)
+        let data = body.data(using: .utf8)
+        try? data?.write(to: file, options: .atomic)
+        // Legacy v1 compat: AppState's slideshow watcher (the single-
+        // window GUI shipping today) reads the unsuffixed file. We
+        // mirror the write here so existing watchers keep firing.
+        // Group D removes the legacy file when AppState becomes
+        // per-window.
+        try? data?.write(to: AppPaths.macSlideshowHintFileV1, options: .atomic)
 
         var extra: [(String, String)] = [
+            ("window_id", String(windowID)),
             ("on", on ? "true" : "false"),
         ]
         if let i = interval {
@@ -206,15 +218,23 @@ public struct FilePanelBridgeMCPTools {
         }
         let path = AppPaths.expandTilde(raw)
         try? AppPaths.ensureMacDirectories()
-        let selectionFile = AppPaths.macAppSupportDir
-            .appendingPathComponent("selection.txt")
-        try? path.data(using: .utf8)?.write(to: selectionFile, options: .atomic)
+        // multi_window.mdx §6.1: retarget to the frontmost window. The
+        // hint file is per-window so two windows hosting different
+        // file panels can be steered independently.
+        MCPWindowTarget.bringForward()
+        let windowID = MCPWindowTarget.currentWindowID()
+        let selectionFile = AppPaths.macSelectionHintFile(windowID: windowID)
+        let data = path.data(using: .utf8)
+        try? data?.write(to: selectionFile, options: .atomic)
+        // Legacy v1 compat — see comment in setSlideshow.
+        try? data?.write(to: AppPaths.macSelectionHintFileV1, options: .atomic)
         notifier.emitSelectionChanged(path: path, corr: corr)
         logger.logDirectoryToolCall(
             toolName: "select_file", path: path,
-            client: client, corr: corr, ok: true
+            client: client, corr: corr, ok: true,
+            extra: [("window_id", String(windowID))]
         )
-        return .text(prettyJSON(["path": path, "corr": corr] as [String: Any]))
+        return .text(prettyJSON(["path": path, "corr": corr, "window_id": windowID] as [String: Any]))
     }
 
     // MARK: - panel.set_view_mode
@@ -243,16 +263,21 @@ public struct FilePanelBridgeMCPTools {
             )
         }
         try? AppPaths.ensureMacDirectories()
-        let modeFile = AppPaths.macAppSupportDir
-            .appendingPathComponent("panel_view_mode.txt")
-        try? mode.data(using: .utf8)?.write(to: modeFile, options: .atomic)
+        // multi_window.mdx §6.1: retarget to the frontmost window.
+        MCPWindowTarget.bringForward()
+        let windowID = MCPWindowTarget.currentWindowID()
+        let modeFile = AppPaths.macPanelViewModeHintFile(windowID: windowID)
+        let data = mode.data(using: .utf8)
+        try? data?.write(to: modeFile, options: .atomic)
+        // Legacy v1 compat — see comment in setSlideshow.
+        try? data?.write(to: AppPaths.macPanelViewModeHintFileV1, options: .atomic)
         notifier.emitViewModeChanged(mode: mode, corr: corr)
         logger.logDirectoryToolCall(
             toolName: "panel.set_view_mode", path: nil,
             client: client, corr: corr, ok: true,
-            extra: [("mode", mode)]
+            extra: [("window_id", String(windowID)), ("mode", mode)]
         )
-        return .text(prettyJSON(["mode": mode, "corr": corr] as [String: Any]))
+        return .text(prettyJSON(["mode": mode, "corr": corr, "window_id": windowID] as [String: Any]))
     }
 
     // MARK: - Helpers

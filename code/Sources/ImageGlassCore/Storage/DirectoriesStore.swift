@@ -11,7 +11,31 @@ import Foundation
 /// atomic (temp file + `replaceItem`).
 public final class DirectoriesStore: @unchecked Sendable {
 
-    public static let shared = DirectoriesStore()
+    /// Multi-window dispatch hook (multi_window.mdx §6). The GUI
+    /// installs a resolver at launch that returns the frontmost
+    /// `WindowState.directoriesStore`. The CLI, the standalone MCP
+    /// server, and tests leave it nil, in which case `.shared`
+    /// resolves to `_sharedFallback` — the legacy single-window
+    /// instance that points at the v1 file (with the §3.5 compat
+    /// shim).
+    ///
+    /// Implementation note: `@unchecked Sendable` because the resolver
+    /// is set exactly once at launch on the main actor and read
+    /// thereafter; concurrent installs are not supported.
+    nonisolated(unsafe) public static var frontmostResolver: (@Sendable () -> DirectoriesStore?)?
+
+    /// The default-target store for any caller that does not specify
+    /// a window. When the GUI is attached this resolves to the
+    /// frontmost window's per-window store; when not (CLI, MCP-only
+    /// process, tests), it falls back to the legacy singleton.
+    public static var shared: DirectoriesStore {
+        if let resolver = frontmostResolver, let store = resolver() {
+            return store
+        }
+        return _sharedFallback
+    }
+
+    private static let _sharedFallback = DirectoriesStore()
 
     /// Optional override for tests so they can isolate the YAML file.
     public var overrideFile: URL?
@@ -41,7 +65,19 @@ public final class DirectoriesStore: @unchecked Sendable {
     public var fileURL: URL {
         if let overrideFile { return overrideFile }
         if let windowID { return AppPaths.macDirectoriesWindowFile(id: windowID) }
-        return AppPaths.macDirectoriesFile
+        // v1 → v2 compat shim (multi_window.mdx §3.5): when this store is
+        // the legacy `.shared` singleton (no `windowID` set), prefer the
+        // v1 file if it still exists, otherwise fall back to
+        // `directories_window_1.yaml`. After the migration runs the v1
+        // file has been renamed to `.v1.bak`, so all reads/writes through
+        // `.shared` start landing on window 1's file — which is the
+        // single-window-equivalent behavior the rest of the codebase
+        // assumes during Groups B/C.
+        let v1 = AppPaths.macDirectoriesFile
+        if FileManager.default.fileExists(atPath: v1.path) {
+            return v1
+        }
+        return AppPaths.macDirectoriesWindowFile(id: 1)
     }
 
     private let lock = NSLock()

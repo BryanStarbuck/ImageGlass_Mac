@@ -258,6 +258,17 @@ public final class AppState {
             try AppPaths.ensureDirectories()
             try AppPaths.ensureLayoutDirectories()
             try AppPaths.ensureMacDirectories()
+            // multi_window.mdx §1.4 / §3.5 / §4.3 — run the v1 → v2 Local
+            // Storage migration and populate `WindowRegistry.shared` with
+            // every `settings_window_<N>.yaml` on disk before any
+            // `DirectoriesStore` read. This is idempotent on subsequent
+            // launches.
+            do {
+                _ = try WindowRegistryBootstrap.runIfNeeded()
+            } catch {
+                ErrorLog.log("WindowRegistryBootstrap.runIfNeeded failed",
+                             error: error, class: String(describing: Self.self))
+            }
             await loadConfig()
             await loadSettings()
             themeStore.bootstrap()
