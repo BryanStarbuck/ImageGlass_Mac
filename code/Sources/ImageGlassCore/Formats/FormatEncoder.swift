@@ -76,6 +76,23 @@ public enum FormatEncoder {
         format: FormatInfo,
         options: EncoderOptions = .default
     ) throws -> URL {
+        // §5.2 `Format.Convert` — wraps the actual encode + atomic write.
+        // We don't always know a *source* format here (the caller hands us
+        // a CGImage), so `from` is "cgimage" unless the URL extension is
+        // recognized, in which case we use that as a hint of where this
+        // image came from.
+        let srcFmt = FormatRegistry.shared.format(forURL: url)?.id ?? "cgimage"
+        let _trace = PerformanceLog.shared.start(
+            "Format.Convert",
+            extra: [
+                ("from", srcFmt),
+                ("to", format.id),
+                ("path", url.path),
+                ("pixels", String(image.width * image.height)),
+            ]
+        )
+        defer { _trace.finish() }
+
         guard format.canWrite else {
             throw FormatEncoderError.unwritableFormat(format)
         }

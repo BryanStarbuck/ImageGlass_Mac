@@ -33,6 +33,11 @@ public enum SVGDetection {
 
     /// Detect static vs. animated by scanning the file.
     public static func detectKind(at url: URL) -> SVGKind {
+        let _trace = PerformanceLog.shared.start(
+            "SVG.Detect",
+            extra: [("path", url.path)]
+        )
+        defer { _trace.finish() }
         guard let data = try? Data(contentsOf: url) else { return .animated }
         return detectKind(data: data)
     }

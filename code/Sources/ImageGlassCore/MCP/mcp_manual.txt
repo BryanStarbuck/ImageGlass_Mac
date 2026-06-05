@@ -30,9 +30,14 @@ Replace a root's filter wholesale:
     update_directory_filter(path, filter)
     set_global_filter(filter)             — applies to every root
 
-Add or list one filter item without clobbering the others:
+Add, remove, or list one filter item without clobbering the others:
     add_filter_item(targets, item)
+    remove_filter_item(targets, match)        — match = { id | pattern | regex }
     list_filter_items(targets?)
+
+Toggle the panel's "Hide Empty Directories" UI preference:
+    set_hide_empty_directories(enabled)
+    get_hide_empty_directories()
 
 Open a root in Finder:
     reveal_directory(path)

@@ -201,6 +201,18 @@ public final class ExternalToolIPC: @unchecked Sendable {
     }
 
     public func broadcast(_ message: [String: Any]) {
+        // §5.6 `ExternalTool.IPCRoundtrip` — covers the JSON encode and the
+        // per-client write fan-out. The transport is broadcast-style so we
+        // measure the send half here; inbound client lines emit a paired
+        // `event` from `readFromClient` below.
+        let msgType = (message["type"] as? String) ?? "unknown"
+        let _trace = PerformanceLog.shared.start(
+            "ExternalTool.IPCRoundtrip",
+            extra: [
+                ("direction", "broadcast"),
+                ("type", msgType),
+            ]
+        )
         let data: Data
         do {
             data = try JSONSerialization.data(withJSONObject: message)
@@ -208,13 +220,15 @@ public final class ExternalToolIPC: @unchecked Sendable {
             ErrorLog.log("JSONSerialization.data(withJSONObject:) failed for broadcast",
                          error: error,
                          class: String(describing: Self.self))
+            _trace.finish(reason: "error")
             return
         }
         queue.async { [weak self] in
-            guard let self else { return }
+            guard let self else { _trace.finish(reason: "auto_finish"); return }
             for fd in self.clientFDs {
                 self.writeLine(data, to: fd)
             }
+            _trace.finish(extra: [("clients", String(self.clientFDs.count))])
         }
     }
 
@@ -265,17 +279,33 @@ public final class ExternalToolIPC: @unchecked Sendable {
             if buf[i] == 0x0A {
                 if i > start {
                     let line = Data(buf[start..<i])
+                    // §5.6 `ExternalTool.IPCRoundtrip` (inbound). One trace
+                    // per parsed line so the analyzer can pair tool replies
+                    // against the broadcast that prompted them. We wrap the
+                    // JSON parse + handler call together because the handler
+                    // is the user-visible side of "tool responded".
+                    let _inTrace = PerformanceLog.shared.start(
+                        "ExternalTool.IPCRoundtrip",
+                        extra: [
+                            ("direction", "inbound"),
+                            ("bytes", String(line.count)),
+                        ]
+                    )
                     do {
                         if let obj = try JSONSerialization.jsonObject(with: line) as? [String: Any] {
                             incomingMessageHandler?(fd, obj)
+                            let msgType = (obj["type"] as? String) ?? "unknown"
+                            _inTrace.finish(extra: [("type", msgType)])
                         } else {
                             ErrorLog.log("client JSON line was not a top-level object on fd \(fd)",
                                          class: String(describing: Self.self))
+                            _inTrace.finish(reason: "error")
                         }
                     } catch {
                         ErrorLog.log("JSONSerialization.jsonObject failed for client line on fd \(fd)",
                                      error: error,
                                      class: String(describing: Self.self))
+                        _inTrace.finish(reason: "error")
                     }
                 }
                 start = i + 1

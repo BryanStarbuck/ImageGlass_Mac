@@ -84,8 +84,9 @@ Two on-disk surfaces hold preferences. The split is deliberate:
 
 | Surface | Backing store | Contents |
 | --- | --- | --- |
-| **UserDefaults** (`com.starbuck.imageglass`) | `~/Library/Preferences/com.starbuck.imageglass.plist` | Trivial UI prefs that the **app** owns: last window position and size, last selected sidebar tab in Settings, last sort order in the file panel, whether the welcome image is dismissed, the active layout preset name. Anything you would not want an MCP client to touch and anything that is intrinsically per-user-per-machine. |
-| **settings.json** | `~/Library/Application Support/ImageGlass_Mac/settings.json` | The canonical config: viewer behavior, color management, keybindings, mouse actions, slideshow settings, gallery defaults, tools, plugins. This file is the contract for both the GUI and the MCP server. |
+| **UserDefaults** (`com.starbuck.imageglass`) | `~/Library/Preferences/com.starbuck.imageglass.plist` | Trivial UI prefs that the **app** owns: last selected sidebar tab in Settings, whether the welcome image is dismissed, in-progress modal sheet state. Anything you would not want an MCP client to touch. |
+| **settings.json** | `~/Library/Application Support/ImageGlass_Mac/settings.json` | The canonical config: viewer behavior, color management, keybindings, mouse actions, slideshow settings, gallery defaults, tools, plugins. This file is the contract for both the GUI and the MCP server. Also holds the **session-state block** described in §2.1.1. |
+| **layout.json** | `~/Library/Application Support/ImageGlass_Mac/layout.json` | Detailed panel layout coordinates — divider sizes, dock positions, floating frames, hidden last-positions. Owned by the panel framework (see `panels.mdx` §6). The high-level session summary in `settings.json` cross-references this file. |
 
 Justification:
 
@@ -96,6 +97,44 @@ Justification:
   philosophy as the Local Storage scope files (see `automation.mdx` §4):
   a binary blob would close off the MCP, hand-editing, and
   version-control workflows ImageGlass_Mac explicitly wants to enable.
+
+### 2.1.1 Session state — save on quit, restore on launch
+
+`settings.json` carries a `session` block that records the workspace
+the user left, so the next launch reproduces it. The schema (with
+worked example) lives in `local_storage.mdx` §4.2.1; this spec
+summarizes what gets saved and the one explicit exclusion.
+
+What is restored on launch:
+
+* **Window** — frame `(x, y, w, h)`, the display the window was on,
+  full-screen / frameless flags.
+* **Panels** — which side of the window each panel was docked to,
+  visible / collapsed state, divider sizes. The detailed coordinates
+  live in `layout.json` (see `panels.mdx` §6); the `session.panels`
+  summary in `settings.json` is the human-readable cross-reference.
+* **Viewer** — last-used zoom mode (Fit, Width, Fill, Actual, or
+  Custom with explicit percent) and last pan offset.
+* **Selection** — the file the viewer was showing and which surface
+  had keyboard focus.
+* **Directory tree** — every directory the user expanded or
+  collapsed in the Directory Panel, recorded as an `expanded_paths`
+  map keyed by absolute POSIX path (see `dir_ui.mdx` §3.3).
+
+The single explicit **exclusion** is **slideshow mode**. If the user
+quits while a slideshow is running, the next launch starts with
+slideshow off; the viewer parks on the last-shown file but no
+timer fires. The slideshow's *configuration* (interval, randomness,
+hide-main-in-slideshow, etc.) remains in `slideshow.*` and is
+unaffected — only the live "is running right now" state is
+discarded. Rationale: a running slideshow on launch would race with
+the user's first input and contradict the workspace-fidelity goal.
+
+Session-state writes happen on clean quit only. A crash or kill
+loses at most the position / size changes made since the last
+debounced settings write. MCP clients should treat `session.*` as
+read-only (`R` in the MCP column of the §4 page tables) — these keys
+are the app's workspace memory, not a remote-control surface.
 
 ### 2.2 File layout
 

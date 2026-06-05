@@ -26,6 +26,9 @@ public enum BuiltInPreset: String, CaseIterable, Sendable {
 
     /// Materialize the preset into a fresh `PanelLayout` value.
     public func layout() -> PanelLayout {
+        let _trace = PerformanceLog.shared.start("Panel.ApplyPreset",
+            extra: [("name", self.rawValue)])
+        defer { _trace.finish() }
         switch self {
         case .viewerOnly:   return Self.viewerOnlyLayout()
         case .browser:      return Self.browserLayout()

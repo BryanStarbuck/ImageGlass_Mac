@@ -52,8 +52,21 @@ struct FileListTreeView: View {
             .padding(.vertical, 2)
             .contentShape(Rectangle())
             .onTapGesture {
-                if isExpanded { expanded.remove(node.id) }
-                else { expanded.insert(node.id) }
+                if isExpanded {
+                    let _trace = PerformanceLog.shared.start(
+                        "FileTree.Collapse",
+                        extra: [("path", node.id)]
+                    )
+                    defer { _trace.finish() }
+                    expanded.remove(node.id)
+                } else {
+                    let _trace = PerformanceLog.shared.start(
+                        "FileTree.Expand",
+                        extra: [("path", node.id)]
+                    )
+                    defer { _trace.finish() }
+                    expanded.insert(node.id)
+                }
             }
             if isExpanded, let children = node.children {
                 ForEach(children) { child in

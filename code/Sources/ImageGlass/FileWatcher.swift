@@ -10,6 +10,12 @@ final class FileWatcher {
     private var fileDescriptor: Int32 = -1
     private let queue = DispatchQueue(label: "ImageGlass.FileWatcher")
     private var pendingWorkItem: DispatchWorkItem?
+    /// docs/performance.mdx §5.3 — one `FileWatcher.EventBatch` trace
+    /// covers one full debounce window. We keep the trace alive across
+    /// repeated kqueue events so its `count=` reflects how many raw
+    /// events the user-visible batch coalesced.
+    private var pendingTrace: PerformanceTrace?
+    private var pendingEventCount: Int = 0
 
     init(url: URL, onChange: @escaping @Sendable () -> Void) {
         self.url = url
@@ -33,7 +39,27 @@ final class FileWatcher {
         src.setEventHandler { [weak self] in
             guard let self else { return }
             self.pendingWorkItem?.cancel()
-            let work = DispatchWorkItem { self.onChange() }
+            // docs/performance.mdx §5.3 — `FileWatcher.EventBatch` covers
+            // one debounce window. We start the trace on the first event
+            // in the window and reuse it for subsequent events so the
+            // `count=` payload reflects how many raw events the
+            // user-visible batch coalesced.
+            if self.pendingTrace == nil {
+                self.pendingTrace = PerformanceLog.shared.start(
+                    "FileWatcher.EventBatch",
+                    extra: [("path", self.url.path)]
+                )
+            }
+            self.pendingEventCount += 1
+            let work = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                let trace = self.pendingTrace
+                let count = self.pendingEventCount
+                self.pendingTrace = nil
+                self.pendingEventCount = 0
+                self.onChange()
+                trace?.finish(extra: [("count", String(count))])
+            }
             self.pendingWorkItem = work
             // Spec §6.6: debounce 250 ms so bulk filesystem ops (e.g. cp -R)
             // collapse to a single re-evaluation.

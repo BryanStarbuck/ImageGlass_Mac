@@ -44,6 +44,12 @@ public final class MCPServer {
     }
 
     public func run() {
+        // Boot phase: encoders/decoders + subscriber wire-up. Instrumented
+        // per `docs/performance.mdx` §5.6 as `MCP.Server.Boot`. The read
+        // loop below is *not* part of boot — it is the long-lived
+        // request loop.
+        let bootTrace = PerformanceLog.shared.start("MCP.Server.Boot")
+
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.withoutEscapingSlashes]
         encoder.dateEncodingStrategy = .iso8601
@@ -63,6 +69,8 @@ public final class MCPServer {
                 notificationSubscription = nil
             }
         }
+
+        bootTrace.finish()
 
         var buffer = Data()
         while true {
@@ -97,6 +105,12 @@ public final class MCPServer {
     }
 
     private func handleLine(_ data: Data, encoder: JSONEncoder, decoder: JSONDecoder) {
+        // Per `docs/performance.mdx` §5.6 — wrap one full JSON-RPC frame
+        // handle as `MCP.Server.HandleRequest`. Inner work (the actual
+        // tool dispatch) shows up as its own `MCP.ToolCall.<name>` trace.
+        let _serverTrace = PerformanceLog.shared.start("MCP.Server.HandleRequest")
+        defer { _serverTrace.finish() }
+
         // Per JSON-RPC 2.0, a notification has no `id`. We need to distinguish
         // "no id at all" from "id present and null" so we don't reply to
         // notifications. Peek at the raw JSON object first.

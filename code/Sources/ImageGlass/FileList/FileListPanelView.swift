@@ -90,6 +90,14 @@ public struct FileListPanelView: View {
     /// inside the per-mode views in the production fork. The bindings here
     /// cover the panel-level shortcuts.
     private func handleKey(_ press: KeyPress) -> KeyPress.Result {
+        let _trace = PerformanceLog.shared.start(
+            "FileTree.FocusChange",
+            extra: [
+                ("key", String(describing: press.key)),
+                ("source", "keypress"),
+            ]
+        )
+        defer { _trace.finish() }
         switch press.key {
         case .leftArrow:
             model.moveFocus(by: -1, extending: press.modifiers.contains(.shift))

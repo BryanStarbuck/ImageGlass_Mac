@@ -39,6 +39,8 @@ public struct ThemeCatalog {
 
     /// Just the disk-installed themes (no built-ins).
     public func scanInstalledThemeFolders() -> [Theme] {
+        let _trace = PerformanceLog.shared.start("Theme.ScanCatalog")
+        defer { _trace.finish() }
         let fm = FileManager.default
         let dir = AppPaths.themesDir
         guard fm.fileExists(atPath: dir.path) else { return [] }

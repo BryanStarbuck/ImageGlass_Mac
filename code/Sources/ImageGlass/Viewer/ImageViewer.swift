@@ -22,25 +22,15 @@ struct ImageViewer: View {
                     .onDrop(of: [.fileURL], delegate: FileDropDelegate(state: state))
                     .focusable()
                     .focusEffectDisabled()
-                    .onKeyPress(.leftArrow,  phases: .down) { handleArrow(.left,  $0) }
-                    .onKeyPress(.rightArrow, phases: .down) { handleArrow(.right, $0) }
-                    .onKeyPress(.upArrow,    phases: .down) { handleArrow(.up,    $0) }
-                    .onKeyPress(.downArrow,  phases: .down) { handleArrow(.down,  $0) }
+                    // hotkeys.mdx §4 + §5 — shared arrow + bare-letter
+                    // zoom bindings (also attached to the Directory
+                    // Panel so they work under either focus context).
+                    .imageGlassHotkeys(state: state, viewer: viewer)
                     .onKeyPress(.space)      { handleSpace() }
                     .onKeyPress(.escape) {
                         if state.crop.isActive { state.crop.cancel(); return .handled }
                         return .ignored
                     }
-                    // hotkeys.mdx §5 — bare-letter zoom hotkeys. Only fire
-                    // when no modifier is held so ⌘C / ⌘W keep their menu
-                    // bindings (Copy, Close Window).
-                    .onKeyPress("c", phases: .down) { handleZoomKey($0, action: .center) }
-                    .onKeyPress("n", phases: .down) { handleZoomKey($0, action: .normalize) }
-                    .onKeyPress("z", phases: .down) { handleZoomKey($0, action: .fit) }
-                    .onKeyPress("w", phases: .down) { handleZoomKey($0, action: .width) }
-                    .onKeyPress("=", phases: .down) { handleZoomKey($0, action: .zoomIn) }
-                    .onKeyPress("+", phases: .down) { handleZoomKey($0, action: .zoomIn) }
-                    .onKeyPress("-", phases: .down) { handleZoomKey($0, action: .zoomOut) }
                     // slideshow.mdx §1 / §3 / §5 — bare `S` toggles the
                     // slideshow on or off. Focus-aware via onKeyPress
                     // (text fields keep `s` for typing) and modifier-
@@ -155,77 +145,6 @@ struct ImageViewer: View {
             SlideshowController.shared.toggle(appState: state, source: "key:Space")
             return .handled
         }
-    }
-
-    /// Arrow-key handler. Behavior depends on the modifier:
-    /// * Crop active — preserved from docs/crop.mdx §2.4 (nudge / grow).
-    /// * `⌃` held — pan the viewer by 15% of viewport (hotkeys.mdx §4.3).
-    /// * Bare — tree navigation: ↑/↓ step through visible rows, ←
-    ///   collapses/parents, → expands/steps-in (hotkeys.mdx §4.1).
-    private enum ArrowDir { case left, right, up, down }
-    private func handleArrow(_ dir: ArrowDir, _ press: KeyPress) -> KeyPress.Result {
-        if state.crop.isActive {
-            let mods = press.modifiers
-            let shift = mods.contains(.shift)
-            let cmd = mods.contains(.command)
-            let mag: CGFloat = shift ? 10 : 1
-            switch (cmd, dir) {
-            case (false, .left):  state.crop.nudge(dx: -mag, dy: 0); return .handled
-            case (false, .right): state.crop.nudge(dx:  mag, dy: 0); return .handled
-            case (false, .up):    state.crop.nudge(dx: 0, dy: -mag); return .handled
-            case (false, .down):  state.crop.nudge(dx: 0, dy:  mag); return .handled
-            case (true,  .left):  state.crop.grow(dw: -mag, dh: 0); return .handled
-            case (true,  .right): state.crop.grow(dw:  mag, dh: 0); return .handled
-            case (true,  .up):    state.crop.grow(dw: 0, dh: -mag); return .handled
-            case (true,  .down):  state.crop.grow(dw: 0, dh:  mag); return .handled
-            }
-        }
-        // ⌃-arrow → viewport pan. hotkeys.mdx §4.3. Step is read from
-        // Settings ▸ Viewer ▸ Pan step (percent of viewport).
-        if press.modifiers.contains(.control) {
-            let step = CGFloat(max(state.settings.viewer.pan_step_percent, 1) / 100.0)
-            switch dir {
-            case .left:  viewer.requestPan(dx: -step, dy:  0); return .handled
-            case .right: viewer.requestPan(dx:  step, dy:  0); return .handled
-            case .up:    viewer.requestPan(dx:  0,    dy: -step); return .handled
-            case .down:  viewer.requestPan(dx:  0,    dy:  step); return .handled
-            }
-        }
-        // Bare arrows: walk the visible tree (mix of folders + files).
-        // hotkeys.mdx §4.1.
-        switch dir {
-        case .left:  state.arrowLeft();  return .handled
-        case .right: state.arrowRight(); return .handled
-        case .up:    state.arrowUp();    return .handled
-        case .down:  state.arrowDown();  return .handled
-        }
-    }
-
-    /// Bare-letter zoom hotkeys. hotkeys.mdx §5. Returns `.ignored`
-    /// (so `⌘C` etc. still route to menu items) whenever a modifier
-    /// other than Shift is held.
-    private enum ZoomKey { case zoomIn, zoomOut, center, normalize, fit, width }
-    private func handleZoomKey(_ press: KeyPress, action: ZoomKey) -> KeyPress.Result {
-        // Crop overlay owns most letter keys — let them through.
-        guard !state.crop.isActive else { return .ignored }
-        // Allow Shift (so `+` reaches us as Shift-`=`), but not ⌘/⌥/⌃.
-        let blocking: EventModifiers = [.command, .option, .control]
-        if !press.modifiers.intersection(blocking).isEmpty { return .ignored }
-        let step = state.settings.viewer.zoom_step_percent
-        let lastRaw = UserDefaults.standard.string(forKey: ViewerState.lastZoomModeKey)
-        let last = lastRaw.flatMap(ZoomMode.init(rawValue:))
-        switch action {
-        case .zoomIn:    viewer.zoomIn(stepPercent: step)
-        case .zoomOut:   viewer.zoomOut(stepPercent: step)
-        case .center:    viewer.centerImage()
-        case .normalize: viewer.normalizeZoom(
-            mode: state.settings.viewer.default_zoom_on_open,
-            lastMode: last
-        )
-        case .fit:       viewer.zoomToFit()
-        case .width:     viewer.zoomToWidth()
-        }
-        return .handled
     }
 
     /// slideshow.mdx §1 / §3 / §5 — the bare `S` key. `onKeyPress` is
@@ -358,6 +277,11 @@ private struct CanvasHost: NSViewRepresentable {
         // silently presenting an empty cyan window.
         let resolvedPath = state.selectedFile.map { AppPaths.expandTilde($0) }
         if v.loadedPath != resolvedPath {
+            let _loadTrace = PerformanceLog.shared.start(
+                "Image.Load",
+                extra: [("path", resolvedPath ?? "")]
+            )
+            defer { _loadTrace.finish() }
             if let raw = state.selectedFile, let expanded = resolvedPath {
                 let result = ImageCanvasView.validate(path: expanded)
                 if result != .ok {
@@ -383,13 +307,24 @@ private struct CanvasHost: NSViewRepresentable {
             // (in the host, on the SwiftUI side) is the only place that
             // sticks, because `updateNSView` runs again right after and
             // would otherwise stamp the old values back onto the view.
+            //
+            // hotkeys.mdx §6.1 — Zoom to Width persists across image
+            // changes. Width mode keeps the rescale (so a fresh tall
+            // mockup also fills the viewport horizontally) and re-arms
+            // the top-align pass.
             Task { @MainActor in
-                viewer.zoomMode = .fit
+                let preserveWidth = (viewer.zoomMode == .width)
                 viewer.lockedZoom = 1.0
                 viewer.panOffset = .zero
                 viewer.rotationQuarterTurns = 0
                 viewer.flipHorizontal = false
                 viewer.flipVertical = false
+                if preserveWidth {
+                    viewer.zoomMode = .width
+                    viewer.pendingScrollToTop = true
+                } else {
+                    viewer.zoomMode = .fit
+                }
             }
         }
         v.zoomMode = viewer.zoomMode

@@ -1029,6 +1029,50 @@ public struct AdvancedSettings: Codable, Equatable, Sendable {
     }
 }
 
+// MARK: - Actions
+
+/// `docs/use_cases/actions.mdx` §10 — knobs for the file-action verbs
+/// (Rename, Move to Trash, Copy Image, Copy File Path, Print).
+public struct ActionsSettings: Codable, Equatable, Sendable {
+    /// Show the confirmation dialog before *Move to Trash*. The dialog
+    /// also has a "Don't ask again" checkbox that writes this key.
+    public var confirm_move_to_trash: Bool
+    /// When the user clears the extension while renaming, append the
+    /// original extension on commit. Matches Finder behavior.
+    public var rename_preserve_extension: Bool
+    /// Toast feedback for *Copy Image* and *Copy File Path*. Off
+    /// silences the toast but still emits the audit line.
+    public var show_copy_toast: Bool
+    /// Default copies for the MCP `print_current_image` tool when the
+    /// caller does not supply `copies`.
+    public var default_print_copies: Int
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self), d = ActionsSettings()
+        confirm_move_to_trash = try c.decodeIfPresent(Bool.self, forKey: .confirm_move_to_trash) ?? d.confirm_move_to_trash
+        rename_preserve_extension = try c.decodeIfPresent(Bool.self, forKey: .rename_preserve_extension) ?? d.rename_preserve_extension
+        show_copy_toast = try c.decodeIfPresent(Bool.self, forKey: .show_copy_toast) ?? d.show_copy_toast
+        default_print_copies = try c.decodeIfPresent(Int.self, forKey: .default_print_copies) ?? d.default_print_copies
+    }
+
+    public init(
+        confirm_move_to_trash: Bool = true,
+        rename_preserve_extension: Bool = true,
+        show_copy_toast: Bool = true,
+        default_print_copies: Int = 1
+    ) {
+        self.confirm_move_to_trash = confirm_move_to_trash
+        self.rename_preserve_extension = rename_preserve_extension
+        self.show_copy_toast = show_copy_toast
+        self.default_print_copies = default_print_copies
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case confirm_move_to_trash, rename_preserve_extension
+        case show_copy_toast, default_print_copies
+    }
+}
+
 // MARK: - Root settings struct
 
 public struct Settings: Codable, Equatable, Sendable {
@@ -1052,6 +1096,8 @@ public struct Settings: Codable, Equatable, Sendable {
     public var tools: ToolsSettings
     public var plugins: PluginsSettings
     public var advanced: AdvancedSettings
+    /// `docs/use_cases/actions.mdx` §10 — file-action knobs.
+    public var actions: ActionsSettings
     /// Multi-monitor window state. See `docs/multi_monitor.mdx`.
     public var window: WindowSettings
 
@@ -1073,6 +1119,7 @@ public struct Settings: Codable, Equatable, Sendable {
         tools: ToolsSettings = .init(),
         plugins: PluginsSettings = .init(),
         advanced: AdvancedSettings = .init(),
+        actions: ActionsSettings = .init(),
         window: WindowSettings = .init()
     ) {
         self.version = version
@@ -1092,6 +1139,7 @@ public struct Settings: Codable, Equatable, Sendable {
         self.tools = tools
         self.plugins = plugins
         self.advanced = advanced
+        self.actions = actions
         self.window = window
     }
 
@@ -1122,6 +1170,7 @@ public struct Settings: Codable, Equatable, Sendable {
         self.tools = try c.decodeIfPresent(ToolsSettings.self, forKey: .tools) ?? d.tools
         self.plugins = try c.decodeIfPresent(PluginsSettings.self, forKey: .plugins) ?? d.plugins
         self.advanced = try c.decodeIfPresent(AdvancedSettings.self, forKey: .advanced) ?? d.advanced
+        self.actions = try c.decodeIfPresent(ActionsSettings.self, forKey: .actions) ?? d.actions
         self.window = try c.decodeIfPresent(WindowSettings.self, forKey: .window) ?? d.window
     }
 
@@ -1129,7 +1178,7 @@ public struct Settings: Codable, Equatable, Sendable {
         case version, general, image, viewer, appearance, layout, slideshow
         case edit, mouse, keyboard, gallery, toolbar
         case fileAssoc = "file_assoc"
-        case language, tools, plugins, advanced, window
+        case language, tools, plugins, advanced, actions, window
     }
 }
 
@@ -1183,7 +1232,14 @@ public enum SettingsDefaults {
         "flipHorizontal":    [Hotkey(key: "[", modifiers: ["command", "shift"])],
         "flipVertical":      [Hotkey(key: "]", modifiers: ["command", "shift"])],
         "toggleFullScreen":  [Hotkey(key: "F", modifiers: ["control", "command"])],
-        "startSlideshow":    [Hotkey(key: "B", modifiers: ["command"])],
+        // slideshow.mdx §0 / §1 / §10 — bare `S` is the focus-aware
+        // viewer hotkey, `⌥⌘S` is the unconditional menu shortcut.
+        // Two entries so a user-edited keyboard map can override either
+        // without losing the other.
+        "toggleSlideshow":   [
+            Hotkey(key: "S", modifiers: []),
+            Hotkey(key: "S", modifiers: ["command", "option"]),
+        ],
         "toggleGallery":     [Hotkey(key: "L", modifiers: ["command"])],
         "toggleToolbar":     [Hotkey(key: "T", modifiers: ["option", "command"])],
         "togglePanelMode":   [Hotkey(key: "P", modifiers: ["control", "command"])],

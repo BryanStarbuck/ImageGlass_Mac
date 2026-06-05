@@ -9,6 +9,8 @@ public enum FileListSorter {
         _ entries: [FileEntry],
         by descriptor: FileListSortDescriptor
     ) -> [FileEntry] {
+        let _trace = PerformanceLog.shared.start("FileList.Sort", extra: [("count", String(entries.count))])
+        defer { _trace.finish() }
         var work = entries
         switch descriptor.field {
         case .name:

@@ -85,6 +85,11 @@ public final class VideoPlaybackController {
     /// Replace the current item with the asset at `url`. Returns when the
     /// AVAsset reports `isPlayable`; throws `VideoError.unplayable` if not.
     public func load(_ url: URL) async {
+        let _trace = PerformanceLog.shared.start(
+            "Video.LoadAsset",
+            extra: [("path", url.path)]
+        )
+        defer { _trace.finish() }
         loadError = nil
         currentURL = url
 
@@ -175,6 +180,14 @@ public final class VideoPlaybackController {
             isPlaying = false
         }
         rate = player.rate
+
+        // performance.mdx §5.2 — emit the first-frame marker once the
+        // asset is ready and the player has been attached. AVKit will
+        // paint imminently; this is the closest deterministic moment.
+        PerformanceLog.shared.event(
+            "Video.FirstFrame",
+            extra: [("path", url.path)]
+        )
     }
 
     /// Tear down the player and free the current item. Called when the

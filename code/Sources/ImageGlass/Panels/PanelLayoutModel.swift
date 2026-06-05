@@ -181,6 +181,9 @@ public final class PanelLayoutModel {
 
     private func apply(_ new: PanelLayout) {
         guard new != layout else { return }
+        let _trace = PerformanceLog.shared.start("Panel.LayoutApply",
+            extra: [("preset", new.activePreset)])
+        defer { _trace.finish() }
         self.layout = new
         // Persist; if persistence fails (e.g., schema violation), we still
         // publish the new in-memory state so the user can recover.

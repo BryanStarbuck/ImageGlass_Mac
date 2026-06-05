@@ -18,7 +18,10 @@ public enum PanelLayoutMutations {
         defaultPosition: DockPosition = .right,
         defaultSize: CGSize = .init(width: 280, height: 600)
     ) -> PanelLayout {
-        showPanel(layout, id: id,
+        let _trace = PerformanceLog.shared.start("Panel.Show",
+            extra: [("id", id)])
+        defer { _trace.finish() }
+        return showPanel(layout, id: id,
                   defaultPosition: defaultPosition,
                   defaultSize: defaultSize,
                   asPrimary: false)
@@ -35,7 +38,10 @@ public enum PanelLayoutMutations {
         defaultPosition: DockPosition = .left,
         defaultSize: CGSize = .init(width: 280, height: 600)
     ) -> PanelLayout {
-        showPanel(layout, id: id,
+        let _trace = PerformanceLog.shared.start("Panel.Show",
+            extra: [("id", id), ("primary", "true")])
+        defer { _trace.finish() }
+        return showPanel(layout, id: id,
                   defaultPosition: defaultPosition,
                   defaultSize: defaultSize,
                   asPrimary: true)
@@ -109,6 +115,9 @@ public enum PanelLayoutMutations {
         _ layout: PanelLayout,
         id: String
     ) throws -> PanelLayout {
+        let _trace = PerformanceLog.shared.start("Panel.Hide",
+            extra: [("id", id)])
+        defer { _trace.finish() }
         var l = layout
         guard l.isVisible(id) else { return l }
 
@@ -157,6 +166,9 @@ public enum PanelLayoutMutations {
         to position: DockPosition,
         preferredSize: CGSize = .init(width: 320, height: 600)
     ) throws -> PanelLayout {
+        let _trace = PerformanceLog.shared.start("Panel.Move",
+            extra: [("id", id), ("position", position.wireValue)])
+        defer { _trace.finish() }
         // Remove from current location (without writing to hidden).
         var l = layout
         l = removePanelFromVisibleSlots(l, id: id)
@@ -189,6 +201,9 @@ public enum PanelLayoutMutations {
         size: CGFloat,
         minSize: CGFloat = 64
     ) throws -> PanelLayout {
+        let _trace = PerformanceLog.shared.start("Panel.SetSize",
+            extra: [("id", id), ("size", String(format: "%.1f", Double(size)))])
+        defer { _trace.finish() }
         var l = layout
         let clamped = max(size, minSize)
         for gIdx in l.groups.indices {
@@ -214,6 +229,9 @@ public enum PanelLayoutMutations {
         targetID: String,
         sourceID: String
     ) throws -> PanelLayout {
+        let _trace = PerformanceLog.shared.start("Panel.Tab",
+            extra: [("target_id", targetID), ("source_id", sourceID)])
+        defer { _trace.finish() }
         guard targetID != sourceID else { return layout }
         var l = layout
         guard let targetGroupIdx = l.groups.firstIndex(where: { $0.panelIDs.contains(targetID) }) else {
@@ -237,6 +255,9 @@ public enum PanelLayoutMutations {
         _ layout: PanelLayout,
         id: String
     ) throws -> PanelLayout {
+        let _trace = PerformanceLog.shared.start("Panel.Untab",
+            extra: [("id", id)])
+        defer { _trace.finish() }
         var l = layout
         for gIdx in l.groups.indices {
             if let pIdx = l.groups[gIdx].panelIDs.firstIndex(of: id) {

@@ -61,6 +61,8 @@ public actor ThumbnailCache {
     /// memory cache first, then disk, then generates via ImageIO.
     /// Returns `nil` if the file is not a decodable image.
     public func thumbnail(for url: URL, maxSide: Int) -> CGImage? {
+        let _trace = PerformanceLog.shared.start("Thumbnail.Generate", extra: [("path", url.path)])
+        defer { _trace.finish() }
         let key = Self.cacheKey(url: url, maxSide: maxSide)
 
         if let box = memory.object(forKey: key as NSString) {

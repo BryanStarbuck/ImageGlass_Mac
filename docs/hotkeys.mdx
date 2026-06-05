@@ -116,10 +116,9 @@ moves between levels (collapse / expand a folder, or step out / in).
   already filtered through inclusion / exclusion criteria. A folder
   marked shallow (see `local_storage.mdx`) exposes only its own files;
   pressing `→` on it never enters its sub-folders.
-* **Multi-select.** Holding `⇧` while pressing `↑` or `↓` extends the
-  selection in the Directory Panel (standard Mac behavior) but does
-  **not** advance the viewer until the user releases `⇧`. The viewer
-  then loads the most-recently-added file in the selection.
+* **Multi-select** is **deferred to v2** — see §11. v1 keeps the
+  single-cursor model so `↑` and `↓` always advance the viewer, with
+  no Shift-extends-selection semantics.
 
 ### 4.3 Arrow Keys With `⌃` (Page-Pan)
 
@@ -158,14 +157,18 @@ the most-used viewer commands after arrow navigation.
 | **`+`** / **`=`** | **Zoom In by 20%.** | Multiplicative — each press multiplies the current zoom factor by `1.20`. `=` is the unshifted twin of `+` so the user does not need `⇧`. |
 | **`-`** | **Zoom Out by 20%.** | Each press divides the current zoom factor by `1.20`. |
 | **`C`** | **Center.** | Re-centers the image inside the viewport without changing the current zoom factor. Useful after `⌃`-arrow panning or after dragging the image off-center with the mouse. |
-| **`N`** | **Normalize.** | Resets to the user's *default zoom mode*. The default is **Zoom to Fit** unless the user has changed it in Settings ▸ Viewer ▸ *Default zoom on open*; setting that to *Actual size (100%)* makes `N` snap to 100% instead. `N` is a one-press way to undo any ad-hoc zooming. |
+| **`M`** | **Normalize.** | Resets to the user's *default zoom mode*. The default is **Zoom to Fit** unless the user has changed it in Settings ▸ Viewer ▸ *Default zoom on open*; setting that to *Actual size (100%)* makes `M` snap to 100% instead. `M` is a one-press way to undo any ad-hoc zooming. *(Was bound to `N` prior to the slideshow-cursor work; `N` now navigates — see §6A.)* |
+| **`N`** | **Next Image.** | Advance the global selection cursor to the next image in the file tree's top-down visible order (see [slideshow.mdx §10A](./use_cases/slideshow.mdx)). Wraps at the end when *Settings ▸ Viewer ▸ Wrap at ends* is on. Skips files whose include state is *exclude* or *inherit-exclude*. Works inside and outside a running slideshow — pressing `N` during a slideshow re-anchors the controller. |
+| **`P`** | **Previous Image.** | Step the global selection cursor back to the previous image, same list and same skip rule as `N`. *(The earlier `P`-for-Copy-Path binding moved to `⇧P`.)* |
 | **`Z`** | **Zoom to Fit.** | Explicit fit-to-screen, regardless of the default zoom mode. The image scales so the longer dimension exactly fits the viewport; the other dimension may have letterboxing. |
 | **`W`** | **Zoom to Width.** | Switches to the new Zoom to Width mode (§6). The image is rescaled so its width exactly matches the viewport width, and the viewport scrolls to the top of the image. |
+| **`⇧P`** | **Copy Path.** | Copies the **absolute POSIX path** of the currently displayed file (or the file selected in the Directory Panel when no image is loaded) to the system pasteboard as plain UTF-8. In-viewer twin of File ▸ Copy File Path (`⌃⌘C` in `menus.mdx`). See §5A for the full pasteboard contract. |
+| **`L`** | **Load From Clipboard.** | Reads a file path or `file://` URL from the system pasteboard and loads it in the viewer. The path is **not** added to any scope — it is shown as an ad-hoc open. See §5B for the parse and error contract. |
 | **`F`** | (Reserved) | Reserved for *Zoom to Fill* (the cover-style mode) in v2. v1 does not bind `F`. |
 
 ### 5.1 Mode vs. One-Shot
 
-`Z`, `W`, and `N` set a **zoom mode** that persists until the user
+`Z`, `W`, and `M` set a **zoom mode** that persists until the user
 zooms manually or switches mode. `+`, `-`, and `C` are one-shot
 adjustments that put the viewer into a **custom-zoom** state. The
 status bar shows the current mode (*Fit*, *Width*, *Actual*, *Custom*)
@@ -180,6 +183,104 @@ and the current percent.
   arbitrary percent.
 * Pressing any bare-letter zoom key after smooth-magnifying overrides
   the gesture's zoom factor and switches back to the named mode.
+
+---
+
+## 5A. Clipboard Path Hotkeys (`P` / `L`)
+
+`P` (Copy Path) and `L` (Load From Clipboard) are a paired set: `P`
+puts a path **out** to the system clipboard so the user (or another
+app) can act on it; `L` reads a path **in** from the system clipboard
+and opens it in the viewer. Together they give the viewer a one-key
+"send" and one-key "receive" surface for image paths, which is the
+most-asked-for interop with Finder, Terminal, Claude Code, browser
+downloads, and chat windows.
+
+Both keys obey the focus rules in §3 (viewer or Directory Panel; not
+text fields). Both are bare letters with no modifier.
+
+### 5A.1 `P` — Copy Path
+
+* **What gets copied.** The **absolute POSIX path** of the file that
+  drives the viewer:
+  * If an image is currently loaded, the path of that image.
+  * Else, if the Directory Panel has a file selected, the path of
+    that file.
+  * Else (no image, no file selection), the key is a no-op and the
+    status bar shows "No file to copy."
+* **Pasteboard format.** Plain UTF-8 string on
+  `NSPasteboard.PasteboardType.string`. Additionally,
+  `NSPasteboard.PasteboardType.fileURL` is set to the file's
+  `file://` URL, so paste targets that prefer the URL type (Finder,
+  most Mac apps) accept the same paste. No HTML, no RTF, no other
+  representations.
+* **Symlinks and aliases.** The path is **not** resolved through
+  symlinks or aliases. If the user is viewing the file via a symlink,
+  the symlink path is what gets copied. (Reveal in Finder is the
+  command that resolves; `P` is the command that preserves what the
+  user sees.)
+* **Sandbox-relative paths.** Are expanded to absolute paths before
+  copy. Nothing relative ever lands on the clipboard.
+* **Confirmation.** A 1.2-second status-bar toast confirms the copy:
+  "Copied path: …/filename.jpg".
+
+### 5A.2 `L` — Load From Clipboard
+
+* **What gets read.** The system pasteboard is read in this order:
+  1. `NSPasteboard.PasteboardType.fileURL` — preferred. The first
+     `file://` URL is used.
+  2. `NSPasteboard.PasteboardType.string` — if the string is a single
+     line that parses as a POSIX path (absolute or `~`-prefixed) or
+     as a `file://` URL, use it.
+  3. If neither yields a usable path, `L` is a no-op and the status
+     bar shows "Clipboard does not contain a file path."
+* **What gets loaded.** The viewer attempts to display the file at
+  that path. The same decoder path used for File ▸ Open is used here
+  — ImageIO first, vendored decoders as a fallback per
+  `automation.mdx`. Format support and error reporting are identical
+  to drag-from-Finder.
+* **Scope behavior.** The loaded file is **not** added to any scope
+  and does **not** mutate `directories.yaml`. The Directory Panel
+  selection is **cleared** for the duration of the ad-hoc view: the
+  panel shows a one-row "(ad-hoc) /Users/…/filename.jpg" entry
+  italicized in the active scope header area, and `↑` / `↓` are
+  no-ops until the user picks a scope file again.
+* **Path normalization.** `~` is expanded to the user's home
+  directory. `file://` URLs are decoded (percent-decode + drop the
+  scheme). Trailing whitespace and surrounding quotes (`"…"`, `'…'`)
+  are stripped — these survive copy-paste from chat windows.
+* **Errors.**
+  * File does not exist → status-bar error "File not found: …" and a
+    300 ms shake on the viewer canvas.
+  * File exists but ImageIO cannot decode it → standard error card
+    used by File ▸ Open.
+  * Path resolves to a **directory** → the viewer does not open the
+    directory as an image; instead it asks Local Storage to add the
+    directory to the active scope (same gesture as drag-folder-onto-
+    panel from `dir_ui.mdx`), and the status bar shows "Added folder
+    to active scope."
+* **Security.** No remote URLs are followed. `http://`, `https://`,
+  and other non-`file` schemes are rejected with "Clipboard does not
+  contain a file path." This is deliberate — `L` is for local files
+  the user already trusts, not for downloading from the web.
+
+### 5A.3 Round-trip Workflow
+
+The canonical `P` → `L` round trip:
+
+1. User is on image `~/Pictures/2026/03/IMG_1234.heic` in the
+   viewer. Presses `P`. The path is on the clipboard.
+2. User switches to Claude Code, pastes the path into a prompt:
+   "rotate this image 90° and save the result next to it".
+3. Later, the user pastes the result path (which Claude Code echoed
+   back) into Finder, into Terminal, or back into ImageGlass_Mac.
+   Inside ImageGlass_Mac, the user presses `L`, and the rotated
+   version loads.
+
+This loop — viewer → clipboard → external tool → clipboard →
+viewer — is the primary reason `P` and `L` are single-key bindings.
+Any extra modifier on this loop would defeat the muscle-memory
+intent.
 
 ---
 
@@ -278,6 +379,8 @@ function; menu-bar twins are listed in the *Menu shortcut* column.
 | **`N`** | Normalize to default zoom mode | View ▸ Normalize Zoom *(menu item, no shortcut)* |
 | **`Z`** | Zoom to Fit | View ▸ Zoom to Fit (⌘ 9) |
 | **`W`** | Zoom to Width | View ▸ Zoom to Width (⌥ ⌘ 9) |
+| **`P`** | Copy file path to clipboard | File ▸ Copy File Path (⌃ ⌘ C) |
+| **`L`** | Load image from clipboard path | File ▸ Load From Clipboard (⌥ ⌘ V) |
 | **␣** (Space) | Toggle slideshow | View ▸ Slideshow |
 | **⌫** | Move selected file to Trash | Edit ▸ Delete |
 
@@ -290,33 +393,41 @@ The full list of `⌘`-prefixed shortcuts (menu chords) is owned by
 
 ### 8.1 Routing
 
-All bindings in this document are routed through a single
-`KeyEquivalentDispatcher` that sits between the AppKit
-`NSResponder.performKeyEquivalent(with:)` path and the SwiftUI
-`.keyboardShortcut` modifier:
+All bindings in this document are routed through a single SwiftUI
+`ViewModifier` — `ImageGlassHotkeysModifier` — applied to both the
+viewer canvas and the Directory Panel via the
+`.imageGlassHotkeys(state:viewer:)` extension. SwiftUI's
+`.onKeyPress` inside the modifier guarantees that:
 
-* Bare letters (`C`, `N`, `Z`, `W`, `+`, `=`, `-`) are dispatched
-  **only** when the first responder is the viewer or the Directory
-  Panel. The dispatcher consults the responder chain on every key
-  event.
-* Arrow keys with no modifier are dispatched to the file-list
-  navigation handler regardless of which of those two surfaces has
-  focus, because both surfaces share the same selection model.
-* `⌃`-arrow combinations are dispatched to the viewer's pan handler
-  only when the viewer has focus *and* the current image overflows
-  the viewport on the relevant axis.
+* Bare letters (`C`, `N`, `Z`, `W`, `+`, `=`, `-`) reach the handler
+  only when the modifier's host is the focused surface — i.e., the
+  viewer or the Directory Panel. A focused text field swallows the
+  keystroke before it ever arrives.
+* Arrow keys with no modifier route to `AppState.arrow*()`, which
+  walks the visible-tree row model shared by both surfaces, so the
+  viewer and panel always show the same cursor.
+* `⌃`-arrow combinations route to the viewer pan handler, which is a
+  no-op on an axis where the image already fits the viewport (the
+  canvas computes overflow from its own bounds; see §4.3).
 
 ### 8.2 SwiftUI + AppKit Split
 
-* The viewer canvas is `MTKView`-backed (AppKit). It implements
-  `NSResponder.keyDown(with:)` to handle the bare-letter zoom keys and
-  the `⌃`-arrow pan keys.
-* The Directory Panel is `OutlineGroup` in SwiftUI for v1, with the
-  arrow-key handling implemented through `.onKeyPress(.upArrow)` /
-  `.downArrow` / `.leftArrow` / `.rightArrow` modifiers (macOS 14+).
-* When focus is on either surface and the user presses an arrow,
-  selection mutates through the shared `FileListSelectionModel`
-  observable object so the viewer and panel stay in lockstep.
+* The viewer canvas is `NSView`-backed (AppKit, `ImageCanvasView`).
+  Mouse-wheel zoom, pinch zoom, drag-pan, and the color-picker
+  readouts live on `NSResponder`.
+* The Directory Panel is a SwiftUI `LazyVStack` rendering recursive
+  `DesignTreeNode` rows, with expansion + cursor state held in a
+  shared `TreeNavigator` (`@Observable`).
+* Both surfaces attach the same `ImageGlassHotkeysModifier`
+  (`.imageGlassHotkeys(state:viewer:)`). Each `.onKeyPress(...)`
+  inside the modifier translates the arrow / letter key into a call
+  on `AppState.arrow*()` or `ViewerState.zoom*()`, so the viewer and
+  panel always agree about which file is selected and which folders
+  are open.
+* Focus routing relies on SwiftUI's first-responder model. When a
+  text field (search field, rename field) is focused, the modifier's
+  `.onKeyPress` blocks never receive the keystroke — the text field
+  consumes it for typing, satisfying spec §3's text-field rule.
 
 ### 8.3 Conflict With System and Menu Bindings
 
@@ -331,6 +442,17 @@ All bindings in this document are routed through a single
 
 This pattern (bare-letter wins, `⌘`-modified routes to the menu)
 applies uniformly to `C`, `N`, `Z`, `W`, `+`, `-`.
+
+The same pattern covers the two clipboard-path letters added in §5A:
+
+* `⌘ P` → Print, and `⇧ ⌘ P` → Page Setup (owned by `menus.mdx`
+  §4.2).
+* Bare `P` (no modifier) → Copy Path.
+* `⌘ L` and any other modified-`L` chord → routed by the menu bar
+  per `menus.mdx`. Bare `L` (no modifier) never reaches the menu;
+  it is dispatched to Load From Clipboard.
+* `⇧ P`, `⇧ L` → No binding. Fall through to text input if a field
+  has focus.
 
 ### 8.4 Performance Budget
 
@@ -354,18 +476,24 @@ The following Settings ▸ Viewer / Settings ▸ Navigation fields
 influence the behavior in this document. None of them rebind keys in
 v1 (rebinding is a v2 feature, see `menus.mdx` §9).
 
-| Settings field | Effect |
-| --- | --- |
-| Viewer ▸ *Default zoom on open* | Determines what `N` snaps to: `Zoom to Fit` (default), `Actual size`, or `Restore last mode`. |
-| Viewer ▸ *Zoom step (percent)* | Overrides the 20% multiplicative step for `+` and `-`. Range 5%–50%. |
-| Viewer ▸ *Pan step (percent of viewport)* | Overrides the 15% pan step for `⌃`-arrow keys. Range 5%–50%. |
-| Viewer ▸ *Zoom to Width: scroll target* | `Top` (default) / `Center` / `Last viewed`. Most users want Top; the option exists for the rare workflow that wants to resume reading. |
-| Navigation ▸ *Wrap at ends* | When on, `↓` on the last file wraps to the first; `↑` on the first wraps to the last. Off by default. |
-| Navigation ▸ *Arrow keys move focus to viewer after selection* | When on, pressing `↓` in the Directory Panel also moves first responder to the viewer so zoom letters work without a second click. On by default. |
+| `settings.json` key | UI field | Effect |
+| --- | --- | --- |
+| `viewer.default_zoom_on_open` | Viewer ▸ *Default zoom on open* | Drives `N` (Normalize): `fit` (default), `actual`, or `restore_last`. |
+| `viewer.zoom_step_percent` | Viewer ▸ *Zoom step (percent)* | Multiplicative step for `+` / `-` / ⌘+ / ⌘-. Default `20`. |
+| `viewer.pan_step_percent` | Viewer ▸ *Pan step (percent of viewport)* | Per-keypress pan for `⌃`-arrow. Default `15`. |
+| `viewer.zoom_to_width_scroll` | Viewer ▸ *Zoom to Width: scroll target* | `top` (default — v1 only honors this), `center`, or `last_viewed` (reserved). |
+| `viewer.wrap_at_ends` | Viewer ▸ *Wrap at ends* | `↓` on the last row wraps to the first when `true`. Default `false`. |
+| `ig.viewer.last_zoom_mode` *(UserDefaults)* | — | Persisted last mode (`fit` / `width` / `lock` / `actual` / `auto` / `fill` / `height`). Read by `restore_last`. |
 
-All fields persist in `settings.json` under `viewer.*` and
-`navigation.*` and are exposed to MCP via the standard settings tool
-surface (see `settings.mdx`).
+All `viewer.*` fields persist in `settings.json` and are exposed to
+MCP via the standard settings tool surface (see `settings.mdx`).
+The last-mode breadcrumb is per-machine state, so it lives in
+`UserDefaults`, not `settings.json`.
+
+A v2 setting — *Navigation ▸ Arrow keys move focus to viewer after
+selection* — is not in v1 because SwiftUI's responder chain already
+lands the next keystroke in whichever surface most recently sent
+selection through `state.selectedFile`.
 
 ---
 
@@ -398,6 +526,10 @@ The hotkey surface is considered v1-complete when:
   v1. Settings ▸ Keybindings is the v2 surface that will let the user
   swap `Z` and `W`, change the zoom step, or assign hotkeys to MCP
   tools.
+* **Multi-select with `⇧`.** Holding Shift on `↑`/`↓` does **not**
+  extend a multi-row selection in v1. Mac batch-edit workflows are
+  out of scope until v2, when the Directory Panel grows a real
+  selection-set model. v1 keeps a single cursor row.
 * **Vim-style chords.** No `gg` / `G` / `:` style multi-key chords.
   Mac users do not expect them in an image viewer.
 * **Per-scope hotkeys.** Hotkeys are global to the app; they do not

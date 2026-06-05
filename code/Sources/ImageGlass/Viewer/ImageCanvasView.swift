@@ -46,17 +46,27 @@ final class ImageCanvasView: NSView {
     // Reads `dy` as a fraction of viewport height: 0.15 → pan down by 15%.
     // `dx` is a fraction of viewport width. macOS y-axis is bottom-up
     // (isFlipped=false), so a positive request "down" subtracts from
-    // panOffset.height. Returns the resulting (clamped) pan offset.
+    // panOffset.height. Per hotkeys.mdx §4.3, this is a **no-op on an
+    // axis where the rendered image fits inside the viewport** — there
+    // is nothing to scroll into view, so dragging an already-centered
+    // small image off-screen would be wrong.
     @discardableResult
     func panByFraction(dx: CGFloat, dy: CGFloat) -> CGSize {
         let vw = bounds.width
         let vh = bounds.height
         guard vw > 0, vh > 0 else { return panOffset }
-        let new = CGSize(
-            width:  panOffset.width  + dx * vw,
-            height: panOffset.height - dy * vh
+        let drawn = rotatedImageSize
+        let scale = currentScale
+        let drawnW = drawn.width  * scale
+        let drawnH = drawn.height * scale
+        // Skip an axis when the image already fits there.
+        let effDx = drawnW > vw ? dx : 0
+        let effDy = drawnH > vh ? dy : 0
+        if effDx == 0 && effDy == 0 { return panOffset }
+        panOffset = CGSize(
+            width:  panOffset.width  + effDx * vw,
+            height: panOffset.height - effDy * vh
         )
-        panOffset = new
         onUserTransform?(panOffset, lockedZoom, zoomMode)
         return panOffset
     }
@@ -112,6 +122,13 @@ final class ImageCanvasView: NSView {
     private var trackingArea: NSTrackingArea?
     private var lastDragLocation: NSPoint = .zero
 
+    // First-frame instrumentation. `firstPaintPath` is the path that
+    // setImage(path:) most recently mounted; `firstPaintEmitted` flips
+    // to true on the first successful draw for that path, gating the
+    // `FileTree.FirstPaint` + `Image.FirstFrame` events to one-shot.
+    private var firstPaintPath: String?
+    private var firstPaintEmitted: Bool = false
+
     override var isFlipped: Bool { false }
     override var acceptsFirstResponder: Bool { true }
 
@@ -142,8 +159,17 @@ final class ImageCanvasView: NSView {
     }
 
     func setImage(path: String?) {
+        let _decodeTrace = PerformanceLog.shared.start(
+            "Image.Decode",
+            extra: [("path", path ?? "")]
+        )
+        defer { _decodeTrace.finish() }
         stopAnimationTimer()
         loadedPath = path
+        // Reset the first-frame marker so the next successful draw emits
+        // `FileTree.FirstPaint` + `Image.FirstFrame` for this new path.
+        firstPaintPath = path
+        firstPaintEmitted = false
         guard let path else {
             clearImageState()
             onFrameSourceChanged?(nil)
@@ -366,6 +392,11 @@ final class ImageCanvasView: NSView {
     }
 
     override func draw(_ dirtyRect: NSRect) {
+        let _renderTrace = PerformanceLog.shared.start(
+            "Image.Render",
+            extra: [("path", loadedPath ?? "")]
+        )
+        defer { _renderTrace.finish() }
         Self.debugBackgroundColor.setFill()
         dirtyRect.fill()
 
@@ -399,6 +430,15 @@ final class ImageCanvasView: NSView {
         )
         ctx.draw(cg, in: drawRect)
         ctx.restoreGState()
+
+        // First-frame markers — performance.mdx §5.1 / §5.2. The
+        // emission is one-shot per `setImage(path:)` cycle so a
+        // pan/zoom redraw on the same image does not re-emit.
+        if !firstPaintEmitted, let path = firstPaintPath, path == loadedPath {
+            firstPaintEmitted = true
+            PerformanceLog.shared.event("FileTree.FirstPaint", extra: [("path", path)])
+            PerformanceLog.shared.event("Image.FirstFrame", extra: [("path", path)])
+        }
     }
 
     override func scrollWheel(with event: NSEvent) {
@@ -493,6 +533,8 @@ final class ImageCanvasView: NSView {
     }
 
     private func readColor(at imagePixel: CGPoint) -> RGBA? {
+        let _trace = PerformanceLog.shared.start("Image.ColorSample")
+        defer { _trace.finish() }
         guard let s = samplingImage else { return nil }
         let w = s.width, h = s.height
         let x = Int(imagePixel.x), y = Int(imagePixel.y)

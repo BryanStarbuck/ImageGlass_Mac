@@ -43,6 +43,16 @@ public struct IgCmdDispatcher {
 
         let rest = Array(arguments.dropFirst())
 
+        // docs/performance.mdx §5.6 / §10.12 — `Igcmd.RunSubcommand`
+        // wraps the inner dispatch step (post-arg-parsing, pre-handler).
+        // Distinct from the outer `Igcmd.Dispatch` in `igcmd/main.swift`,
+        // which also covers help / version / unknown-verb paths.
+        let _runTrace = PerformanceLog.shared.start(
+            "Igcmd.RunSubcommand",
+            extra: [("subcommand", cmd.rawValue)]
+        )
+        defer { _runTrace.finish() }
+
         // Per-subcommand `--help` is delegated to each handler so the help
         // text can document positional args specific to that subcommand.
         switch cmd {
@@ -81,6 +91,8 @@ public struct IgCmdDispatcher {
     // MARK: - Subcommand handlers
 
     private func handleSetWallpaper(args: [String]) -> Int32 {
+        let _trace = PerformanceLog.shared.start("Igcmd.Subcommand.SetWallpaper")
+        defer { _trace.finish() }
         if args.contains("--help") || args.contains("-h") {
             printLine("Usage: igcmd \(IgCmdSubcommand.setWallpaper.usage)", to: .stdout)
             printLine("  style: fit | fill | stretch | tile | center  (default: fill)", to: .stdout)
@@ -147,6 +159,8 @@ public struct IgCmdDispatcher {
     }
 
     private func handleSetLockScreen(args: [String]) -> Int32 {
+        let _trace = PerformanceLog.shared.start("Igcmd.Subcommand.SetLockScreen")
+        defer { _trace.finish() }
         if args.contains("--help") || args.contains("-h") {
             printLine("Usage: igcmd \(IgCmdSubcommand.setLockScreen.usage)", to: .stdout)
             return IgCmdExit.success.rawValue
@@ -159,6 +173,12 @@ public struct IgCmdDispatcher {
     }
 
     private func handleSetDefaultViewer(args: [String], register: Bool) -> Int32 {
+        let _trace = PerformanceLog.shared.start(
+            register
+                ? "Igcmd.Subcommand.SetDefaultViewer"
+                : "Igcmd.Subcommand.RemoveDefaultViewer"
+        )
+        defer { _trace.finish() }
         let verb = register ? IgCmdSubcommand.setDefaultViewer : IgCmdSubcommand.removeDefaultViewer
         if args.contains("--help") || args.contains("-h") {
             printLine("Usage: igcmd \(verb.usage)", to: .stdout)
@@ -226,6 +246,8 @@ public struct IgCmdDispatcher {
     }
 
     private func handleExportFrames(args: [String]) -> Int32 {
+        let _trace = PerformanceLog.shared.start("Igcmd.Subcommand.ExportFrames")
+        defer { _trace.finish() }
         if args.contains("--help") || args.contains("-h") {
             printLine("Usage: igcmd \(IgCmdSubcommand.exportFrames.usage)", to: .stdout)
             printLine("  Frames are written next to <filePath> as <basename>-frame-<NNN>.png", to: .stdout)
@@ -288,6 +310,8 @@ public struct IgCmdDispatcher {
     }
 
     private func handleQuickSetup(args: [String]) -> Int32 {
+        let _trace = PerformanceLog.shared.start("Igcmd.Subcommand.QuickSetup")
+        defer { _trace.finish() }
         if args.contains("--help") || args.contains("-h") {
             printLine("Usage: igcmd \(IgCmdSubcommand.quickSetup.usage)", to: .stdout)
             printLine("  Creates the on-disk configuration files used by ImageGlass.", to: .stdout)
@@ -314,6 +338,8 @@ public struct IgCmdDispatcher {
     }
 
     private func handleCheckForUpdate(args: [String]) -> Int32 {
+        let _trace = PerformanceLog.shared.start("Igcmd.Subcommand.CheckForUpdate")
+        defer { _trace.finish() }
         if args.contains("--help") || args.contains("-h") {
             printLine("Usage: igcmd \(IgCmdSubcommand.checkForUpdate.usage)", to: .stdout)
             return IgCmdExit.success.rawValue
@@ -330,6 +356,8 @@ public struct IgCmdDispatcher {
     }
 
     private func handleInstallLanguages(args: [String]) -> Int32 {
+        let _trace = PerformanceLog.shared.start("Igcmd.Subcommand.InstallLanguages")
+        defer { _trace.finish() }
         if args.contains("--help") || args.contains("-h") {
             printLine("Usage: igcmd \(IgCmdSubcommand.installLanguages.usage)", to: .stdout)
             printLine("  Pass one or more .iglang files, or pipe a newline-separated list on stdin.", to: .stdout)
@@ -381,6 +409,8 @@ public struct IgCmdDispatcher {
     }
 
     private func handleInstallThemes(args: [String]) -> Int32 {
+        let _trace = PerformanceLog.shared.start("Igcmd.Subcommand.InstallThemes")
+        defer { _trace.finish() }
         if args.contains("--help") || args.contains("-h") {
             printLine("Usage: igcmd \(IgCmdSubcommand.installThemes.usage)", to: .stdout)
             printLine("  Pass one or more .igtheme files, or pipe a newline-separated list on stdin.", to: .stdout)
@@ -422,6 +452,8 @@ public struct IgCmdDispatcher {
     }
 
     private func handleUninstallTheme(args: [String]) -> Int32 {
+        let _trace = PerformanceLog.shared.start("Igcmd.Subcommand.UninstallTheme")
+        defer { _trace.finish() }
         if args.contains("--help") || args.contains("-h") {
             printLine("Usage: igcmd \(IgCmdSubcommand.uninstallTheme.usage)", to: .stdout)
             printLine("  Accepts a folder name (e.g. \"Kobe.Duong-Dieu-Phap\") or a .igtheme path.", to: .stdout)
@@ -461,6 +493,12 @@ public struct IgCmdDispatcher {
     }
 
     private func handleStartupBoost(args: [String], enable: Bool) -> Int32 {
+        let _trace = PerformanceLog.shared.start(
+            enable
+                ? "Igcmd.Subcommand.SetStartupBoost"
+                : "Igcmd.Subcommand.RemoveStartupBoost"
+        )
+        defer { _trace.finish() }
         let verb = enable ? IgCmdSubcommand.setStartupBoost : IgCmdSubcommand.removeStartupBoost
         if args.contains("--help") || args.contains("-h") {
             printLine("Usage: igcmd \(verb.usage)", to: .stdout)

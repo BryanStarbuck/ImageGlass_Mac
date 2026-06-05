@@ -115,10 +115,86 @@ public enum AppPaths {
         macAppSupportDir.appendingPathComponent("log.log")
     }
 
+    /// Append-only file used by `PerformanceLog` (docs/performance.mdx). All
+    /// start/finish pairs across every actor and thread land in this single
+    /// file so an offline analyzer can pair the Nth start with the Nth
+    /// finish for a given action.
+    public static var macPerformanceLogFile: URL {
+        macAppSupportDir.appendingPathComponent("performance.log")
+    }
+
     /// The directory tree panel's own store (use_cases/mcp_file.mdx §0,
     /// list_of_files.mdx §3A.1). A single YAML file alongside `scopes/`.
+    ///
+    /// This is the **legacy v1 single-window** path; the multi-window
+    /// model (use_cases/multi_window.mdx §3.3) splits this into
+    /// `directories_window_<N>.yaml`. The v1 file is read once at launch
+    /// for migration, then renamed to `directories.yaml.v1.bak`.
     public static var macDirectoriesFile: URL {
         macAppSupportDir.appendingPathComponent("directories.yaml")
+    }
+
+    /// v1 single-window settings file (multi_window.mdx §3.1). Read once
+    /// at launch for migration, then renamed to `settings.yaml.v1.bak`.
+    public static var macSettingsFile: URL {
+        macAppSupportDir.appendingPathComponent("settings.yaml")
+    }
+
+    /// Per-window directories file (multi_window.mdx §3.3).
+    public static func macDirectoriesWindowFile(id: Int) -> URL {
+        precondition(id >= 1, "window_id must be >= 1")
+        return macAppSupportDir.appendingPathComponent("directories_window_\(id).yaml")
+    }
+
+    /// Per-window settings file (multi_window.mdx §3.2).
+    public static func macSettingsWindowFile(id: Int) -> URL {
+        precondition(id >= 1, "window_id must be >= 1")
+        return macAppSupportDir.appendingPathComponent("settings_window_\(id).yaml")
+    }
+
+    /// Trash subdirectory where retired windows' YAML files are moved
+    /// (multi_window.mdx §1.1, §5.3). The window number suffix keeps
+    /// retired windows discoverable by ID forever.
+    public static func macTrashDir(windowID: Int) -> URL {
+        precondition(windowID >= 1, "window_id must be >= 1")
+        return macAppSupportDir
+            .appendingPathComponent("Trash", isDirectory: true)
+            .appendingPathComponent("window_\(windowID)", isDirectory: true)
+    }
+
+    /// The per-window hint file the MCP `select_file` tool writes to so
+    /// the GUI can pick up the change via FSEvents (mcp_file.mdx §2).
+    /// In the multi-window model each window has its own hint file so
+    /// two MCP-driven mutations targeting different windows do not
+    /// race on the same path. The unsuffixed `selection.txt` remains as
+    /// the v1 compat read for the migration window only.
+    public static func macSelectionHintFile(windowID: Int) -> URL {
+        precondition(windowID >= 1, "window_id must be >= 1")
+        return macAppSupportDir.appendingPathComponent("selection_window_\(windowID).txt")
+    }
+
+    public static func macPanelViewModeHintFile(windowID: Int) -> URL {
+        precondition(windowID >= 1, "window_id must be >= 1")
+        return macAppSupportDir.appendingPathComponent("panel_view_mode_window_\(windowID).txt")
+    }
+
+    public static func macSlideshowHintFile(windowID: Int) -> URL {
+        precondition(windowID >= 1, "window_id must be >= 1")
+        return macAppSupportDir.appendingPathComponent("slideshow_window_\(windowID).txt")
+    }
+
+    /// Legacy unsuffixed hint files (v1). Read once for migration; new
+    /// writes always target the per-window variants above.
+    public static var macSelectionHintFileV1: URL {
+        macAppSupportDir.appendingPathComponent("selection.txt")
+    }
+
+    public static var macPanelViewModeHintFileV1: URL {
+        macAppSupportDir.appendingPathComponent("panel_view_mode.txt")
+    }
+
+    public static var macSlideshowHintFileV1: URL {
+        macAppSupportDir.appendingPathComponent("slideshow.txt")
     }
 
     public static func ensureMacDirectories() throws {
@@ -127,6 +203,16 @@ public enum AppPaths {
             if !fm.fileExists(atPath: dir.path) {
                 try fm.createDirectory(at: dir, withIntermediateDirectories: true)
             }
+        }
+    }
+
+    /// Ensure the on-disk trash subdirectory for a retired window exists
+    /// before the registry moves its YAML files in.
+    public static func ensureMacTrashDir(windowID: Int) throws {
+        let fm = FileManager.default
+        let dir = macTrashDir(windowID: windowID)
+        if !fm.fileExists(atPath: dir.path) {
+            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
         }
     }
 

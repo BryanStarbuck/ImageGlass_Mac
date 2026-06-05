@@ -55,6 +55,11 @@ public enum CropSideFileStore {
 
     @discardableResult
     public static func write(_ entry: CropSideFile, for imageURL: URL) throws -> URL {
+        let _trace = PerformanceLog.shared.start(
+            "Crop.SaveSideFile",
+            extra: [("path", imageURL.path)]
+        )
+        defer { _trace.finish() }
         let dir = sideFileDir(for: imageURL)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let url = sideFileURL(for: imageURL)
@@ -67,6 +72,11 @@ public enum CropSideFileStore {
     }
 
     public static func read(for imageURL: URL) -> CropSideFile? {
+        let _trace = PerformanceLog.shared.start(
+            "Crop.ReadSideFile",
+            extra: [("path", imageURL.path)]
+        )
+        defer { _trace.finish() }
         let url = sideFileURL(for: imageURL)
         let data: Data
         do {

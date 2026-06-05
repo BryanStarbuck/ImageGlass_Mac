@@ -55,6 +55,11 @@ public final class CropSession: @unchecked Sendable {
     }
 
     public func update(_ state: State) {
+        let _trace = PerformanceLog.shared.start(
+            "Crop.SessionCommit",
+            extra: [("path", state.imagePath ?? "")]
+        )
+        defer { _trace.finish() }
         lock.lock(); defer { lock.unlock() }
         _state = state
     }

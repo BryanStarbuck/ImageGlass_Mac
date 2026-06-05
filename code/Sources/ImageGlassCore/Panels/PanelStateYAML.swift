@@ -33,6 +33,8 @@ public enum PanelStateYAML {
     /// (descriptor catalog order, with unknown ids tacked on the end)
     /// so a `git diff` of `panels.yaml` is a real semantic diff.
     public static func encode(_ layout: PanelLayout) -> String {
+        let _trace = PerformanceLog.shared.start("Layout.YAMLEncode")
+        defer { _trace.finish() }
         var out = ""
         out += "schema_version: \(currentSchemaVersion)\n"
         out += "active_preset: \(quote(layout.activePreset))\n"
@@ -126,6 +128,8 @@ public final class PanelStateYAMLStore: @unchecked Sendable {
     }
 
     public func save(_ layout: PanelLayout) throws {
+        let _trace = PerformanceLog.shared.start("LocalStorage.Write.panels.yaml")
+        defer { _trace.finish() }
         lock.lock()
         defer { lock.unlock() }
         try AppPaths.ensureMacDirectories()

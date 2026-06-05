@@ -461,7 +461,9 @@ public struct MCPTools {
 
             // Charter (see overview.mdx)
             case "charter_status":
-                return .text(prettyJSON(CharterStatus.report()))
+                return PerformanceLog.shared.measure("MCP.ToolCall.charter_status") {
+                    return .text(prettyJSON(CharterStatus.report()))
+                }
 
             // Releases & version metadata (see releases.mdx)
             case "app_version":
@@ -515,11 +517,15 @@ public struct MCPTools {
     // MARK: - Tool bodies
 
     private func listScopes() throws -> MCP.CallToolResult {
+        let _trace = PerformanceLog.shared.start("MCP.ToolCall.list_scopes")
+        defer { _trace.finish() }
         let scopes = try storage.listScopes()
         return .text(prettyJSON(["scopes": scopes]))
     }
 
     private func getScope(_ args: [String: Any?]) throws -> MCP.CallToolResult {
+        let _trace = PerformanceLog.shared.start("MCP.ToolCall.get_scope")
+        defer { _trace.finish() }
         let scopeName = try MCPScopeName.validate(try requireString(args, "name"))
         guard storage.scopeExists(scopeName) else {
             throw MCPToolError.unknownScope(scopeName)
@@ -529,6 +535,8 @@ public struct MCPTools {
     }
 
     private func createScope(_ args: [String: Any?]) throws -> MCP.CallToolResult {
+        let _trace = PerformanceLog.shared.start("MCP.ToolCall.create_scope")
+        defer { _trace.finish() }
         let scopeName = try MCPScopeName.validate(try requireString(args, "name"))
         if storage.scopeExists(scopeName) {
             throw MCPToolError.duplicateScope(scopeName)
@@ -556,6 +564,8 @@ public struct MCPTools {
     }
 
     private func setDirectories(_ args: [String: Any?]) throws -> MCP.CallToolResult {
+        let _trace = PerformanceLog.shared.start("MCP.ToolCall.set_directories")
+        defer { _trace.finish() }
         let scopeName = try MCPScopeName.validate(try requireString(args, "name"))
         guard storage.scopeExists(scopeName) else {
             throw MCPToolError.unknownScope(scopeName)
@@ -571,6 +581,8 @@ public struct MCPTools {
     }
 
     private func setIncludeCriteria(_ args: [String: Any?]) throws -> MCP.CallToolResult {
+        let _trace = PerformanceLog.shared.start("MCP.ToolCall.set_include_criteria")
+        defer { _trace.finish() }
         let scopeName = try MCPScopeName.validate(try requireString(args, "name"))
         guard storage.scopeExists(scopeName) else {
             throw MCPToolError.unknownScope(scopeName)
@@ -587,6 +599,8 @@ public struct MCPTools {
     }
 
     private func setExcludeCriteria(_ args: [String: Any?]) throws -> MCP.CallToolResult {
+        let _trace = PerformanceLog.shared.start("MCP.ToolCall.set_exclude_criteria")
+        defer { _trace.finish() }
         let scopeName = try MCPScopeName.validate(try requireString(args, "name"))
         guard storage.scopeExists(scopeName) else {
             throw MCPToolError.unknownScope(scopeName)
@@ -603,6 +617,8 @@ public struct MCPTools {
     }
 
     private func evaluateScope(_ args: [String: Any?]) throws -> MCP.CallToolResult {
+        let _trace = PerformanceLog.shared.start("MCP.ToolCall.evaluate_scope")
+        defer { _trace.finish() }
         let scopeName = try MCPScopeName.validate(try requireString(args, "name"))
         guard storage.scopeExists(scopeName) else {
             throw MCPToolError.unknownScope(scopeName)
@@ -627,6 +643,8 @@ public struct MCPTools {
     }
 
     private func setCriteria(_ args: [String: Any?]) throws -> MCP.CallToolResult {
+        let _trace = PerformanceLog.shared.start("MCP.ToolCall.set_criteria")
+        defer { _trace.finish() }
         let scopeName = try MCPScopeName.validate(try requireString(args, "name"))
         guard storage.scopeExists(scopeName) else {
             throw MCPToolError.unknownScope(scopeName)
@@ -658,6 +676,8 @@ public struct MCPTools {
     }
 
     private func setSort(_ args: [String: Any?]) throws -> MCP.CallToolResult {
+        let _trace = PerformanceLog.shared.start("MCP.ToolCall.set_sort")
+        defer { _trace.finish() }
         let scopeName = try MCPScopeName.validate(try requireString(args, "name"))
         guard storage.scopeExists(scopeName) else {
             throw MCPToolError.unknownScope(scopeName)
@@ -683,6 +703,8 @@ public struct MCPTools {
     }
 
     private func setFilter(_ args: [String: Any?]) throws -> MCP.CallToolResult {
+        let _trace = PerformanceLog.shared.start("MCP.ToolCall.set_filter")
+        defer { _trace.finish() }
         let scopeName = try MCPScopeName.validate(try requireString(args, "name"))
         guard storage.scopeExists(scopeName) else {
             throw MCPToolError.unknownScope(scopeName)
@@ -716,6 +738,8 @@ public struct MCPTools {
     }
 
     private func deleteScope(_ args: [String: Any?]) throws -> MCP.CallToolResult {
+        let _trace = PerformanceLog.shared.start("MCP.ToolCall.delete_scope")
+        defer { _trace.finish() }
         let scopeName = try MCPScopeName.validate(try requireString(args, "name"))
         let existed = storage.scopeExists(scopeName)
         try storage.deleteScope(scopeName)
@@ -737,11 +761,15 @@ public struct MCPTools {
     // MARK: - External tool bodies (see build-tools.mdx)
 
     private func listExternalTools() throws -> MCP.CallToolResult {
+        let _trace = PerformanceLog.shared.start("MCP.ToolCall.list_external_tools")
+        defer { _trace.finish() }
         let list = try toolStorage.listTools()
         return .text(prettyJSON(["tools": list]))
     }
 
     private func registerExternalTool(_ args: [String: Any?]) throws -> MCP.CallToolResult {
+        let _trace = PerformanceLog.shared.start("MCP.ToolCall.register_external_tool")
+        defer { _trace.finish() }
         let id = try requireString(args, "id")
         try ExternalToolId.validate(id)
         if toolStorage.toolExists(id) {
@@ -762,6 +790,8 @@ public struct MCPTools {
     }
 
     private func updateExternalTool(_ args: [String: Any?]) throws -> MCP.CallToolResult {
+        let _trace = PerformanceLog.shared.start("MCP.ToolCall.update_external_tool")
+        defer { _trace.finish() }
         let id = try requireString(args, "id")
         var tool = try toolStorage.loadTool(id)
         if let dn = args["display_name"] as? String { tool.displayName = dn }
@@ -776,12 +806,16 @@ public struct MCPTools {
     }
 
     private func unregisterExternalTool(_ args: [String: Any?]) throws -> MCP.CallToolResult {
+        let _trace = PerformanceLog.shared.start("MCP.ToolCall.unregister_external_tool")
+        defer { _trace.finish() }
         let id = try requireString(args, "id")
         try toolStorage.deleteTool(id)
         return .text("Unregistered external tool '\(id)'.")
     }
 
     private func fireExternalTool(_ args: [String: Any?]) throws -> MCP.CallToolResult {
+        let _trace = PerformanceLog.shared.start("MCP.ToolCall.fire_external_tool")
+        defer { _trace.finish() }
         let id = try requireString(args, "id")
         let tool = try toolStorage.loadTool(id)
         let file = args["file"] as? String
@@ -815,6 +849,8 @@ public struct MCPTools {
     // MARK: - Releases & version metadata
 
     private func appVersion() -> MCP.CallToolResult {
+        let _trace = PerformanceLog.shared.start("MCP.ToolCall.app_version")
+        defer { _trace.finish() }
         let payload: [String: Any] = [
             "marketing_version": AppVersion.marketingVersion,
             "build_number": AppVersion.buildNumber,
@@ -828,6 +864,8 @@ public struct MCPTools {
     }
 
     private func listReleases(_ args: [String: Any?]) -> MCP.CallToolResult {
+        let _trace = PerformanceLog.shared.start("MCP.ToolCall.list_releases")
+        defer { _trace.finish() }
         let originFilter = (args["origin"] as? String) ?? "all"
         let entries: [Changelog.Entry]
         switch originFilter.lowercased() {
@@ -853,6 +891,8 @@ public struct MCPTools {
     }
 
     private func checkForUpdate(_ args: [String: Any?]) throws -> MCP.CallToolResult {
+        let _trace = PerformanceLog.shared.start("MCP.ToolCall.check_for_update")
+        defer { _trace.finish() }
         let force = (args["force"] as? Bool) ?? false
         let checker = UpdateChecker()
         // Synchronously dispatch the async check from a non-async tool call.

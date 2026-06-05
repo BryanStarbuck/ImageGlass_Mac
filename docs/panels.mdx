@@ -526,6 +526,25 @@ write. On load, if `layout.json` is missing or fails schema
 validation, the framework falls back to `layout.json.bak`; if that
 also fails, the built-in default preset (`Browser`) is materialized.
 
+#### 6.3.1 Save-on-quit and the slideshow exclusion
+
+On clean quit, `LayoutStore.flush()` runs as part of the app's
+shutdown sequence and writes the live `layout.json` so the next
+launch reproduces the same dock positions, divider sizes, floating
+frames, and hidden last-positions. The high-level summary of which
+panel is on which side also lands in `settings.yaml` under
+`session.panels` (see `local_storage.mdx` §4.2.1 and `settings.mdx`
+§2.1.1).
+
+The one explicit exclusion from save-on-quit is **slideshow mode**.
+If the user quits while a slideshow is running, the live "is
+running right now" state is **not** written. The next launch starts
+with slideshow off. The slideshow-related layout overrides defined
+on the **Slideshow preset** (e.g., main window hidden, gallery
+hidden) are kept as a saved preset and reachable from the View
+menu, but they are not the active preset on the next launch unless
+the user explicitly switched to that preset before quitting.
+
 ### 6.4 Reads
 
 `FSEventStream` watches `layout.json`. An MCP-driven edit triggers

@@ -49,6 +49,14 @@ public enum FrameExporter {
         baseName: String,
         extension ext: String = "png"
     ) throws -> [URL] {
+        let _trace = PerformanceLog.shared.start(
+            "Image.ExportFrames",
+            extra: [
+                ("path", directory.path),
+                ("count", String(source.frameCount)),
+            ]
+        )
+        defer { _trace.finish() }
         try FileManager.default.createDirectory(
             at: directory, withIntermediateDirectories: true
         )

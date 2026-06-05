@@ -53,6 +53,11 @@ public final class ScopeAuditLog {
 
     /// Append a row to the scope's audit log. Creates the file if needed.
     public func append(_ entry: ScopeAuditEntry, scopeName: String) throws {
+        let _trace = PerformanceLog.shared.start(
+            "Scope.AuditAppend",
+            extra: [("scope", scopeName)]
+        )
+        defer { _trace.finish() }
         try AppPaths.ensureDirectories()
         let url = logURL(for: scopeName)
         var data = try encoder.encode(entry)

@@ -55,6 +55,11 @@ public enum ScopeBundleService {
         scopeStorage: LocalStorage = .shared,
         ruleSetStorage: RuleSetStorage = .shared
     ) throws -> ScopeBundle {
+        let _trace = PerformanceLog.shared.start(
+            "Scope.LoadBundle",
+            extra: [("scope", scopeName)]
+        )
+        defer { _trace.finish() }
         let scope = try scopeStorage.loadScope(scopeName)
         var ruleSets: [RuleSet] = []
         for name in scope.ruleSets ?? [] {
@@ -114,6 +119,11 @@ public enum ScopeBundleService {
         scopeStorage: LocalStorage = .shared,
         ruleSetStorage: RuleSetStorage = .shared
     ) throws -> Scope {
+        let _trace = PerformanceLog.shared.start(
+            "Scope.SaveBundle",
+            extra: [("scope", bundle.scope.name)]
+        )
+        defer { _trace.finish() }
         guard bundle.version == 1 else {
             throw ImportError.unsupportedVersion(bundle.version)
         }

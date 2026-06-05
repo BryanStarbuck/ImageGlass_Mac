@@ -21,6 +21,7 @@ public struct FilePanelBridgeMCPTools {
     public static let toolNames: Set<String> = [
         "select_file",
         "panel.set_view_mode",
+        "set_slideshow",
     ]
 
     public init(
@@ -56,6 +57,32 @@ public struct FilePanelBridgeMCPTools {
                 ])
             ),
             .init(
+                name: "set_slideshow",
+                description: """
+                    Toggle the slideshow on or off and optionally override \
+                    the interval for the current run (slideshow.mdx §12). \
+                    Writes a hint to `slideshow.txt` that the GUI watches; \
+                    the controller picks it up within ~250 ms and produces \
+                    the same `tool=slideshow.toggle source=mcp:set_slideshow` \
+                    audit line as the `S` key path. A passed `interval` is \
+                    a one-shot override — it is NOT written to settings.json.
+                    """,
+                inputSchema: AnyCodable([
+                    "type": "object",
+                    "properties": [
+                        "on":       ["type": "boolean"],
+                        "interval": [
+                            "type":    "number",
+                            "minimum": 1,
+                            "maximum": 600,
+                        ] as [String: Any],
+                        "client":   ["type": "string"],
+                    ] as [String: Any],
+                    "required": ["on"],
+                    "additionalProperties": false,
+                ])
+            ),
+            .init(
                 name: "panel.set_view_mode",
                 description: """
                     Switch the file panel's view mode (mcp_file.mdx §3). \
@@ -85,16 +112,91 @@ public struct FilePanelBridgeMCPTools {
         switch name {
         case "select_file":         return selectFile(arguments)
         case "panel.set_view_mode": return setPanelViewMode(arguments)
+        case "set_slideshow":       return setSlideshow(arguments)
         default:
             return .text("Unknown file-panel-bridge tool: \(name)", isError: true)
         }
     }
 
+    // MARK: - set_slideshow
+
+    private func setSlideshow(_ args: [String: Any?]) -> MCP.CallToolResult {
+        let client = (args["client"] as? String) ?? "claude-code"
+        let _trace = PerformanceLog.shared.start(
+            "MCP.ToolCall.set_slideshow",
+            extra: [("client", client)]
+        )
+        defer { _trace.finish() }
+        let corr = MCPAuditLogger.newCorrelationId()
+        guard let on = args["on"] as? Bool else {
+            logger.logDirectoryToolCall(
+                toolName: "set_slideshow", path: nil,
+                client: client, corr: corr, ok: false, err: "missing_on"
+            )
+            return .text("Missing required boolean `on`.", isError: true)
+        }
+        // Optional one-shot interval override. Validated here so the GUI
+        // side can trust the parsed file.
+        var interval: Double? = nil
+        if let raw = args["interval"] {
+            if let d = raw as? Double {
+                interval = d
+            } else if let i = raw as? Int {
+                interval = Double(i)
+            } else if let s = raw as? String, let d = Double(s) {
+                interval = d
+            }
+            if let i = interval, !(i >= 1 && i <= 600) {
+                logger.logDirectoryToolCall(
+                    toolName: "set_slideshow", path: nil,
+                    client: client, corr: corr, ok: false, err: "invalid_interval"
+                )
+                return .text(
+                    "Invalid `interval`: must be a number between 1 and 600.",
+                    isError: true
+                )
+            }
+        }
+
+        try? AppPaths.ensureMacDirectories()
+        let file = AppPaths.macAppSupportDir
+            .appendingPathComponent("slideshow.txt")
+        // Plain-text format the GUI watcher parses: one or two
+        // whitespace-separated `key=value` tokens.
+        var body = "on=\(on ? "true" : "false") corr=\(corr)"
+        if let i = interval {
+            body += String(format: " interval=%.1f", i)
+        }
+        body += "\n"
+        try? body.data(using: .utf8)?.write(to: file, options: .atomic)
+
+        var extra: [(String, String)] = [
+            ("on", on ? "true" : "false"),
+        ]
+        if let i = interval {
+            extra.append(("interval", String(format: "%.1f", i)))
+            extra.append(("persisted", "false"))
+        }
+        logger.logDirectoryToolCall(
+            toolName: "set_slideshow", path: nil,
+            client: client, corr: corr, ok: true,
+            extra: extra
+        )
+        var responseDict: [String: Any] = ["on": on, "corr": corr]
+        if let i = interval { responseDict["interval"] = i }
+        return .text(prettyJSON(responseDict))
+    }
+
     // MARK: - select_file
 
     private func selectFile(_ args: [String: Any?]) -> MCP.CallToolResult {
-        let corr = MCPAuditLogger.newCorrelationId()
         let client = (args["client"] as? String) ?? "claude-code"
+        let _trace = PerformanceLog.shared.start(
+            "MCP.ToolCall.select_file",
+            extra: [("client", client)]
+        )
+        defer { _trace.finish() }
+        let corr = MCPAuditLogger.newCorrelationId()
         guard let raw = args["path"] as? String, !raw.isEmpty else {
             logger.logDirectoryToolCall(
                 toolName: "select_file", path: nil,
@@ -122,8 +224,13 @@ public struct FilePanelBridgeMCPTools {
     ]
 
     private func setPanelViewMode(_ args: [String: Any?]) -> MCP.CallToolResult {
-        let corr = MCPAuditLogger.newCorrelationId()
         let client = (args["client"] as? String) ?? "mcp"
+        let _trace = PerformanceLog.shared.start(
+            "MCP.ToolCall.panel.set_view_mode",
+            extra: [("client", client)]
+        )
+        defer { _trace.finish() }
+        let corr = MCPAuditLogger.newCorrelationId()
         guard let mode = args["mode"] as? String,
               Self.validViewModes.contains(mode) else {
             logger.logDirectoryToolCall(

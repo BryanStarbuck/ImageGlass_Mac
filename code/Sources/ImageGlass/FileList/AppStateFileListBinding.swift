@@ -14,6 +14,14 @@ public enum FileListBinding {
         appState: AppState,
         to model: FileListViewModel
     ) {
+        let _trace = PerformanceLog.shared.start(
+            "FileTree.Reload",
+            extra: [
+                ("source", "binding.apply"),
+                ("files", String(appState.resolvedFiles.count)),
+            ]
+        )
+        defer { _trace.finish() }
         let scopeName: String
         if let scope = appState.activeScope {
             scopeName = scope.description ?? scope.name

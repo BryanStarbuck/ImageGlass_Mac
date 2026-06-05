@@ -65,6 +65,11 @@ final class SlideshowController {
     /// the attempted toggle and the reason it produced nothing
     /// (slideshow.mdx §8.4).
     func start(appState: AppState, seconds: Double, source: String) {
+        let _trace = PerformanceLog.shared.start(
+            "Slideshow.Start",
+            extra: [("source", source), ("interval_s", String(seconds))]
+        )
+        defer { _trace.finish() }
         // Idempotent restart: if a previous run is still up, tear it
         // down so we don't end up with two slideshow windows. The
         // stop here records `reason=user_toggle` because the new
@@ -75,7 +80,13 @@ final class SlideshowController {
 
         let corr = MCPAuditLogger.newCorrelationId()
 
-        guard !appState.resolvedFiles.isEmpty else {
+        // slideshow.mdx §1A + §8 — gate the start on the same
+        // ordered, filtered navigation list the advance loop walks.
+        // Bare `resolvedFiles` would pass when every file is
+        // excluded, which would race the user into a single
+        // `no_in_scope_files` advance failure instead of the clean
+        // `no_files_available` toggle audit line §8.4 expects.
+        guard !appState.orderedNavigationFiles.isEmpty else {
             MCPAuditLogger.shared.logSlideshowToggle(
                 on: true, interval: seconds, source: source,
                 corr: corr, ok: false, err: "no_files_available"
@@ -134,6 +145,11 @@ final class SlideshowController {
     /// user explicitly hit a stop UI). End-of-list stops are silent on
     /// the `tool=` surface.
     func stop(reason: String, source: String) {
+        let _trace = PerformanceLog.shared.start(
+            "Slideshow.Stop",
+            extra: [("reason", reason), ("source", source)]
+        )
+        defer { _trace.finish() }
         countdownTimer?.invalidate()
         countdownTimer = nil
         nextAdvanceAt = nil
@@ -204,13 +220,41 @@ final class SlideshowController {
     /// `reason=end_of_list`. Either way, an `app=slideshow.advance`
     /// line is written before any wrap/stop decision lands in the log
     /// so verifiers can see the last from/to pair.
+    ///
+    /// slideshow.mdx §0A + §1A + §2A — the controller re-reads
+    /// `appState.selectedFile` and `appState.orderedNavigationFiles`
+    /// on **every** tick. A panel-row click during a running
+    /// slideshow changes `selectedFile`, and the next advance steps
+    /// from the clicked file. The navigation list is the file-tree's
+    /// depth-first, top-down visible order — the same list `N`, `P`,
+    /// `↑`, `↓` walk — already filtered to drop excluded /
+    /// inherit-excluded files (`passesFilter == false`).
+    ///
+    /// include_checks.mdx §10 — when walker roots exist, additionally
+    /// filter through `IncludeStateController.effectiveState` so a
+    /// folder-level `.exclude` override is honored even if the row's
+    /// `passesFilter` flag predates the override.
     private func advance() {
+        let _trace = PerformanceLog.shared.start("Slideshow.Advance")
+        defer { _trace.finish() }
         guard let appState, let state = hostingState else { return }
-        let files = appState.resolvedFiles
+        let ordered = appState.orderedNavigationFiles
+        let walkerRoots = appState.walkerRoots
+        let files: [String] = walkerRoots.isEmpty
+            ? ordered
+            : ordered.filter { Self.isInScope(path: $0, roots: walkerRoots) }
         let loop = appState.settings.slideshow.loop
         let interval = appState.settings.slideshow.interval_seconds
 
         let fromPath = appState.selectedFile ?? ""
+
+        // §10.3 — every in-scope file got carved out. Stop with a
+        // distinct reason so the audit log records the cause.
+        if files.isEmpty {
+            stop(reason: "no_in_scope_files", source: "")
+            return
+        }
+
         // Determine the target index without mutating `selectedFile`
         // yet, so we can decide loop/stop with full information.
         let currentIdx = files.firstIndex(of: fromPath)
@@ -226,7 +270,10 @@ final class SlideshowController {
                 nextIdx = nil // end of list, no wrap → stop
             }
         } else {
-            nextIdx = files.first.map { _ in 0 }
+            // §2A.5 — current selection is not in the navigation list
+            // (excluded mid-run, ad-hoc dropped file, or pre-click
+            // path from elsewhere). Re-enter at index 0.
+            nextIdx = 0
         }
 
         guard let target = nextIdx else {
@@ -264,6 +311,19 @@ final class SlideshowController {
     /// `height`, `fit`, `fill`).
     private func zoomModeLabel(_ mode: ZoomMode) -> String {
         mode.rawValue
+    }
+
+    /// include_checks.mdx §9.1 — a file is in scope iff it both
+    /// passes the existing filter (already true for everything in
+    /// `resolvedFiles`) AND its effective include state is
+    /// `.include`. Used by the slideshow picker (§10) and the
+    /// arrow-key navigation (§10.4).
+    static func isInScope(path: String, roots: [RootDirectory]) -> Bool {
+        guard let root = IncludeStateController.root(for: path, in: roots) else {
+            return true
+        }
+        let relative = IncludePath.relative(absolutePath: path, root: root.path)
+        return root.effectiveState(for: relative) == .include
     }
 }
 

@@ -112,7 +112,14 @@ struct SwiftUIOutlineTreeView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
         .onTapGesture {
-            if let path = node.fullPath { state.selectedFile = path }
+            if let path = node.fullPath {
+                let _trace = PerformanceLog.shared.start(
+                    "FileTree.SelectionChange",
+                    extra: [("path", path), ("source", "swiftUIOutline")]
+                )
+                defer { _trace.finish() }
+                state.selectedFile = path
+            }
         }
     }
 
@@ -276,6 +283,11 @@ struct AppKitOutlineTreeView: NSViewRepresentable {
         }
 
         func outlineViewSelectionDidChange(_ notification: Notification) {
+            let _trace = PerformanceLog.shared.start(
+                "FileTree.SelectionChange",
+                extra: [("source", "appKitOutline")]
+            )
+            defer { _trace.finish() }
             guard let outline = notification.object as? NSOutlineView else { return }
             let row = outline.selectedRow
             guard row >= 0,
@@ -441,9 +453,21 @@ struct CatalystStyledTreeView: View {
         .contentShape(Rectangle())
         .onTapGesture {
             if node.isDirectory {
+                let willExpand = !isExpanded
+                let action = willExpand ? "FileTree.Expand" : "FileTree.Collapse"
+                let _trace = PerformanceLog.shared.start(
+                    action,
+                    extra: [("path", node.id), ("depth", String(depth))]
+                )
+                defer { _trace.finish() }
                 if isExpanded { expanded.remove(node.id) }
                 else { expanded.insert(node.id) }
             } else if let path = node.fullPath {
+                let _trace = PerformanceLog.shared.start(
+                    "FileTree.SelectionChange",
+                    extra: [("path", path), ("source", "catalystRow")]
+                )
+                defer { _trace.finish() }
                 state.selectedFile = path
             }
         }

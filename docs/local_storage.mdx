@@ -168,7 +168,129 @@ recents:
   files: []
   folders: []
   scopes: []
+
+# ────────────────────────────────────────────────────────────────────
+# Session state — every value below is written when the app quits and
+# replayed on the next launch so the user sees the same workspace they
+# left. This block is rewritten on every clean quit.
+#
+# Slideshow mode is intentionally NOT persisted: if the user quits
+# while slideshow is running, the next launch starts with slideshow
+# OFF. See §4.2.1.
+# ────────────────────────────────────────────────────────────────────
+session:
+  # Main window geometry, in screen-space points. Restored exactly on
+  # the same display if that display is still attached at launch; if
+  # not, the framework falls back to the primary display and clamps
+  # the rect to the visible area.
+  window:
+    frame: [120, 140, 1440, 900]   # [x, y, w, h]
+    screen_id: "primary"           # opaque per-display identifier
+    full_screen: false
+    frameless: false
+
+  # Which side of the window each panel currently lives on, plus the
+  # active tab inside multi-panel groups. The detailed layout —
+  # divider sizes, floating frames, hidden panels — lives in
+  # layout.json (see panels.mdx §6). The fields here are the short
+  # human-readable summary that an MCP client or hand-editor can scan
+  # quickly.
+  panels:
+    file_panel:    { dock: left,   visible: true,  collapsed: false }
+    scope_editor:  { dock: left,   visible: false, collapsed: false }
+    metadata:      { dock: right,  visible: false, collapsed: false }
+    histogram:     { dock: right,  visible: false, collapsed: false }
+    mcp_activity:  { dock: right,  visible: false, collapsed: false }
+    gallery_strip: { dock: bottom, visible: false, collapsed: false }
+
+  # Last-used zoom mode, restored on launch (see hotkeys.mdx §6.5).
+  # Slideshow is NOT a zoom mode and never appears here.
+  viewer:
+    zoom_mode: fit             # fit | width | fill | actual | custom
+    custom_zoom_percent: null  # only meaningful when zoom_mode == custom
+    pan_offset: [0, 0]         # last viewport offset within the image
+
+  # The file the viewer was showing when the app quit. On next launch
+  # the viewer reopens this file if it still exists; if it does not,
+  # the viewer falls back to the first file in the resolved scope.
+  selection:
+    current_file: ~/Pictures/2026/03/IMG_1234.heic
+    panel_focus: directory_panel   # directory_panel | viewer | none
+
+  # Expanded / collapsed state of every directory row the user has
+  # interacted with in the Directory Panel tree (see dir_ui.mdx §3.3).
+  # The map key is the absolute POSIX path of the directory; the
+  # value is true (expanded) or false (collapsed). Roots that the
+  # user has never touched do not appear and fall back to the
+  # default rule in dir_ui.mdx §3.3 (roots expanded, immediate
+  # children collapsed).
+  directory_panel:
+    expanded_paths:
+      ~/Pictures:                true
+      ~/Pictures/2026:           true
+      ~/Pictures/2026/03:        true
+      ~/Pictures/2025:           false
+      ~/Pictures/Screenshots:    false
 ```
+
+### 4.2.1 Session State — Save on Quit
+
+The `session:` block at the bottom of the schema is the **save-on-
+quit** record. Its purpose is to restore the user's workspace exactly
+as they left it.
+
+What is persisted:
+
+* **Main window** — frame (x, y, w, h), the display the window was
+  on, and whether the window was in full screen or frameless mode.
+* **Panel placement** — which side of the window each panel was
+  docked to (left / right / top / bottom / floating), and whether it
+  was visible or collapsed. The detailed coordinates (divider sizes,
+  floating frames, hidden last-positions) live in `layout.json` —
+  see `panels.mdx` §6.
+* **Viewer zoom mode** — Fit, Width, Fill, Actual, or Custom (with
+  the explicit percent for Custom). Plus the last pan offset within
+  the image, so the user lands on the same part of the image.
+* **Current selection** — the file the viewer was showing, plus
+  which surface had keyboard focus.
+* **Directory tree expansion** — for the Directory Panel tree, every
+  directory the user expanded or collapsed (relative to the
+  `dir_ui.mdx` §3.3 default rule) is recorded as an explicit
+  `expanded_paths` map entry. On next launch the tree is
+  re-materialized with the same nodes open and closed.
+
+What is **not** persisted:
+
+* **Slideshow mode.** If the user quits while a slideshow is
+  running, the next launch starts with slideshow off and the viewer
+  parked on the last shown file. The rationale: slideshow is an
+  active workflow the user explicitly entered, not a workspace
+  preference. Restoring a running slideshow on launch would be
+  surprising and would race with the user's first input. The
+  slideshow's **configuration** (interval, randomness, etc.) is
+  still in `settings.yaml` (see §4.2); only the live "is running
+  right now" state is discarded.
+* **Transient UI states** — modal sheets that were open, the
+  contents of inline search fields, drag-in-progress state, the
+  currently-tooltipped row, the visible hover preview on a
+  collapsed panel strip. Anything that exists for the duration of
+  one interaction is dropped at quit time.
+
+When the session block is written:
+
+1. **On clean quit** (`NSApplication.terminate`, `⌘Q`, window close
+   when the close-quits-app preference is on) — `SettingsStore`
+   gathers the live values and writes the block as part of the
+   normal `settings.yaml` save pipeline (atomic temp-file rename;
+   see §6).
+2. **On crash or kill** — the previous launch's session block is
+   used. There is no live mid-session journaling of session state.
+   A user who force-quits loses at most the position/size changes
+   they made since the last debounced settings write.
+3. **On MCP-driven edit** — MCP clients should not normally write
+   `session.*`; the keys are tagged `R` (read-only via MCP) in
+   `settings.mdx` §4.5. The intent is that `session.*` is the app's
+   own workspace memory, not a remote-control surface.
 
 ### 4.3 Defaults
 

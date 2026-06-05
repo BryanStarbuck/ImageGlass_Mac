@@ -59,7 +59,16 @@ public final class MCPNotificationBus: @unchecked Sendable {
     }
 
     /// Broadcast a notification to every subscriber.
+    ///
+    /// Instrumented per `docs/performance.mdx` §5.6 — the real "post" step
+    /// (snapshot + fan-out to subscribers) is the part that does work.
+    /// Property storage (add/remove subscriber) is left uninstrumented.
     public func emit(_ notification: Notification) {
+        let trace = PerformanceLog.shared.start(
+            "MCP.NotifyPost",
+            extra: [("method", notification.method)]
+        )
+        defer { trace.finish() }
         lock.lock()
         let snapshot = Array(subscribers.values)
         lock.unlock()
@@ -91,6 +100,19 @@ public final class MCPNotificationBus: @unchecked Sendable {
             method: "notifications/imageglass/view_mode_changed",
             params: params
         ))
+    }
+
+    /// include_checks.mdx §5.4 — post the cross-process Darwin
+    /// distributed notification so any other process (typically the
+    /// headless MCP server) reloads `directories.yaml`. Used after
+    /// any GUI-driven `include_overrides` mutation (§3, §4, §7).
+    public func postDirectoriesChanged() {
+        DistributedNotificationCenter.default().postNotificationName(
+            .init(Self.directoriesChangedNotificationName),
+            object: nil,
+            userInfo: nil,
+            deliverImmediately: true
+        )
     }
 
     /// `notifications/imageglass/auto_select_first` — emitted when the

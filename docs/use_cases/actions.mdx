@@ -1,0 +1,1064 @@
+---
+title: Use Case — File Actions (Rename, Delete, Copy Image, Copy Path, Print) and New Window
+description: Full product specification for the file-action surface of ImageGlass_Mac — the verbs the user can perform on the currently loaded file or the row currently focused in the Directory Panel. Covers Rename, Move to Trash (Delete), Copy Image to Clipboard, Copy File Path, and Print, plus the New Window action that creates an additional main ImageGlass window with full per-window state save/restore when more than one window exists. Every action is reachable from the menu bar (File menu, with two exceptions called out below), from a keyboard shortcut (single key when possible, ⌘-chord by default), from the Directory Panel context menu, and — for the destructive verbs — from the MCP server. Each scenario in this spec lists ordered actions, the expected on-screen, on-disk, and in-state result, and an explicit verify step that proves the action ran. Every action emits a single audit line into `~/Library/Application Support/ImageGlass_Mac/logs/log.log` using the shape defined in `error_handling.mdx` §4.2 so a human or an XCUITest run can replay the session.
+---
+
+# Use Case — File Actions and New Window
+
+This page is the **scenario-by-scenario product specification** for
+the *file action* surface of ImageGlass_Mac and for the multi-window
+behavior of the main viewer. It is written as a sequence of user
+actions: *click here, then press this key, then this*, and at each
+step it spells out the on-screen, on-disk, and in-state result so a
+human (or an XCUITest run) can verify the step actually worked.
+
+It is the user-facing companion to:
+
+* [Menus](../menus.mdx) §4.2 *File* and §4.3 *Edit* — the
+  menu-bar twins of every keyboard shortcut introduced here.
+* [Hotkeys](../hotkeys.mdx) §3 *Focus Contexts* — the
+  first-responder routing rules that decide whether a key event
+  ends up in this action subsystem or in a text field. Every
+  shortcut in this document inherits §3 verbatim.
+* [Directory UI](../dir_ui.mdx) — the right-click context menu
+  of the Directory Panel mirrors the entries defined here.
+* [Local Storage](../local_storage.mdx) — the on-disk scope
+  records that get patched whenever a Rename or Delete mutates
+  a path that lives in `directories.yaml`.
+* [Error Handling](../error_handling.mdx) §4.2 — the `log.log`
+  record format every action in this scenario must produce.
+* [MCP](../mcp.mdx) — the externally-callable surface (`rename_file`,
+  `delete_file`, `copy_file_path`, `copy_image_to_clipboard`,
+  `print_current_image`, `new_window`) that mirrors the GUI verbs.
+* [Multi-Monitor State](../multi_monitor.mdx) — the per-window
+  geometry record this spec extends with a `window_id` field so
+  each window's frame is restored independently.
+
+Nothing in this spec changes the viewer pipeline, the panels
+framework, the scope evaluator, or the MCP transport. It adds:
+
+1. A canonical **action vocabulary** of five file verbs:
+   *Rename Image*, *Move Image to Trash*, *Copy Image*, *Copy File
+   Path*, *Print Image*. Every verb has one menu surface, one
+   keyboard shortcut, one context-menu surface, and one MCP tool.
+2. A **focus-aware target rule** so the same verb always operates on
+   "the file the user means" — the loaded viewer image if the viewer
+   has focus, the panel cursor's file if the Directory Panel has
+   focus, and neither (the menu item is disabled) if a text field has
+   focus.
+3. **Hotkey discipline**: the most-used, low-risk action (*Copy File
+   Path*) gets a bare-letter shortcut in the viewer. Destructive or
+   modal actions (*Rename*, *Move to Trash*, *Print*) require the
+   `⌘` chord so the user can't trigger them by accident.
+4. A **New Window** menu item, hotkey, and MCP tool that creates an
+   additional, fully-functional main ImageGlass window. The session
+   state of every open main window is persisted independently so
+   that a relaunch reopens the same set of windows on the same
+   screens with the same selections.
+
+---
+
+## 0. Common Preconditions
+
+These hold for every scenario unless a scenario explicitly overrides
+them.
+
+* The app is installed, signed, and at least one previous launch has
+  happened so `~/Library/Application Support/ImageGlass_Mac/` exists
+  with `settings.yaml`, `panels.yaml`, `directories.yaml`, and the
+  `logs/` directory.
+* At least one root directory in `directories.yaml` has been walked
+  and contains ≥ 3 image files whose `kind == .image`. The reference
+  fixture is `~/Pictures/tour/` (the same fixture used by
+  [`mcp_file.mdx`](./mcp_file.mdx) §0 and
+  [`slideshow.mdx`](./slideshow.mdx) §0), with images sorted
+  depth-first lexicographically:
+
+  ```
+  tour/beach/001.jpg
+  tour/beach/002.jpg
+  tour/beach/notes_old.png
+  tour/mountains/peak.heic
+  tour/mountains/peak.jpg
+  ```
+
+  Five `.image` files in deterministic order. The non-media file
+  `tour/README.txt` never enters the list (built-in file-kind
+  filter, [list_of_files.mdx §3A.3](../list_of_files.mdx#3a3-built-in-file-kind-filter)).
+* The viewer is the focused window. The status bar reads `5 files`,
+  `001.jpg` is selected, and the viewer canvas shows that image. The
+  panel may be in any view mode; the action verbs do not depend on
+  panel layout.
+* "Verify" means: read the named file with `cat`, observe a named
+  pixel region on screen, observe a named in-memory field, or read
+  the named log line. Each verify step is a check a human or an
+  XCUITest run can perform.
+* The `log.log` path is
+  `~/Library/Application Support/ImageGlass_Mac/logs/log.log`
+  ([error_handling.mdx](../error_handling.mdx) §3).
+
+---
+
+## 1. Action Catalog
+
+This spec defines exactly **six** user-callable actions. Five operate
+on a single file ("the action target"); the sixth is the window verb.
+Every other file-related verb already documented elsewhere
+(*Open…*, *Save As…*, *Convert To…*, *Reveal in Finder*, *Reveal
+Local Storage*, the crop save verbs) is **out of scope** for this
+document — it is owned by [`menus.mdx`](../menus.mdx) §4.2 and the
+crop spec.
+
+| # | Action | Default shortcut | Bare-letter twin | Menu home | Context-menu home | MCP tool |
+|---|---|---|---|---|---|---|
+| 1 | Rename Image | `↵` (Return) when panel has focus; otherwise `F2` | None | File ▸ Rename Image… | Directory Panel ▸ row ▸ Rename… | `rename_file(path, new_name)` |
+| 2 | Move Image to Trash | `⌘ ⌫` | `⌫` (Backspace) when panel has focus on a file row | File ▸ Move Image to Trash | Directory Panel ▸ row ▸ Move to Trash | `delete_file(path)` |
+| 3 | Copy Image | `⌘ C` | None | Edit ▸ Copy (when viewer focused) | Viewer ▸ Copy Image; Panel ▸ row ▸ Copy Image | `copy_image_to_clipboard(path)` |
+| 4 | Copy File Path | `⌃ ⌘ C` | `⇧ P` (viewer focus only) | File ▸ Copy File Path | Viewer ▸ Copy File Path; Panel ▸ row ▸ Copy Path | `copy_file_path(path)` |
+| 5 | Print Image | `⌘ P` | None | File ▸ Print… | Viewer ▸ Print…; Panel ▸ row ▸ Print… | `print_current_image(path)` |
+| 6 | New Window | `⌘ N` | None | File ▸ New Window | — | `new_window(open_path?)` |
+
+Two design choices are worth calling out and are enforced by every
+implementation:
+
+1. **Most important hotkeys do not require the Command key.** *Copy
+   File Path* is the highest-traffic, lowest-risk verb in the
+   catalog, so it gets a no-modifier binding — `⇧ P` — while the
+   viewer has focus. (Bare `P` is reserved for *Previous Image* in
+   [slideshow.mdx §10A](./slideshow.mdx#10a) so `⇧ P` is the
+   collision-free single-key shortcut for Copy Path.) Every other
+   action defaults to a `⌘`-chord because they are either modal
+   (open a sheet or a print panel) or destructive (move to trash,
+   rename in place).
+2. **One verb, one menu home.** Every action is listed once in the
+   menu bar. Convenience surfaces (context menus, the right-click in
+   the Directory Panel) repeat the verb but never invent a new one.
+   This matches the rule already documented in
+   [menus.mdx §2 *Design Principles*](../menus.mdx#2-design-principles)
+   item 7.
+
+### 1.1 The action target
+
+Every file verb resolves "the target" through a single rule, applied
+in this order. The first match wins:
+
+1. **A modal that owns its own target.** Rename's text-field sheet,
+   Print's `NSPrintOperation`, and the destination prompts each
+   capture the target they were opened with; subsequent focus
+   changes do not redirect them.
+2. **Directory Panel focus.** If the Directory Panel
+   (`OutlineGroup` / `NSOutlineView`) is the first responder, the
+   target is the panel's tree-nav cursor row when that row is a
+   **file**; on a folder row the verb is disabled. Multi-select is
+   deferred to v2 ([hotkeys.mdx §11](../hotkeys.mdx#11-future-work)).
+3. **Viewer focus (default).** The target is `AppState.selectedFile`
+   — the image the canvas is currently rendering.
+4. **Text-field focus.** Every file-action menu item is disabled and
+   no keyboard shortcut fires. Letter keys type into the field; the
+   `⌘`-chord shortcuts route to the standard Edit-menu actions
+   (`⌘ C` copies the text selection, `⌘ X` cuts, etc.). This rule is
+   the same one in [hotkeys.mdx §3](../hotkeys.mdx#3-focus-contexts).
+
+The resolved target is logged on every action so a debugger can
+correlate a keystroke or a click with the file the verb ran against.
+
+### 1.2 Disabled-state rules
+
+A menu item or a shortcut is disabled when any of the following hold:
+
+* No file is loaded — `state.selectedFile == nil` AND the panel
+  cursor is not on a file row.
+* The target file does not exist on disk at the moment the verb is
+  invoked (the panel may still be showing a row for a file the user
+  trashed in Finder before the walker re-scanned).
+* The target file is not readable (permission denied; security-scoped
+  bookmark expired).
+* A modal sheet (Rename, Print) is already open for the same target.
+
+The disabled state propagates to the menu surface (greyed out in the
+menu bar and in context menus), to the keyboard surface (the shortcut
+beeps and emits no log line), and to the MCP surface (the tool
+returns `ok=false` with one of the `err` codes listed in §9).
+
+---
+
+## 2. Action — Rename Image
+
+Rename the currently loaded image (or the focused panel row) in
+place on disk. This is a single-file rename, not a batch operation.
+
+### 2.1 Surfaces and shortcuts
+
+| Surface | Trigger | Notes |
+|---|---|---|
+| Menu | File ▸ **Rename Image…** | The ellipsis indicates a sheet is shown. |
+| Keyboard, viewer focus | `F2` | Standard Windows-era rename key. Bound here so users coming from upstream ImageGlass keep their muscle memory. |
+| Keyboard, panel focus | `↵` (Return) on a file row | Matches Finder. On a folder row, Return descends into the folder; on a file row it opens the inline rename editor. |
+| Context menu, panel | right-click a row ▸ **Rename…** | The ellipsis is dropped when an inline editor is used in lieu of a sheet. The panel surface uses inline editing; the menu-bar surface uses a sheet. |
+| MCP | `rename_file(path: String, new_name: String) → {ok, new_path, err?}` | `path` is absolute; `new_name` is the new last path component only (no directory components allowed — see §9). |
+
+### 2.2 Sheet vs. inline editor
+
+The two GUI surfaces deliberately use different presentations:
+
+* **Sheet (File menu, `F2`).** An `NSAlert`-style sheet attached to
+  the main window. Two fields: the **old name** (read-only, shown
+  for confirmation) and the **new name** (focused, pre-populated
+  with the old name minus extension, selection covers everything
+  before the extension). Buttons: *Rename* (default), *Cancel*. The
+  sheet validates input live (see §2.4) and disables *Rename* when
+  the input is invalid.
+* **Inline editor (panel `↵`, context menu *Rename…*).** The row's
+  filename label becomes editable in place (Finder-style). Pressing
+  `↵` commits, `⎋` (Escape) cancels. Validation runs on each
+  keystroke; an invalid name shows a red highlight and disables the
+  commit. This is the lower-friction path for a power user already
+  cursoring through the panel.
+
+### 2.3 Actions, in order — Sheet path
+
+1. With the viewer focused on `tour/beach/notes_old.png`, choose
+   **File ▸ Rename Image…**.
+2. The Rename sheet drops down. The old-name label reads
+   `notes_old.png`. The new-name field reads `notes_old` (extension
+   stripped). The cursor selection spans `notes_old`.
+3. Type `beach_notes`. The field now reads `beach_notes`.
+4. Click **Rename**.
+
+### 2.4 Validation rules
+
+The same rules apply to both surfaces. They are checked on every
+keystroke and again on commit:
+
+* The trimmed input is non-empty after `trimmingCharacters(in:
+  .whitespacesAndNewlines)`.
+* The input does not contain `/` or `\` (no path-component
+  splitting).
+* The input does not contain a NUL byte.
+* The input does not equal `.` or `..`.
+* If the user clears the extension entirely, the **original
+  extension is appended automatically** on commit (matches Finder
+  behavior; prevents accidental extension loss when the user only
+  meant to edit the basename).
+* The destination path
+  `parent + "/" + new_name (+ original_ext if absent)` does not
+  already exist as a *different* file. If it equals the source
+  (case-insensitive on APFS) the verb is a no-op and the sheet
+  closes silently.
+* The user has write permission on the parent directory.
+
+If any rule fails on commit, the sheet displays a red error label
+below the field with the reason ("A file named `beach_notes.png`
+already exists in this folder.") and re-focuses the field; nothing
+is written.
+
+### 2.5 Expected result — success path
+
+* The file `~/Pictures/tour/beach/notes_old.png` is moved to
+  `~/Pictures/tour/beach/beach_notes.png` via
+  `FileManager.moveItem(at:to:)` (which is a single `rename(2)` on
+  APFS — atomic, no double-write).
+* `AppState.selectedFile` updates from
+  `…/notes_old.png` to `…/beach_notes.png`. The Directory Panel
+  row updates in place (the walker observes the rename via
+  `FSEventStream` and emits a single delta-update — no full
+  refresh).
+* The viewer canvas does **not** flicker. The image is the same
+  inode; only the path is new. The title-bar and the on-image info
+  overlay (`⌘I`) re-read the new filename.
+* If the original path was on the Open Recent list, the recent-list
+  entry is updated to the new path so the user can re-open it
+  without breakage.
+* If the original path was the value of `window_state.last_selected_file`
+  for any open window, that record is patched too (see §7.7) so a
+  relaunch restores the renamed file.
+* If the original path appears in any `directories.yaml` filter
+  *include* / *exclude* list, the list is patched in place to the
+  new path. The rename does **not** add a new root and does not
+  reorder the lists.
+
+### 2.6 Verify — Sheet path
+
+* On screen:
+  * The Directory Panel row that previously read `notes_old.png` now
+    reads `beach_notes.png`. Its include-checkbox state is preserved.
+  * The viewer's title bar (or the on-image info overlay) shows
+    `beach_notes.png`.
+* On disk:
+  ```sh
+  ls ~/Pictures/tour/beach/
+  # → 001.jpg 002.jpg beach_notes.png
+  ```
+  The file `notes_old.png` is gone.
+* In state:
+  * `AppState.selectedFile` is `~/Pictures/tour/beach/beach_notes.png`.
+  * `AppState.resolvedFiles` contains the new path and does not
+    contain the old.
+* In `log.log`, the most recent action line reads:
+  ```
+  ts=… tool=file.rename
+   from=/Users/…/tour/beach/notes_old.png
+   to=/Users/…/tour/beach/beach_notes.png
+   source=menu:File corr=… ok=true
+  ```
+  Bare-letter `F2` records `source=key:F2`; the panel inline editor
+  records `source=panel:rename`; the MCP tool records
+  `source=mcp:rename_file`. The shared shape lets a debugger collate
+  all four origins on the same correlation id when the operation
+  was a single user intent.
+
+### 2.7 Actions, in order — Inline editor path
+
+1. With the Directory Panel focused, arrow-cursor onto
+   `tour/beach/notes_old.png`.
+2. Press `↵`.
+3. The row's filename becomes editable; selection covers
+   `notes_old`. Type `beach_notes`. Press `↵`.
+
+The expected result, verify steps, and log line are identical to
+§2.5 / §2.6, except `source=panel:rename` replaces `source=menu:File`.
+
+### 2.8 Cancel paths
+
+* Pressing `⎋` (Escape) on the sheet closes it; nothing is written
+  and no log line is emitted (the user never crossed the commit
+  boundary).
+* Clicking *Cancel* in the sheet has the same effect.
+* In the inline editor, `⎋` reverts the text and dismisses the
+  editor; nothing is written.
+
+---
+
+## 3. Action — Move Image to Trash
+
+Remove the target file from disk by routing it through the system
+Trash via `FileManager.trashItem(at:resultingItemURL:)`. The verb is
+**non-destructive** in the standard macOS sense — the file remains
+recoverable from `~/.Trash/` until the user empties it. We never
+call `removeItem(at:)` or unlink directly.
+
+### 3.1 Surfaces and shortcuts
+
+| Surface | Trigger | Notes |
+|---|---|---|
+| Menu | File ▸ **Move Image to Trash** | Disabled when no target is resolvable (§1.2). |
+| Keyboard, anywhere | `⌘ ⌫` | The standard macOS *Move to Trash* chord. Fires unconditionally — the same target rule resolves the file. |
+| Keyboard, panel focus | `⌫` (Backspace) on a file row | Matches Finder. Only fires when the row is a **file**; a folder row beeps. |
+| Context menu, panel | right-click a row ▸ **Move to Trash** | |
+| Context menu, viewer | right-click the canvas ▸ **Move Image to Trash** | |
+| MCP | `delete_file(path: String) → {ok, trash_url?, err?}` | Returns the recovered `~/.Trash/…` URL so an MCP client can confirm where the file landed. |
+
+### 3.2 Confirmation prompt
+
+Move-to-Trash shows a confirmation dialog by default. The dialog is
+`NSAlert.style = .warning` with:
+
+* **Title.** `Move "<filename>" to the Trash?`
+* **Body.** `You can put it back later from the Trash.`
+* **Default button.** *Move to Trash* (returns `.alertFirstButtonReturn`).
+* **Cancel button.** *Cancel*.
+* **"Don't ask again" checkbox** (`NSAlert.showsSuppressionButton = true`)
+  bound to the persistent setting
+  `settings.actions.confirm_move_to_trash` (default `true`). Once
+  the user disables it, subsequent invocations skip the dialog and
+  go straight to the trash call.
+
+If `confirm_move_to_trash` is `false`, the dialog is bypassed
+entirely. The MCP tool **always** bypasses it — the MCP server has
+no UI surface; if confirmation is required, the calling client must
+handle that itself.
+
+### 3.3 Actions, in order
+
+1. With the viewer focused on `tour/beach/notes_old.png`, press `⌘ ⌫`.
+2. The confirmation dialog appears with the body above. Click
+   **Move to Trash**.
+
+### 3.4 Expected result
+
+* The file `~/Pictures/tour/beach/notes_old.png` is moved to
+  `~/.Trash/notes_old.png` (or a numbered sibling if a same-named
+  trashed file already lives there — Finder's standard behavior).
+* `AppState.resolvedFiles` removes the path on the next walker
+  delta-pass (FSEvents fires within ~250 ms; in tests, we await the
+  walker tick before the verify).
+* **Selection advances** to the next file in the resolved list
+  using the same "advance to next" policy the right-arrow uses
+  ([hotkeys.mdx §4.1](../hotkeys.mdx#41-bare-arrow-keys)): the file
+  after the deleted one in display order, falling back to the file
+  before it, falling back to `nil` if the list is now empty. The
+  viewer reloads to the new selection in the same paint cycle as
+  the row delete — there is no transient *(no image)* flash.
+* If `directories.yaml` had filter entries that referenced the
+  trashed path, those entries are scrubbed (silent — no user
+  prompt).
+* If the path equaled `window_state.last_selected_file` for any
+  open window, that record is updated to the new selection (the
+  same file that the panel just advanced to). If the window is now
+  empty, the record clears to `null` and the next launch will fall
+  back to *resolvedFiles.first*.
+
+### 3.5 Verify
+
+* On screen:
+  * The Directory Panel row for `notes_old.png` is gone. The viewer
+    canvas shows `peak.heic` (the next file in display order).
+  * The status bar reads `4 files` (was `5`).
+* On disk:
+  ```sh
+  ls ~/Pictures/tour/beach/
+  # → 001.jpg 002.jpg
+  ls ~/.Trash/ | grep notes_old
+  # → notes_old.png
+  ```
+* In state:
+  * `AppState.selectedFile == "~/Pictures/tour/mountains/peak.heic"`.
+  * `AppState.resolvedFiles.count == 4`.
+* In `log.log`, the most recent action line reads:
+  ```
+  ts=… tool=file.trash
+   from=/Users/…/tour/beach/notes_old.png
+   trash=/Users/…/.Trash/notes_old.png
+   source=key:cmd-delete corr=… ok=true
+  ```
+  The MCP path records `source=mcp:delete_file` and includes the
+  `trash` field on the response so a client can roll the action
+  back via `NSWorkspace.shared.open(trashURL)` if the user changes
+  their mind.
+
+### 3.6 Cancel / suppressed-dialog paths
+
+* Pressing *Cancel* in the dialog leaves the file in place; no
+  log line, no state mutation.
+* When `confirm_move_to_trash == false`, the file is trashed
+  immediately; the log line still records `source=key:cmd-delete`
+  (or whichever surface fired).
+
+### 3.7 Empty-list and last-file edge cases
+
+* **Trashing the only file.** The list is now empty.
+  `selectedFile` becomes `nil`. The viewer shows the empty-state
+  placeholder ([panels.mdx §7.1](../panels.mdx)). The window-state
+  record for that window has `last_selected_file = nil`.
+* **Trashing a file that's outside the active scope.** Allowed (the
+  user may have opened the file ad-hoc via *Open…*). The trash call
+  still routes through `FileManager.trashItem`; no scope is patched.
+  Selection becomes `nil` because there's no list to advance through.
+
+---
+
+## 4. Action — Copy Image
+
+Place the **rendered** image on the system clipboard as raster bitmap
+data so any other Mac app can paste it. This is *not* a file-URL
+copy; for that, see §5 *Copy File Path*.
+
+### 4.1 Surfaces and shortcuts
+
+| Surface | Trigger | Notes |
+|---|---|---|
+| Menu | Edit ▸ **Copy** (viewer focused) | Standard `⌘ C` slot in the Edit menu. When the panel is focused, `⌘ C` still copies the image data of the panel cursor's file — not the file URL. The cursor's *file URL* is reachable via §5. |
+| Keyboard, viewer or panel focus | `⌘ C` | |
+| Context menu, viewer | right-click ▸ **Copy Image** | |
+| Context menu, panel | right-click a row ▸ **Copy Image** | |
+| MCP | `copy_image_to_clipboard(path: String) → {ok, byte_count, err?}` | Returns the byte count of the PNG written to the pasteboard so a client can sanity-check the copy. |
+
+### 4.2 What gets copied
+
+The clipboard gets two representations declared on a single
+`NSPasteboard.Item` so the receiving app can choose whichever it
+understands:
+
+1. **PNG bitmap data** (`NSPasteboard.PasteboardType.png`). Produced
+   by re-encoding the current `CGImage` through `NSBitmapImageRep`
+   with no compression flag (default settings) — the result is a
+   lossless PNG so a Preview-paste does not lose color depth.
+2. **TIFF bitmap data** (`NSPasteboard.PasteboardType.tiff`). The
+   legacy AppKit pasteboard type many older apps still ask for
+   first.
+
+The image data is **the rendered image at its native resolution,
+with rotation and flip applied but without zoom or pan applied**.
+A user who rotated the view 90° before copying gets a 90°-rotated
+PNG on the clipboard; a user who zoomed in to 400% still gets a
+100%-pixel PNG. This matches Preview.app's behavior.
+
+We do **not** also write a file URL onto the clipboard. The reason:
+many apps (e.g., Slack, Messages) prefer the URL form when both are
+available, which sidesteps the user's expectation that "Copy Image"
+puts pixels on the clipboard. Use §5 *Copy File Path* when a URL is
+wanted.
+
+### 4.3 Actions, in order
+
+1. With the viewer focused on `tour/mountains/peak.heic` (HEIC test
+   case — exercises ImageIO HEIC decode through the same path as
+   PNG), press `⌘ C`.
+
+### 4.4 Expected result
+
+* `NSPasteboard.general` is cleared (`clearContents()`), then a
+  single `NSPasteboardItem` is added with the two representations
+  above.
+* The viewer briefly flashes a "Copied to clipboard" toast in the
+  status-bar area (the same toast pattern documented in
+  [panels.mdx](../panels.mdx)). The toast auto-dismisses after
+  ~1.2 s and is suppressed when the action fired via MCP (no human
+  is watching that window).
+* No file is created on disk. The clipboard data is the only
+  artifact.
+
+### 4.5 Verify
+
+* On the clipboard:
+  ```sh
+  pbpaste -Prefer png | wc -c        # → non-zero byte count
+  osascript -e 'the clipboard as «class PNGf»' >/dev/null   # → no error
+  ```
+* On screen: the "Copied to clipboard" toast appears for ~1.2 s and
+  fades out.
+* In `log.log`:
+  ```
+  ts=… tool=file.copy_image
+   path=/Users/…/tour/mountains/peak.heic
+   bytes=… source=key:cmd-c corr=… ok=true
+  ```
+
+### 4.6 Cancel / failure paths
+
+* The image fails to decode (corrupt file, missing on disk). The
+  toast becomes "Copy failed — file unreadable" and the log line
+  records `ok=false err=decode_failed`.
+* The clipboard write throws. The toast becomes "Copy failed —
+  clipboard unavailable" (rare, but possible if a kernel limit was
+  hit). The log line records `ok=false err=pasteboard_write`.
+
+---
+
+## 5. Action — Copy File Path
+
+Place the absolute POSIX path of the target file onto the clipboard
+as plain text (UTF-8). This is the highest-traffic verb in the
+catalog — the path is what users paste into Terminal, into Finder's
+*Go to Folder…*, into the Anthropic / Claude conversation, and into
+documentation.
+
+### 5.1 Surfaces and shortcuts
+
+| Surface | Trigger | Notes |
+|---|---|---|
+| Menu | File ▸ **Copy File Path** | |
+| Keyboard, viewer focus | **`⇧ P`** (no `⌘`) | Highest-traffic, lowest-risk verb gets a single-letter binding. Bare `P` is taken by *Previous Image* (slideshow.mdx §10A); `⇧ P` is the collision-free twin. Fires only when the viewer is the first responder — text-field focus eats the key. |
+| Keyboard, anywhere | `⌃ ⌘ C` | The cross-context twin so the same action is reachable while a text field is focused or while the panel is focused. The bare `P` and the chord do **not** conflict — they are alternate shortcuts on the same menu item. |
+| Context menu, viewer | right-click ▸ **Copy File Path** | |
+| Context menu, panel | right-click a row ▸ **Copy File Path** | |
+| MCP | `copy_file_path(path: String) → {ok, copied_path, err?}` | Server-side convenience: writes the path to the pasteboard on the host running the GUI. |
+
+### 5.2 What gets copied
+
+The clipboard gets the **absolute POSIX path** (no `file://`
+prefix, no trailing newline) on the standard string pasteboard
+type (`NSPasteboard.PasteboardType.string`). The path is:
+
+* `URL(fileURLWithPath:).path` of the target — fully resolved and
+  canonical, with `~` already expanded and no `..` components.
+* Symlinks are **not** resolved. A path under a symlinked folder is
+  copied verbatim. Users who want the resolved path can chain
+  through `readlink` themselves.
+* The path is preserved byte-for-byte; we do not URL-encode spaces
+  or shell-quote.
+
+### 5.3 Actions, in order — single-letter path
+
+1. With the viewer focused on `tour/beach/001.jpg`, press `⇧ P`.
+
+### 5.4 Expected result
+
+* The clipboard now contains the string
+  `/Users/<username>/Pictures/tour/beach/001.jpg`.
+* The status-bar toast reads "Path copied". Same ~1.2 s
+  auto-dismiss as §4.4.
+* No file is created. The pasteboard write is the only artifact.
+
+### 5.5 Verify
+
+* On the clipboard:
+  ```sh
+  pbpaste
+  # → /Users/<username>/Pictures/tour/beach/001.jpg
+  pbpaste | wc -c        # length matches; trailing newline absent
+  ```
+* In `log.log`:
+  ```
+  ts=… tool=file.copy_path
+   path=/Users/…/tour/beach/001.jpg
+   source=key:P corr=… ok=true
+  ```
+  The `⌃ ⌘ C` chord records `source=key:ctrl-cmd-c`; the menu surface
+  records `source=menu:File`; the MCP path records
+  `source=mcp:copy_file_path`.
+
+### 5.6 Cancel / failure paths
+
+* The target file no longer exists on disk. The action **still
+  copies the last-known path** — the user's intent is usually to
+  paste it somewhere; whether the file still exists is the user's
+  problem, not the verb's. The log line records `ok=true note=missing`
+  so a debugger can see the warning without the verb refusing.
+* The clipboard write throws (extremely rare). Toast: "Copy failed".
+  Log line: `ok=false err=pasteboard_write`.
+
+---
+
+## 6. Action — Print Image
+
+Open the standard macOS print panel for the target image and print
+through `NSPrintOperation`. The verb is **modal** — the print panel
+takes focus and the rest of the app is inert until the user clicks
+*Print* or *Cancel*.
+
+### 6.1 Surfaces and shortcuts
+
+| Surface | Trigger | Notes |
+|---|---|---|
+| Menu | File ▸ **Print…** | Standard macOS slot. The ellipsis is required — the verb opens a panel. |
+| Keyboard, anywhere | `⌘ P` | Standard macOS print chord. Fires unconditionally, target resolved per §1.1. |
+| Context menu, viewer | right-click ▸ **Print Image…** | |
+| Context menu, panel | right-click a row ▸ **Print…** | |
+| MCP | `print_current_image(path: String, copies: Int = 1, paper_name: String? = nil) → {ok, err?}` | Optional copies and paper name. Printer is the user's default; MCP cannot pick a non-default printer for safety. |
+
+The menu also surfaces a companion item, **File ▸ Page Setup…**
+(`⇧ ⌘ P`), that opens the print-info panel without printing. The
+*Page Setup* result is remembered for the current session and
+applied as the seed `NSPrintInfo` for subsequent `Print…` calls.
+
+### 6.2 What gets printed
+
+The print operation renders **the rendered image at its native
+resolution, with rotation and flip applied but without zoom or
+pan**. The image is fit to the printable area of the chosen paper
+using a single uniform scale — never stretched, never clipped at
+the print-panel level (the user can clip via the print panel's
+own *Scale* and *Crop* controls). Background is white; image alpha
+is composited onto white at print time.
+
+Multi-frame files (animated GIF/APNG/WebP) print the current frame
+only. SVG prints the rasterized current frame at the print
+resolution.
+
+### 6.3 Actions, in order
+
+1. With the viewer focused on `tour/mountains/peak.jpg`, press `⌘ P`.
+
+### 6.4 Expected result
+
+* The macOS print panel slides in attached to the main window.
+* The print preview shows `peak.jpg` fit to one page using the
+  user's default `NSPrintInfo` (default paper, 1 copy).
+* The panel's printer dropdown defaults to the user's system
+  default printer.
+* The window underneath is dimmed and inert.
+
+### 6.5 Verify
+
+* On screen: the print panel is the key window; the title bar reads
+  *Print*. Clicking *Cancel* dismisses the panel without printing.
+* In `log.log`, the act of **opening** the panel emits:
+  ```
+  ts=… tool=file.print_open
+   path=/Users/…/tour/mountains/peak.jpg
+   source=key:cmd-p corr=… ok=true
+  ```
+  The act of **committing** the print (the user clicks *Print*)
+  emits a second line on the same correlation id:
+  ```
+  ts=… tool=file.print_commit
+   path=/Users/…/tour/mountains/peak.jpg
+   printer="<NSPrinter.name>"
+   copies=<N>
+   source=key:cmd-p corr=… ok=true
+  ```
+  *Cancel* emits a `file.print_cancel` line with `ok=true`. The MCP
+  surface emits both lines (open + commit) atomically because it
+  bypasses the panel UI.
+
+### 6.6 Failure paths
+
+* No printer configured on the system. The verb still opens the
+  print panel — `NSPrintOperation` handles the "no printer" state
+  with its own warning row. We do not pre-empt it.
+* The image fails to render to the print context. Log: `ok=false
+  err=render_failed`. The panel surfaces a system-level alert.
+
+---
+
+## 7. Action — New Window
+
+Create an additional, fully-featured main ImageGlass window. Every
+new window is a peer of the original main window: it has its own
+viewer canvas, its own Directory Panel, its own selection cursor,
+its own zoom / rotate / flip state, its own slideshow controller,
+and its own window-geometry record. The shared, app-level state
+(scope set, MCP server, panels framework, theme) is **shared** —
+exactly one MCP server runs no matter how many windows are open.
+
+### 7.1 Surfaces and shortcuts
+
+| Surface | Trigger | Notes |
+|---|---|---|
+| Menu | File ▸ **New Window** | The first verb in the File menu, sitting above *Open…*. Matches Safari / Preview menu ordering. |
+| Keyboard, anywhere | `⌘ N` | Standard macOS *New* chord. Fires unconditionally. |
+| MCP | `new_window(open_path: String? = nil) → {ok, window_id, err?}` | When `open_path` is non-nil, the new window opens with that file as its initial selection (and the file is added to Recent). |
+| Window menu | The standard *Window* menu lists every open main window by its current title and selection, so the user can jump between them with `⌃ ⇥` / `⌃ ⇧ ⇥`. The list updates live. | |
+
+There is no context-menu surface for *New Window* — opening a
+window is not a per-row verb.
+
+### 7.2 Actions, in order
+
+1. With the viewer focused on `tour/beach/001.jpg`, press `⌘ N`.
+
+### 7.3 Expected result
+
+* A new main window opens. It is the same `WindowGroup` scene as
+  the original — full menu surface, full panels, full hotkeys —
+  not a stripped-down secondary window like the existing *Second
+  Viewer* (which remains as a separate, passive mirror; see
+  [`Window/SecondViewerWindow.swift`](../../code/Sources/ImageGlass/Window/SecondViewerWindow.swift)).
+* The new window's initial state is seeded as follows:
+  * **Scope.** Same active scope as the spawning window. (Scopes are
+    app-level, not window-level.)
+  * **Selection.** `AppState.selectedFile` of the new window is
+    set to the same file the spawning window is showing
+    (`001.jpg`). This is the highest-utility seed — the user usually
+    spawns a new window to A/B two views of the same image.
+  * **Zoom / pan / rotate / flip.** Reset to settings defaults
+    (`viewer.default_zoom_on_open`, no rotation, no flip). Per-window
+    state is not inherited from the spawning window, because the
+    user's most common intent is "I want a clean second view".
+  * **Panels.** Same layout preset as the spawning window. (Panels
+    are app-level, not window-level, in the v1 architecture.) A
+    future v2 may add per-window panel layouts; the spec is forward-
+    compatible because every window already carries its own
+    `WindowStateController` (§7.5).
+  * **Geometry.** New windows cascade by `(24, 24)` from the
+    spawning window on the same screen, following the standard
+    `NSWindow.cascadeTopLeft(from:)` behavior, so a stack of
+    three feels Mac-native.
+* The new window becomes key and front. The spawning window stays
+  open (this is *New Window*, not *Replace*).
+
+### 7.4 Verify
+
+* On screen: two main windows are visible. The new one is key; the
+  spawning one is in the background.
+* The Window menu lists both, with the active one checkmarked.
+* `NSApp.windows.filter { $0.canBecomeMain }.count == 2`.
+* In `log.log`:
+  ```
+  ts=… tool=window.new
+   window_id=<UUID>
+   spawned_from=<UUID>
+   initial_path=/Users/…/tour/beach/001.jpg
+   source=key:cmd-n corr=… ok=true
+  ```
+
+### 7.5 Per-window state record
+
+To support multi-window save/restore, the existing single
+`window_state` record in `settings.yaml` is generalized to a
+**list of window state records keyed by `window_id`**. The
+single-record format remains valid (it is read as a one-entry list
+during migration).
+
+```yaml
+windows:
+  - window_id: "1f3c6e6e-6c5b-4a3a-9c66-…"
+    is_primary: true
+    display_id: "37D8832A-2D66-02CA-B9F7-…"
+    display_name: "Studio Display"
+    frame:
+      x: 120
+      y: 86
+      width: 1280
+      height: 820
+    fullscreen: false
+    zoomed: false
+    minimized: false
+    last_selected_file: "/Users/…/tour/beach/001.jpg"
+    saved_at: "2026-06-05T15:42:11Z"
+  - window_id: "a4d77e2c-9e58-4c01-8f1d-…"
+    is_primary: false
+    display_id: "37D8832A-2D66-02CA-B9F7-…"
+    display_name: "Studio Display"
+    frame:
+      x: 168
+      y: 134
+      width: 1280
+      height: 820
+    fullscreen: false
+    zoomed: false
+    minimized: false
+    last_selected_file: "/Users/…/tour/mountains/peak.heic"
+    saved_at: "2026-06-05T15:42:11Z"
+```
+
+Rules:
+
+* `window_id` is a UUID minted when the window is created and
+  persisted on every save.
+* **Exactly one** record has `is_primary: true`. If the primary
+  window is closed and other windows remain, the lowest-id
+  surviving window is promoted to primary at close time (this
+  affects how the *Open File* and *Reveal* verbs pick a target
+  when no window is key — they target the primary).
+* Each record carries the full set of geometry fields the existing
+  [`WindowSettings`](../../code/Sources/ImageGlassCore/Config/Settings.swift)
+  type has today (`display_id`, `display_name`, `frame`,
+  `fullscreen`, `zoomed`, `minimized`, `last_selected_file`,
+  `saved_at`). The save/restore semantics in
+  [`multi_monitor.mdx`](../multi_monitor.mdx) apply unchanged to
+  each record.
+* The save is **per-window debounced**. Each window's controller
+  schedules its own 500 ms debounce on resize / move / selection
+  changes; the records are merged into a single `settings.yaml`
+  list and written through the existing atomic-rename pipeline.
+* On `applicationWillTerminate`, every window's controller forces
+  a synchronous save so the final state is on disk before exit.
+
+### 7.6 Restore on next launch
+
+When more than one window record is present on cold launch, the app
+opens **all** of them, in the order they appear in the YAML:
+
+1. The primary window is opened first (the same path that
+   `WindowGroup` already opens on launch). Its geometry and selection
+   are restored from the primary record exactly as
+   [`WindowStateController.bootstrap`](../../code/Sources/ImageGlass/Window/WindowStateController.swift)
+   does today.
+2. Each remaining record triggers a `new_window` call internally
+   *with the saved `last_selected_file` as the initial selection*.
+   Each new window's controller restores its own geometry,
+   `fullscreen`, `zoomed`, and `minimized` flags from the matching
+   record.
+3. If the user has explicitly closed every window before quitting
+   (so the list is empty), the next launch opens a single primary
+   window per the existing single-window behavior and seeds a new
+   `window_id`. This preserves the "open the app, get a window"
+   expectation.
+
+The order of windows in the YAML list is the order the user last
+saw them in the Window menu, which is itself the
+`NSWindow.orderedIndex` order. This means a relaunch reproduces the
+visible Z-order users had at quit time as closely as the system
+permits.
+
+### 7.7 Path-mutating verbs across windows
+
+When a Rename (§2) or Move-to-Trash (§3) mutates a path, the spec
+applies the patch to **every** window-state record whose
+`last_selected_file` matched the old path. The implementation walks
+the in-memory list once after the FS mutation succeeds and before
+the debounce save fires.
+
+The Copy and Print verbs do not mutate state and therefore touch no
+other window's record.
+
+### 7.8 Closing the last window
+
+Closing the last main window does **not** quit the app on macOS —
+this matches the standard system convention. The dock icon stays
+lit, the menu bar remains the app's, and *File ▸ New Window* (or
+clicking the dock icon) reopens a window. The window-state list in
+`settings.yaml` is preserved through the close; if the user quits
+with zero windows open, the list is left as-is so a subsequent
+launch can still reproduce them. The Quit verb writes an additional
+`tool=app.quit windows_open=<N>` audit line so a debugger can
+correlate.
+
+### 7.9 Verify — multi-window restore
+
+1. Open two windows (`⌘ N` once). Move window A to monitor 1 and
+   resize to 1280×820 at `(120, 86)`. Move window B to monitor 2
+   and resize to 1024×640 at `(40, 40)`. Set window A's selection
+   to `001.jpg` and window B's selection to `peak.heic`. Quit
+   (`⌘ Q`).
+2. Relaunch.
+
+* On screen: two main windows reappear. Window A is on monitor 1
+  at `(120, 86)` with size `1280×820`, showing `001.jpg`. Window B
+  is on monitor 2 at `(40, 40)` with size `1024×640`, showing
+  `peak.heic`.
+* `settings.yaml` ▸ `windows:` has two entries, in their pre-quit
+  order, each with the right `display_id`, `frame`,
+  `last_selected_file`.
+* In `log.log` at startup:
+  ```
+  ts=… app=window.restore window_id=<A> primary=true selected=/…/001.jpg ok=true
+  ts=… app=window.restore window_id=<B> primary=false selected=/…/peak.heic ok=true
+  ```
+
+---
+
+## 8. Surface Cross-Reference
+
+This table is the at-a-glance summary an XCUITest run can use to
+enumerate every action surface. The MCP column lists the tool name;
+absent entries are not MCP-callable.
+
+| Action | Menu | Hotkey (viewer) | Hotkey (panel) | Bare-letter | Context menu (viewer) | Context menu (panel) | MCP |
+|---|---|---|---|---|---|---|---|
+| Rename | File ▸ Rename Image… | F2 | ↵ | — | — | Rename… (inline) | `rename_file` |
+| Move to Trash | File ▸ Move Image to Trash | ⌘⌫ | ⌘⌫ / ⌫ | — | Move Image to Trash | Move to Trash | `delete_file` |
+| Copy Image | Edit ▸ Copy | ⌘C | ⌘C | — | Copy Image | Copy Image | `copy_image_to_clipboard` |
+| Copy File Path | File ▸ Copy File Path | ⇧P / ⌃⌘C | ⌃⌘C | **⇧P** | Copy File Path | Copy File Path | `copy_file_path` |
+| Print | File ▸ Print… | ⌘P | ⌘P | — | Print Image… | Print… | `print_current_image` |
+| New Window | File ▸ New Window | ⌘N | ⌘N | — | — | — | `new_window` |
+
+---
+
+## 9. MCP Tool Surface
+
+The five file-action verbs and the window verb each get one
+JSON-RPC tool on the existing MCP server. The shape follows the
+patterns in [`mcp.mdx`](../mcp.mdx) §6.
+
+### 9.1 `rename_file`
+
+```jsonc
+// request
+{ "name": "rename_file",
+  "arguments": { "path": "/abs/path/old.png", "new_name": "new.png" } }
+
+// response — success
+{ "ok": true, "new_path": "/abs/path/new.png" }
+
+// response — failure
+{ "ok": false, "err": "name_invalid" | "name_collides" |
+                       "src_missing" | "permission_denied" |
+                       "name_has_path_sep" | "name_empty" }
+```
+
+* `new_name` must be a single path component (no `/`, no `\\`).
+* Cross-directory moves are **not** supported by this tool. Use
+  `set_current_directory` or a future `move_file` for that.
+
+### 9.2 `delete_file`
+
+```jsonc
+// request
+{ "name": "delete_file", "arguments": { "path": "/abs/path/x.png" } }
+
+// response
+{ "ok": true, "trash_url": "file:///Users/…/.Trash/x.png" }
+```
+
+* The confirmation dialog (§3.2) is **always** bypassed by MCP.
+* Returns the `.Trash` URL so the client can roll back via
+  `NSWorkspace.shared.open(trashURL)`.
+
+### 9.3 `copy_image_to_clipboard`
+
+```jsonc
+// request
+{ "name": "copy_image_to_clipboard", "arguments": { "path": "/abs/path/x.png" } }
+
+// response
+{ "ok": true, "byte_count": 482931, "types": ["public.png", "public.tiff"] }
+```
+
+### 9.4 `copy_file_path`
+
+```jsonc
+// request
+{ "name": "copy_file_path", "arguments": { "path": "/abs/path/x.png" } }
+
+// response
+{ "ok": true, "copied_path": "/abs/path/x.png" }
+```
+
+* The "file missing" case (§5.6) still returns `ok: true` with a
+  `note: "missing"` field so the client knows.
+
+### 9.5 `print_current_image`
+
+```jsonc
+// request
+{ "name": "print_current_image",
+  "arguments": { "path": "/abs/path/x.png",
+                 "copies": 1,
+                 "paper_name": null } }
+
+// response
+{ "ok": true }
+```
+
+* No print panel is shown — the MCP path commits straight to the
+  user's default printer with the supplied copy count.
+
+### 9.6 `new_window`
+
+```jsonc
+// request
+{ "name": "new_window", "arguments": { "open_path": "/abs/path/x.png" } }
+
+// response
+{ "ok": true, "window_id": "a4d77e2c-9e58-4c01-8f1d-…" }
+```
+
+* `open_path` is optional. When omitted, the new window seeds its
+  selection from the spawning window (the window that owns the MCP
+  session — for stdio, that is the primary main window).
+
+---
+
+## 10. Settings Keys Introduced
+
+The actions subsystem adds a small block to `settings.yaml`. Defaults
+are listed; every key is editable through the Settings scene under
+the *Actions* tab (added by this spec).
+
+```yaml
+actions:
+  # Show the confirmation dialog before Move to Trash. The dialog
+  # also has a "Don't ask again" checkbox that writes this key.
+  confirm_move_to_trash: true
+
+  # When a Rename omits the extension, append the original extension
+  # automatically on commit. Matches Finder.
+  rename_preserve_extension: true
+
+  # Toast feedback for the Copy Image and Copy File Path verbs.
+  show_copy_toast: true
+
+  # Default copy count for the MCP `print_current_image` tool when
+  # the caller does not supply `copies`. The GUI path is unaffected
+  # — the print panel always shows the system default.
+  default_print_copies: 1
+
+  # Print operations write a transient PDF to a temp directory for
+  # the print spooler. This key controls how long the transient lives.
+  print_temp_retention_seconds: 60
+```
+
+Settings scene wiring is owned by [`settings.mdx`](../settings.mdx);
+this spec is the source of truth for the keys themselves.
+
+---
+
+## 11. Forward Compatibility
+
+Three follow-on capabilities are out of scope for v1 but the spec is
+written so they can be added without breaking the surface above:
+
+1. **Multi-select on the panel.** The §1.1 target rule is written
+   to resolve a single file. A v2 multi-select adds a list and each
+   verb runs in a loop on commit. The menu items pluralize ("Move 3
+   Images to Trash") and the MCP tools gain `paths: [String]`
+   variants alongside the singulars.
+2. **Move-without-trash.** Some users want `⇧ ⌘ ⌫` to bypass the
+   Trash entirely (the standard macOS "delete immediately" chord).
+   Reserved; not implemented in v1.
+3. **Per-window panel layout.** The window-state record in §7.5
+   already has room for a `layout_preset` field. When v2 enables
+   per-window panels, the field is written; v1 leaves it absent.

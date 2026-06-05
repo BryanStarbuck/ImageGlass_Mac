@@ -1,0 +1,1704 @@
+---
+title: Use Case — Multi-Window State and Per-Window Persistence
+description: Specification for ImageGlass_Mac's multi-window model. Each open window owns its own directories_window_N.yaml and settings_window_N.yaml on disk and its own WindowState instance in memory. Application-level settings stay in settings.yaml. The frontmost window is the implicit MCP target — calls like add_directory, remove_directory, set_global_filter, select_file, and slideshow toggles always retarget the current frontmost window, bringing it forward first. Per-window state covers slideshow on/off, the current cursor file, the active scope, expanded tree rows, and panel layout overrides; application-level state covers theme, language, MCP server config, file associations, and update cadence. The Window menu lists every window that has ever existed (open + recently-closed) and can reopen a closed window by its persistent number, replaying the saved YAML. Two-window canonical use case (UX design slideshow + family-pictures browser, switched with ⌘`) walks the whole flow end-to-end with on-disk verification at every step.
+---
+
+# Use Case — Multi-Window State and Per-Window Persistence
+
+ImageGlass_Mac is a multi-window app. The user can have several
+viewer windows open at once, each pointing at its own set of
+directories, each holding its own viewer state (zoom, current image,
+slideshow on/off), each with its own panel layout. The two windows
+do not share state. Closing a window does not lose its state.
+
+This spec pins down:
+
+* The vocabulary (what "window 1" means, where its number comes from,
+  what survives a close-and-reopen).
+* The on-disk file layout — one `directories_window_N.yaml` and one
+  `settings_window_N.yaml` per window, in addition to the
+  application-level `settings.yaml`.
+* The in-memory mirror — a `WindowState` class with one instance
+  per live window, owned by a global `WindowRegistry`.
+* What state is per-window vs. what stays application-level.
+* How the **frontmost window** acts as the implicit MCP target so a
+  call like `add_directory("…/family")` lands in the right window
+  without the MCP client having to know about window numbers.
+* The Window menu integration so closed windows can be reopened by
+  number.
+* The two-window canonical use case the rest of the product is
+  designed around: one window driving a slideshow over the UX design
+  hierarchy, another window flipping through family pictures, with
+  ⌘\` switching between them and each holding its own slideshow /
+  cursor independently.
+
+This is the user-facing companion to:
+
+* [Local Storage](../local_storage.mdx) §3 — the on-disk layout of
+  `~/T/_imageglass/` and the schemas for `settings.yaml` and
+  `directories.yaml`. This spec **extends** those schemas to
+  per-window files. The application-level `settings.yaml` keeps its
+  existing schema minus the per-window subset; the per-window subset
+  moves into `settings_window_N.yaml`. `directories.yaml` becomes
+  `directories_window_N.yaml`, one per window, with the same schema.
+* [Settings](../settings.mdx) §2.1.1 — the existing "save on quit,
+  restore on launch" session block. That block is preserved verbatim
+  but is now **per window**: a `session:` block lives inside each
+  `settings_window_N.yaml`, not inside the application-level
+  `settings.yaml`.
+* [Menus](../menus.mdx) §4.9 — the macOS Window menu. This spec
+  adds two new sections to it: a "Reopen Closed Window" submenu and
+  an explicit "New Image Window" item, plus the numbered list of
+  currently-open windows that AppKit already provides.
+* [File List Panel](../list_of_files.mdx) §3A — the engineering
+  spec for the file-tree panel and `directories.yaml`. Every contract
+  there still holds; it now applies **per window** to the matching
+  `directories_window_N.yaml`.
+* [MCP Tour](./mcp_file.mdx) — the per-call walkthrough of the MCP
+  surface. Everything that tour says about the `directories.yaml`
+  file and the file panel now applies to the **frontmost window's**
+  `directories_window_N.yaml` and the **frontmost window's** file
+  panel. This spec adds the "retarget to the frontmost window" rule
+  to every mutating MCP call in that tour.
+
+This spec does **not** invent new MCP tools. The existing
+`add_directory`, `remove_directory`, `set_global_filter`,
+`update_directory_filter`, `clear_directories`, `select_file`,
+`list_directories`, `get_directory`, and the slideshow tools all
+keep their existing signatures. What changes is the **implicit
+target**: every mutating tool retargets the frontmost window's
+state instead of one app-wide blob.
+
+---
+
+## 0. Common Preconditions
+
+These hold for every scenario unless a scenario explicitly overrides
+them.
+
+* The app is installed and signed; first launch has already happened
+  once, so `~/T/_imageglass/` exists with at minimum a
+  `settings.yaml`.
+* The MCP server is reachable (see [MCP Tour](./mcp_file.mdx) §0).
+* The on-disk layout is:
+
+  ```
+  ~/T/_imageglass/
+  ├── settings.yaml                  # application-level only (§3.1)
+  ├── settings_window_1.yaml         # one per live or remembered window (§3.2)
+  ├── settings_window_2.yaml
+  ├── …
+  ├── directories_window_1.yaml      # one per live or remembered window (§3.3)
+  ├── directories_window_2.yaml
+  ├── …
+  └── logs/
+      └── log.log                    # every MCP call lands here, with window_id
+  ```
+
+* The user has at least one display attached. Multi-display rules
+  for restoring window geometry are inherited from
+  [local_storage.mdx](../local_storage.mdx) §4.2.1.
+* "Verify" still means `cat` the named file, look at the named
+  pixel region on screen, or read the named log line.
+
+---
+
+## 1. The Window Model
+
+### 1.1 Vocabulary
+
+* **Window** — one top-level `NSWindow` that owns a viewer canvas,
+  a file panel, a toolbar, and the menu state it commits to AppKit
+  when it is the key window. There is exactly one viewer per window.
+* **Window number** (`window_id`) — a positive integer (`1, 2, 3,
+  …`) assigned the first time a window is created and **kept
+  forever**. Closing a window does not retire its number. Reopening
+  the window via Window → Reopen Closed Window restores the same
+  number. The number is the suffix in `directories_window_<N>.yaml`
+  and `settings_window_<N>.yaml`.
+* **Live window** — a window whose `NSWindow` is currently
+  instantiated, regardless of visibility (a minimized window is
+  still live).
+* **Closed window** — a window whose `NSWindow` has been released
+  but whose `settings_window_<N>.yaml` and
+  `directories_window_<N>.yaml` still exist on disk. Closed windows
+  are listed under Window → Reopen Closed Window.
+* **Frontmost window** — the `NSApplication.shared.keyWindow`, or
+  if none is key (e.g. an inspector floating window has key focus),
+  the most recently key viewer window. Used as the implicit MCP
+  target. See §6.
+* **Retired window** — a window the user explicitly retired via
+  Window → Forget Closed Window. Its YAML files are moved to
+  `~/T/_imageglass/Trash/` (not deleted), and its number is **not
+  reused** for the lifetime of the application support directory
+  (so a future user, or a future `git log` looking at backups, can
+  always tell window 3 in May from window 3 in June apart — there
+  is no such thing as window 3 in June, because window 3 was
+  retired in May).
+
+### 1.2 Window number allocation
+
+Numbers are allocated by `WindowRegistry.allocateNextWindowID()`:
+
+1. The registry reads `next_window_id` from the application-level
+   `settings.yaml` (§3.1).
+2. It returns `next_window_id`, then increments it in memory and
+   schedules a debounced write back to `settings.yaml`.
+3. If `settings.yaml` is missing the key, the registry computes
+   `max(existing windows' numbers) + 1` by scanning
+   `~/T/_imageglass/` for `directories_window_*.yaml` and
+   `settings_window_*.yaml`, then writes that as the new
+   `next_window_id`.
+
+This monotonic counter — never re-using a number — is what makes the
+`window_id` field in `log.log` (§13) a stable foreign key across
+sessions. An auditor reading the log six months later can match a
+`window_id=7` line against `directories_window_7.yaml` and know it
+is the same window, even if window 7 has been closed and reopened
+several times since.
+
+### 1.3 Window lifecycle
+
+Six events drive a window's lifetime:
+
+1. **`open`** — `NSWindow` is created; the registry allocates a
+   new `window_id` (or reuses the stored one if reopening); the
+   matching `WindowState` instance is constructed (§4); both YAML
+   files are loaded from disk (or written with defaults if they do
+   not yet exist).
+2. **`activate`** — the window becomes the key window. The
+   registry updates `frontmost_window_id` and the MCP-target rule
+   (§6) takes effect.
+3. **`mutate`** — anything that changes per-window state: an MCP
+   call, a menu action, a hotkey, a click in the file panel, a
+   selection change, a slideshow start/stop, a viewer zoom change.
+4. **`deactivate`** — the window stops being key (some other window
+   or app takes focus). State is unchanged; only the frontmost-
+   window rule shifts.
+5. **`close`** — the user closes the `NSWindow`. The registry
+   marks the window closed but keeps the YAML files in place.
+   Both files get a final debounced flush before release. The
+   number is **not** reused.
+6. **`reopen`** — Window → Reopen Closed Window → "Window 3" is
+   chosen, or the user runs the MCP `open_window(window_id: 3)`
+   tool. The registry resurrects the `WindowState` from the saved
+   YAML files; the `NSWindow` is rebuilt; the viewer reloads the
+   `session.selection.current_file` from the YAML.
+
+A seventh event — **`retire`** — is the only operation that drops
+the YAML files. See §1.1. The registry does **not** auto-retire
+closed windows. The user must do it explicitly.
+
+### 1.4 First-launch baseline
+
+On first launch ever:
+
+* `~/T/_imageglass/` does not exist. The bootstrap (per
+  [local_storage.mdx §3.2](../local_storage.mdx#32-bootstrap-on-first-launch))
+  creates it.
+* `settings.yaml` is written with `next_window_id: 2`.
+* `settings_window_1.yaml` is written with the v1 defaults from §3.2.
+* `directories_window_1.yaml` is written with `root_directories: []`
+  (the same starter as the single-window `directories.yaml` would
+  have used).
+* Exactly one `NSWindow` is opened as window 1, key, in the default
+  "Browser" panel preset.
+
+On every subsequent launch:
+
+* The registry scans for `settings_window_*.yaml` files. For each,
+  it constructs a `WindowState`, loads it from disk, then decides
+  whether to **resurrect** the `NSWindow` based on the
+  `session.was_open_on_quit` flag (§3.2.2):
+  * `true` → reopen the `NSWindow` immediately, restoring the saved
+    geometry, panel layout, selection, and viewer zoom mode.
+  * `false` → keep the `WindowState` in memory in a closed state;
+    the window appears under Window → Reopen Closed Window but
+    does not draw.
+
+The first window resurrected becomes the key window. If no window
+had `was_open_on_quit: true` (e.g. the user quit with every window
+closed), one **fresh** window is opened — never window N+1, but
+the lowest-numbered closed window, so the user is greeted with
+"window 1" instead of an ever-growing count.
+
+---
+
+## 2. Per-Window vs. Application-Level State
+
+The single hardest design question this spec answers is: *which
+state is per-window, and which is application-level?* The rule:
+**per-window if a thoughtful user might reasonably want it
+different in window 1 vs. window 2.** Anything else is
+application-level.
+
+### 2.1 Per-window state
+
+These move into `settings_window_<N>.yaml`. Every value below
+appears in the schema in §3.2.
+
+* **Directory roots** — the set of root directories driving the
+  file panel. (`directories_window_<N>.yaml`, not the settings YAML,
+  but conceptually the same per-window scoping rule.)
+* **Active filter** — the filter applied to those roots.
+* **Active scope name** — if the user is on the multi-scope
+  feature, the named scope this window is bound to.
+* **Slideshow mode** — on/off, plus the live state needed to
+  resume (current index, randomized order seed, paused-vs-running).
+  This is the **only** part of `session:` that is not
+  `was_open_on_quit`-style "restore exactly as I left it" state —
+  see §7.
+* **Cursor file** — the file the viewer is currently showing
+  (`session.selection.current_file`). Per window: window 1's
+  cursor and window 2's cursor are independent.
+* **Viewer zoom mode and pan offset** — Fit, Width, Fill, Actual,
+  Custom + custom percent + pan offset. Per window.
+* **Panel layout** — which side each panel is docked on, divider
+  sizes, visible / collapsed flags. The detailed layout is in
+  `layout_window_<N>.json` if needed (mirroring
+  [panels.mdx](../panels.mdx) §6); the high-level summary lives
+  in `session.panels` per window.
+* **Window geometry** — frame, screen ID, full-screen flag,
+  frameless flag.
+* **Directory tree expansion** — `session.directory_panel.
+  expanded_paths`, the user-driven expanded/collapsed state of
+  every tree row they have touched.
+* **Recently used inside this window** — the per-window MRU list
+  of files opened in the viewer (not the application-level
+  Open Recent submenu in the File menu, which stays global).
+* **Sort order** — sort key and direction in the file panel, if
+  the user wants window 1 sorted by name and window 2 sorted by
+  date.
+* **View mode** — strip / grid / details / tree, the panel's
+  current rendering. Per window because the user might want
+  tree view in the UX-design window and strip view in the
+  family-pictures window.
+
+### 2.2 Application-level state (stays in `settings.yaml`)
+
+These are global because they are an attribute of the **app**, not
+of any one window.
+
+* **Theme** (`appearance.theme`) — light, dark, system. There is
+  no reasonable user request for "window 1 in dark, window 2 in
+  light." macOS does not even support it cleanly.
+* **Language** — the Settings page localization.
+* **MCP server configuration** — transport, port, allowed clients,
+  rate limits. There is only one MCP server.
+* **File associations** (`Info.plist` UTIs) — system-wide, not
+  per-window.
+* **Default keybindings and mouse bindings** — same for every
+  window. Per-window key remaps are a non-goal.
+* **Tools and plugins** — installed plugin list and configuration.
+* **Update channel and update cadence** — once per app.
+* **Most-recently-used file/folder/scope lists** for File → Open
+  Recent — global by design (the user wants "my last 10 files"
+  not "my last 10 files in window 2").
+* **Quick Setup version** (`general.quick_setup_version`).
+* **`next_window_id`** — the monotonic counter from §1.2.
+* **The "retired windows" log** — a list of window numbers that
+  were explicitly retired, kept so the registry never reuses them.
+
+### 2.3 The three-axis decision matrix
+
+For any state value not listed above, the answer is given by three
+yes/no questions:
+
+| Question | If yes |
+| --- | --- |
+| Does the user reasonably want it different per window? | per window |
+| Is it an attribute of the user's identity / install / OS? | application |
+| Is it set up once and never thought about? | application |
+
+If two questions say yes and one says no, the **per-window** answer
+wins — the per-window storage is strictly more flexible (the user
+can hand-edit both windows' files to the same value), while the
+application-level storage cannot be made per-window without code
+changes.
+
+### 2.4 The slideshow-mode case
+
+Slideshow mode is the headline example of per-window state. The
+upstream single-window model has a "slideshow is running" boolean
+that lives on the viewer. In the multi-window model the running
+boolean lives on each window's `WindowState`, and the **interval,
+randomness, hide-main-in-slideshow, transition style** stay
+application-level under `slideshow.*` in `settings.yaml` because
+those are user preferences, not workspace state.
+
+The canonical asymmetry the product needs to support:
+
+* Window 1 is in slideshow for hours, churning through the UX
+  design hierarchy.
+* Window 2 is **not** in slideshow; the user is hand-stepping
+  through family pictures.
+* The user switches between them with ⌘\`.
+* When window 1 is frontmost, the slideshow indicator is on, the
+  viewer is auto-advancing, ⌘. pauses; when window 2 is frontmost,
+  the indicator is off, the viewer holds, arrow keys step.
+* Quitting and relaunching restores **window 2's selection** and
+  the **window 1 slideshow's last selection** — but slideshow is
+  off in window 1 on relaunch, per §7.4 (the existing
+  "slideshow does not survive quit" rule applied per window).
+
+---
+
+## 3. On-Disk File Layout
+
+### 3.1 `settings.yaml` (application-level, what changes)
+
+The existing [local_storage.mdx §4](../local_storage.mdx#4-settingsyaml)
+schema is preserved as the application-level schema, with three
+edits:
+
+1. The `session:` block is **removed** — every key it held is now
+   per-window and lives in `settings_window_<N>.yaml`.
+2. The `ui.show_*_panel` flags become **default values** that are
+   read by a brand-new window's `WindowState` when it is bootstrapped.
+   Once a window has been created its panel visibility is read
+   from its own `settings_window_<N>.yaml`.
+3. Two new keys are added at the top level:
+
+   ```yaml
+   schema_version: 2
+   next_window_id: 5
+   retired_window_ids: [3]   # numbers that must never be reused
+   ```
+
+The `schema_version` bumps from 1 to 2 to mark this split. The
+migration is in §3.5.
+
+### 3.2 `settings_window_<N>.yaml`
+
+This is the per-window settings file. One file per `window_id`.
+
+```yaml
+schema_version: 2
+window_id: 1
+window_name: "UX design slideshow"   # optional, user-supplied display name
+
+# Which scope from directories_window_1.yaml is currently active.
+# When the multi-scope feature is off, this is the single anonymous
+# scope and the key may be absent.
+active_scope: default
+
+ui:
+  # Per-window overrides of the application-level defaults in
+  # settings.yaml. A key that is absent means "use the application
+  # default at read time."
+  show_directory_panel: true
+  show_preview_panel: true
+  show_metadata_panel: false
+  show_toolbar: true
+  show_status_bar: true
+  show_file_info_overlay: false
+
+viewer:
+  # Per-window viewer preferences. These are the **defaults applied
+  # when this window is the frontmost window**; they are also what
+  # the §7 restore-on-launch logic reads when the window is
+  # resurrected.
+  default_zoom_mode: fit
+  interpolation: high
+  lock_zoom: false
+  frameless_window: false
+
+navigation:
+  sort_panel_by: name
+  sort_ascending: true
+  loop_at_ends: false
+
+slideshow:
+  # Per-window slideshow state. The interval / randomness /
+  # hide-main-in-slideshow flags are *not* here — they are in
+  # settings.yaml under the global slideshow.* block, because they
+  # are preferences, not workspace state.
+  was_running_on_quit: false   # always false at startup; see §7
+  current_index: 0             # the last shown index inside the
+                               # window's resolved file list
+
+session:
+  # The save-on-quit / restore-on-launch block — same shape as the
+  # one removed from settings.yaml in §3.1, but scoped to this
+  # window only.
+  was_open_on_quit: true
+  window:
+    frame: [120, 140, 1440, 900]
+    screen_id: "primary"
+    full_screen: false
+    frameless: false
+  panels:
+    file_panel:    { dock: left,   visible: true,  collapsed: false }
+    scope_editor:  { dock: left,   visible: false, collapsed: false }
+    metadata:      { dock: right,  visible: false, collapsed: false }
+    histogram:     { dock: right,  visible: false, collapsed: false }
+    mcp_activity:  { dock: right,  visible: false, collapsed: false }
+    gallery_strip: { dock: bottom, visible: false, collapsed: false }
+  viewer:
+    zoom_mode: fit
+    custom_zoom_percent: null
+    pan_offset: [0, 0]
+  selection:
+    current_file: ~/BGit/work/into_Work/StarbuckLabs/JFK/UX/screens/login/frame_1.png
+    panel_focus: viewer
+  directory_panel:
+    expanded_paths:
+      ~/BGit/work/into_Work/StarbuckLabs/JFK/UX:          true
+      ~/BGit/work/into_Work/StarbuckLabs/JFK/UX/screens:  true
+      ~/BGit/work/into_Work/StarbuckLabs/JFK/UX/screens/login: true
+```
+
+#### 3.2.1 Required vs. optional keys
+
+* `schema_version`, `window_id` — required.
+* `window_name` — optional. If absent, the window menu shows
+  `Window <N>`; if present, the menu shows the name. Free text,
+  not used as a key.
+* Every other top-level block (`ui`, `viewer`, `navigation`,
+  `slideshow`, `session`) is optional in the sense that the loader
+  merges it with the application-level defaults. A brand-new
+  `settings_window_<N>.yaml` written by the bootstrap can be as
+  short as the first three lines (`schema_version`, `window_id`,
+  `was_open_on_quit: false`).
+
+#### 3.2.2 The `was_open_on_quit` and `slideshow.was_running_on_quit` flags
+
+`session.was_open_on_quit` is the **only** field the launch logic
+reads to decide whether to draw the window on launch (§1.4). It is
+written on clean quit (§7) and set to `false` when the user
+explicitly closes the window (so a window that was closed before
+quit stays closed after launch).
+
+`slideshow.was_running_on_quit` is a record, not an instruction:
+it is set when the user quits while slideshow was running, so the
+log line at next launch can record `slideshow_carryover=true`
+even though the slideshow itself does not start. See §7.4.
+
+#### 3.2.3 Unknown keys
+
+Unknown keys are preserved on round-trip with the same rule as
+[local_storage.mdx §4.5](../local_storage.mdx#45-unknown-keys).
+A newer build that adds a `viewer.cinema_mode` flag will round-trip
+that key when re-saved by an older build.
+
+### 3.3 `directories_window_<N>.yaml`
+
+The schema from [list_of_files.mdx §3A.2](../list_of_files.mdx#3a2-schema)
+is preserved verbatim. The only changes are:
+
+1. The filename is per-window (`directories_window_<N>.yaml`).
+2. A new top-level `window_id` field is added so the file is
+   self-identifying — if someone hand-edits the filename to the
+   wrong number, the loader rejects the file at startup rather
+   than wiring it up to the wrong `WindowState`.
+
+```yaml
+schema_version: 1
+window_id: 1
+root_directories:
+  - path: /Users/<you>/BGit/work/into_Work/StarbuckLabs/JFK/UX
+    filter:
+      match: any
+      items:
+        - pattern: ".*_DM_.*\\.jpg$"
+          kind: regex
+          negate: true
+    last_walked: 2026-06-02T10:23:41Z
+```
+
+The single-window `directories.yaml` migration is in §3.5.
+
+### 3.4 Atomicity
+
+Writes go through the existing [local_storage.mdx §6](../local_storage.mdx#6-atomicity-and-concurrency)
+pipeline: serialize to a temp file (`directories_window_2.yaml.tmp-NNNN`),
+fsync, atomic rename. The only addition is that the
+`SettingsStore` and `DirectoriesStore` each manage a **per-window
+serial queue** so that two MCP calls targeting window 1 are
+serialized against each other, while a window-1 call and a window-2
+call can proceed in parallel.
+
+### 3.5 Migration from `settings.yaml` v1 + `directories.yaml`
+
+When the app launches and finds the v1 single-window layout, the
+migration runs **once** before any window is constructed:
+
+1. Read `~/T/_imageglass/settings.yaml` (v1).
+2. Read `~/T/_imageglass/directories.yaml` (v1) if it exists.
+3. Write `~/T/_imageglass/settings_window_1.yaml` by:
+   * Setting `schema_version: 2` and `window_id: 1`.
+   * Copying the v1 `ui`, `viewer`, `navigation`, `scope_evaluation`
+     (the per-window subset) verbatim.
+   * Copying the v1 `session:` block verbatim into the per-window
+     `session:` block.
+   * Writing `was_open_on_quit: true` if the previous run was a
+     clean quit, else `false`.
+4. Write `~/T/_imageglass/directories_window_1.yaml` as a verbatim
+   copy of the old `directories.yaml`, with `window_id: 1` added
+   at the top.
+5. Rewrite `~/T/_imageglass/settings.yaml` with `schema_version: 2`,
+   the `next_window_id: 2`, the `retired_window_ids: []` field,
+   and the application-level subset of the old schema (theme,
+   language, MRU lists, MCP config, etc.). The `session:` block
+   is removed.
+6. Rename the v1 `directories.yaml` to `directories.yaml.v1.bak`.
+7. Backup the v1 `settings.yaml` to `settings.yaml.v1.bak` before
+   rewriting it (matching the existing
+   [local_storage.mdx §7](../local_storage.mdx#7-schema-versioning-and-migration)
+   convention).
+
+If the migration fails partway, the app refuses to launch and
+shows an explainer sheet pointing at the backup files. The
+migration is idempotent: if `settings_window_1.yaml` already
+exists when the migration would run, the migration treats the
+v1 files as orphaned and only renames them to `.v1.bak`.
+
+---
+
+## 4. The In-Memory Mirror
+
+### 4.1 `WindowState`
+
+```swift
+@MainActor
+public final class WindowState: Identifiable {
+    public let windowID: Int
+    public var windowName: String?
+    public var settings: WindowSettings          // mirrors settings_window_<N>.yaml
+    public var directories: DirectoriesFile       // mirrors directories_window_<N>.yaml
+    public var viewer: ViewerState                // the per-window viewer-state instance
+    public var slideshow: SlideshowState          // per-window running flag + current index
+    public var window: NSWindow?                  // nil when the window is closed
+    public var isOpen: Bool { window != nil }
+    public var isFrontmost: Bool { window?.isKeyWindow == true }
+    // …
+}
+```
+
+One `WindowState` per `window_id`. The `windowID` is set at
+construction and never changes. The two `Codable` subfields
+(`settings` and `directories`) are the in-memory mirrors of the
+two YAML files; they are written back through the existing
+`SettingsStore` and `DirectoriesStore` actors but indexed by
+`windowID`.
+
+The `viewer` field replaces the current single-process
+`AppState.viewer` reference. The `ViewerState` class itself is
+unchanged from its current single-instance form — there is now
+one instance per `WindowState` rather than one instance globally.
+
+### 4.2 `WindowRegistry`
+
+```swift
+@MainActor
+public final class WindowRegistry {
+    public static let shared = WindowRegistry()
+    public private(set) var windows: [Int: WindowState] = [:]
+    public private(set) var frontmostWindowID: Int? = nil
+    public private(set) var retiredWindowIDs: Set<Int> = []
+    public var nextWindowID: Int = 1
+    // …
+}
+```
+
+The registry owns every `WindowState` (open or closed). The
+`frontmostWindowID` is updated in response to
+`NSWindowDidBecomeKeyNotification`; the value is the implicit MCP
+target (§6).
+
+`windows` is **closed-and-open** — closing a window does not remove
+its `WindowState` entry. Calling `openWindow(id:)` on an existing
+entry just rebuilds the `NSWindow`. Retiring removes the entry and
+adds the ID to `retiredWindowIDs`.
+
+### 4.3 Loading on launch
+
+1. The registry reads `settings.yaml` and learns `next_window_id`
+   and `retired_window_ids`.
+2. The registry enumerates `~/T/_imageglass/settings_window_*.yaml`.
+3. For each file, it parses the `window_id` (rejecting files
+   where the in-file `window_id` does not match the filename's
+   `<N>`).
+4. For each accepted file it constructs a `WindowState` and loads
+   the matching `directories_window_<N>.yaml`.
+5. For each `WindowState` whose `session.was_open_on_quit == true`,
+   it constructs the `NSWindow` and applies the saved geometry,
+   panel layout, selection, and viewer zoom mode.
+6. The first window to receive `becomeKey` wins the
+   `frontmostWindowID`.
+
+### 4.4 Saving on mutation
+
+Every mutation goes through `WindowRegistry.window(id:).mutate {
+… }`. The closure receives a `WindowState` and is run on the
+main actor. After the closure returns:
+
+1. `SettingsStore.scheduleSave(windowID:)` is called with a 200 ms
+   debounce.
+2. `DirectoriesStore.scheduleSave(windowID:)` is called with the
+   same debounce, if the mutation touched `directories`.
+3. An entry is appended to `log.log` (§13).
+
+The per-window serial queue (§3.4) lives inside `SettingsStore`
+and `DirectoriesStore`; the registry does not need its own lock
+because mutations are serialized through the main actor.
+
+### 4.5 Sharing the application-level settings
+
+The application-level `Settings` struct (theme, language, MCP
+config, etc.) is a separate `@Observable` instance, not part of
+`WindowState`. Every `WindowState` reads from the same global
+`AppSettings` instance, and every window's UI re-renders when the
+global theme changes (the existing observation pipeline already
+covers this — adding the per-window split does not require a new
+observer plumbing).
+
+---
+
+## 5. The Window Menu
+
+The standard macOS Window menu (§4.9 of [menus.mdx](../menus.mdx))
+is extended with three groups:
+
+```
+┌─ Window ────────────────────────────────────┐
+│  Minimize                              ⌘ M  │
+│  Zoom                                       │
+│  Tile Window to Left of Screen              │
+│  Tile Window to Right of Screen             │
+│  ─                                          │
+│  New Image Window                      ⌘ N  │  ← NEW (§5.1)
+│  Close Window                          ⌘ W  │
+│  ─                                          │
+│  Reopen Closed Window ▸                     │  ← NEW (§5.2)
+│  Forget Closed Window ▸                     │  ← NEW (§5.3)
+│  ─                                          │
+│  Cycle to Next Window                  ⌘ `  │  ← NEW (§5.4)
+│  Cycle to Previous Window           ⌘ ⇧ `   │
+│  ─                                          │
+│  Bring All to Front                         │
+│  ─                                          │
+│  ✓ Window 1 — UX design slideshow           │  ← AppKit auto-list (§5.5)
+│    Window 2 — Family pictures               │
+│    Window 4                                  │
+└─────────────────────────────────────────────┘
+```
+
+### 5.1 New Image Window (⌘N)
+
+* Allocates the next `window_id` via §1.2.
+* Constructs a fresh `WindowState` with default `WindowSettings`
+  (inheriting application-level defaults) and an empty
+  `directories.root_directories`.
+* Opens the `NSWindow`; the file panel renders its empty state
+  (per [mcp_file.mdx §9](./mcp_file.mdx#9-no-image-previewed--empty-viewer-state)).
+* Writes `settings_window_<new-N>.yaml` and
+  `directories_window_<new-N>.yaml` immediately so a crash
+  before the first user mutation does not lose the window.
+* `log.log` records `app=window.open window_id=<N> source=menu`.
+
+### 5.2 Reopen Closed Window ▸
+
+A submenu of every closed (non-retired) window. Each item shows
+`Window <N>` or `Window <N> — <name>`. Selecting an item runs the
+`reopen` event (§1.3 step 6):
+
+1. The `WindowState` for that ID is already in the registry.
+2. The `NSWindow` is rebuilt with the saved geometry.
+3. The file panel and viewer are populated from the saved
+   `directories_window_<N>.yaml` and `session.selection.
+   current_file`.
+4. `was_open_on_quit` is set to `true` so the window will resurrect
+   on next launch too.
+5. `log.log` records `app=window.open window_id=<N> source=reopen`.
+
+If the submenu has zero items, it is disabled but still visible
+(macOS convention so the user can discover the feature).
+
+### 5.3 Forget Closed Window ▸
+
+A submenu identical in shape to §5.2 but for explicit retirement.
+Selecting an item:
+
+1. Moves `settings_window_<N>.yaml` and
+   `directories_window_<N>.yaml` (and any `layout_window_<N>.json`)
+   to `~/T/_imageglass/Trash/window_<N>/`.
+2. Removes the `WindowState` from `WindowRegistry.windows`.
+3. Appends `<N>` to `retired_window_ids` in `settings.yaml`.
+4. Logs `app=window.retire window_id=<N>`.
+
+A `Move to Trash` confirmation sheet appears with the
+`window_name` if any, the count of root directories, and the
+last seen `selection.current_file`. The user can opt out of the
+confirmation via a Settings flag.
+
+### 5.4 Cycle to Next / Previous Window (⌘` / ⌘⇧`)
+
+This is the macOS-standard window-cycling shortcut, already
+implemented by AppKit for windows of the same app. We bind it
+here because the existing single-window app does not. The cycle
+order is by `window_id` ascending, skipping closed windows. The
+key event activates the next window in the cycle, which triggers
+`becomeKey` and updates `frontmostWindowID` (§6).
+
+The shortcut is the **physical** ⌘` key — the same one macOS uses
+system-wide to cycle within an app. On non-US layouts the binding
+follows `NSEvent.charactersIgnoringModifiers == "`"`.
+
+### 5.5 The AppKit-managed window list
+
+AppKit auto-appends every open `NSWindow` to the bottom of the
+Window menu with a checkmark next to the key window. The window's
+title (set from `windowName` or `Window <N>`) is what shows. No
+extra code is required — the registry only needs to set
+`NSWindow.title` correctly on `open` and on rename (§5.6).
+
+### 5.6 Renaming a window
+
+Window → Rename Window… (added in this spec) opens a tiny sheet
+with a text field. Saving updates `windowName` in the `WindowState`,
+writes `settings_window_<N>.yaml` with the new `window_name`,
+sets `NSWindow.title`, and refreshes the Window menu's auto-list.
+The MCP equivalent is `rename_window(window_id, name)`.
+
+---
+
+## 6. The Frontmost Window Is the Implicit MCP Target
+
+The single most important behavioral rule in this spec. Every
+mutating MCP call from [mcp_file.mdx](./mcp_file.mdx) and every
+slideshow-related MCP call retargets the **frontmost window** by
+default. The rule is:
+
+> When an MCP call arrives that does not specify a `window_id`,
+> the registry resolves the target as
+> `WindowRegistry.shared.frontmostWindowID`. If that target is
+> currently behind another window, the registry **brings it
+> forward** by calling `NSWindow.makeKeyAndOrderFront(nil)` before
+> applying the mutation.
+
+The "bring it forward" half is critical. The user typing into
+Claude Code wants to see the mutation happen; if the window were
+silently mutated in the background the user would be confused.
+Bringing it to the front is the unambiguous signal "this is the
+window I just acted on."
+
+### 6.1 Tools that retarget the frontmost window
+
+Every tool from [mcp_file.mdx §3A.10](./mcp_file.mdx#3a10-mcp-tools-for-the-file-tree)
+gains the rule. Names below match the existing tool names; the
+existing arguments are unchanged.
+
+| MCP tool | Retargeted? | Notes |
+| --- | --- | --- |
+| `add_directory(path, filter?)` | yes | Adds to frontmost window's `directories_window_<N>.yaml`. |
+| `remove_directory(path)` | yes | Removes from frontmost window's roots. |
+| `clear_directories()` | yes | Clears the frontmost window's roots only. Other windows are unaffected. |
+| `set_global_filter(filter)` | yes | Applies to every root in the **frontmost window's** `directories_window_<N>.yaml` — not every root in every window. |
+| `update_directory_filter(path, filter)` | yes | Updates one root in the frontmost window. |
+| `set_active_scope(name)` | yes | Per-window. Sets `active_scope` in frontmost window. |
+| `select_file(path)` | yes | Moves the cursor in the frontmost window. |
+| `set_view_mode(mode)` | yes | Per-window UI. |
+| `slideshow_start / slideshow_stop / slideshow_pause / slideshow_resume` | yes | The headline §7 case. |
+| `list_directories()` | yes | Returns the frontmost window's roots. |
+| `get_directory(path)` | yes | Lookup is inside the frontmost window's roots. |
+| `refresh_directory(path)` | yes | Re-walks one root inside the frontmost window. |
+
+### 6.2 Tools that accept an explicit `window_id`
+
+Every tool above is extended with an **optional** `window_id`
+parameter. When the caller supplies it, the registry uses that
+target instead of the frontmost. If `window_id` is unknown or
+retired, the call returns `ok=false err=unknown_window_id`.
+
+This is the escape hatch for callers (especially scripts and
+tests) that need deterministic targeting. The CLI / Claude Code
+default does not need it because the frontmost rule is the
+expected behavior.
+
+### 6.3 Tools that are application-level (never retarget)
+
+These tools operate on `settings.yaml`, not on any one window:
+
+* `get_settings` / `set_settings` for application-level keys —
+  theme, language, MRU lists, MCP config.
+* `list_themes`, `install_theme_pack`, `uninstall_theme_pack`.
+* `list_releases`, `check_for_update`.
+* `app_version`.
+* `register_external_tool`, `list_external_tools`,
+  `unregister_external_tool`.
+
+A `set_settings("ui.show_directory_panel", false)` is ambiguous
+because that key is per-window in v2. The tool returns
+`ok=false err=ambiguous_per_window_key` with a message telling
+the caller to use the per-window equivalent
+(`set_window_panel(window_id?, panel, visible)`).
+
+### 6.4 New tools for window management
+
+These are the only **new** MCP tools introduced by this spec.
+They make multi-window behavior fully addressable from outside:
+
+| Tool | Behavior |
+| --- | --- |
+| `list_windows()` | Returns `[{ window_id, name?, is_open, is_frontmost, root_count, current_file? }]` for every non-retired window. |
+| `open_window(window_id?)` | Reopen `window_id` from disk, or create a new window if no ID is given. Returns the resulting `window_id`. |
+| `close_window(window_id?)` | Close the named window (or frontmost). The `WindowState` survives; the YAML stays. |
+| `focus_window(window_id)` | Equivalent to clicking the window's title bar. Triggers `becomeKey` and updates `frontmostWindowID`. |
+| `rename_window(window_id?, name)` | Set `window_name`. |
+| `retire_window(window_id)` | The §5.3 forget operation. Never retires the frontmost without an `allow_frontmost: true` flag. |
+| `get_window(window_id?)` | Returns the merged settings + directories view for the window. |
+
+### 6.5 The race: MCP call arrives, no window is open
+
+If the user closed every window, `frontmostWindowID` is `nil`.
+The retarget rule has nothing to target. The MCP call returns
+`ok=false err=no_open_window` with a message telling the caller
+to call `open_window()` first. The error is **not** silently
+fixed by auto-opening a window — the user shut every window for
+a reason, and silently reopening one is the kind of surprise the
+spec wants to avoid (see also §10.7 "viewer already has an
+image" in [mcp_file.mdx](./mcp_file.mdx#107-negative-cases-that-must-not-auto-select)).
+
+The Settings flag `mcp.auto_open_window_on_empty` (default
+`false`) flips this behavior to "create a new window and apply
+the call to it" for users who want a more lenient model.
+
+---
+
+## 7. Per-Window Slideshow
+
+The slideshow state lives on `WindowState.slideshow: SlideshowState`.
+The application-level slideshow **preferences** (interval,
+randomness, transitions, hide-main-in-slideshow) stay in the
+existing `settings.yaml` `slideshow.*` block, because they apply
+the same way regardless of which window happens to be running a
+slideshow.
+
+### 7.1 `SlideshowState`
+
+```swift
+@MainActor
+public final class SlideshowState {
+    public var isRunning: Bool = false
+    public var isPaused: Bool = false
+    public var currentIndex: Int = 0
+    public var order: [Int] = []           // resolved file indices (randomized or sequential)
+    public var timer: Timer? = nil
+    public var lastAdvancedAt: Date? = nil
+    // …
+}
+```
+
+One `SlideshowState` per `WindowState`. The `timer` lives on the
+window's main actor and fires on its own; window 2's timer keeps
+running even when window 1 is frontmost (and vice versa).
+
+### 7.2 Toggling slideshow
+
+* **GUI**: pressing the slideshow hotkey, or choosing
+  Slideshow → Start, toggles `WindowState.slideshow.isRunning` for
+  the **frontmost** window. Other windows are unaffected.
+* **MCP**: `slideshow_start(window_id?)` retargets per §6.1.
+  Omit `window_id` to start the frontmost window's slideshow.
+* The cinema-darkening overlay (per [settings.mdx](../settings.mdx)
+  §4 slideshow page) applies only to the window that started the
+  slideshow.
+
+### 7.3 The two-window asymmetry
+
+Window 1: `slideshow.isRunning = true`, `interval = 5s`. The
+viewer auto-advances every 5 seconds. After an hour the user has
+moved through ~720 images.
+
+Window 2: `slideshow.isRunning = false`. The viewer waits for
+user input. The user steps with the arrow keys, hits ⌘+ to zoom,
+right-clicks for the context menu.
+
+The two windows do not interfere. ⌘\` switches focus instantly;
+both viewers keep their internal state across the switch.
+
+### 7.4 Slideshow does not survive quit (per window)
+
+The existing rule from
+[local_storage.mdx §4.2.1](../local_storage.mdx#421-session-state--save-on-quit):
+slideshow mode is **not** persisted. The per-window adaptation:
+
+* On clean quit, each `WindowState` writes
+  `slideshow.was_running_on_quit = true|false` and
+  `slideshow.current_index = <last index>`.
+* On launch, each resurrected `WindowState` reads those values
+  but always sets `slideshow.isRunning = false` and does not start
+  the timer. The `current_index` is used to position the viewer
+  on the same image so the user resumes "in the same place" but
+  with slideshow off.
+* `log.log` records
+  `app=window.restore window_id=<N> slideshow_carryover=true` if
+  the prior slideshow was running, so an auditor can tell why the
+  viewer landed on the file it did.
+
+The user resumes manually with the hotkey or Slideshow → Start.
+This avoids the audio-surprise + race-with-first-input problems
+described in the single-window rule.
+
+---
+
+## 8. Per-Window Cursor (Current Image)
+
+Each window remembers the file the viewer is currently showing
+in `session.selection.current_file`. The rules:
+
+* The cursor is updated on every selection change (per
+  [mcp_file.mdx §2](./mcp_file.mdx#2-select-a-file--image--svg--video-all-load-in-the-viewer))
+  and on every slideshow tick.
+* Writes to `current_file` are debounced — a slideshow running at
+  5s intervals does not write the YAML 12 times per minute;
+  instead the debounce coalesces and the file is flushed every
+  ~2 seconds while the slideshow is active. On clean quit the
+  pending write is forced through synchronously.
+* The cursor is **per window**. ⌘\` between window 1 and window 2
+  does not move the cursor in either window.
+* On launch, each window's viewer reopens its saved
+  `current_file`. If the file no longer exists or no longer
+  passes the active filter, the viewer falls back to the first
+  file in the resolved list for that window's roots.
+
+### 8.1 The mid-slideshow quit case
+
+If the user quits while window 1's slideshow is on `image 412 of
+the UX design list`:
+
+* `session.selection.current_file` is `…/screens/cluster/frame_42.png`.
+* `slideshow.current_index = 411` (0-based).
+* `slideshow.was_running_on_quit = true`.
+* `was_open_on_quit = true`.
+
+On next launch:
+
+* Window 1 is resurrected.
+* The viewer reopens `…/cluster/frame_42.png`.
+* Slideshow is off; the user is parked on the image they were
+  last seeing, no timer fires.
+* `log.log` records `app=window.restore window_id=1 selection=
+  …/cluster/frame_42.png slideshow_carryover=true`.
+
+This is the per-window adaptation of the existing single-window
+rule. Every contract in
+[local_storage.mdx §4.2.1](../local_storage.mdx#421-session-state--save-on-quit)
+still applies — the only change is that there are now N session
+blocks (one per window) instead of one.
+
+---
+
+## 9. Canonical Use Case — UX Design Slideshow + Family Pictures
+
+This is the worked example the rest of the spec is designed
+around. It is written as a sequence of user actions, each with
+a verify step, in the same shape as [mcp_file.mdx](./mcp_file.mdx).
+
+### 9.1 Preconditions
+
+* The app has just been freshly installed; no `~/T/_imageglass/`
+  exists yet. (If you have an existing install, replicate by
+  moving the directory aside before the run.)
+* The directories
+  `~/BGit/work/into_Work/StarbuckLabs/JFK/UX` and `~/Pictures/Family/`
+  exist and contain media.
+
+### 9.2 Step 1 — First launch creates window 1
+
+1. Launch the app.
+
+#### Expected result
+
+* The bootstrap (§1.4) creates `~/T/_imageglass/` and writes
+  `settings.yaml` with `next_window_id: 2`, `settings_window_1.yaml`
+  with the v1 defaults plus `window_id: 1`, and
+  `directories_window_1.yaml` with `root_directories: []`.
+* One `NSWindow` opens as window 1, key, with the file panel on
+  the left (empty), the viewer center (empty), and the toolbar
+  on top.
+* `WindowRegistry.shared.frontmostWindowID == 1`.
+
+#### Verify
+
+```sh
+ls ~/T/_imageglass/
+# settings.yaml
+# settings_window_1.yaml
+# directories_window_1.yaml
+# logs/
+
+cat ~/T/_imageglass/settings.yaml | grep next_window_id
+# next_window_id: 2
+```
+
+### 9.3 Step 2 — Give window 1 the UX design hierarchy
+
+1. From Claude Code:
+
+   ```
+   add_directory(path="~/BGit/work/into_Work/StarbuckLabs/JFK/UX")
+   ```
+
+#### Expected result
+
+* Per §6, the call retargets `frontmostWindowID = 1`. Since
+  window 1 is already frontmost, no `makeKeyAndOrderFront` is
+  needed.
+* `directories_window_1.yaml` is rewritten with one root
+  pointing at the JFK/UX directory.
+* The file panel walks the hierarchy.
+* The auto-select-first-image rule from
+  [mcp_file.mdx §10](./mcp_file.mdx#10-auto-select-first-image-when-viewer-is-empty)
+  fires: the viewer in window 1 loads the first image found.
+
+#### Verify
+
+```sh
+cat ~/T/_imageglass/directories_window_1.yaml
+# window_id: 1
+# root_directories:
+#   - path: /Users/<you>/BGit/work/into_Work/StarbuckLabs/JFK/UX
+#     filter: { items: [] }
+#     last_walked: …
+```
+
+`directories_window_2.yaml` does **not** exist.
+
+### 9.4 Step 3 — Start the slideshow in window 1
+
+1. Press the slideshow hotkey in window 1 (default
+   [hotkeys.mdx](../hotkeys.mdx) §6 — `F5`).
+
+#### Expected result
+
+* `WindowState[1].slideshow.isRunning = true`.
+* The window 1 timer starts; the viewer auto-advances every
+  `slideshow.interval` seconds (default 5).
+* The cinema overlay darkens the rest of window 1; window 2
+  does not exist yet, so nothing else is dimmed.
+
+#### Verify
+
+* On screen: window 1's viewer auto-advances.
+* No new YAML write yet (slideshow start is in-memory; the
+  debounced `current_file` writes start landing within ~2s).
+
+### 9.5 Step 4 — Open window 2 with ⌘N
+
+1. Press ⌘N.
+
+#### Expected result
+
+* `WindowRegistry.shared.allocateNextWindowID()` returns `2`,
+  increments `next_window_id` to `3`, and schedules a
+  debounced write of `settings.yaml`.
+* `settings_window_2.yaml` is written with `window_id: 2`,
+  `was_open_on_quit: false` (it has not yet been through a
+  quit cycle), and the v1 defaults.
+* `directories_window_2.yaml` is written with `root_directories: []`.
+* A second `NSWindow` opens. It becomes key; `frontmostWindowID
+  = 2`. **Window 1's slideshow keeps running** — slideshow is
+  per-window state.
+* `log.log` records `app=window.open window_id=2 source=menu`.
+
+#### Verify
+
+```sh
+ls ~/T/_imageglass/
+# settings.yaml  settings_window_1.yaml  settings_window_2.yaml
+# directories_window_1.yaml  directories_window_2.yaml  logs/
+
+cat ~/T/_imageglass/settings.yaml | grep next_window_id
+# next_window_id: 3
+```
+
+* On screen: window 2 sits in front; window 1 is visible behind,
+  still slideshow-cycling.
+
+### 9.6 Step 5 — Give window 2 the family pictures directory
+
+1. From Claude Code (window 2 is still frontmost from §9.5):
+
+   ```
+   add_directory(path="~/Pictures/Family")
+   ```
+
+#### Expected result
+
+* The call retargets `frontmostWindowID = 2`. Window 2 stays in
+  front (it already is).
+* `directories_window_2.yaml` is rewritten with the family
+  root. `directories_window_1.yaml` is **unchanged** — the JFK/UX
+  root from §9.3 is still there.
+* The window 2 file panel populates. Auto-select-first-image
+  loads the first family photo.
+
+#### Verify
+
+```sh
+cat ~/T/_imageglass/directories_window_2.yaml
+# window_id: 2
+# root_directories:
+#   - path: /Users/<you>/Pictures/Family
+#     filter: { items: [] }
+#     last_walked: …
+
+cat ~/T/_imageglass/directories_window_1.yaml
+# (unchanged — still the JFK/UX root)
+```
+
+### 9.7 Step 6 — Switch with ⌘\`
+
+1. Press ⌘\`.
+
+#### Expected result
+
+* Window 1 becomes key. `frontmostWindowID = 1`.
+* Window 1's slideshow is **still running** — the user sees the
+  next slideshow tick land in window 1.
+* No YAML writes are triggered by the focus change itself; only
+  the debounced `current_file` writes from the running slideshow.
+* `log.log` records `app=window.activate window_id=1`.
+
+#### Verify
+
+* On screen: window 1 jumps to the front; the slideshow continues
+  ticking.
+
+2. Press ⌘\` again.
+
+#### Expected result
+
+* Window 2 becomes key. `frontmostWindowID = 2`. Window 1's
+  slideshow keeps ticking in the background.
+* Window 2's viewer is exactly where the user left it (cursor
+  on the family photo from §9.6, no slideshow timer).
+
+### 9.8 Step 7 — Verify the MCP retarget rule
+
+1. With **window 2 frontmost**, from Claude Code:
+
+   ```
+   add_directory(path="~/Pictures/Vacations")
+   ```
+
+#### Expected result
+
+* The call retargets `frontmostWindowID = 2`. The new root lands
+  in `directories_window_2.yaml`, **not** `_1.yaml`.
+
+#### Verify
+
+```sh
+cat ~/T/_imageglass/directories_window_2.yaml
+# now has two roots: Family and Vacations
+
+cat ~/T/_imageglass/directories_window_1.yaml
+# still only JFK/UX
+```
+
+2. Press ⌘\` to make window 1 frontmost. From Claude Code:
+
+   ```
+   update_directory_filter(
+     path="~/BGit/work/into_Work/StarbuckLabs/JFK/UX",
+     filter={
+       "match": "any",
+       "items": [{ "pattern": "*_DM_*.jpg", "kind": "glob", "negate": true }]
+     }
+   )
+   ```
+
+#### Expected result
+
+* The call retargets `frontmostWindowID = 1`. The filter lands
+  in `directories_window_1.yaml`. Window 2's roots are
+  untouched.
+
+#### Verify
+
+```sh
+cat ~/T/_imageglass/directories_window_1.yaml
+# JFK/UX root now carries the _DM_ negative filter
+
+cat ~/T/_imageglass/directories_window_2.yaml
+# unchanged (Family + Vacations, no filter)
+```
+
+### 9.9 Step 8 — Quit and relaunch
+
+1. ⌘Q.
+
+#### Expected result on disk
+
+* `settings_window_1.yaml`:
+  * `session.was_open_on_quit: true`
+  * `session.selection.current_file: <…the last slideshow image>`
+  * `slideshow.was_running_on_quit: true`
+  * `slideshow.current_index: <last index>`
+* `settings_window_2.yaml`:
+  * `session.was_open_on_quit: true`
+  * `session.selection.current_file: <…the family photo cursor>`
+  * `slideshow.was_running_on_quit: false`
+
+2. Relaunch the app.
+
+#### Expected result
+
+* Both windows resurrect (per §1.4 and §4.3).
+* Window 1's viewer reopens at the saved slideshow position
+  but **slideshow is off** (per §7.4). The user sees the same
+  image they last saw, no timer.
+* Window 2's viewer reopens at the saved family photo cursor.
+* `frontmostWindowID` is whichever window AppKit restored as
+  key (the one that was key when the user quit; AppKit handles
+  this).
+* `log.log` shows:
+
+  ```
+  ts=… app=window.restore window_id=1 selection=…/cluster/frame_42.png slideshow_carryover=true
+  ts=… app=window.restore window_id=2 selection=…/Family/IMG_0931.heic slideshow_carryover=false
+  ```
+
+3. Press F5 in window 1 to resume the slideshow.
+
+#### Expected result
+
+* Window 1's slideshow restarts at `slideshow.current_index` and
+  continues. The cursor advances from where it was.
+
+### 9.10 Step 9 — Close window 2 and reopen by number
+
+1. Close window 2 (⌘W).
+
+#### Expected result
+
+* `settings_window_2.yaml` is updated with
+  `session.was_open_on_quit: false` (the user explicitly closed
+  this window).
+* `directories_window_2.yaml` is untouched.
+* The Window menu's "Reopen Closed Window ▸" submenu now contains
+  one item: `Window 2 — <name if any>`.
+* `log.log` records `app=window.close window_id=2`.
+
+2. Verify the YAML is preserved:
+
+```sh
+ls ~/T/_imageglass/settings_window_*.yaml
+# settings_window_1.yaml
+# settings_window_2.yaml      ← still there
+```
+
+3. Choose Window → Reopen Closed Window → Window 2.
+
+#### Expected result
+
+* Window 2 reopens at the saved geometry, cursor, and panel
+  layout.
+* `was_open_on_quit` is flipped back to `true` so next launch
+  resurrects it.
+* `log.log` records `app=window.open window_id=2 source=reopen`.
+
+### 9.11 Step 10 — Open a third window via MCP
+
+1. From Claude Code:
+
+   ```
+   open_window()
+   ```
+
+#### Expected result
+
+* `WindowRegistry.allocateNextWindowID()` returns `3`,
+  increments `next_window_id` to `4`, schedules a debounced
+  write of `settings.yaml`.
+* `settings_window_3.yaml` and `directories_window_3.yaml` are
+  written with empty defaults.
+* The new window opens and becomes key. `frontmostWindowID = 3`.
+* The MCP call returns `{ window_id: 3 }`.
+
+2. From Claude Code (still window 3 frontmost):
+
+   ```
+   add_directory(path="~/Pictures/Screenshots")
+   ```
+
+#### Expected result
+
+* The Screenshots root lands in `directories_window_3.yaml`.
+  Windows 1 and 2 are unaffected.
+
+#### Verify
+
+```sh
+ls ~/T/_imageglass/directories_window_*.yaml
+# directories_window_1.yaml   (JFK/UX)
+# directories_window_2.yaml   (Family + Vacations)
+# directories_window_3.yaml   (Screenshots)
+```
+
+### 9.12 Step 11 — Retire window 3
+
+1. Window → Forget Closed Window → Window 3 (after closing it
+   with ⌘W first; the submenu only lists closed windows).
+2. Confirm the move-to-trash sheet.
+
+#### Expected result
+
+* `settings_window_3.yaml` and `directories_window_3.yaml` move
+  to `~/T/_imageglass/Trash/window_3/`.
+* `settings.yaml` has `retired_window_ids: [3]`.
+* `next_window_id` is still `4` — the registry does **not**
+  reclaim retired numbers. The next new window via ⌘N or
+  `open_window()` will be window 4.
+
+#### Verify
+
+```sh
+ls ~/T/_imageglass/
+# settings.yaml settings_window_1.yaml settings_window_2.yaml
+# directories_window_1.yaml directories_window_2.yaml
+# Trash/  logs/
+
+ls ~/T/_imageglass/Trash/window_3/
+# settings_window_3.yaml  directories_window_3.yaml
+
+cat ~/T/_imageglass/settings.yaml | grep -E "next_window_id|retired"
+# next_window_id: 4
+# retired_window_ids: [3]
+```
+
+---
+
+## 10. Long-Running Asymmetry
+
+This section makes explicit what §2.4 and §7 imply: the two
+windows can stay in wildly different modes for arbitrarily long
+periods, and the spec treats that as the **normal case**, not an
+edge case.
+
+### 10.1 Window 1: slideshow on for hours
+
+A typical workflow: the UX-design slideshow window cycles through
+~720 images per hour at the default 5-second interval. Over a
+4-hour design review the window will run ~2,880 slideshow ticks.
+Per tick:
+
+* `WindowState[1].slideshow.currentIndex` increments.
+* `session.selection.current_file` is updated in memory.
+* The debounced write fires every ~2 seconds, so over 4 hours
+  there are ~7,200 writes to `settings_window_1.yaml` — each is
+  a small atomic temp-file rename.
+
+Two design checks that this volume does not violate:
+
+* **Disk wear / atomic-rename storm** — at ~30 writes/minute the
+  filesystem barely notices. APFS handles this without issue;
+  the per-window serial queue (§3.4) coalesces nearby ticks if
+  the timer drifts.
+* **MCP audit log size** — slideshow ticks are **not** logged to
+  `log.log` (they are internal app state, not MCP calls). Only
+  MCP-driven and menu-driven mutations log lines. The log grows
+  at the rate of actual user / agent interactions, not at the
+  rate of slideshow ticks.
+
+### 10.2 Window 2: slideshow off, hand-stepping
+
+The family-pictures window has `slideshow.isRunning = false`.
+The user steps with the arrow keys; each step updates
+`session.selection.current_file` and triggers one debounced
+write. A user flipping through 50 photos triggers ~50 writes,
+spread out as the user thinks.
+
+### 10.3 The mixed-mode quit
+
+If the user quits during this asymmetric workflow:
+
+* `settings_window_1.yaml` records the slideshow's last position
+  and `was_running_on_quit: true`.
+* `settings_window_2.yaml` records the last hand-stepped cursor
+  and `was_running_on_quit: false`.
+* On relaunch (§9.9 step 2 generalized) both windows reopen
+  with their cursors intact, slideshow off, ready to resume.
+* The user presses F5 in window 1 (only) to resume; window 2 is
+  unaffected.
+
+---
+
+## 11. Persistence Pipeline
+
+### 11.1 Per-window write coalescing
+
+`SettingsStore` and `DirectoriesStore` each maintain a dictionary
+`pending: [Int: PendingWrite]` keyed by `window_id`. When a
+mutation arrives:
+
+1. The matching `PendingWrite` is updated with the new value.
+2. A 200 ms debounce timer is (re-)started for that `window_id`.
+3. On timer fire, the YAML is written to a temp file and
+   atomically renamed. The `PendingWrite` is cleared.
+
+Two windows can have pending writes simultaneously; they do not
+serialize against each other. One window mutated rapidly does
+not delay another window's writes.
+
+### 11.2 Quit-time flush
+
+On clean quit, `WindowRegistry.shared.flushAll()` runs:
+
+1. For each `WindowState`, snapshot `session.*` from the live UI.
+2. Force any pending debounced writes through synchronously.
+3. Write `settings.yaml` (with `next_window_id` and
+   `retired_window_ids`).
+4. Only then call `NSApplication.shared.terminate(nil)`.
+
+If any write fails the quit is aborted with an error sheet; the
+user can retry or quit-anyway-and-lose-pending-changes.
+
+### 11.3 Crash recovery
+
+There is no journaling. A crash loses the per-window writes
+since the last debounced fire (at most ~200 ms of in-memory
+changes per window). This matches the existing single-window
+contract from [local_storage.mdx §4.2.1](../local_storage.mdx#421-session-state--save-on-quit).
+
+### 11.4 External edits to YAML
+
+Each per-window YAML file is watched by an `FSEventStream`. If
+the file changes from outside the running app, the matching
+`WindowState` reloads the file and the UI updates live. The
+existing single-window contract from
+[settings.mdx §2.4](../settings.mdx#24-persistence-pipeline)
+applies per window.
+
+### 11.5 The "in-flight MCP call collides with FSEvent reload" race
+
+If an MCP `add_directory` call writes `directories_window_1.yaml`
+**and** an external editor saves the same file at nearly the same
+time, the per-window serial queue (§3.4) serializes the writes;
+the second writer wins. The `FSEventStream` notification arrives
+after the second write completes and the in-memory state is
+reloaded from the final on-disk version. The MCP call's response
+is still `ok=true` (the call did write), and the UI shows the
+final merged state.
+
+---
+
+## 12. Layout Files
+
+`layout.json` becomes `layout_window_<N>.json`, one per window.
+The schema is unchanged from [panels.mdx](../panels.mdx) §6.
+The migration in §3.5 also migrates a v1 `layout.json` into
+`layout_window_1.json`.
+
+The application-level panel preset list (Browser, Photographer,
+Power user) stays in `settings.yaml` — presets are a global
+catalog, not per-window state. A window can be assigned a
+preset, which copies the preset's layout into the window's
+`layout_window_<N>.json`.
+
+---
+
+## 13. The MCP Audit Log
+
+Every `tool=mcp.*` and `app=*` line in `log.log` gains a
+`window_id=<N>` field. The format is:
+
+```
+ts=2026-06-05T14:02:11.231Z window_id=1 tool=mcp.add_directory path=…/JFK/UX corr=ab12cd34 client=claude-code ok=true
+```
+
+The field is **required** for window-scoped events and **omitted**
+for application-level events (theme change, MCP server start,
+update check). The grep recipes from
+[mcp_file.mdx §8.3](./mcp_file.mdx#83-verify) extend trivially:
+
+```sh
+# every event that hit window 1
+grep "window_id=1" ~/T/_imageglass/logs/log.log
+
+# every add_directory across all windows, with the targeted window
+grep "tool=mcp.add_directory" ~/T/_imageglass/logs/log.log
+```
+
+The `corr=` correlation id continues to tie an MCP request to
+its `directory.walk` / `directory.refilter` follow-up; both share
+the same `window_id`.
+
+### 13.1 Window-lifecycle events
+
+These are the new `app=window.*` lines this spec adds:
+
+| Event | Line shape | When |
+| --- | --- | --- |
+| `window.open` | `app=window.open window_id=<N> source=menu|reopen|mcp|first_launch|restore` | Window is created or resurrected. |
+| `window.activate` | `app=window.activate window_id=<N>` | `becomeKey` fires. |
+| `window.close` | `app=window.close window_id=<N> reason=user|terminate` | Window is destroyed (state survives). |
+| `window.retire` | `app=window.retire window_id=<N>` | YAML moved to Trash/. |
+| `window.rename` | `app=window.rename window_id=<N> name="<new>"` | `window_name` changed. |
+| `window.restore` | `app=window.restore window_id=<N> selection=<path> slideshow_carryover=<bool>` | Launch-time restore landed. |
+
+`window.activate` fires on every focus change including ⌘\`
+cycles. This is the audit trail for §6 (which window was
+frontmost when an MCP call arrived).
+
+---
+
+## 14. Failure Modes
+
+### 14.1 The YAML file for window N is missing
+
+On launch, if `settings_window_5.yaml` exists but
+`directories_window_5.yaml` is missing (or vice versa), the
+registry writes a default-empty version of the missing file and
+logs `app=window.recover window_id=5 missing=directories`. No
+data is lost beyond what was already missing.
+
+### 14.2 The in-file `window_id` does not match the filename
+
+`settings_window_3.yaml` carries `window_id: 7` in its content.
+The registry rejects the file at load and writes
+`settings_window_3.yaml.invalid-<timestamp>.bak`; the slot for
+window 3 is then bootstrapped with defaults. This is a strong
+signal of hand-editing gone wrong; the bak file preserves the
+user's content.
+
+### 14.3 `next_window_id` is behind the actual maximum
+
+If `settings.yaml` says `next_window_id: 3` but
+`settings_window_7.yaml` exists on disk, the registry repairs
+`next_window_id` to `max(observed_id) + 1 = 8` at load and logs
+`app=registry.repair next_window_id=8 was=3`. The repair is
+idempotent.
+
+### 14.4 A retired window's YAML is restored by hand
+
+If the user (or a backup tool) restores
+`~/T/_imageglass/Trash/window_3/settings_window_3.yaml` to
+`~/T/_imageglass/`, the registry sees the file on next launch.
+Because `retired_window_ids: [3]`, the registry does **not**
+adopt the window. It logs
+`app=registry.skip_retired window_id=3` and leaves the file
+alone. The user can remove `3` from `retired_window_ids` to
+re-adopt.
+
+### 14.5 No window is open when an MCP call arrives
+
+Per §6.5: `ok=false err=no_open_window`. The MCP client should
+call `open_window()` first.
+
+### 14.6 The frontmost window changes mid-call
+
+If the user ⌘\`s between an `add_directory` arriving on the MCP
+server and the server applying it, the call still targets the
+window that was frontmost **at the moment the call was
+received**. The retargeting is a snapshot, not a race against
+subsequent focus changes. This avoids the surprise of a call
+landing in a window the user did not have focused when they
+issued it.
+
+### 14.7 Two windows have the same root directory
+
+This is allowed. Window 1 has `~/Pictures` as a root; window 2
+also has `~/Pictures` as a root. The walker creates two
+independent in-memory trees; each window's file panel renders
+independently. Filter changes in one window do not affect the
+other.
+
+The Local Storage on disk has the same directory recorded in
+two separate `directories_window_<N>.yaml` files. This is the
+expected on-disk shape — there is no normalization.
+
+### 14.8 A `window_id` parameter targets a closed window
+
+`add_directory(path="…", window_id=5)` where window 5 is closed
+but exists on disk: the call **reopens** window 5 first (the
+same path as Window → Reopen Closed Window), applies the
+mutation, and returns. The audit log shows
+`app=window.open window_id=5 source=mcp` followed by the
+`tool=mcp.add_directory window_id=5` line, both with the same
+`corr=` id.
+
+If the `window_id` is retired or unknown: `ok=false
+err=unknown_window_id`.
+
+---
+
+## 15. End-to-End Acceptance
+
+A run of the §9 canonical use case passes when **all of**:
+
+* §9.2 — first launch creates `settings.yaml` (with
+  `next_window_id: 2`), `settings_window_1.yaml`, and
+  `directories_window_1.yaml`. Exactly one window opens.
+* §9.3 — `add_directory("…/JFK/UX")` lands in
+  `directories_window_1.yaml`; auto-select rule loads the first
+  image into window 1's viewer.
+* §9.4 — slideshow starts in window 1 only; no YAML write is
+  triggered by the start itself; the debounced
+  `selection.current_file` writes begin landing.
+* §9.5 — ⌘N creates window 2, allocates `window_id: 2`, writes
+  `settings_window_2.yaml` and `directories_window_2.yaml`,
+  increments `next_window_id` to 3. Window 1's slideshow keeps
+  running.
+* §9.6 — `add_directory("…/Family")` lands in
+  `directories_window_2.yaml`. `directories_window_1.yaml` is
+  unchanged.
+* §9.7 — ⌘\` cycles focus between window 1 and window 2; each
+  window's internal state is intact across the switch.
+* §9.8 — `add_directory("…/Vacations")` retargets to whichever
+  window is frontmost; the new root lands in the matching YAML;
+  the other window's YAML is untouched.
+  `update_directory_filter("…/JFK/UX", …)` from window 1 lands
+  in `directories_window_1.yaml` only.
+* §9.9 — clean quit writes both windows' `was_open_on_quit:
+  true`, both windows' `selection.current_file`, and window 1's
+  `slideshow.was_running_on_quit: true`. Relaunch resurrects
+  both windows; both viewers land on the saved cursor; slideshow
+  is off in window 1; manual F5 resumes it at the saved index.
+* §9.10 — close + reopen via Window menu preserves all
+  per-window state; `was_open_on_quit` toggles correctly.
+* §9.11 — `open_window()` allocates window 3; subsequent
+  `add_directory` from Claude Code lands in
+  `directories_window_3.yaml`; windows 1 and 2 are unaffected.
+* §9.12 — Forget Closed Window moves window 3's YAML to
+  `~/T/_imageglass/Trash/window_3/`; `retired_window_ids: [3]`
+  is set in `settings.yaml`; `next_window_id` does **not**
+  reclaim 3 and the next new window is window 4.
+* The audit log contains a `window_id=<N>` field on every
+  window-scoped line, and the §13.1 lifecycle events fire in
+  the documented order.
+
+If any step fails, the matching `log.log` line is the first
+place to look — `grep "window_id=<N>" log.log` returns the
+per-window audit trail; `grep corr=<id> log.log` returns the
+specific call.
+
+---
+
+## 16. Non-Goals (v1)
+
+These are explicitly out of scope for the v1 multi-window
+implementation; each is a candidate for a later version.
+
+* **Window groups / tabs.** macOS native tabs (Window → Merge
+  All Windows) are accepted at the AppKit level — the user can
+  merge windows into one tabbed window — but the per-window
+  state model treats each tab as a separate `window_id`. There
+  is no v1 "tab group" concept.
+* **Cross-window selection sync.** "When I select a file in
+  window 1, also select the same file in window 2" is not
+  supported.
+* **Cross-window scope sharing.** Two windows cannot reference
+  the same scope by name; the v1 scopes live inside each
+  window's `directories_window_<N>.yaml`. The named-scope
+  feature for sharing across windows is a future extension of
+  the `scopes/` directory referenced in
+  [local_storage.mdx §3.1](../local_storage.mdx#31-why-tlocal_storage-and-not-librarayapplication-support).
+* **Per-window keybindings.** Keybindings stay application-level.
+* **Per-window theme override.** Theme stays application-level.
+* **Per-window MCP server.** There is one MCP server. Every
+  call targets the frontmost window (or an explicit `window_id`).
+  Spawning a dedicated MCP server per window is a non-goal.

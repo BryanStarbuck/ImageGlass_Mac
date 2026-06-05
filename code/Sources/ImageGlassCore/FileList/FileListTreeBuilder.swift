@@ -48,6 +48,8 @@ public enum FileListTreeBuilder {
         entries: [FileEntry],
         sourceDirectories: [String]
     ) -> [FileListTreeNode] {
+        let _trace = PerformanceLog.shared.start("FileList.BuildTree", extra: [("count", String(entries.count))])
+        defer { _trace.finish() }
         // Normalize source directories — tilde-expand and trim trailing "/".
         let normalizedSources = sourceDirectories.map { Self.normalize($0) }
 

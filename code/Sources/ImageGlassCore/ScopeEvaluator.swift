@@ -6,9 +6,14 @@ public enum ScopeEvaluator {
 
     /// Returns a new copy of the scope with `resolved` and `lastEvaluated` populated.
     public static func evaluate(_ scope: Scope) -> Scope {
+        let _trace = PerformanceLog.shared.start(
+            "Scope.Evaluate",
+            extra: [("scope", scope.name)]
+        )
         var out = scope
         out.resolved = resolveEntries(for: scope)
         out.lastEvaluated = Date()
+        _trace.finish(extra: [("count", String(out.resolved.count))])
         return out
     }
 

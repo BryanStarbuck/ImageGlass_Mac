@@ -42,6 +42,11 @@ public final class FrameSource: @unchecked Sendable {
     /// Load a FrameSource from disk. Returns nil for empty/unreadable files
     /// and a single-frame FrameSource for ordinary stills.
     public static func load(url: URL) -> FrameSource? {
+        let _trace = PerformanceLog.shared.start(
+            "Image.LoadFrames",
+            extra: [("path", url.path)]
+        )
+        defer { _trace.finish() }
         // Cheap up-front diagnosis catches Git LFS pointers, cloud
         // placeholders, broken symlinks, and permission issues before we
         // hand the URL to ImageIO. Anything but `.ok` gets logged with a
@@ -73,6 +78,11 @@ public final class FrameSource: @unchecked Sendable {
     }
 
     public static func load(data: Data) -> FrameSource? {
+        let _trace = PerformanceLog.shared.start(
+            "Image.LoadFrames",
+            extra: [("path", "<data:\(data.count)b>")]
+        )
+        defer { _trace.finish() }
         let opts: [CFString: Any] = [kCGImageSourceShouldCache: false]
         guard let src = CGImageSourceCreateWithData(data as CFData, opts as CFDictionary) else {
             ErrorLog.log("CGImageSourceCreateWithData returned nil (data size=\(data.count))",

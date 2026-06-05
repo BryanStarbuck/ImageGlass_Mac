@@ -1,0 +1,1231 @@
+---
+title: Use Case — Per-Row Include / Inherit / Don't-Include Column
+description: Deep product engineering specification for the leftmost "Include" column in the directory / filename panel. Each visible **sub-directory or file** row carries one of three explicit states — **Include**, **Inherit**, **Don't Include**. Each visible **root** row carries only two — **Include** or **Don't Include** — because a root has no ancestor to inherit from. The panel renders that state as a small square swatch sized to ~80% of the file icon height (intentionally smaller than the row so the column does not add vertical padding to the tree). Children default to **Inherit**, walking up the chain until they hit an explicit decision (`Inherit Include` or `Inherit Don't Include`). The user toggles state by (a) clicking the swatch — which cycles `Include → Inherit → Don't Include → Include …` on sub-rows and `Include ↔ Don't Include` on roots, (b) pressing the bare `I` key on the focused row to cycle the same states, or (c) choosing one of three menu items pinned to ⌃1 / ⌃2 / ⌃3 to set a state directly. The per-row state persists in `directories.yaml` alongside the existing `filter` block. The primary consumer of the resolved include state is the slideshow's "next image" picker — files whose effective state is `Don't Include` (whether explicit or inherited) are skipped during slideshow advance and during `arrowRight`/`arrowDown` navigation.
+---
+
+# Use Case — Per-Row Include / Inherit / Don't-Include Column
+
+This page is the **engineering spec** for the per-row include
+column that runs down the left edge of every row in the directory
+/ filename panel. It is the third use-case spec in this directory
+(after [mcp_file.mdx](./mcp_file.mdx) and
+[mcp_and_filters_on_dirs.mdx](./mcp_and_filters_on_dirs.mdx)) and
+the **first** spec in the directory that adds a new visual column
+to the panel.
+
+It is the spec being implemented by the work-in-progress code in
+`code/Sources/ImageGlass/DirectoryFilenamePanel.swift`,
+`code/Sources/ImageGlass/FileList/DesignTreeNode.swift`, and
+`code/Sources/ImageGlassCore/FileList/DirectoryTree.swift`. Every
+behavior verified in this page has a corresponding code path
+there.
+
+It is the **engineering** companion to:
+
+* [list_of_files.mdx §3A](../list_of_files.mdx#3a-the-file-tree-panel--directoriesyaml-and-live-walker)
+  — the on-disk schema (`directories.yaml`) and the in-memory
+  `DirectoryNode` tree. This spec extends both with a new
+  `include_overrides` block (§5) and a new `IncludeState` per
+  `DirectoryNode` (§4.3) without breaking the existing schema.
+* [mcp_file.mdx §7](./mcp_file.mdx#7-mcp-applies-an-exclude-by-negate-filter-item) —
+  the existing `filter.items[]` model. The include column is a
+  **second**, orthogonal exclusion mechanism (§9 explains how they
+  compose).
+* [hotkeys.mdx](../hotkeys.mdx) — the bare-letter focus and
+  text-field-suppression contract the new `I` hotkey rides on.
+* [menus.mdx](../menus.mdx) — the View / Directory menu where the
+  three explicit-state items live with ⌃1 / ⌃2 / ⌃3 chords.
+* [local_storage.mdx](../local_storage.mdx) — the
+  `directories.yaml` lifecycle and atomic-write guarantee that the
+  new overrides block reuses.
+* [slideshow.mdx](./slideshow.mdx) — the consumer that drives the
+  feature's most visible user benefit (§10).
+
+---
+
+## 0. Common Preconditions
+
+These hold for every scenario unless a scenario explicitly
+overrides them.
+
+* The app is installed and signed; first launch has already
+  happened once (so
+  `~/Library/Application Support/ImageGlass_Mac/` exists).
+* The MCP server is reachable. Every behavior in this spec is also
+  exposed over MCP (§11) so it can be exercised from Claude Code
+  as easily as from the GUI.
+* `directories.yaml` exists at
+  `~/Library/Application Support/ImageGlass_Mac/directories.yaml`.
+  Its schema for `root_directories[]`, `filter`, and `last_walked`
+  is unchanged. This spec adds **one new top-level block per
+  root** — `include_overrides` (§5) — and one new top-level
+  default — `default_include_state` (§5.2). Both fields are
+  optional; their absence is equivalent to "everything defaults to
+  `inherit`, roots default to `include`."
+* The viewer canvas is in the center. The directory/filename
+  panel docks on the **left** (default *Browser* layout).
+* The panel only ever lists files of three kinds — images, SVG,
+  video — per the built-in file-kind filter in
+  [list_of_files.mdx §3A.3](../list_of_files.mdx#3a3-built-in-file-kind-filter).
+  The include column applies to **every** row the panel renders,
+  including directory rows.
+* Test fixtures live under `~/Pictures/tour/`:
+
+  ```
+  ~/Pictures/tour/
+  ├── beach/
+  │   ├── 001.jpg
+  │   ├── 002.jpg
+  │   └── notes_old.png
+  ├── mountains/
+  │   ├── peak.heic
+  │   └── peak.jpg
+  └── README.txt          # never appears in the panel
+  ```
+
+* "Verify" means: read the named file with `cat`, look at the
+  named pixel region on screen, or read the named log line. Each
+  verify step is a check a human or an XCUITest run can perform.
+
+---
+
+## 1. The Mental Model — Three States, Two Surfaces
+
+The include column adds **one decision** to every row: should the
+file (or every file under this directory) be included in the
+active file set, or not? The decision is recorded as one of three
+states:
+
+| State | What it means | Persisted? |
+| --- | --- | --- |
+| **Include** | This row is *explicitly* in scope. If it is a directory, every descendant that does not override it is in scope by inheritance. | Yes — written to `directories.yaml` `include_overrides` (sub-rows) or `default_include_state` (roots). |
+| **Inherit** | This row carries no explicit decision. The effective state is whatever the nearest explicit ancestor declared. If no ancestor is explicit, the file is **included** (the root default — §5.2). | No — `inherit` is the absence of an entry. |
+| **Don't Include** | This row is *explicitly* excluded. If it is a directory, every descendant that does not override it is excluded by inheritance. | Yes — written to `directories.yaml` `include_overrides` (sub-rows) or `default_include_state` (roots). |
+
+These three states are the **only** values the user ever
+manipulates. The runtime additionally exposes two *resolved*
+states for rendering (§3.3): `inherit-include` and
+`inherit-don't-include` are what the engine reports when a row's
+own state is `inherit` and the walk up the parent chain found an
+explicit ancestor. They are not states the user can set directly
+— they fall out of the inheritance resolver in §4.
+
+### 1.0 Root rows are two-state, never `Inherit`
+
+A **root directory** row — the top-level entry the user added via
+`Add Directory…` — has no ancestor in the inheritance walk. By
+definition `Inherit` would have no fallback to resolve against, so
+roots never adopt the `Inherit` state at all. The contract:
+
+* A freshly added root defaults to `Include` (matching §5.2's
+  factory `default_include_state: include`).
+* Clicking the root's swatch or pressing `I` on a focused root
+  cycles **only** between `Include` and `Don't Include` — the
+  `Inherit` step is skipped.
+* The ⌃2 (Inherit) menu item is **disabled** when the focused row
+  is a root (§7).
+* On disk, a root's state lives in the root-level
+  `default_include_state` field (§5.2), **not** as a relative-path
+  `""` entry in `include_overrides[]`. This keeps "what does the
+  root say?" a single, obvious YAML key.
+* MCP `set_include_state(path="")` is rejected with
+  `err=invalid_root_state` if `state="inherit"`; callers must use
+  `set_default_include_state` (§11.3) to mutate the root's value.
+
+The reasoning: the inheritance walk in §6.1 is the engine's only
+fallback path, and a root has no ancestor to walk up to. Allowing
+`Inherit` on a root would force the resolver to invent a phantom
+"meta-root" default. Banning the state on roots is simpler than
+inventing that fiction.
+
+### 1.1 Why three states, not two
+
+A two-state model (a single checkbox per row) cannot express
+"this file should follow whatever the parent says" without making
+every individual file a separate explicit decision. With ~5 000
+files under JFK/UX (the working directory called out by every
+other spec in this directory), the cost of recording an explicit
+state per file would balloon `directories.yaml` to thousands of
+lines and require the MCP server to ship an "inherit" tool just
+to remove entries. The third state — `inherit` — makes that
+removal *free*: an `inherit` row writes nothing to disk, and an
+`include`/`don't include` decision on the parent applies to every
+descendant in one stroke.
+
+### 1.2 Why a column, not a context menu
+
+Every other "carve out" mechanism in this project lives in the
+[filter system](./mcp_file.mdx#7-mcp-applies-an-exclude-by-negate-filter-item).
+Filters are abstract — `pattern: "*_DM_*"` — and the user has to
+mentally project the pattern onto the file list to know what gets
+hidden. The include column is the **opposite**: the decision is
+attached to the row itself, and the visual is right next to the
+filename. The user does not need to know any pattern language to
+say "I just don't want this directory in the slideshow."
+
+The two surfaces (filters vs. include overrides) compose by
+intersection — §9 spells out the rule.
+
+---
+
+## 2. The Column on Screen
+
+A new column is added to the directory / filename panel between
+the left edge of each row and the existing disclosure-triangle /
+folder-icon / filename cluster. The column applies to **both**
+view modes (tree and list) and to every row the panel renders.
+
+### 2.1 Geometry
+
+* **Position** — leftmost edge of every row. Sits to the **left**
+  of the existing 14-pt-per-depth indent the tree view applies.
+  The indent moves the chevron + folder/file icon + filename
+  cluster, but the include swatch is **never** indented — it
+  stays flush with the panel's left padding so every row's
+  include swatch sits in a single column you can scan top-to-
+  bottom in one glance.
+* **Shape** — a perfect square. The swatch is intentionally
+  **smaller than the row** — its outer side equals the file-icon
+  reference height (`fileIconReferenceHeight = 13 pt`, matching
+  the SF Symbol point size of the file icon — see
+  `DesignTreeNode.row(...)`). The row height itself is unchanged
+  (28 pt for directories, 30 pt for files); the swatch sits
+  vertically centered inside that height. This is the one rule
+  that protects the file tree's vertical density — the include
+  column **must not** add padding or grow the row.
+* **Glyph-to-row ratio** — the rendered check / X glyph inside
+  the swatch is exactly **80% of the file image icon's height**
+  (`glyphPointSize = fileIconReferenceHeight * 0.80` ≈ 10.4 pt).
+  The swatch's outer square is `glyphPointSize / 0.80` ≈ the
+  file icon height so the glyph fills the swatch the same way
+  the file icon fills its own 16 pt bounding box. The
+  ratio — *not* the row height — is what determines every other
+  number in this column.
+* **Corner radius** — 3 pt (half the row's 6 pt selection radius)
+  so the small swatch still reads as a soft square at its
+  reduced size.
+* **Padding** — 4 pt between the swatch and the panel's left edge;
+  6 pt between the swatch and the chevron column. Neither value
+  is configurable in v1; both are constants in
+  `DirectoryPanelMetrics.swift`.
+* **No row-height contribution** — the swatch lives inside an
+  `HStack(alignment: .center)` whose vertical extent is bounded
+  by `.frame(height: rowHeight)`. Because the swatch is shorter
+  than the row, the row's height is unchanged from the
+  pre-feature baseline. A regression where the column makes rows
+  taller is treated as a P1 bug — the column is supposed to be
+  invisible to the file tree's vertical rhythm.
+
+### 2.2 The four rendered variants
+
+Every visible row falls into exactly one of the four variants
+below. The columns map directly to the per-row state in §1 — the
+two "Inherit" rows are the resolved-state branches from §1's
+table.
+
+| # | User state | Resolved state | Background fill | Glyph | Glyph color |
+| --- | --- | --- | --- | --- | --- |
+| (1) | `include` | (n/a — explicit) | Medium dark **green** | `checkmark` | White |
+| (2) | `don't include` | (n/a — explicit) | Medium dark **red** | `xmark` | White |
+| (3) | `inherit` | `inherit-include` | Medium **gray** | `checkmark` | Medium dark green |
+| (4) | `inherit` | `inherit-don't-include` | Very light **gray** | `xmark` | Red |
+
+Three intentional asymmetries to call out:
+
+* (1) vs. (3) — the background is the loudest signal. Explicit
+  decisions are saturated; inherited decisions are gray. A user
+  scanning the column sees explicit decisions first.
+* (3) vs. (4) — both inherits use gray, but the *shade* differs:
+  `inherit-include` is **medium** gray (because most rows live in
+  this state and the visual is the panel's calm default);
+  `inherit-don't-include` is **very light** gray (so it sits
+  visually quieter than (3) — the user already excluded a
+  parent; the descendants are not meant to fight for attention).
+* (3) and (4) flip the glyph color. The glyph color (green check,
+  red X) carries the resolved-state's *polarity* even though the
+  background is muted gray. This is the single hint that says
+  "you don't have to look up the tree to know what would happen
+  if you turned this row into an explicit decision."
+
+A fifth variant — the "no resolved state" case — cannot happen.
+By construction every row resolves to one of include / don't
+include, even when no ancestor is explicit, because the root
+default in §5.2 acts as the always-present fallback.
+
+### 2.3 Concrete color tokens
+
+The Swift theme tokens — same names used elsewhere in the panel,
+defined in `IGTheme.swift`:
+
+| Variant | Token name (light + dark mode) |
+| --- | --- |
+| (1) Explicit include — background | `IG.includeGreenC` — sRGB `#2E7D32` light, `#43A047` dark |
+| (1) Explicit include — glyph | `Color.white` |
+| (2) Explicit don't include — background | `IG.excludeRedC` — sRGB `#C62828` light, `#E53935` dark |
+| (2) Explicit don't include — glyph | `Color.white` |
+| (3) Inherit-include — background | `IG.inheritIncludeBgC` — sRGB `#B0B0B0` light, `#5C5C5C` dark |
+| (3) Inherit-include — glyph | `IG.includeGreenC` (same green as the explicit fill) |
+| (4) Inherit-don't-include — background | `IG.inheritExcludeBgC` — sRGB `#EDEDED` light, `#3A3A3A` dark |
+| (4) Inherit-don't-include — glyph | `IG.excludeRedC` (same red as the explicit fill) |
+
+In dark mode the medium-gray backgrounds invert direction (light
+becomes dark) but maintain the relative contrast — explicit stays
+saturated; inherit-include stays mid; inherit-don't-include stays
+muted.
+
+### 2.4 Glyph weights and sizes
+
+* Glyph point size = `fileIconReferenceHeight * 0.80` ≈ 10.4 pt.
+  The same number for both directory rows (28 pt tall) and file
+  rows (30 pt tall) — the glyph is sized against the
+  **file image icon**, not the row, so the column's visual
+  weight is constant top-to-bottom.
+* Stroke weight `.semibold` for the SF Symbol so the mark is
+  legible at the reduced 10.4 pt size.
+* SF Symbol names: `checkmark` (variants 1 and 3) and `xmark`
+  (variants 2 and 4). Both are system-rendered, so they pick up
+  the user's "Reduce Transparency" / "Increase Contrast"
+  accessibility settings without our intervention.
+
+### 2.5 Cursor, hover, and click hit-testing
+
+* The swatch is rendered as a SwiftUI `Button` with
+  `.buttonStyle(.plain)` so the button frame *is* the hit target.
+  Using a `Button` (rather than a plain view with
+  `.onTapGesture`) is the only way to keep the swatch click from
+  bleeding through to the row's own tap gesture in the file
+  panel: `Button` registers its activation through AppKit's
+  hit-test path, which takes precedence over the parent's
+  `.onTapGesture`. The earlier v0 implementation used a
+  view-level `.onTapGesture` and **did not work** — taps were
+  swallowed by the row's selection gesture before reaching the
+  swatch. The `Button` form is mandatory; do not regress this.
+* The swatch has `.contentShape(Rectangle())` and an
+  `.onHover` modifier that changes the system cursor to
+  `pointingHand` when the pointer is over the swatch — matching
+  the existing folder-row disclosure behavior so the user knows
+  the swatch is a hit target.
+* The whole row remains clickable for selection (clicks outside
+  the swatch land the file in the viewer per
+  [mcp_file.mdx §2](./mcp_file.mdx#2-select-a-file--image--svg--video-all-load-in-the-viewer)).
+  The Button-shaped swatch consumes its own click and the
+  parent's tap gesture never sees it — that is the contract.
+
+### 2.6 Accessibility
+
+* The swatch's `.accessibilityLabel` is one of
+  `"Include"`, `"Don't include"`, `"Inherit (currently include)"`,
+  or `"Inherit (currently don't include)"` — the resolved state
+  is spoken so a VoiceOver user does not have to chase the
+  inheritance chain.
+* `.accessibilityHint` is `"Click to cycle: include, inherit,
+  don't include."` so the cycle order is also announced.
+* `.accessibilityValue` carries the row's filename so VoiceOver
+  reads e.g. `"Include, checked, frame_42.jpg"`.
+
+---
+
+## 3. The Click — Cycle Through Three States
+
+Clicking the swatch cycles the **explicit** state (the value
+written to `include_overrides` for sub-rows, or
+`default_include_state` for roots) through the states in a fixed
+order.
+
+For a **sub-directory or file** row, the cycle is three steps:
+
+```
+Include  →  Inherit  →  Don't Include  →  Include  →  ...
+```
+
+For a **root** row, the cycle is two steps (per §1.0):
+
+```
+Include  →  Don't Include  →  Include  →  ...
+```
+
+The three-step order was chosen so the most common "I want this
+back the way it was" intent — undo the carve-out I just made —
+is one click away from `Don't Include` (one more click lands on
+`Include`). The two-step root order is a straight binary flip
+because there is no `Inherit` state to pass through.
+
+### 3.1 Action — single click on the swatch
+
+1. The user clicks anywhere inside the include-column square on
+   any visible row.
+2. The panel reads the row's current explicit state (or `inherit`
+   if no override exists), advances one step in the row-type-
+   appropriate cycle order (three-step for sub-rows, two-step
+   for roots — §3 header), writes the new explicit state through
+   `IncludeOverridesStore` (§5.3) or `set_default_include_state`
+   (§5.2) depending on whether the row is a root, and the panel
+   re-renders within one frame.
+3. The walker's in-memory `includeOverrides` /
+   `defaultIncludeState` mirror is updated **in place on
+   `state.walkerRoots`** before the YAML write returns; see
+   §5.6 for the synchronous in-memory mirror contract. The panel
+   re-renders by binding to `state.walkerRoots`; descendant rows
+   whose effective state changed (because they were inheriting
+   from this row) re-render in the same frame.
+
+### 3.2 The cycle goes through `inherit`
+
+Every state — explicit include, explicit don't include, inherit
+— is reachable in two or fewer clicks from any starting state.
+The cycle does **not** skip `inherit`. The user can therefore
+"remove an override" entirely without ever touching a menu — one
+click from `Include` lands them on `Inherit`, which deletes the
+row's entry from `include_overrides`.
+
+### 3.3 Resolved state vs. explicit state — what the click sees
+
+The swatch click always operates on the **explicit** state. An
+`inherit-include` swatch and an `inherit-don't-include` swatch
+both advance to `don't include` on the first click (because the
+explicit state in both cases is `inherit`, and the cycle's next
+step after `inherit` is `don't include`). The *resolved* state
+the swatch was rendering before the click is irrelevant to the
+cycle math — only the row's own decision changes.
+
+This is the one rule the §2.6 accessibility hint exists to
+explain: `"Click to cycle: include, inherit, don't include."`
+The hint is the cycle order, not a description of the resolved
+state. A VoiceOver user hears the cycle, sees the resolved state,
+and the two combine into a complete mental model.
+
+### 3.4 Verify
+
+* On screen: each click flips the swatch to the next variant in
+  the cycle order. A click that lands on `Inherit` immediately
+  re-resolves: the swatch shows variant (3) or (4) depending on
+  the nearest explicit ancestor.
+* On disk: after each click that lands on `Include` or `Don't
+  Include`, `directories.yaml` contains a new (or updated) entry
+  in `include_overrides[]` for the clicked row's path. A click
+  that lands on `Inherit` **removes** the row's entry from
+  `include_overrides[]` — the row's decision goes back to "no
+  decision" and is no longer persisted.
+* On disk: `log.log` contains one
+  `tool=panel.set_include_state` line per click with
+  `state=include|inherit|exclude path=<absolute> client=gui
+  corr=… ok=true`. The audit format is identical for clicks,
+  hotkeys (§4), menu picks (§7), and MCP calls (§11) so a
+  downstream auditor cannot tell which surface made the change —
+  only the row that changed.
+
+### 3.5 Single-selection across rows
+
+The directory / filename panel maintains **one** highlighted row
+at a time across both the file selection (the blue-fill
+`state.selectedFile`) and the keyboard cursor (the muted
+`state.treeNav.activeRow`). The two stores are technically
+distinct in `AppState` — the viewer needs a stable
+`selectedFile` even when the user parks the keyboard cursor on a
+folder — but the on-screen rule is simple:
+
+* Clicking any row replaces the previous highlight. The newly
+  clicked row gets the highlight; every other row loses it.
+* This rule applies to clicks on either the include swatch or
+  the row body. The swatch-click cycle (§3.1) also moves the
+  highlight to the row the swatch belongs to — same as a row-
+  body click.
+* In practice this means: tapping a folder clears
+  `state.selectedFile` to `nil` (the row body click handler
+  does this synchronously) so the previously selected file is
+  no longer painted blue. Tapping a file mirrors the path into
+  both `state.selectedFile` **and** `state.treeNav.activeRow`,
+  which clears any folder's "cursor" highlight.
+* A regression where two rows display the selection fill at
+  the same time (e.g. last-selected file + newly-clicked
+  folder) is treated as a P1 bug — the panel must always show
+  exactly one row as the active selection.
+
+---
+
+## 4. The `I` Hotkey — Cycle on the Focused Row
+
+The bare letter `I` (uppercase or lowercase) is bound to the same
+three-state cycle as the swatch click, scoped to whichever row
+the keyboard focus is currently on.
+
+### 4.1 Focus rules
+
+The hotkey rides on the existing
+[hotkeys.mdx](../hotkeys.mdx) §3 contract:
+
+* `I` fires when the **directory panel** has focus (the panel's
+  `.focusable()` modifier — already attached in
+  `DirectoryFilenamePanel.swift`).
+* `I` fires when the **viewer canvas** has focus, in which case it
+  applies to the *currently selected* row — `state.selectedFile`
+  in tree mode, or the row whose `state.treeNav.activeRow` points
+  to a folder (which lets the user park the keyboard cursor on a
+  folder and toggle the folder's include state without picking a
+  file).
+* `I` is **suppressed** when a `TextField` has first responder —
+  the panel's filter field, the search box, any inline-rename
+  field. SwiftUI's `.onKeyPress` runs after the text field's
+  responder chain, so the key never reaches the handler in the
+  first place — this matches the same suppression rule that
+  protects `c`, `n`, `z`, `w` from being captured during typing
+  ([hotkeys.mdx §5](../hotkeys.mdx#5-bare-letter-zoom-keys)).
+
+### 4.2 Action
+
+1. The user presses `I` while the panel or viewer has focus.
+2. `HotkeyHandlers.swift` resolves the target row:
+   * If `state.treeNav.activeRow` is non-nil, that path is the
+     target. This is the path the keyboard arrow keys parked on,
+     and is the right target whether it is a folder (root or
+     sub-) or a file.
+   * Else if `state.selectedFile` is non-nil, that path is the
+     target.
+   * Else the keypress is `.ignored` (there is no row to
+     mutate).
+3. The handler classifies the target as a **root** or a
+   **sub-row** by asking the walker whether the path equals
+   any registered root's path:
+   * Sub-row: cycle through three states via
+     `IncludeState.next` (§4.3) and persist through
+     `IncludeOverridesStore`.
+   * Root: cycle through two states via
+     `IncludeState.nextForRoot` (§4.3) and persist through
+     `set_default_include_state` (§5.2 / §11.3).
+4. The handler updates `state.walkerRoots` in place per §5.6
+   so the swatch on screen re-renders in the next frame. A
+   regression where `I` writes the YAML but the column does not
+   update is treated as a P1 bug — the I-key must be
+   indistinguishable from a click on the swatch.
+
+### 4.3 The `IncludeState` enum (Swift)
+
+```swift
+public enum IncludeState: String, Sendable, Codable, CaseIterable {
+    case include
+    case inherit
+    case exclude   // "don't include" — stored as "exclude" in YAML
+
+    /// Next state in the **three-step** cycle order from §3.
+    /// Used on sub-directory and file rows.
+    public var next: IncludeState {
+        switch self {
+        case .include: return .inherit
+        case .inherit: return .exclude
+        case .exclude: return .include
+        }
+    }
+
+    /// Next state in the **two-step** root cycle order from §1.0 /
+    /// §3 header. `inherit` is not a legal root state, so a root
+    /// whose stored state is somehow `inherit` (corrupt YAML, or
+    /// a v1→v2 row that wasn't migrated) is coerced to `include`
+    /// on the first press.
+    public var nextForRoot: IncludeState {
+        switch self {
+        case .include: return .exclude
+        case .exclude: return .include
+        case .inherit: return .include
+        }
+    }
+}
+```
+
+The on-disk identifier is `exclude` (not `don't_include`) so the
+YAML stays simple to parse, the audit-log `state=…` value is one
+unambiguous token, and the MCP wire shape matches the rest of
+the project's "include/exclude" vocabulary.
+
+### 4.4 Verify
+
+* On screen: pressing `I` on a focused row flips the swatch to
+  the next variant in the cycle order. Pressing `I` three times
+  in a row returns the row to its original variant.
+* On disk: each press appends a single
+  `tool=panel.set_include_state state=… client=gui` line to
+  `log.log`. The `client=gui` value carries no information about
+  *which* GUI surface (mouse vs. keyboard) — that distinction is
+  intentionally collapsed.
+
+---
+
+## 5. Persistence — `include_overrides` in `directories.yaml`
+
+`directories.yaml` is the single source of truth for what
+`DirectoryTreeWalker` walks (mcp_file.mdx §4) and what filters
+each root applies (mcp_file.mdx §7). The include state extends
+that file with **one** new optional block per root, plus one
+optional top-level default per root, and is written through the
+same atomic-write code path the existing schema uses.
+
+### 5.1 Schema diff
+
+The existing schema (list_of_files.mdx §3A.2):
+
+```yaml
+schema_version: 1
+root_directories:
+  - path: /Users/<you>/Pictures/tour/beach
+    filter:
+      items: []
+    last_walked: 2026-06-02T10:05:00Z
+```
+
+After this spec lands:
+
+```yaml
+schema_version: 1
+root_directories:
+  - path: /Users/<you>/Pictures/tour/beach
+    filter:
+      items: []
+    last_walked: 2026-06-02T10:05:00Z
+    default_include_state: include          # § 5.2 — root-level default
+    include_overrides:                       # § 5.3 — per-path overrides
+      - path: notes_old.png
+        state: exclude
+      - path: subfolder/wip
+        state: exclude
+      - path: subfolder/wip/keeper.jpg
+        state: include
+```
+
+Both new fields are optional. A root without them behaves exactly
+as it did before this spec — every row is effectively `Include`
+and the column renders variant (3) for every descendant. This is
+the schema's backwards-compatibility guarantee: a v1 reader
+encountering a v2 file ignores the new fields; a v2 reader
+encountering a v1 file inherits the new defaults.
+
+### 5.2 `default_include_state`
+
+The root-level default seeds the inheritance walk's terminus. The
+allowed values are `include` and `exclude` — `inherit` is not a
+legal root default because the walk needs a concrete answer when
+no ancestor is explicit. The factory default is `include` so the
+first thing a user sees after `add_directory` is every file in
+scope, exactly as it works today.
+
+### 5.3 `include_overrides[]`
+
+A flat list of override entries. Each entry has exactly two
+required fields:
+
+* `path` — **relative** to the root, using forward slashes. A
+  bare filename (e.g. `notes_old.png`) means a file directly
+  inside the root. A path with intermediate components (e.g.
+  `subfolder/wip/keeper.jpg`) means that descendant. Storing
+  paths relative to the root (not absolute) makes the file
+  portable: relocating the root's parent directory does not
+  invalidate the overrides.
+* `state` — one of `include` or `exclude`. (`inherit` is never
+  written — the absence of an entry **is** `inherit`.)
+
+The list is intentionally flat, not nested, so reading any
+override is O(1) on a per-path basis (with a hash-map mirror in
+memory) and editing one override never requires re-laying-out an
+entire YAML subtree.
+
+### 5.4 Atomic write semantics
+
+Every mutation routes through `IncludeOverridesStore.setState(...)`,
+which:
+
+1. Reads `directories.yaml` from disk through the existing
+   `DirectoriesStore.load()` helper.
+2. Mutates the in-memory `RootDirectory` struct for the right
+   root (adding, updating, or removing the matching
+   `include_overrides[]` entry depending on the new value).
+3. Writes the file back via the existing temp-file + rename
+   atomic-write path used by every other YAML mutation.
+4. Posts the `DistributedNotificationCenter`
+   `directories_changed` notification so any other process
+   (typically the headless MCP server) reloads its copy.
+
+There is no separate sidecar file. The override data lives in
+the same YAML as everything else so a `git diff` of
+`directories.yaml` shows one logical change per click.
+
+### 5.5 What `inherit` does not write
+
+A row whose state is `inherit` has **no** entry in
+`include_overrides[]`. The first user action that turns a row
+into `inherit` is the *removal* of its prior entry. This rule
+makes the file the smallest representation possible and keeps
+"delete an override" mechanically identical to "set it to
+inherit."
+
+A consequence: the YAML diff for "carve out a directory of 200
+files" is **one** new entry (the directory's `exclude` override).
+The 200 descendant files inherit silently and are not stored.
+
+### 5.6 Synchronous in-memory mirror on `state.walkerRoots`
+
+The panel renders by binding to
+`AppState.walkerRoots: [RootDirectory]`, but the walker
+(`DirectoryTreeWalker.shared.snapshot()`) only returns the
+`tree` + `filter` + `lastWalked` parts of a `RootDirectory`. It
+**does not** carry `includeOverrides[]` or
+`defaultIncludeState`. If the panel had to wait for the
+filesystem watcher → notification → reload chain to refresh the
+mirror, every `I`-key press and every swatch click would appear
+to do nothing for several hundred milliseconds (and on a slow
+disk, longer).
+
+The contract: any GUI surface that mutates the include state —
+swatch click (§3), `I` hotkey (§4), menu item (§7) — **must
+update `AppState.walkerRoots` synchronously, in place, before
+returning** in addition to writing the YAML. The order is:
+
+1. Compute the new `RootDirectory` value by mutating a copy of
+   the existing in-memory `RootDirectory` (the one already in
+   `state.walkerRoots`).
+2. Write the YAML atomically through
+   `DirectoriesStore.setIncludeState(...)` /
+   `setDefaultIncludeState(...)`.
+3. Replace the corresponding `state.walkerRoots` entry with the
+   mutated value so the next SwiftUI render reads the new
+   resolved state.
+4. Post `directories_changed` so out-of-process MCP clients
+   refresh their copies. The in-process panel does **not** rely
+   on this notification — its own update already happened in
+   step 3.
+
+The MCP server, when it mutates the YAML from outside the GUI
+process, still triggers the reload-from-disk path (which now
+also has to merge `includeOverrides` / `defaultIncludeState`
+into `state.walkerRoots`, since they are no longer "walker only"
+fields). See §5.7.
+
+### 5.7 `reloadDirectoriesFromDisk()` must merge include state
+
+When the YAML changes from *outside* the GUI process — e.g. an
+MCP `set_include_state` call against the headless MCP server —
+the GUI process catches the change through its `directories.yaml`
+file watcher and calls `AppState.reloadDirectoriesFromDisk()`.
+Pre-feature, that method only diffed `filter` changes. After
+this spec lands it **also** merges `defaultIncludeState` and
+`includeOverrides[]` from each on-disk `RootDirectory` into the
+matching entry of `state.walkerRoots`. The merge is the
+component of the data flow that closes the loop for external
+mutations.
+
+---
+
+## 6. Inheritance Resolution — `effectiveState(for:)`
+
+The runtime resolver answers "what is the resolved state of this
+row?" for every row the panel renders. The signature:
+
+```swift
+public func effectiveState(
+    for relativePath: String,
+    in root: RootDirectory
+) -> IncludeState
+```
+
+### 6.1 Algorithm
+
+1. Build a flat map `[String: IncludeState]` from
+   `root.include_overrides[]` — keyed by `path`, value by `state`.
+   (This map is cached on the `RootDirectory` after the first
+   call; it is rebuilt only when `include_overrides[]` mutates.)
+2. Walk *up* the path from `relativePath` toward the root one
+   component at a time. For each ancestor path (including the
+   row's own path on iteration 0), check the map. Return the
+   first hit — that is the nearest explicit ancestor.
+3. If no ancestor is in the map, return `root.default_include_state`
+   (§5.2, default `include`).
+
+The returned value is one of `include` or `exclude` — never
+`inherit`, by construction. The resolver returns the concrete
+answer the panel needs to render variants (1)/(2) directly, or to
+render variants (3)/(4) when the row's own explicit state is
+`inherit`.
+
+### 6.2 Two-pass render
+
+The panel renders each row by calling `effectiveState(for:)`
+twice — once for the row's own explicit state (variant (1) /
+(2) / `inherit`) and, if the result is `inherit`, once for the
+ancestor walk that produces the resolved variant (3) / (4).
+Wrapping both calls is `EffectiveIncludeDecision` which carries:
+
+```swift
+public struct EffectiveIncludeDecision {
+    public let explicit: IncludeState        // what the row itself says
+    public let resolved: IncludeState        // include or exclude after walk
+    /// True iff `explicit == .inherit` and the panel renders one
+    /// of the "Inherit" variants (3) or (4).
+    public var isInherited: Bool { explicit == .inherit }
+}
+```
+
+### 6.3 Caching
+
+`EffectiveIncludeDecision` is **not** cached. Each panel render
+recomputes per visible row. The walk is `O(depth)` per row and
+the override map lookup is `O(1)`; on a JFK/UX-sized tree of
+~5 000 visible files, the per-frame cost of recomputing every
+row's resolution is well under one millisecond and is dominated
+by SwiftUI's diff cost. The simplicity of "no cache" eliminates
+the entire class of cache-invalidation bugs that would otherwise
+come with overrides being mutable from MCP at any moment.
+
+### 6.4 Cycle on a folder, descendants follow
+
+When the user cycles a folder row's state from `inherit` to
+`exclude`, every descendant file whose own explicit state is
+`inherit` flips its **resolved** state from include (or whatever
+the ancestor chain previously said) to exclude — in the next
+panel render. No descendant entries are added to
+`include_overrides[]`; their resolved state changes because the
+ancestor walk now finds the folder's new explicit decision
+first.
+
+This is the single most important consequence of the inheritance
+design and is also the user-facing reason the column exists: one
+click on a directory carves out its entire subtree.
+
+---
+
+## 7. The Menu Items — ⌃1 / ⌃2 / ⌃3
+
+The three explicit states are exposed as three menu items so they
+are also discoverable through the menu bar. The items live in
+the **Directory** menu (the same menu that hosts
+`Add Directory…`, `Refresh All Roots`, etc. — see
+[menus.mdx](../menus.mdx) §4):
+
+| Menu item label | Keyboard chord | Action on focused row |
+| --- | --- | --- |
+| `Include` | ⌃1 | Set explicit state to `include`. |
+| `Inherit` | ⌃2 | Set explicit state to `inherit` (i.e. remove the row's override entry). |
+| `Don't Include` | ⌃3 | Set explicit state to `exclude`. |
+
+Notes:
+
+* The chords are **⌃** (Control), not ⌘ (Command). The Command
+  variants are reserved for system-wide and document chords
+  (⌘1 / ⌘2 / ⌘3 already pick between viewer windows). The
+  control prefix also clusters the three together as a
+  "directional pad" — there is nothing else on ⌃1 / ⌃2 / ⌃3 in
+  this app.
+* The menu items are **enabled** whenever a row is focused
+  (panel selection or viewer selection), **disabled** otherwise.
+* When the focused row is a **root**, the ⌃2 `Inherit` item is
+  additionally disabled (per §1.0 — roots are two-state).
+  Picking ⌃1 or ⌃3 on a focused root persists through
+  `default_include_state` instead of `include_overrides[]`.
+* The menu items reflect the focused row's current explicit
+  state by drawing a checkmark next to the matching item
+  (NSMenuItem's `.state = .on`). The user can see at a glance
+  which state the focused row is in.
+* The menu items reinforce the same audit log line as a click
+  or a hotkey (§3.4 / §4.4) — `client=gui` is again the only
+  client identifier.
+
+### 7.1 Menu vs. hotkey vs. click — three surfaces, one action
+
+The three surfaces are interchangeable. A user who learns the
+menu (⌃1 / ⌃2 / ⌃3 to set a state directly) will sometimes
+prefer the hotkey (`I` to cycle when they don't remember which
+state they want next), and the swatch click is always there as a
+direct-manipulation fallback. All three surfaces share one code
+path — `IncludeOverridesStore.setState(...)` — so the only thing
+that varies between them is how the user expresses intent.
+
+---
+
+## 8. Defaults and First-Run Behavior
+
+The feature ships with the most permissive default so existing
+workflows do not change after the upgrade:
+
+| Scope | Default value | Why |
+| --- | --- | --- |
+| Root's `default_include_state` | `include` | Adding a directory should make every file in it visible — same behavior as before the feature existed. |
+| Sub-directory's explicit state | `inherit` | Children carry no decision until the user makes one — the entire point of the third state. |
+| File's explicit state | `inherit` | Same reason. |
+| The "I just added a root" experience | Every row renders variant (3) — medium-gray fill with a green check — and every file is in scope. | The visual difference between a fresh root and a post-edit root is itself information: a gray column means "you have not yet curated this tree." |
+
+### 8.1 First-launch of an existing user
+
+A user upgrading from a pre-feature build opens the app with
+their existing `directories.yaml`. The file has no
+`include_overrides[]` blocks and no `default_include_state`
+fields. The schema reader treats both as absent, defaults the
+root to `include`, and every row renders variant (3). The user
+sees the column for the first time, every file is still in
+scope, and nothing about the slideshow or arrow-key navigation
+has changed yet — until they explicitly cycle a row.
+
+This is the v1 → v2 migration contract: zero behavioral change
+without explicit user action.
+
+### 8.2 Settings (no new keys)
+
+The feature adds **no** keys to `settings.json`. Visibility of
+the include column is part of the panel's layout (not a setting),
+and the v1 contract is that the column is always visible. A
+future "hide include column" toggle would be a single boolean in
+`settings.layout`, but it is out of scope for v1 — the visual is
+intentionally always-on so users see the affordance.
+
+---
+
+## 9. Composition with the Existing Filter System
+
+The include column is a **second** exclusion mechanism. The
+existing `filter.items[]` (mcp_file.mdx §7) keeps doing exactly
+what it did before; the include column rides on top.
+
+### 9.1 The rule
+
+A file is **visible** in the panel and **in scope** for the
+slideshow if and only if **both** of the following are true:
+
+1. It passes the root's filter — `RootFilter.evaluate(filename:)`
+   returns `true` (mcp_file.mdx §7).
+2. Its resolved include state — `effectiveState(...)` (§6) — is
+   `.include`.
+
+In Swift:
+
+```swift
+func isInScope(file: DirectoryNode, in root: RootDirectory) -> Bool {
+    return file.passesFilter
+        && root.effectiveState(for: file.relativePath) == .include
+}
+```
+
+The two surfaces compose **by intersection**. A file that fails
+the filter is never in scope regardless of include state, and a
+file the user marked `exclude` is never in scope regardless of
+filter.
+
+### 9.2 Why intersection, not union
+
+Both mechanisms express *exclusion* by design — filters do it
+abstractly (by pattern), include overrides do it concretely (by
+row). The natural meaning of "I have two ways to say 'don't show
+this'" is *either one is enough*. Intersection makes that work:
+saying `don't include` always wins over the filter; the filter
+always wins over a default `include`.
+
+### 9.3 What the column shows when a file is filter-excluded
+
+A file that fails the filter is **not rendered** at all — same as
+today (mcp_file.mdx §7.3 / §7.4). The include column therefore
+never has to render a "filter excluded but user wants it" state,
+which would otherwise be a fifth visual variant. If the user
+later widens the filter, the file re-appears with whatever
+include state it had (which is `inherit` by default).
+
+### 9.4 The slideshow consumes the *combined* result
+
+The slideshow's next-image picker (§10) calls `isInScope(...)`
+above, not `passesFilter` alone. Any `exclude` decision —
+explicit or inherited from a parent — removes the file from the
+slideshow rotation.
+
+---
+
+## 10. Slideshow — Skip `Don't Include` Files
+
+The slideshow is the feature's primary consumer. When the user
+starts a slideshow ([slideshow.mdx](./slideshow.mdx)), the
+controller picks the next file by walking the same depth-first
+lexicographic order the file panel renders. The picker now
+filters that order through `isInScope(...)` from §9.1.
+
+### 10.1 The picker, before this spec
+
+```swift
+func nextFile(after current: String?) -> String? {
+    let files = state.orderedNavigationFiles  // §4 of AppState
+    // walks `files` and returns the next entry whose passesFilter is true
+}
+```
+
+### 10.2 The picker, after this spec
+
+```swift
+func nextFile(after current: String?) -> String? {
+    let files = state.orderedNavigationFiles
+    // walks `files` and returns the next entry whose `isInScope(...)`
+    // returns true — i.e. passes the filter AND has resolved include
+    // state == .include
+}
+```
+
+A file marked `exclude` (explicitly or via an ancestor) is
+silently skipped; the slideshow advances to the next file as
+though the excluded one were not in the list.
+
+### 10.3 Edge cases
+
+* **The current slideshow file gets `exclude`'d mid-show.** If the
+  user (or an MCP call) flips the currently displayed file to
+  `exclude` while the slideshow is running, the picker advances to
+  the next in-scope file at the next tick. The current file does
+  not vanish instantly — the user sees one more tick of it before
+  the show moves on. (This avoids a jarring "the image just
+  disappeared" experience.)
+* **Every file in scope is excluded.** The slideshow stops with
+  a `slideshow_stopped reason=no_in_scope_files` audit line and
+  the viewer reverts to the §9.2 empty state from mcp_file.mdx.
+  This is symmetric with "the slideshow ran out of files
+  because all roots were removed."
+* **A new file is added to a directory whose state is `exclude`.**
+  The walker picks up the new file via `FSEventStream`, gives it
+  `passesFilter = true` (the filter logic is unchanged), but
+  `effectiveState(...)` returns `exclude` because the ancestor
+  decision is unchanged. The new file silently does not enter
+  the slideshow rotation.
+
+### 10.4 Arrow-key navigation matches the slideshow
+
+The same `isInScope(...)` test is applied to `selectNext()` /
+`selectPrevious()` in `AppState` so the arrow keys skip excluded
+files. A user who excludes a directory and then mashes the right
+arrow does not visit every file inside that directory — the arrow
+walks straight past them. The visible-row list itself is **not**
+filtered down; the user still sees the directory's rows in the
+panel (with their gray-X swatches), they just can't navigate into
+them with arrows or the slideshow.
+
+This split is deliberate: keeping excluded rows visible is the
+only way the user can later cycle them back to `include` without
+hunting for a separate "show excluded" toggle.
+
+### 10.5 Verify
+
+* On screen: start a slideshow; cycle a directory's swatch to
+  `exclude`; press right arrow until the slideshow advances. The
+  next picked file is the first file lexicographically after the
+  excluded directory's last file.
+* On disk: every `slideshow_advance` line in `log.log` carries
+  `from=<path> to=<path> skipped=<N>`. When the slideshow has to
+  skip excluded files to find the next in-scope one, `skipped`
+  is non-zero and the value matches the count of `exclude`
+  resolutions between `from` and `to`.
+
+---
+
+## 11. MCP Tools — The Headless Surface
+
+Every action the GUI exposes also lands on the MCP server so
+Claude Code can drive the feature without the user touching the
+GUI. Three new tools:
+
+### 11.1 `set_include_state`
+
+```
+set_include_state(
+  root="~/Pictures/tour/beach",
+  path="notes_old.png",      # relative to root
+  state="exclude"            # one of: "include" | "inherit" | "exclude"
+)
+```
+
+* Canonicalizes `root` and validates it is in
+  `root_directories[]` — returns `err=path_not_found` otherwise.
+* Validates `state` is one of the three values — returns
+  `err=invalid_state` otherwise.
+* Adds, updates, or removes the matching
+  `include_overrides[]` entry depending on whether `state` is
+  `inherit` (removes) or one of the two explicit values
+  (adds/updates).
+* Writes `directories.yaml` atomically; posts
+  `directories_changed`; produces one
+  `tool=mcp.set_include_state` line in `log.log`. No filesystem
+  walk is triggered — this is an in-memory + YAML change.
+* Returns `{ ok: true, resolved: "include" | "exclude" }` where
+  `resolved` is the effective state of the row *after* the
+  change (so the caller knows whether the file is now in scope
+  even if they set the state to `inherit` and let the ancestor
+  walk decide).
+
+### 11.2 `get_include_state`
+
+```
+get_include_state(
+  root="~/Pictures/tour/beach",
+  path="notes_old.png"
+)
+```
+
+Returns `{ explicit: "include" | "inherit" | "exclude", resolved:
+"include" | "exclude" }`. Read-only; does not modify
+`directories.yaml`; does not produce a `tool=mcp.*` line in
+`log.log` (read tools are not journaled by default, matching the
+existing `get_directory` behavior).
+
+### 11.3 `set_default_include_state`
+
+```
+set_default_include_state(
+  root="~/Pictures/tour/beach",
+  state="include"            # "include" | "exclude" only
+)
+```
+
+Sets the root-level `default_include_state` (§5.2). `inherit` is
+**not** allowed at the root level (§5.2); the call returns
+`err=invalid_state` if requested.
+
+### 11.4 Audit log lines
+
+```
+ts=… tool=mcp.set_include_state         root=…/beach path=notes_old.png state=exclude client=claude-code corr=… ok=true
+ts=… tool=mcp.set_default_include_state root=…/beach state=exclude client=claude-code corr=… ok=true
+ts=… tool=panel.set_include_state       root=…/beach path=notes_old.png state=exclude client=gui          corr=… ok=true
+```
+
+Note the third form: GUI surfaces (swatch click, `I` hotkey,
+menu item) all log as `tool=panel.set_include_state` with
+`client=gui` — distinct from the MCP-driven
+`tool=mcp.set_include_state`. This split lets a downstream
+auditor know whether a state change came from outside the app
+(MCP) or from a user in front of the screen (GUI), without
+sacrificing the "same shape" guarantee.
+
+---
+
+## 12. Real-World Rehearsal — Carve `~/Pictures/tour/beach/notes_old.png` Out of the Slideshow
+
+A short end-to-end exercise that ties the spec together. Run it
+against the `~/Pictures/tour/` fixture from §0.
+
+### 12.1 Preconditions
+
+* `directories.yaml` has one root —
+  `/Users/<you>/Pictures/tour/beach` — added per
+  [mcp_file.mdx §4](./mcp_file.mdx#4-mcp-adds-a-directory). The
+  panel is in tree mode (per
+  [mcp_file.mdx §3](./mcp_file.mdx#3-toggle-into-file-tree-view))
+  and shows three file rows under `beach`: `001.jpg`, `002.jpg`,
+  `notes_old.png`. Every row's include swatch renders variant
+  (3) — medium-gray fill, green check.
+
+### 12.2 Actions, in order
+
+1. Click the swatch on the `notes_old.png` row.
+   * Resolved state changes from `inherit-include` to
+     `exclude` (the cycle order in §3 takes one click to get
+     from `inherit` to `exclude`).
+   * The swatch flips to variant (2) — medium dark red, white
+     X.
+   * `directories.yaml` gains one entry:
+
+     ```yaml
+     include_overrides:
+       - path: notes_old.png
+         state: exclude
+     ```
+
+   * `log.log` gains
+     `tool=panel.set_include_state root=…/beach path=notes_old.png state=exclude client=gui ok=true`.
+2. Start a slideshow at 2 seconds per tick. The slideshow
+   advances `001.jpg → 002.jpg → 001.jpg …`. `notes_old.png` is
+   skipped on every cycle.
+3. Press `I` on the `notes_old.png` row. The swatch advances
+   one step in the cycle order — from `exclude` to `include`.
+   The swatch is now variant (1) — medium dark green, white
+   check. `directories.yaml` updates the existing
+   `include_overrides[]` entry to `state: include`.
+4. The slideshow's next tick picks up `notes_old.png` and shows
+   it for one tick before continuing.
+5. Press `I` again. The swatch advances to `inherit` and the
+   `include_overrides[]` entry is **removed** entirely. The
+   resolved state walks up to the root default
+   (`include`), so the swatch renders variant (3) again. The
+   slideshow keeps showing `notes_old.png` because the
+   resolved state is still `include`.
+
+### 12.3 Verify
+
+* On disk:
+
+  ```sh
+  cat ~/Library/Application\ Support/ImageGlass_Mac/directories.yaml
+  ```
+
+  After step 1: one `include_overrides[]` entry for
+  `notes_old.png` with `state: exclude`. After step 3: same
+  entry with `state: include`. After step 5: the
+  `include_overrides[]` block is gone (either omitted entirely
+  or written as an empty list, both representations are valid
+  per §5.3).
+* On screen: the swatch on the `notes_old.png` row matches the
+  variant predicted in §12.2 at each step. Every other row
+  remains variant (3) throughout — they are inheriting from a
+  root default that never changed.
+* On disk:
+
+  ```sh
+  grep "set_include_state" ~/Library/Application\ Support/ImageGlass_Mac/logs/log.log | tail -n 3
+  ```
+
+  shows three lines, one per step (1, 3, 5), each with
+  `client=gui` and the state value the step landed on.
+
+---
+
+## 13. End-to-End Acceptance
+
+A run of this tour passes when **all of**:
+
+* §1 — every visible row in the panel exposes the three-state
+  model: `Include`, `Inherit`, `Don't Include`.
+* §2 — the include swatch is a square at the leftmost edge of
+  every row; its width equals the row height; it renders one of
+  exactly four variants per the table in §2.2 with the colors in
+  §2.3 and the glyphs in §2.4.
+* §3 — clicking the swatch cycles the explicit state in the order
+  `Include → Inherit → Don't Include → Include …`. A click that
+  lands on `Inherit` removes the row's entry from
+  `include_overrides[]`.
+* §4 — pressing `I` on the focused row produces the same cycle
+  as a swatch click; bare-letter focus and text-field suppression
+  rules from hotkeys.mdx §3 apply unchanged.
+* §5 — `directories.yaml` carries one `default_include_state`
+  and one `include_overrides[]` per root; both are optional;
+  `inherit` is never written; entries are paths relative to the
+  root; writes are atomic via the existing rename path.
+* §6 — `effectiveState(for:)` walks ancestors and falls back to
+  the root default; the resolver never returns `inherit`; the
+  panel re-renders per row on every state change without caching
+  the resolver.
+* §7 — the **Directory** menu exposes `Include` / `Inherit` /
+  `Don't Include` items bound to ⌃1 / ⌃2 / ⌃3. The items show a
+  checkmark next to the focused row's current explicit state.
+* §8 — first launch and v1→v2 upgrades are zero-behavior-change:
+  every existing root reads as `default_include_state: include`
+  with no overrides, the column renders variant (3) on every
+  row, and the slideshow behaves identically to the pre-feature
+  build.
+* §9 — the include state composes with the existing filter by
+  intersection: a file is in scope iff `passesFilter == true`
+  **and** `effectiveState(...) == .include`. Filter-excluded
+  files are not rendered at all (the column does not produce a
+  fifth variant).
+* §10 — the slideshow's next-file picker calls `isInScope(...)`
+  from §9.1; arrow-key navigation does the same; excluded files
+  are silently skipped. The slideshow stops with a
+  `no_in_scope_files` reason when no in-scope file remains.
+  `slideshow_advance` log lines record `skipped=N`.
+* §11 — three MCP tools exist: `set_include_state`,
+  `get_include_state`, `set_default_include_state`. Their wire
+  shapes match §11.1–§11.3. The audit log distinguishes
+  `tool=mcp.set_include_state` from
+  `tool=panel.set_include_state` by `client=` field.
+* §12 — the real-world rehearsal against
+  `~/Pictures/tour/beach/notes_old.png` produces the predicted
+  YAML, log lines, and on-screen variants at each step.
+
+If any step fails, the failing line in `log.log` (with its
+`corr=` correlation id) is the first place to look — `grep
+corr=<id> log.log` returns the audit line(s) interleaved with
+the matching error record, reproducing the call in full.

@@ -74,6 +74,8 @@ public final class ConfigLoader {
 
     /// Resolves the effective config without writing anything back.
     public func resolve(cli: CLIOverrides = CLIOverrides()) throws -> Resolution {
+        let _trace = PerformanceLog.shared.start("Config.Load")
+        defer { _trace.finish() }
         let defaultLayer = try readPartial(at: paths.effectiveDefaultFileURL)
         let userLayer    = try readPartial(at: paths.userFileURL)
         let adminLayer   = try readPartial(at: paths.effectiveAdminFileURL)

@@ -210,6 +210,13 @@ public final class AppState {
     /// so MCP `panel.set_view_mode` switches the file panel between list
     /// and tree views without a wire-level push (mcp_file.mdx §3).
     private var viewModeWatcher: FileWatcher?
+    /// Watches `~/Library/Application Support/ImageGlass_Mac/slideshow.txt`
+    /// so MCP `set_slideshow` calls drive `SlideshowController` without a
+    /// direct cross-module call (slideshow.mdx §12).
+    private var slideshowWatcher: FileWatcher?
+    /// `corr=` value of the last applied slideshow.txt — used to dedupe
+    /// re-fires when the FileWatcher coalesces events.
+    private var lastSlideshowCorr: String = ""
     /// Watches `~/Library/Application Support/ImageGlass_Mac/` (the parent
     /// directory) so that when the MCP server process writes `directories.yaml`
     /// the GUI app notices and schedules walks for any newly-added roots.
@@ -270,6 +277,12 @@ public final class AppState {
             // else happens to share the left column.
             reconcilePanelsWithSettings()
             panelLayout.startWatching()
+            // docs/performance.mdx §5.4 / §7.8 — wrap the directory-load
+            // kickoff so the analyzer can see the cost of restoring the
+            // user's persisted roots and scheduling their walks. Scope
+            // evaluation itself is instrumented separately (see
+            // ScopeEvaluator) — do not double-instrument here.
+            let _loadDirsTrace = PerformanceLog.shared.start("AppLaunch.LoadDirectories")
             let bootstrapped = try storage.bootstrapIfNeeded()
             // mcp_file.mdx §1.3 — first launch leaves an empty
             // `directories.yaml` so the panel has a defined state.
@@ -290,6 +303,7 @@ public final class AppState {
             startWatching()
             startSelectionWatcher()
             startViewModeWatcher()
+            startSlideshowWatcher()
             startDirectoryTreeWalkerObserver()
             startDirectoriesFileWatcher()
             writeHeartbeat()
@@ -305,6 +319,10 @@ public final class AppState {
                     root: root.path, filter: root.filter, corr: corr
                 )
             }
+            _loadDirsTrace.finish(extra: [
+                ("roots", String(storedRoots.count)),
+                ("scope", bootstrapped),
+            ])
             // Restore the last image the user previewed (saved on
             // every selection via `lastSelectedFileKey`). Runs after
             // `activate()` so it can override the scope's first-file
@@ -742,7 +760,7 @@ public final class AppState {
         // still see whatever roots the walker already has (e.g. when
         // bootstrap scheduled walks that finish synchronously on a
         // tiny test fixture).
-        walkerRoots = DirectoryTreeWalker.shared.snapshot()
+        refreshWalkerRoots()
 
         directoryDidChangeToken = NotificationCenter.default.addObserver(
             forName: DirectoryTreeWalker.didChangeNotification,
@@ -751,7 +769,7 @@ public final class AppState {
         ) { [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
-                self.walkerRoots = DirectoryTreeWalker.shared.snapshot()
+                self.refreshWalkerRoots()
             }
         }
 
@@ -852,6 +870,11 @@ public final class AppState {
     /// * New root → `scheduleWalk` (background walk + FS watch)
     /// * Removed root → `removeRoot` (watcher torn down, tree dropped)
     /// * Filter changed → `refilter` (in-memory recompute, no re-walk)
+    ///
+    /// include_checks.mdx §5.7 — also merges the YAML's
+    /// `defaultIncludeState` and `includeOverrides[]` into
+    /// `walkerRoots` via `refreshWalkerRoots()` so an external
+    /// (MCP-driven) include-state change paints the column immediately.
     private func reloadDirectoriesFromDisk() {
         let file = (try? DirectoriesStore.shared.load()) ?? DirectoriesFile()
         directoriesRootCount = file.roots.count
@@ -875,6 +898,39 @@ public final class AppState {
         for path in currentByPath.keys where !filePaths.contains(path) {
             DirectoryTreeWalker.shared.removeRoot(path: path)
         }
+        // include_checks.mdx §5.7 — merge YAML include state into
+        // walkerRoots. The walker's snapshot only carries
+        // tree+filter+lastWalked; the include override fields live in
+        // the YAML and have to be glued on here.
+        refreshWalkerRoots()
+    }
+
+    /// include_checks.mdx §5.6 — rebuild `walkerRoots` by taking the
+    /// walker's tree snapshot and grafting the YAML's
+    /// `defaultIncludeState` + `includeOverrides[]` onto each matching
+    /// entry. The walker is the source of truth for the *file tree
+    /// structure*; `directories.yaml` is the source of truth for the
+    /// include state. The panel binds to `walkerRoots`, so this merge
+    /// is the single place the two halves meet.
+    public func refreshWalkerRoots() {
+        let snapshot = DirectoryTreeWalker.shared.snapshot()
+        let yaml = (try? DirectoriesStore.shared.load()) ?? DirectoriesFile()
+        var overridesByPath: [URL: (IncludeState, [IncludeOverrideEntry])] = [:]
+        for r in yaml.roots {
+            overridesByPath[r.path] = (r.defaultIncludeState, r.includeOverrides)
+        }
+        let merged: [RootDirectory] = snapshot.map { walked in
+            guard let yamlForRoot = overridesByPath[walked.path] else { return walked }
+            return RootDirectory(
+                path: walked.path,
+                filter: walked.filter,
+                lastWalked: walked.lastWalked,
+                tree: walked.tree,
+                defaultIncludeState: yamlForRoot.0,
+                includeOverrides: yamlForRoot.1
+            )
+        }
+        self.walkerRoots = merged
     }
 
     private func startViewModeWatcher() {
@@ -902,6 +958,64 @@ public final class AppState {
         }
         w.start()
         self.viewModeWatcher = w
+    }
+
+    /// slideshow.mdx §12 — the MCP `set_slideshow` tool writes
+    /// `slideshow.txt`. The GUI reads `on=<bool> corr=<id>
+    /// [interval=<sec>]` and routes the toggle through
+    /// `SlideshowController`. A one-shot `interval` is applied for the
+    /// current run only — it is not persisted to `settings.json`.
+    private func startSlideshowWatcher() {
+        slideshowWatcher?.cancel()
+        let url = AppPaths.macAppSupportDir.appendingPathComponent("slideshow.txt")
+        // Do not pre-seed the file: an empty slideshow.txt at startup
+        // must not retroactively trigger a toggle. The watcher only
+        // fires on writes that arrive after launch.
+        let w = FileWatcher(url: url) { [weak self] in
+            Task { @MainActor in
+                guard let self else { return }
+                guard let data = try? Data(contentsOf: url),
+                      let raw = String(data: data, encoding: .utf8) else { return }
+                let line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !line.isEmpty else { return }
+                // Parse whitespace-separated key=value tokens.
+                var on: Bool? = nil
+                var interval: Double? = nil
+                var corr: String = ""
+                for token in line.split(whereSeparator: { $0.isWhitespace }) {
+                    let kv = token.split(separator: "=", maxSplits: 1)
+                    guard kv.count == 2 else { continue }
+                    let key = String(kv[0])
+                    let val = String(kv[1])
+                    switch key {
+                    case "on":       on = (val == "true")
+                    case "interval": interval = Double(val)
+                    case "corr":     corr = val
+                    default:         break
+                    }
+                }
+                guard let on else { return }
+                // Dedup: kqueue can re-fire on identical writes.
+                if !corr.isEmpty, corr == self.lastSlideshowCorr { return }
+                self.lastSlideshowCorr = corr
+                if on {
+                    let seconds = interval
+                        ?? self.settings.slideshow.interval_seconds
+                    SlideshowController.shared.start(
+                        appState: self,
+                        seconds: seconds,
+                        source: "mcp:set_slideshow"
+                    )
+                } else {
+                    SlideshowController.shared.stop(
+                        reason: "user_toggle",
+                        source: "mcp:set_slideshow"
+                    )
+                }
+            }
+        }
+        w.start()
+        self.slideshowWatcher = w
     }
 
     private func startWatching() {
@@ -953,10 +1067,17 @@ public final class AppState {
     /// depth-first **folder order** — exactly the order the tree shows — so
     /// Up/Down/Left/Right step through images in folder order. Falls back to
     /// the scope's `resolvedFiles` when there are no walker roots.
+    ///
+    /// include_checks.mdx §10.4 — when walker roots exist, excluded
+    /// files are dropped from the navigation order so the arrow keys
+    /// skip past them. The panel still renders them (with a red-X
+    /// swatch), so the user can later cycle them back to `include`.
     public var orderedNavigationFiles: [String] {
-        walkerRoots.isEmpty
-            ? resolvedFiles
-            : DirectoryFilenamePanel.flattenVisible(walkerRoots)
+        guard !walkerRoots.isEmpty else { return resolvedFiles }
+        let roots = walkerRoots
+        return DirectoryFilenamePanel.flattenVisible(roots).filter {
+            SlideshowController.isInScope(path: $0, roots: roots)
+        }
     }
 
     /// Move selection to the previous file in folder order.

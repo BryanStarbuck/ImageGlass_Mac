@@ -81,6 +81,8 @@ public final class ViewerState {
     public init() {}
 
     public func resetView() {
+        let _trace = PerformanceLog.shared.start("Viewer.StateUpdate", extra: [("op", "resetView")])
+        defer { _trace.finish() }
         panOffset = .zero
         lockedZoom = 1.0
         rotationQuarterTurns = 0
@@ -89,50 +91,72 @@ public final class ViewerState {
     }
 
     public func rotateClockwise() {
+        let _trace = PerformanceLog.shared.start("Viewer.StateUpdate", extra: [("op", "rotateClockwise")])
+        defer { _trace.finish() }
         rotationQuarterTurns = (rotationQuarterTurns + 1) & 3
     }
 
     public func rotateCounterClockwise() {
+        let _trace = PerformanceLog.shared.start("Viewer.StateUpdate", extra: [("op", "rotateCounterClockwise")])
+        defer { _trace.finish() }
         rotationQuarterTurns = (rotationQuarterTurns + 3) & 3
     }
 
-    public func toggleFlipHorizontal() { flipHorizontal.toggle() }
-    public func toggleFlipVertical()   { flipVertical.toggle() }
+    public func toggleFlipHorizontal() {
+        let _trace = PerformanceLog.shared.start("Viewer.StateUpdate", extra: [("op", "toggleFlipHorizontal")])
+        defer { _trace.finish() }
+        flipHorizontal.toggle()
+    }
+    public func toggleFlipVertical() {
+        let _trace = PerformanceLog.shared.start("Viewer.StateUpdate", extra: [("op", "toggleFlipVertical")])
+        defer { _trace.finish() }
+        flipVertical.toggle()
+    }
 
     /// Multiplicative zoom step for ⌘+/⌘- and the bare `+` / `-` keys.
     /// hotkeys.mdx §5 — "by about 20%". The actual percent is read from
     /// `Settings.viewer.zoom_step_percent` at the call site; this constant
     /// is just the spec default used when nothing supplies one.
-    public static let defaultZoomStepPercent: Double = 20
+    /// `nonisolated` so the default-argument expression on `zoomIn` /
+    /// `zoomOut` doesn't trip Swift 6 actor isolation.
+    public nonisolated static let defaultZoomStepPercent: Double = 20
 
     /// UserDefaults key — hotkeys.mdx §6.5. Updated on every zoomMode
     /// helper call so a Settings ▸ Viewer ▸ *Default zoom on open* =
     /// *Restore last mode* can pick up where the user left off.
-    public static let lastZoomModeKey = "ig.viewer.last_zoom_mode"
+    public nonisolated static let lastZoomModeKey = "ig.viewer.last_zoom_mode"
 
     private func persistMode(_ mode: ZoomMode) {
         UserDefaults.standard.set(mode.rawValue, forKey: Self.lastZoomModeKey)
     }
 
     public func zoomIn(stepPercent: Double = ViewerState.defaultZoomStepPercent) {
+        let _trace = PerformanceLog.shared.start("Viewer.StateUpdate", extra: [("op", "zoomIn")])
+        defer { _trace.finish() }
         let mul = 1.0 + max(stepPercent, 1) / 100
         lockedZoom = ZoomMath.clamp(lockedZoom * CGFloat(mul))
         zoomMode = .lock
         persistMode(.lock)
     }
     public func zoomOut(stepPercent: Double = ViewerState.defaultZoomStepPercent) {
+        let _trace = PerformanceLog.shared.start("Viewer.StateUpdate", extra: [("op", "zoomOut")])
+        defer { _trace.finish() }
         let mul = 1.0 + max(stepPercent, 1) / 100
         lockedZoom = ZoomMath.clamp(lockedZoom / CGFloat(mul))
         zoomMode = .lock
         persistMode(.lock)
     }
     public func zoomToActual() {
+        let _trace = PerformanceLog.shared.start("Viewer.StateUpdate", extra: [("op", "zoomToActual")])
+        defer { _trace.finish() }
         lockedZoom = 1.0; zoomMode = .lock; panOffset = .zero
         persistMode(.lock)
     }
 
     /// `Z` — fit the whole image, recentered.
     public func zoomToFit() {
+        let _trace = PerformanceLog.shared.start("Viewer.StateUpdate", extra: [("op", "zoomToFit")])
+        defer { _trace.finish() }
         zoomMode = .fit
         panOffset = .zero
         pendingScrollToTop = false
@@ -143,6 +167,8 @@ public final class ViewerState {
     /// The actual top-align happens in the canvas on the next display pass
     /// (it owns viewport size). hotkeys.mdx §6.1.
     public func zoomToWidth() {
+        let _trace = PerformanceLog.shared.start("Viewer.StateUpdate", extra: [("op", "zoomToWidth")])
+        defer { _trace.finish() }
         zoomMode = .width
         panOffset = .zero
         pendingScrollToTop = true
@@ -152,6 +178,8 @@ public final class ViewerState {
     /// `C` — recenter the image without changing the zoom factor. Pan offset
     /// = .zero is the centered position; zoomMode is preserved. hotkeys.mdx §5.
     public func centerImage() {
+        let _trace = PerformanceLog.shared.start("Viewer.StateUpdate", extra: [("op", "centerImage")])
+        defer { _trace.finish() }
         panOffset = .zero
         pendingScrollToTop = false
     }
@@ -163,6 +191,8 @@ public final class ViewerState {
         mode: DefaultZoomOnOpen = .fit,
         lastMode: ZoomMode? = nil
     ) {
+        let _trace = PerformanceLog.shared.start("Viewer.StateUpdate", extra: [("op", "normalizeZoom")])
+        defer { _trace.finish() }
         switch mode {
         case .fit:    zoomToFit()
         case .actual: zoomToActual()
@@ -183,6 +213,8 @@ public final class ViewerState {
     /// The canvas converts the fraction into points using its own bounds
     /// on the next display pass. hotkeys.mdx §4.3.
     public func requestPan(dx: CGFloat, dy: CGFloat) {
+        let _trace = PerformanceLog.shared.start("Viewer.StateUpdate", extra: [("op", "requestPan")])
+        defer { _trace.finish() }
         pendingPanFraction = CGSize(
             width:  pendingPanFraction.width  + dx,
             height: pendingPanFraction.height + dy
@@ -191,12 +223,20 @@ public final class ViewerState {
 
     // Frame navigation (multi-frame stills + paused animations).
     public func nextFrame() {
+        let _trace = PerformanceLog.shared.start("Viewer.StateUpdate", extra: [("op", "nextFrame")])
+        defer { _trace.finish() }
         guard frameCount > 1 else { return }
         currentFrameIndex = (currentFrameIndex + 1) % frameCount
     }
     public func previousFrame() {
+        let _trace = PerformanceLog.shared.start("Viewer.StateUpdate", extra: [("op", "previousFrame")])
+        defer { _trace.finish() }
         guard frameCount > 1 else { return }
         currentFrameIndex = (currentFrameIndex - 1 + frameCount) % frameCount
     }
-    public func toggleAnimationPaused() { isAnimationPaused.toggle() }
+    public func toggleAnimationPaused() {
+        let _trace = PerformanceLog.shared.start("Viewer.StateUpdate", extra: [("op", "toggleAnimationPaused")])
+        defer { _trace.finish() }
+        isAnimationPaused.toggle()
+    }
 }

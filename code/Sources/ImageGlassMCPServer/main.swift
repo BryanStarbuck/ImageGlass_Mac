@@ -7,6 +7,14 @@ import ImageGlassCore
 //
 // Spec §5: transport is stdio. Diagnostics go to stderr only.
 
+// docs/performance.mdx §5.6 / §10.12 — `MCP.Server.Boot` covers the
+// full startup path (ensure dirs, ensure stores, construct server,
+// hand off to its event loop). Emitted as both an event (the marker
+// that the process has gotten past bootstrap) and an interval (the
+// elapsed time the bootstrap consumed).
+PerformanceLog.shared.event("MCP.Server.Boot")
+let _bootTrace = PerformanceLog.shared.start("MCP.Server.Boot")
+
 do {
     try AppPaths.ensureDirectories()
     try AppPaths.ensureMacDirectories()
@@ -20,4 +28,5 @@ do {
 }
 
 let server = MCPServer()
+_bootTrace.finish()
 server.run()

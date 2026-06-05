@@ -27,6 +27,11 @@ public enum GitLFSPointer {
     /// True when `url` points at a Git LFS pointer file instead of the real
     /// asset bytes. Cheap to call: reads only the first 64 bytes.
     public static func isPointer(at url: URL) -> Bool {
+        let _trace = PerformanceLog.shared.start(
+            "Image.LFSDetect",
+            extra: [("path", url.path)]
+        )
+        defer { _trace.finish() }
         guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
         defer { try? handle.close() }
         let prefix = (try? handle.read(upToCount: sniffByteCount)) ?? Data()

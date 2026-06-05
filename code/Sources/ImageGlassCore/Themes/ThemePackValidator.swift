@@ -68,6 +68,11 @@ public enum ThemePackValidator {
     /// Returns the list of issues found in `pack`. Empty array means the
     /// pack passes every check.
     public static func validate(_ pack: ThemePack) -> [ThemePackIssue] {
+        let _trace = PerformanceLog.shared.start(
+            "Theme.Validate",
+            extra: [("pack", pack.folderName)]
+        )
+        defer { _trace.finish() }
         var issues: [ThemePackIssue] = []
 
         // 1. Folder-name convention `<theme-name>.<author-name>`.

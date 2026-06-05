@@ -132,7 +132,9 @@ public enum CharterStatus {
     /// Safe to call from any context; performs only in-memory work plus
     /// an optional Local Storage round-trip in a temporary scratch scope.
     public static func report() -> CharterStatusReport {
-        CharterStatusReport(goals: [
+        let _trace = PerformanceLog.shared.start("Charter.ComputeStatus")
+        defer { _trace.finish() }
+        return CharterStatusReport(goals: [
             evaluateMCPSupport(),
             evaluateModularPanels(),
             evaluateScopeControls(),

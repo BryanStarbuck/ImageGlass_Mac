@@ -82,6 +82,11 @@ public struct SVGCanvasView: View {
     }
 
     private func reload() {
+        let _trace = PerformanceLog.shared.start(
+            "SVG.Render",
+            extra: [("path", path)]
+        )
+        defer { _trace.finish() }
         let url = URL(fileURLWithPath: AppPaths.expandTilde(path))
         plan = controller.load(url)
     }

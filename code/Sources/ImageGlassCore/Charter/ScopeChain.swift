@@ -44,6 +44,11 @@ public enum ScopeChain {
 
     /// Compose `scope` with everything it references.
     public static func compose(_ scope: Scope, loaders: Loaders = Loaders()) -> Effective {
+        let _trace = PerformanceLog.shared.start(
+            "Scope.EvaluateChain",
+            extra: [("scope", scope.name)]
+        )
+        defer { _trace.finish() }
         var visited = Set<String>()
         var sources: [String] = []
         var include = Scope.IncludeRules(

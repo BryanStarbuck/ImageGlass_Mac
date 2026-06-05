@@ -244,3 +244,54 @@ list contains the bootstrap scope `crop-live`.
 ## Upstream
 
 Based on [d2phap/ImageGlass](https://github.com/d2phap/ImageGlass), licensed under GPL v3.
+
+## Hotkeys
+
+Hotkeys fire when the viewer or the Directory Panel has keyboard
+focus. They are inert while a text field, search field, or rename
+field has focus. The canonical specification is
+[`docs/hotkeys.mdx`](./docs/hotkeys.mdx); the menu-bar `⌘`-prefixed
+twins are in [`docs/menus.mdx`](./docs/menus.mdx).
+
+### Navigation
+
+| Key | Action |
+|-----|--------|
+| **↑** | Previous file in the resolved list. |
+| **↓** | Next file in the resolved list. |
+| **←** | Collapse folder, or step out to parent. |
+| **→** | Expand folder, or step into first child. |
+| **⌃ ↑** / **⌃ ↓** | Pan the visible image up / down by 15% of the viewport. |
+| **⌃ ←** / **⌃ →** | Pan the visible image left / right by 15% of the viewport. |
+| **Home** / **End** | Jump to the first / last visible row in the Directory Panel. |
+
+### Zoom
+
+| Key | Action |
+|-----|--------|
+| **`+`** / **`=`** | Zoom in 20%. |
+| **`-`** | Zoom out 20%. |
+| **`C`** | Re-center the image in the viewport. |
+| **`N`** | Normalize — snap to the default zoom mode (Settings ▸ Viewer). |
+| **`Z`** | Zoom to Fit (longer dimension fits viewport). |
+| **`W`** | Zoom to Width (image width = viewport width, scrolled to top). |
+
+### Clipboard Paths
+
+| Key | Action |
+|-----|--------|
+| **`P`** | **Copy Path** — put the absolute path of the current file on the clipboard. In-viewer twin of File ▸ Copy File Path (`⌃⌘C`). |
+| **`L`** | **Load From Clipboard** — read a file path (or `file://` URL) from the clipboard and open it in the viewer. A directory path is added to the active scope instead. Local files only; `http://` / `https://` are rejected. |
+
+### Slideshow and File Actions
+
+| Key | Action |
+|-----|--------|
+| **␣** (Space) | Toggle slideshow on the current scope. |
+| **⌫** | Move the selected file to Trash (confirm). |
+
+### Reserved
+
+`F` is reserved for Zoom to Fill in v2 and unbound today. Hotkey
+rebinding (Settings ▸ Keybindings) is also a v2 feature; v1 ships
+the bindings above as fixed defaults.

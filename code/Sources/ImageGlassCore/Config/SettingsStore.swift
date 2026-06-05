@@ -52,6 +52,8 @@ public actor SettingsStore {
     /// Returns `Settings.defaults` if the file is missing. Throws only on
     /// malformed JSON; an out-of-range numeric is clamped silently.
     public func load() throws -> Settings {
+        let _trace = PerformanceLog.shared.start("Settings.Load")
+        defer { _trace.finish() }
         let fm = FileManager.default
         guard fm.fileExists(atPath: paths.fileURL.path) else {
             return Settings.defaults
@@ -80,6 +82,8 @@ public actor SettingsStore {
     /// Atomic save: write a temp file in the target directory then rename.
     /// On success, rotates the prior `settings.json` to `settings.json.bak`.
     public func save(_ settings: Settings) throws {
+        let _trace = PerformanceLog.shared.start("Settings.Save")
+        defer { _trace.finish() }
         try paths.ensureDirectory()
         var copy = settings
         SettingsValidation.clamp(&copy)
@@ -125,6 +129,8 @@ public actor SettingsStore {
     /// store re-validates and writes back atomically. Returns the new value.
     @discardableResult
     public func update(_ mutate: (inout Settings) throws -> Void) throws -> Settings {
+        let _trace = PerformanceLog.shared.start("Settings.MutateAndPersist")
+        defer { _trace.finish() }
         var current: Settings
         do {
             current = try load()

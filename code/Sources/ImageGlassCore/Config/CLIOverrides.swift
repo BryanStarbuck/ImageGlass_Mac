@@ -50,6 +50,8 @@ public struct CLIOverrides: Equatable, Sendable {
     /// **not** skipped — pass `Array(CommandLine.arguments.dropFirst())`
     /// when calling from `main`.
     public static func parse(_ args: [String]) -> CLIOverrides {
+        let _trace = PerformanceLog.shared.start("Config.ApplyCLIOverrides")
+        defer { _trace.finish() }
         var partial = Config.Partial()
         var positional: [String] = []
         var rawPairs: [(name: String, value: String)] = []

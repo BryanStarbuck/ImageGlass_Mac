@@ -108,6 +108,9 @@ final class WindowStateController: NSObject {
     /// absolute target frame, clamps it to the visible rect, and applies
     /// it to the window. Restores zoomed + fullscreen flags.
     private func applyRestoredFrame(to window: NSWindow) {
+        // docs/performance.mdx §5.4 / §10.12 — `Window.ApplyState`.
+        let _trace = PerformanceLog.shared.start("Window.ApplyState")
+        defer { _trace.finish() }
         guard let saved = appState?.settings.window else { return }
 
         let targetScreen = WindowDisplayResolver.screen(forUUID: saved.display_id)

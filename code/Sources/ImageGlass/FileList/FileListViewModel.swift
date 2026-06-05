@@ -79,6 +79,11 @@ public final class FileListViewModel {
     // MARK: - View-state mutators
 
     public func setViewMode(_ mode: FileListViewMode) {
+        let _trace = PerformanceLog.shared.start(
+            "FileTree.SetViewMode",
+            extra: [("mode", String(describing: mode))]
+        )
+        defer { _trace.finish() }
         viewMode = mode
     }
 
@@ -87,6 +92,15 @@ public final class FileListViewModel {
     }
 
     public func setSort(field: FileListSortField, direction: FileListSortDirection) {
+        let _trace = PerformanceLog.shared.start(
+            "FileTree.Reload",
+            extra: [
+                ("source", "setSort"),
+                ("field", String(describing: field)),
+                ("dir", String(describing: direction)),
+            ]
+        )
+        defer { _trace.finish() }
         sortDescriptor = FileListSortDescriptor(
             field: field,
             direction: direction,
@@ -95,12 +109,22 @@ public final class FileListViewModel {
     }
 
     public func setFilter(_ text: String) {
+        let _trace = PerformanceLog.shared.start(
+            "FileTree.Reload",
+            extra: [("source", "setFilter")]
+        )
+        defer { _trace.finish() }
         filterText = text
     }
 
     // MARK: - Selection mutators
 
     public func click(_ path: String, loadInViewer: Bool = true) {
+        let _trace = PerformanceLog.shared.start(
+            "FileTree.SelectionChange",
+            extra: [("path", path), ("source", "click")]
+        )
+        defer { _trace.finish() }
         applySelection(.click(path))
         if loadInViewer && isPrimary {
             onLoadInViewer?(path)
@@ -108,31 +132,66 @@ public final class FileListViewModel {
     }
 
     public func shiftClick(_ path: String) {
+        let _trace = PerformanceLog.shared.start(
+            "FileTree.SelectionChange",
+            extra: [("path", path), ("source", "shiftClick")]
+        )
+        defer { _trace.finish() }
         applySelection(.shiftClick(path))
     }
 
     public func cmdClick(_ path: String) {
+        let _trace = PerformanceLog.shared.start(
+            "FileTree.SelectionChange",
+            extra: [("path", path), ("source", "cmdClick")]
+        )
+        defer { _trace.finish() }
         applySelection(.cmdClick(path))
     }
 
     public func selectAll() {
+        let _trace = PerformanceLog.shared.start(
+            "FileTree.SelectionChange",
+            extra: [("source", "selectAll")]
+        )
+        defer { _trace.finish() }
         applySelection(.selectAll)
     }
 
     public func clearSelection() {
+        let _trace = PerformanceLog.shared.start(
+            "FileTree.SelectionChange",
+            extra: [("source", "clear")]
+        )
+        defer { _trace.finish() }
         applySelection(.clear)
     }
 
     public func moveFocus(by offset: Int, extending: Bool = false) {
+        let _trace = PerformanceLog.shared.start(
+            "FileTree.FocusChange",
+            extra: [
+                ("offset", String(offset)),
+                ("extending", String(extending)),
+            ]
+        )
+        defer { _trace.finish() }
         applySelection(.moveFocus(offset: offset, extending: extending))
     }
 
     /// Used by MCP `select_files`.
     public func setSelection(paths: [String]) {
+        let _trace = PerformanceLog.shared.start(
+            "FileTree.SelectionChange",
+            extra: [("count", String(paths.count)), ("source", "setSelection")]
+        )
+        defer { _trace.finish() }
         applySelection(.setMany(paths))
     }
 
     private func applySelection(_ action: FileListSelectionAction) {
+        let _trace = PerformanceLog.shared.start("FileTree.SelectionCommit")
+        defer { _trace.finish() }
         let next = FileListSelection.apply(action, to: selectionState, visible: visiblePaths)
         selectionState = next
         onSelectionChanged?(next)
@@ -165,6 +224,14 @@ public final class FileListViewModel {
     /// Rebuild a per-source tree for Tree mode. Spec §2.5. Cached — see above.
     public func buildTree() -> [FileListTreeNode] {
         if let cachedTree { return cachedTree }
+        let _trace = PerformanceLog.shared.start(
+            "FileTree.BuildTree",
+            extra: [
+                ("entries", String(visibleEntries.count)),
+                ("sources", String(sourceDirectories.count)),
+            ]
+        )
+        defer { _trace.finish() }
         let tree = FileListTreeBuilder.build(
             entries: visibleEntries,
             sourceDirectories: sourceDirectories
@@ -176,6 +243,11 @@ public final class FileListViewModel {
     // MARK: - Private
 
     private func rebuildEntries() {
+        let _trace = PerformanceLog.shared.start(
+            "FileTree.Reload",
+            extra: [("source", "rebuildEntries"), ("count", String(resolvedPaths.count))]
+        )
+        defer { _trace.finish() }
         let dirs = sourceDirectories
         var out: [FileEntry] = []
         out.reserveCapacity(resolvedPaths.count)
@@ -192,6 +264,11 @@ public final class FileListViewModel {
     }
 
     private func rebuildVisible() {
+        let _trace = PerformanceLog.shared.start(
+            "FileTree.BuildVisibleEntries",
+            extra: [("count", String(entries.count))]
+        )
+        defer { _trace.finish() }
         cachedTree = nil   // visible set is changing — drop the Tree-mode cache.
         let sorted = FileListSorter.sort(entries, by: sortDescriptor)
         let filtered = FileListSorter.filter(sorted, text: filterText)

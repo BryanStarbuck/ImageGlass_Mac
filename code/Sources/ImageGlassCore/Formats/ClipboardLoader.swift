@@ -42,6 +42,11 @@ public enum ClipboardLoader {
     public static func loadFromClipboard(
         pasteboard: NSPasteboard = .general
     ) -> PasteResult {
+        // §5.2 `Image.Load.Clipboard` — the user-perceived clipboard paste
+        // path. Nested `Image.Load.<format>` + decode traces emitted by
+        // `FormatLoader` will appear inside this interval.
+        let _trace = PerformanceLog.shared.start("Image.Load.Clipboard")
+        defer { _trace.finish() }
         // (1) File URLs.
         let urls = readFileURLs(pasteboard)
         if let firstImageURL = urls.first(where: { FormatRegistry.shared.format(forURL: $0) != nil }) {

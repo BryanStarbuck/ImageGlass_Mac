@@ -51,6 +51,8 @@ public final class LayoutStore: @unchecked Sendable {
     /// validation, fall back to `layout.json.bak`; if that also fails, return
     /// the built-in default preset and log the failure. Spec §6.3.
     public func load() -> PanelLayout {
+        let _trace = PerformanceLog.shared.start("Layout.Load")
+        defer { _trace.finish() }
         lock.lock()
         defer { lock.unlock() }
         do {
@@ -101,6 +103,9 @@ public final class LayoutStore: @unchecked Sendable {
     /// Persist the layout. Validates first; throws if invalid (so a buggy
     /// caller never corrupts the on-disk state). Spec §6.3.
     public func save(_ layout: PanelLayout) throws {
+        let _trace = PerformanceLog.shared.start("Layout.Save",
+            extra: [("preset", layout.activePreset)])
+        defer { _trace.finish() }
         lock.lock()
         defer { lock.unlock() }
         if let reason = PanelLayoutValidator.validate(layout) {

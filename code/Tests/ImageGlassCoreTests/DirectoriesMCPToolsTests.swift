@@ -407,4 +407,352 @@ final class DirectoriesMCPToolsTests: XCTestCase {
         XCTAssertEqual(hi.priority, 1000)
         XCTAssertEqual(lo.priority, -1000)
     }
+
+    // ──────────────────────────────────────────────────────────────
+    // mcp_and_filters_on_dirs.mdx §4.5 — stable item ids
+    // ──────────────────────────────────────────────────────────────
+
+    func testItemIdIsStableForEqualItems() {
+        let a = RootFilterItem(pattern: "*_dn_*", kind: .glob,
+                               negate: true, priority: 0)
+        let b = RootFilterItem(pattern: "*_dn_*", kind: .glob,
+                               negate: true, priority: 0)
+        XCTAssertEqual(a.id, b.id, "same content ⇒ same id")
+        XCTAssertEqual(a.id.count, 6, "id is 6 hex chars")
+    }
+
+    func testItemIdChangesOnAnyField() {
+        let base = RootFilterItem(pattern: "*_dn_*", kind: .glob,
+                                  negate: true, priority: 0)
+        let differentPattern = RootFilterItem(pattern: "*_DN_*", kind: .glob,
+                                              negate: true, priority: 0)
+        let differentKind = RootFilterItem(pattern: "*_dn_*", kind: .substring,
+                                           negate: true, priority: 0)
+        let differentNegate = RootFilterItem(pattern: "*_dn_*", kind: .glob,
+                                             negate: false, priority: 0)
+        let differentPriority = RootFilterItem(pattern: "*_dn_*", kind: .glob,
+                                               negate: true, priority: 10)
+        XCTAssertNotEqual(base.id, differentPattern.id)
+        XCTAssertNotEqual(base.id, differentKind.id)
+        XCTAssertNotEqual(base.id, differentNegate.id)
+        XCTAssertNotEqual(base.id, differentPriority.id)
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // mcp_and_filters_on_dirs.mdx §3.6 — schema_version lazy upgrade
+    // ──────────────────────────────────────────────────────────────
+
+    func testSchemaStaysAtV1WithoutPriorities() throws {
+        let beach = tmpDir.appendingPathComponent("beach")
+        try FileManager.default.createDirectory(at: beach, withIntermediateDirectories: true)
+        _ = try tools.call(name: "add_directory", arguments: ["path": beach.path])
+        _ = try tools.call(name: "set_global_filter", arguments: [
+            "filter": [
+                "items": [
+                    ["pattern": "*_dn_*", "negate": true] as [String: Any],
+                ] as [Any],
+            ] as [String: Any],
+        ])
+        let yaml = try String(contentsOf: dirsFile)
+        XCTAssertTrue(yaml.contains("schema_version: 1"),
+                      "no priority ⇒ schema stays at 1 (byte-stable round-trip)")
+    }
+
+    func testSchemaUpgradesToV2OnPriorityUse() throws {
+        let beach = tmpDir.appendingPathComponent("beach")
+        try FileManager.default.createDirectory(at: beach, withIntermediateDirectories: true)
+        _ = try tools.call(name: "add_directory", arguments: ["path": beach.path])
+        _ = try tools.call(name: "add_filter_item", arguments: [
+            "targets": "all",
+            "item": [
+                "pattern": "hero_dn_logo.png",
+                "negate": false,
+                "priority": 10,
+            ] as [String: Any],
+        ])
+        let yaml = try String(contentsOf: dirsFile)
+        XCTAssertTrue(yaml.contains("schema_version: 2"),
+                      "first non-default priority bumps the file to v2")
+        XCTAssertTrue(yaml.contains("priority: 10"))
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // mcp_and_filters_on_dirs.mdx §5A / §5B — add_filter_item
+    // ──────────────────────────────────────────────────────────────
+
+    func testAddFilterItemAppendsToAllRoots() throws {
+        let beach = tmpDir.appendingPathComponent("beach")
+        let mountains = tmpDir.appendingPathComponent("mountains")
+        for d in [beach, mountains] {
+            try FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+            _ = try tools.call(name: "add_directory", arguments: ["path": d.path])
+        }
+        _ = try tools.call(name: "add_filter_item", arguments: [
+            "targets": "all",
+            "item": ["pattern": "*_dn_*", "negate": true] as [String: Any],
+        ])
+        let loaded = try store.load()
+        for root in loaded.roots {
+            XCTAssertEqual(root.filter.items.count, 1)
+            XCTAssertEqual(root.filter.items[0].pattern, "*_dn_*")
+            XCTAssertTrue(root.filter.items[0].negate)
+        }
+    }
+
+    func testAddFilterItemIsIdempotent() throws {
+        let beach = tmpDir.appendingPathComponent("beach")
+        try FileManager.default.createDirectory(at: beach, withIntermediateDirectories: true)
+        _ = try tools.call(name: "add_directory", arguments: ["path": beach.path])
+        let payload: [String: Any?] = [
+            "targets": "all",
+            "item": ["pattern": "*_dn_*", "negate": true] as [String: Any],
+        ]
+        _ = try tools.call(name: "add_filter_item", arguments: payload)
+        _ = try tools.call(name: "add_filter_item", arguments: payload)
+        let loaded = try store.load()
+        XCTAssertEqual(loaded.roots[0].filter.items.count, 1,
+                       "second add of the same item must not duplicate")
+    }
+
+    func testAddFilterItemSingleTargetLeavesOthersUntouched() throws {
+        let beach = tmpDir.appendingPathComponent("beach")
+        let mountains = tmpDir.appendingPathComponent("mountains")
+        for d in [beach, mountains] {
+            try FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+            _ = try tools.call(name: "add_directory", arguments: ["path": d.path])
+        }
+        _ = try tools.call(name: "add_filter_item", arguments: [
+            "targets": beach.path,
+            "item": ["pattern": "*_WIP_*", "negate": true] as [String: Any],
+        ])
+        let loaded = try store.load()
+        let beachRoot = loaded.roots.first { $0.path.path == beach.path }!
+        let mountainsRoot = loaded.roots.first { $0.path.path == mountains.path }!
+        XCTAssertEqual(beachRoot.filter.items.count, 1)
+        XCTAssertEqual(mountainsRoot.filter.items.count, 0,
+                       "single-target add must not touch unrelated roots")
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // mcp_and_filters_on_dirs.mdx §5D — remove_filter_item
+    // ──────────────────────────────────────────────────────────────
+
+    func testRemoveFilterItemByPattern() throws {
+        let beach = tmpDir.appendingPathComponent("beach")
+        try FileManager.default.createDirectory(at: beach, withIntermediateDirectories: true)
+        _ = try tools.call(name: "add_directory", arguments: ["path": beach.path])
+        _ = try tools.call(name: "add_filter_item", arguments: [
+            "targets": "all",
+            "item": ["pattern": "*_dn_*", "negate": true] as [String: Any],
+        ])
+        _ = try tools.call(name: "remove_filter_item", arguments: [
+            "targets": "all",
+            "match": ["pattern": "*_dn_*"] as [String: Any],
+        ])
+        let loaded = try store.load()
+        XCTAssertEqual(loaded.roots[0].filter.items.count, 0,
+                       "remove_filter_item by pattern must drop the item")
+    }
+
+    func testRemoveFilterItemById() throws {
+        let beach = tmpDir.appendingPathComponent("beach")
+        try FileManager.default.createDirectory(at: beach, withIntermediateDirectories: true)
+        _ = try tools.call(name: "add_directory", arguments: ["path": beach.path])
+        let item = RootFilterItem(pattern: "*_dn_*", kind: .glob, negate: true)
+        _ = try tools.call(name: "add_filter_item", arguments: [
+            "targets": "all",
+            "item": ["pattern": item.pattern, "negate": true] as [String: Any],
+        ])
+        _ = try tools.call(name: "remove_filter_item", arguments: [
+            "targets": "all",
+            "match": ["id": item.id] as [String: Any],
+        ])
+        let loaded = try store.load()
+        XCTAssertEqual(loaded.roots[0].filter.items.count, 0)
+    }
+
+    func testRemoveFilterItemRequiresExactlyOneMatchField() throws {
+        let beach = tmpDir.appendingPathComponent("beach")
+        try FileManager.default.createDirectory(at: beach, withIntermediateDirectories: true)
+        _ = try tools.call(name: "add_directory", arguments: ["path": beach.path])
+        let result = try tools.call(name: "remove_filter_item", arguments: [
+            "targets": "all",
+            "match": [
+                "pattern": "*_dn_*",
+                "id": "abc123",
+            ] as [String: Any],
+        ])
+        XCTAssertEqual(result.isError, true,
+                       "two match fields ⇒ invalid_match")
+        let log = try String(contentsOf: logFile)
+        XCTAssertTrue(log.contains("err=invalid_match"))
+    }
+
+    func testRemoveFilterItemNoMatchIsCleanNoOp() throws {
+        let beach = tmpDir.appendingPathComponent("beach")
+        try FileManager.default.createDirectory(at: beach, withIntermediateDirectories: true)
+        _ = try tools.call(name: "add_directory", arguments: ["path": beach.path])
+        _ = try tools.call(name: "add_filter_item", arguments: [
+            "targets": "all",
+            "item": ["pattern": "*_dn_*", "negate": true] as [String: Any],
+        ])
+        let result = try tools.call(name: "remove_filter_item", arguments: [
+            "targets": "all",
+            "match": ["pattern": "*_does_not_match_anything_*"] as [String: Any],
+        ])
+        XCTAssertNotEqual(result.isError, true,
+                          "no match ⇒ clean ok=true, not an error")
+        let loaded = try store.load()
+        XCTAssertEqual(loaded.roots[0].filter.items.count, 1,
+                       "no-match must not remove anything")
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // mcp_and_filters_on_dirs.mdx §5E — list_filter_items
+    // ──────────────────────────────────────────────────────────────
+
+    func testListFilterItemsReturnsSortedByPriority() throws {
+        let beach = tmpDir.appendingPathComponent("beach")
+        try FileManager.default.createDirectory(at: beach, withIntermediateDirectories: true)
+        _ = try tools.call(name: "add_directory", arguments: ["path": beach.path])
+        // Insert in reverse priority order — list should sort.
+        _ = try tools.call(name: "add_filter_item", arguments: [
+            "targets": "all",
+            "item": ["pattern": "*_dn_*", "negate": true, "priority": 0] as [String: Any],
+        ])
+        _ = try tools.call(name: "add_filter_item", arguments: [
+            "targets": "all",
+            "item": [
+                "pattern": "hero_dn_logo.png",
+                "negate": false,
+                "priority": 10,
+            ] as [String: Any],
+        ])
+        let result = try tools.call(name: "list_filter_items", arguments: [:])
+        // The result content is a single text block with JSON inside.
+        let body = result.content.first?.text ?? ""
+        let dnIdx   = body.range(of: "*_dn_*")?.lowerBound
+        let heroIdx = body.range(of: "hero_dn_logo.png")?.lowerBound
+        XCTAssertNotNil(dnIdx)
+        XCTAssertNotNil(heroIdx)
+        if let h = heroIdx, let d = dnIdx {
+            XCTAssertTrue(h < d, "highest priority item appears first")
+        }
+        // Each item carries its derived id.
+        XCTAssertTrue(body.contains("\"id\""), "items_by_root entries expose `id`")
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // mcp_and_filters_on_dirs.mdx §4.3 — targets argument
+    // ──────────────────────────────────────────────────────────────
+
+    func testTargetsAllAppliesToEveryRoot() throws {
+        let beach = tmpDir.appendingPathComponent("beach")
+        let mountains = tmpDir.appendingPathComponent("mountains")
+        for d in [beach, mountains] {
+            try FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+            _ = try tools.call(name: "add_directory", arguments: ["path": d.path])
+        }
+        _ = try tools.call(name: "set_global_filter", arguments: [
+            "filter": [
+                "items": [["pattern": "*.jpg"]] as [Any],
+            ] as [String: Any],
+            "targets": "all",
+        ])
+        let loaded = try store.load()
+        for r in loaded.roots {
+            XCTAssertEqual(r.filter.items.first?.pattern, "*.jpg")
+        }
+    }
+
+    func testTargetsArrayLimitsScope() throws {
+        let beach = tmpDir.appendingPathComponent("beach")
+        let mountains = tmpDir.appendingPathComponent("mountains")
+        let cities = tmpDir.appendingPathComponent("cities")
+        for d in [beach, mountains, cities] {
+            try FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+            _ = try tools.call(name: "add_directory", arguments: ["path": d.path])
+        }
+        _ = try tools.call(name: "set_global_filter", arguments: [
+            "filter": [
+                "items": [["pattern": "*.png"]] as [Any],
+            ] as [String: Any],
+            "targets": [beach.path, mountains.path] as [String],
+        ])
+        let loaded = try store.load()
+        let beachRoot = loaded.roots.first { $0.path.path == beach.path }!
+        let mountainsRoot = loaded.roots.first { $0.path.path == mountains.path }!
+        let citiesRoot = loaded.roots.first { $0.path.path == cities.path }!
+        XCTAssertEqual(beachRoot.filter.items.first?.pattern, "*.png")
+        XCTAssertEqual(mountainsRoot.filter.items.first?.pattern, "*.png")
+        XCTAssertEqual(citiesRoot.filter.items.count, 0,
+                       "array targets must not touch roots outside the list")
+    }
+
+    func testTargetsArrayWithUnknownPathRejectsAll() throws {
+        let beach = tmpDir.appendingPathComponent("beach")
+        try FileManager.default.createDirectory(at: beach, withIntermediateDirectories: true)
+        _ = try tools.call(name: "add_directory", arguments: ["path": beach.path])
+        let result = try tools.call(name: "set_global_filter", arguments: [
+            "filter": ["items": [["pattern": "*.png"]] as [Any]] as [String: Any],
+            "targets": [beach.path, tmpDir.appendingPathComponent("nope").path] as [String],
+        ])
+        XCTAssertEqual(result.isError, true,
+                       "any unknown path in targets array ⇒ whole call fails (§4.6)")
+        // Beach root must be unchanged (atomic across targets).
+        let loaded = try store.load()
+        XCTAssertEqual(loaded.roots[0].filter.items.count, 0,
+                       "atomic-across-targets means no partial application")
+    }
+
+    func testUpdateDirectoryFilterPathAndTargetsConflict() throws {
+        let beach = tmpDir.appendingPathComponent("beach")
+        try FileManager.default.createDirectory(at: beach, withIntermediateDirectories: true)
+        _ = try tools.call(name: "add_directory", arguments: ["path": beach.path])
+        let result = try tools.call(name: "update_directory_filter", arguments: [
+            "path": beach.path,
+            "targets": "all",
+            "filter": ["items": [] as [Any]] as [String: Any],
+        ])
+        XCTAssertEqual(result.isError, true)
+        let log = try String(contentsOf: logFile)
+        XCTAssertTrue(log.contains("err=conflicting_arguments"))
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // mcp_and_filters_on_dirs.mdx §6 — hide-empty-directories toggle
+    // ──────────────────────────────────────────────────────────────
+
+    func testHideEmptyDirectoriesRoundTrip() throws {
+        // Point the prefs file at the test tmpDir so we don't touch
+        // the user's real ~/Library/Application Support state and
+        // poison their app. AppPaths uses macAppSupportDir; here we
+        // overlay HOME so the tool's writes land under tmpDir.
+        let originalHome = ProcessInfo.processInfo.environment["HOME"]
+        setenv("HOME", tmpDir.path, 1)
+        defer { if let h = originalHome { setenv("HOME", h, 1) } }
+
+        // Defaults to false when the flag file does not exist.
+        let initial = try tools.call(name: "get_hide_empty_directories",
+                                     arguments: [:])
+        let initialText = initial.content.first?.text ?? ""
+        // Pretty-printed JSON uses " : " (space around colon), so we
+        // assert on a regex-friendly substring rather than an exact
+        // formatting.
+        XCTAssertTrue(initialText.contains("\"enabled\"") && initialText.contains("false"),
+                      "default get must report enabled: false")
+
+        _ = try tools.call(name: "set_hide_empty_directories",
+                           arguments: ["enabled": true])
+
+        let after = try tools.call(name: "get_hide_empty_directories",
+                                   arguments: [:])
+        let afterText = after.content.first?.text ?? ""
+        XCTAssertTrue(afterText.contains("\"enabled\"") && afterText.contains("true"),
+                      "post-set get must report enabled: true")
+
+        let log = try String(contentsOf: logFile)
+        XCTAssertTrue(log.contains("tool=mcp.set_hide_empty_directories"))
+        XCTAssertTrue(log.contains("enabled=true"))
+    }
 }

@@ -49,6 +49,18 @@ public enum Base64Loader {
 
     /// Decode `text` and pipe the resulting bytes through `FormatLoader`.
     public static func loadFromBase64(text: String) throws -> LoadedImage {
+        // §5.2 `Image.Load.Base64` — the user-perceived entry point for a
+        // pasted base64 blob. The inner `FormatLoader.load(data:)` will
+        // emit its own `Image.Load.<format>` + decode traces, nested
+        // under this one.
+        let _trace = PerformanceLog.shared.start(
+            "Image.Load.Base64",
+            extra: [
+                ("source", "text"),
+                ("text_chars", String(text.count)),
+            ]
+        )
+        defer { _trace.finish() }
         let data = try decodeData(from: text)
         return try FormatLoader.load(data: data)
     }
@@ -56,6 +68,17 @@ public enum Base64Loader {
     /// Convenience: read a `.txt` (or any text file) from disk, treat its
     /// contents as base64, and decode.
     public static func loadFromBase64File(url: URL) throws -> LoadedImage {
+        // §5.2 `Image.Load.Base64` — file-on-disk variant. We instrument
+        // the disk path separately so the analyzer can tell apart the
+        // pasted vs. file-loaded base64 workflows.
+        let _trace = PerformanceLog.shared.start(
+            "Image.Load.Base64",
+            extra: [
+                ("source", "file"),
+                ("path", url.path),
+            ]
+        )
+        defer { _trace.finish() }
         guard FileManager.default.fileExists(atPath: url.path) else {
             throw FormatLoaderError.fileNotFound(url)
         }

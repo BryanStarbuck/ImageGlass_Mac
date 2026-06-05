@@ -115,14 +115,37 @@ see in Finder.
 
 ### 3.3 Expand / Collapse
 
-* Initial state: roots are **expanded**, immediate subdirectories are
-  **collapsed**, except when a subdirectory contains the currently
-  selected file (that path is auto-expanded so the selection is
-  visible).
+* Initial state on **first launch** (or after a reset): roots are
+  **expanded**, immediate subdirectories are **collapsed**, except
+  when a subdirectory contains the currently selected file (that
+  path is auto-expanded so the selection is visible).
 * Disclosure triangles follow standard `OutlineGroup` /
   `NSOutlineView` behavior.
 * `⌥`-click on a disclosure triangle expands or collapses the entire
   subtree, matching Finder.
+
+#### 3.3.1 Persistence Across Launches
+
+Every directory the user expands or collapses is recorded in the
+session-state block in `settings.yaml` (see `local_storage.mdx`
+§4.2.1) under `session.directory_panel.expanded_paths`. The map is
+keyed by absolute POSIX path; the value is `true` (expanded) or
+`false` (collapsed). On the next launch the tree is materialized
+with the same disclosure state — what the user opened stays open,
+what they collapsed stays collapsed.
+
+* A directory the user has **never touched** does not appear in
+  `expanded_paths` and falls back to the §3.3 default rule.
+* A path that no longer exists at launch time (e.g., the user
+  deleted the folder) is silently dropped from the map on the next
+  save.
+* `⌥`-click on a disclosure triangle records the entire subtree
+  state, not just the clicked row — every descendant directory
+  whose disclosure state changed is updated in the map atomically.
+* The expansion map is part of the **save-on-quit** session block.
+  It is not journaled mid-session; a crash loses at most the
+  disclosure changes the user made since the last debounced
+  settings write.
 
 ---
 
@@ -191,6 +214,192 @@ When the Preview Panel is also visible, the selection in the Directory
 Panel and the Preview Panel is **the same selection**. Changing one
 changes the other. Both reflect the viewer's current image at all
 times.
+
+### 5.4 Global Cursor — Viewer and Tree Are Always in Sync
+
+There is exactly **one** "currently selected file" in the app at any
+moment. That single cursor lives in `AppState.selectedFile` and is the
+authority that drives both the viewer's loaded image and the highlighted
+row in the Directory Panel tree. Whenever the cursor moves — for *any*
+reason — the tree must scroll the row into view and highlight it.
+
+The cursor moves through several channels, and the tree highlight is
+required to follow every one of them:
+
+| Cursor source | Tree must… |
+| --- | --- |
+| User clicks a file row in the tree | Highlight the clicked row (trivially — the click itself moved the cursor). |
+| User presses `↑` / `↓` / `←` / `→` per §5.2 | Highlight the newly cursor'd row and ensure it is scrolled into view. |
+| **Slideshow advances to the next image** (timer-driven, see `menus.mdx` View ▸ Slideshow) | Highlight the slideshow's new file. The tree advances row-for-row in lock-step with the slideshow — never lags, never sits on the previous file. |
+| User clicks in the Preview Panel | Highlight the corresponding tree row (per §5.3). |
+| MCP `select_file` call (`mcp.mdx` §6) | Highlight the row that the external tool selected. |
+| File-system watcher removes the current file | Cursor moves to the nearest surviving sibling (§4.1); tree highlight follows. |
+| Drag-and-drop or "Load From Clipboard" loads an ad-hoc file outside the scope (§5A.2 of `hotkeys.mdx`) | Tree clears its highlight and shows the italic "(ad-hoc)" header — the cursor is *not* in the tree's resolved list, so no row is highlighted. |
+
+Implementation contract:
+
+* The slideshow timer mutates `AppState.selectedFile` exactly the same
+  way `↓` does. There is no separate "slideshow cursor." This is what
+  guarantees the tree row, the Preview Panel, and the viewer all stay
+  on the same image without per-surface bookkeeping.
+* The tree subscribes to `AppState.selectedFile` via SwiftUI
+  `@Observable` and reacts by (a) setting the row's selected state and
+  (b) calling `proxy.scrollTo(id, anchor: .center)` when the row is
+  outside the visible viewport. The auto-scroll target is **center**,
+  not **top**, so the user can see what is coming next and what just
+  played.
+* When the cursored file lives inside a currently-collapsed subtree
+  (e.g., the slideshow crossed a folder boundary), the path from the
+  active root down to the file is auto-expanded so the row can be
+  highlighted. This is the same auto-expand rule used in §3.3 for first
+  launch. Auto-expanded directories *are* recorded in
+  `session.directory_panel.expanded_paths` per §3.3.1 — if the user
+  collapses them again later, that collapse sticks.
+* The auto-scroll is debounced at 60 Hz max. During a fast slideshow
+  (sub-second intervals on a 10k-file scope) the tree still tracks but
+  does not thrash `NSOutlineView` row layout.
+
+This is the only acceptable behavior: a user who switches their gaze
+from the image canvas to the Directory Panel mid-slideshow must see the
+highlighted row exactly match what is on the canvas. Anything else
+makes the tree a stale, untrustworthy navigation surface.
+
+---
+
+## 5A. Default Focus and Hover-Routed Pointer Gestures
+
+§5.4 defines *which file* is selected. This section defines *which
+surface* receives the next keystroke when the user is not editing text.
+
+### 5A.1 The Three Focus Surfaces
+
+At any moment, exactly one of the following surfaces holds the keyboard
+first-responder:
+
+1. **The image canvas** (`MTKView` / `ImageCanvasView`).
+2. **The Directory Panel tree**, with the cursor on the currently
+   selected file row.
+3. **The filter text field** in the panel toolbar (`list_of_files.mdx`
+   §3A — the `⌕ filter` input).
+
+Other text fields (rename, search-in-settings) are folded into category
+3 — any focused text input behaves the same way for the routing rules
+below.
+
+### 5A.2 Default Focus Is the Tree, Not the Filter Field
+
+On app launch, after dismissing a sheet, after closing Preferences, and
+after the user clicks anywhere in the main window that is **not** the
+filter field, the focus defaults to **the Directory Panel tree row of
+the currently selected file** — *not* the filter field, and *not* the
+image canvas.
+
+The reason is hotkey routing. Single-letter hotkeys — `S` (toggle
+slideshow), `Z` (Zoom to Fit), `W` (Zoom to Width), `C` (Center), `N`
+(Normalize), `+` / `-` (zoom in/out), `P` (Copy Path), `L` (Load From
+Clipboard) — are the fast muscle-memory keys defined in
+`hotkeys.mdx` §5. They only fire when the focused surface is the viewer
+**or** the Directory Panel (see `hotkeys.mdx` §3). If the filter field
+silently held focus, those bare letters would type into the filter
+instead of firing the action, which is a confusing footgun.
+
+By defaulting focus to the tree:
+
+* `S` toggles slideshow, `Z` fits to viewport, `+` zooms in — they
+  always fire, with no "click the image first" ritual.
+* `↑` and `↓` walk the resolved file list per §5.2 — the most-used keys
+  in the app — and the user does not have to switch focus before using
+  them.
+* The Directory Panel cursor row is visible and highlighted (per §5.4),
+  so the user has a clear visual anchor for where focus lives.
+
+The filter field acquires focus **only** when the user explicitly
+clicks it, presses `⌘ F` (`list_of_files.mdx` §4.5), or tabs into it.
+While focus is in the filter field:
+
+* Letter keys type into the filter — including `S`, `Z`, `W`, `+`, etc.
+  This is the standard text-input behavior and is correct.
+* Arrow keys move the text caret within the filter string, not the
+  file selection. This is also standard.
+* **Escape** returns focus to the Directory Panel tree on the current
+  cursor row. (The filter text is preserved; only focus moves.)
+* **Return / Enter** commits the filter (no-op since filters apply
+  live) and returns focus to the tree, same way Escape does.
+
+After any of those exits, focus is back on the tree row, and bare
+letter hotkeys work again.
+
+### 5A.3 Pointer Hover Overrides Focus for Pointer-Originated Gestures
+
+Keyboard focus and pointer events are different routing planes. The
+rule is:
+
+* **Keyboard events** route to the focused surface (per §5A.2).
+* **Pointer events** — trackpad scroll, mouse-wheel scroll, pinch /
+  `MagnifyGesture`, two-finger pan, click — route to the surface
+  **under the pointer**, regardless of keyboard focus.
+
+This matters specifically for **zoom via trackpad two-finger scroll**
+(when the user has bound the scroll wheel to zoom in Settings ▸ Viewer
+▸ *Mouse wheel*, per `hotkeys.mdx` §5.2) and **pinch-to-zoom**. When
+the user's pointer is hovering over the image canvas, trackpad scroll
+zooms the image — even though keyboard focus is on the Directory Panel
+tree row.
+
+Concretely, all of the following must work without the user clicking
+the canvas first:
+
+* Pointer over canvas, focus on tree row, **two-finger scroll up** →
+  the viewer zooms in.
+* Pointer over canvas, focus on tree row, **pinch-out** → the viewer
+  zooms in smoothly (`MagnifyGesture`).
+* Pointer over canvas, focus on tree row, **two-finger pan after
+  zooming in** → the viewer pans.
+* Pointer over canvas, focus on filter field (user just typed), pinch
+  or scroll-zoom still fires on the canvas. (The filter field does not
+  consume pointer events that originated outside its bounds.)
+* Pointer over a tree row, focus on tree row, **two-finger scroll** →
+  the tree scrolls. This is the inverse case: pointer over the tree
+  scrolls the tree, not the viewer. Matches the §5.2 rule that scroll
+  is pass-through and does not change the selection.
+
+Implementation contract:
+
+* The image canvas owns `NSView.scrollWheel(with:)` and the
+  `MagnifyGesture` SwiftUI modifier. AppKit's native hit-testing
+  delivers the event to the view under the pointer, independent of
+  first-responder state, which is exactly what we want.
+* No code path may funnel pointer events through the first-responder
+  chain (e.g., do not promote `MagnifyGesture` to a window-level
+  shortcut). That would re-introduce the "click the image first" bug.
+* The tree's own scroll view (`NSScrollView` wrapping `NSOutlineView`)
+  must not swallow trackpad events that started outside its frame —
+  AppKit handles this correctly by default, so the requirement here is
+  to *not* override it.
+
+### 5A.4 Acceptance Criteria for §5A
+
+The focus and pointer-routing model is considered v1-complete when:
+
+1. Opening the app with a populated scope leaves focus on the tree row
+   of `AppState.selectedFile`. Pressing `S` immediately toggles the
+   slideshow; pressing `Z` immediately fits the image. Neither types
+   into the filter field.
+2. Clicking the filter field, typing, and pressing **Escape** returns
+   focus to the tree row. Pressing `S` after Escape toggles the
+   slideshow.
+3. With focus on the tree row, moving the pointer over the canvas and
+   two-finger scrolling zooms the image (when scroll-to-zoom is
+   enabled). Pinch on the trackpad zooms the image smoothly via
+   `MagnifyGesture`. Neither action changes which file is selected.
+4. With focus on the tree row, moving the pointer over a tree row and
+   two-finger scrolling scrolls the tree. The viewer's zoom does not
+   change. The selected file does not change.
+5. During a running slideshow, the tree row highlight advances in
+   lock-step with the viewer (per §5.4). The user can take focus into
+   the filter field, type a query, press Escape, and the tree row is
+   still highlighting whichever file the slideshow most recently
+   advanced to.
 
 ---
 

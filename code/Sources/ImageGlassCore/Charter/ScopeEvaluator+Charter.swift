@@ -21,6 +21,11 @@ public extension ScopeEvaluator {
         chainLoaders: ScopeChain.Loaders = .init(),
         auditLog: ScopeAuditLog? = ScopeAuditLog.shared
     ) -> Scope {
+        let _trace = PerformanceLog.shared.start(
+            "Scope.EvaluateCharter",
+            extra: [("scope", scope.name)]
+        )
+        defer { _trace.finish() }
         let effective = ScopeChain.compose(scope, loaders: chainLoaders)
 
         // Build a synthetic scope that carries only the effective rules,

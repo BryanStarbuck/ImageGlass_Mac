@@ -63,6 +63,12 @@ public final class ExternalToolStorage {
     // MARK: - Read / Write
 
     public func loadTool(_ id: String) throws -> ExternalTool {
+        // §5.6 `ExternalTool.StoreLoad` — one JSON file read + decode.
+        let _trace = PerformanceLog.shared.start(
+            "ExternalTool.StoreLoad",
+            extra: [("tool", id)]
+        )
+        defer { _trace.finish() }
         try ExternalToolId.validate(id)
         let url = toolURL(for: id)
         guard FileManager.default.fileExists(atPath: url.path) else {
@@ -75,6 +81,13 @@ public final class ExternalToolStorage {
     }
 
     public func saveTool(_ tool: ExternalTool) throws {
+        // §5.6 `ExternalTool.StoreSave` — encode + atomic write (rename
+        // includes fsync, which is the dominant cost on most filesystems).
+        let _trace = PerformanceLog.shared.start(
+            "ExternalTool.StoreSave",
+            extra: [("tool", tool.id)]
+        )
+        defer { _trace.finish() }
         try ExternalToolId.validate(tool.id)
         try AppPaths.ensureDirectories()
         let url = toolURL(for: tool.id)

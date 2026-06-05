@@ -72,6 +72,8 @@ public final class ThemeStore {
     /// Refresh the catalog from disk and apply the persisted selections.
     /// Safe to call multiple times.
     public func bootstrap() {
+        let _trace = PerformanceLog.shared.start("Theme.Load")
+        defer { _trace.finish() }
         do {
             try AppPaths.ensureThemesDirectory()
         } catch {
@@ -167,6 +169,8 @@ public final class ThemeStore {
     /// Returns `false` if the name is unknown.
     @discardableResult
     public func setCurrentTheme(byName name: String) -> Bool {
+        let _trace = PerformanceLog.shared.start("Theme.Switch", extra: [("theme", name)])
+        defer { _trace.finish() }
         guard let theme = lookup(name) else { return false }
         if theme.settings.isDarkMode {
             darkTheme = theme

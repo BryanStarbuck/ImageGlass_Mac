@@ -89,6 +89,11 @@ public struct ThemePack: Equatable, Sendable {
     /// Load a theme pack from an unpacked theme folder containing
     /// `igtheme.json`. Use ``ThemeInstaller`` to handle `.igtheme` archives.
     public static func load(fromFolder folder: URL) throws -> ThemePack {
+        let _trace = PerformanceLog.shared.start(
+            "Theme.LoadPack",
+            extra: [("folder", folder.lastPathComponent)]
+        )
+        defer { _trace.finish() }
         let manifestURL = folder.appendingPathComponent("igtheme.json")
         guard FileManager.default.fileExists(atPath: manifestURL.path) else {
             throw ThemePackError.manifestMissing(folder: folder)

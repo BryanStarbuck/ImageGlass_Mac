@@ -84,6 +84,11 @@ public struct UpdateChecker: Sendable {
     /// "Check for Updates…" menu item passes `force: true` because the user
     /// is explicitly asking.
     public func check(force: Bool = false) async throws -> UpdateCheckResult {
+        let _trace = PerformanceLog.shared.start(
+            "Releases.CheckForUpdate",
+            extra: [("channel", channel.rawValue), ("force", String(force))]
+        )
+        defer { _trace.finish() }
         if !force && !isEnabled {
             throw UpdateCheckError.disabledByPolicy
         }

@@ -28,6 +28,14 @@ public struct ScopeDiff: Codable, Equatable, Sendable {
 
     /// Compute a diff from two file lists. Order-independent.
     public static func between(previous: [String], current: [String]) -> ScopeDiff {
+        let _trace = PerformanceLog.shared.start(
+            "Scope.Diff",
+            extra: [
+                ("before", String(previous.count)),
+                ("after", String(current.count)),
+            ]
+        )
+        defer { _trace.finish() }
         let prev = Set(previous)
         let curr = Set(current)
         return ScopeDiff(

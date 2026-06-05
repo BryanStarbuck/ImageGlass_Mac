@@ -16,12 +16,32 @@ public final class DirectoriesStore: @unchecked Sendable {
     /// Optional override for tests so they can isolate the YAML file.
     public var overrideFile: URL?
 
+    /// Per-window targeting (multi_window.mdx §3.3, §4.2). When set, this
+    /// store reads/writes `directories_window_<windowID>.yaml` instead of
+    /// the legacy `directories.yaml`. Mutating MCP tools route through
+    /// `WindowRegistry` to the per-window store of the frontmost window.
+    /// Nil means "legacy v1 single-window file" — kept for the migration
+    /// window and for tests that exercise the v1 path.
+    public let windowID: Int?
+
     public init(overrideFile: URL? = nil) {
         self.overrideFile = overrideFile
+        self.windowID = nil
+    }
+
+    /// Per-window initializer (multi_window.mdx §4.2). The store's
+    /// `fileURL` resolves to `directories_window_<id>.yaml`; tests can
+    /// still override the path via `overrideFile`.
+    public init(windowID: Int, overrideFile: URL? = nil) {
+        precondition(windowID >= 1, "window_id must be >= 1")
+        self.overrideFile = overrideFile
+        self.windowID = windowID
     }
 
     public var fileURL: URL {
-        overrideFile ?? AppPaths.macDirectoriesFile
+        if let overrideFile { return overrideFile }
+        if let windowID { return AppPaths.macDirectoriesWindowFile(id: windowID) }
+        return AppPaths.macDirectoriesFile
     }
 
     private let lock = NSLock()
@@ -32,6 +52,8 @@ public final class DirectoriesStore: @unchecked Sendable {
     /// returns an empty `DirectoriesFile` (the panel's bootstrap state
     /// in §1).
     public func load() throws -> DirectoriesFile {
+        let _trace = PerformanceLog.shared.start("LocalStorage.Read.directories")
+        defer { _trace.finish() }
         lock.lock()
         defer { lock.unlock() }
         return try loadUnlocked()
@@ -39,6 +61,8 @@ public final class DirectoriesStore: @unchecked Sendable {
 
     /// Save the entire `DirectoriesFile` atomically.
     public func save(_ file: DirectoriesFile) throws {
+        let _trace = PerformanceLog.shared.start("LocalStorage.Write.directories")
+        defer { _trace.finish() }
         lock.lock()
         defer { lock.unlock() }
         try saveUnlocked(file)
@@ -90,6 +114,8 @@ public final class DirectoriesStore: @unchecked Sendable {
     /// from concurrent calls (spec §3A.10, idempotency guarantee).
     @discardableResult
     public func addRoot(path: String, filter: RootFilter = .empty) throws -> (URL, alreadyExisted: Bool) {
+        let _trace = PerformanceLog.shared.start("LocalStorage.MutateDirectories")
+        defer { _trace.finish() }
         let canonical = try Self.canonicalize(path)
         lock.lock()
         defer { lock.unlock() }
@@ -106,6 +132,8 @@ public final class DirectoriesStore: @unchecked Sendable {
     /// removed.
     @discardableResult
     public func removeRoot(path: String) throws -> Bool {
+        let _trace = PerformanceLog.shared.start("LocalStorage.MutateDirectories")
+        defer { _trace.finish() }
         let canonical = try Self.canonicalize(path, mustExist: false)
         lock.lock()
         defer { lock.unlock() }
@@ -121,6 +149,8 @@ public final class DirectoriesStore: @unchecked Sendable {
     /// unknown.
     @discardableResult
     public func updateFilter(path: String, filter: RootFilter) throws -> Bool {
+        let _trace = PerformanceLog.shared.start("LocalStorage.MutateDirectories")
+        defer { _trace.finish() }
         let canonical = try Self.canonicalize(path, mustExist: false)
         lock.lock()
         defer { lock.unlock() }
@@ -137,6 +167,8 @@ public final class DirectoriesStore: @unchecked Sendable {
     /// of roots affected.
     @discardableResult
     public func setGlobalFilter(_ filter: RootFilter) throws -> Int {
+        let _trace = PerformanceLog.shared.start("LocalStorage.MutateDirectories")
+        defer { _trace.finish() }
         lock.lock()
         defer { lock.unlock() }
         var file = (try? loadUnlocked()) ?? DirectoriesFile()
@@ -150,6 +182,8 @@ public final class DirectoriesStore: @unchecked Sendable {
 
     /// Wipe every root. Used by §9's `clear_directories`.
     public func clearAll() throws {
+        let _trace = PerformanceLog.shared.start("LocalStorage.MutateDirectories")
+        defer { _trace.finish() }
         lock.lock()
         defer { lock.unlock() }
         var file = (try? loadUnlocked()) ?? DirectoriesFile()
@@ -157,9 +191,68 @@ public final class DirectoriesStore: @unchecked Sendable {
         try saveUnlocked(file)
     }
 
+    /// include_checks.mdx §5.3 / §11.1 — set the include override for
+    /// one row. Passing `.inherit` removes the matching
+    /// `include_overrides[]` entry entirely (§5.5 — `inherit` is the
+    /// absence of an entry). Returns the resolved state after the
+    /// change so the caller can report `{ ok, resolved }` per §11.1.
+    /// `rootPath` must match a registered root; `relativePath` is the
+    /// path **relative** to that root.
+    @discardableResult
+    public func setIncludeState(
+        rootPath: URL,
+        relativePath: String,
+        state: IncludeState
+    ) throws -> IncludeState {
+        let _trace = PerformanceLog.shared.start("LocalStorage.MutateDirectories")
+        defer { _trace.finish() }
+        lock.lock()
+        defer { lock.unlock() }
+        var file = (try? loadUnlocked()) ?? DirectoriesFile()
+        guard let idx = file.roots.firstIndex(where: { $0.path == rootPath }) else {
+            throw DirectoriesStoreError.pathNotFound(rootPath.path)
+        }
+        var root = file.roots[idx]
+        let normalized = RootDirectory.normalize(relativePath)
+        root.includeOverrides.removeAll {
+            RootDirectory.normalize($0.path) == normalized
+        }
+        if state != .inherit {
+            root.includeOverrides.append(
+                IncludeOverrideEntry(path: normalized, state: state)
+            )
+        }
+        file.roots[idx] = root
+        try saveUnlocked(file)
+        return root.effectiveState(for: normalized)
+    }
+
+    /// include_checks.mdx §5.2 / §11.3 — root-level default. `inherit`
+    /// is rejected per §5.2 (the resolver needs a concrete fallback).
+    public func setDefaultIncludeState(
+        rootPath: URL,
+        state: IncludeState
+    ) throws {
+        let _trace = PerformanceLog.shared.start("LocalStorage.MutateDirectories")
+        defer { _trace.finish() }
+        guard state != .inherit else {
+            throw DirectoriesStoreError.invalidIncludeState("inherit")
+        }
+        lock.lock()
+        defer { lock.unlock() }
+        var file = (try? loadUnlocked()) ?? DirectoriesFile()
+        guard let idx = file.roots.firstIndex(where: { $0.path == rootPath }) else {
+            throw DirectoriesStoreError.pathNotFound(rootPath.path)
+        }
+        file.roots[idx].defaultIncludeState = state
+        try saveUnlocked(file)
+    }
+
     /// Update the cached `last_walked` timestamp for one root after the
     /// walker completes a pass.
     public func setLastWalked(path: URL, at date: Date) throws {
+        let _trace = PerformanceLog.shared.start("LocalStorage.MutateDirectories")
+        defer { _trace.finish() }
         lock.lock()
         defer { lock.unlock() }
         var file = (try? loadUnlocked()) ?? DirectoriesFile()
@@ -220,6 +313,11 @@ public enum DirectoriesStoreError: Error, CustomStringConvertible {
     /// matching; the MCP tool layer maps this to
     /// `err=path_separator_in_pattern`.
     case pathSeparatorInPattern(String)
+    /// include_checks.mdx §11.1 — an `state=` value outside the
+    /// three-token vocabulary, or `inherit` passed to
+    /// `set_default_include_state` (which only accepts the two
+    /// concrete states per §5.2).
+    case invalidIncludeState(String)
 
     public var description: String {
         switch self {
@@ -228,6 +326,7 @@ public enum DirectoriesStoreError: Error, CustomStringConvertible {
         case .alreadyExists(let p): return "Already a root: \(p)"
         case .invalidRegex(let p, let r): return "Invalid regex \"\(p)\": \(r)"
         case .pathSeparatorInPattern(let p): return "Pattern \"\(p)\" contains a path separator '/'; v1 filters match against the filename only (mcp_file.mdx §10B.8)."
+        case .invalidIncludeState(let v): return "Invalid include state \"\(v)\"; expected one of include / inherit / exclude (include_checks.mdx §11.1)."
         }
     }
 
@@ -241,6 +340,7 @@ public enum DirectoriesStoreError: Error, CustomStringConvertible {
         case .alreadyExists:           return "already_exists"
         case .invalidRegex:            return "invalid_regex"
         case .pathSeparatorInPattern:  return "path_separator_in_pattern"
+        case .invalidIncludeState:     return "invalid_state"
         }
     }
 }

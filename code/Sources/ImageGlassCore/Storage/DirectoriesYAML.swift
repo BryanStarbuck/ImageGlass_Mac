@@ -8,11 +8,29 @@ public struct DirectoriesFile: Sendable, Equatable {
     public var schemaVersion: Int
     public var roots: [RootDirectory]
 
-    public static let currentSchemaVersion = 1
+    /// `mcp_and_filters_on_dirs.mdx` §3.2 / §3.6. `1` is the legacy
+    /// shape; `2` adds optional `priority` per filter item. New
+    /// files stay at `1` until the engine sees a non-default
+    /// priority on any item — at which point the writer bumps to 2
+    /// (§3.6 lazy upgrade).
+    public static let legacySchemaVersion = 1
+    public static let prioritySchemaVersion = 2
+    public static let currentSchemaVersion = legacySchemaVersion
 
     public init(schemaVersion: Int = currentSchemaVersion, roots: [RootDirectory] = []) {
         self.schemaVersion = schemaVersion
         self.roots = roots
+    }
+
+    /// True if any filter item carries a non-default priority. Used
+    /// by the writer to lazily upgrade `schema_version` to 2 (§3.6).
+    public var anyItemHasNonDefaultPriority: Bool {
+        for r in roots {
+            for it in r.filter.items where it.priority != 0 {
+                return true
+            }
+        }
+        return false
     }
 }
 
@@ -35,8 +53,19 @@ public enum DirectoriesYAML {
     // MARK: - Encode
 
     public static func encode(_ file: DirectoriesFile) -> String {
+        let _trace = PerformanceLog.shared.start("LocalStorage.DirectoriesYAMLEncode")
+        defer { _trace.finish() }
         var out = ""
-        out += "schema_version: \(file.schemaVersion)\n"
+        // §3.6 lazy upgrade: bump to v2 if any item uses a non-default
+        // priority, otherwise keep the file at v1 so a no-priority
+        // round-trip is byte-identical.
+        let effectiveVersion: Int = {
+            if file.anyItemHasNonDefaultPriority {
+                return max(file.schemaVersion, DirectoriesFile.prioritySchemaVersion)
+            }
+            return file.schemaVersion
+        }()
+        out += "schema_version: \(effectiveVersion)\n"
         if file.roots.isEmpty {
             out += "root_directories: []\n"
             return out
@@ -70,10 +99,32 @@ public enum DirectoriesYAML {
                     if it.priority != 0 {
                         out += "          priority: \(it.priority)\n"
                     }
+                    // `id` (spec §4.5) is NOT emitted — it is a pure
+                    // function of `pattern + kind + negate + priority`
+                    // and is derived on demand via `RootFilterItem.id`.
+                    // Skipping it keeps existing v1 YAML byte-stable
+                    // through a no-op round-trip.
                 }
             }
             if let walked = r.lastWalked {
                 out += "    last_walked: \(iso8601(walked))\n"
+            }
+            // include_checks.mdx §5.2 — only emit when non-default
+            // so v1 → v2 upgrades stay byte-identical until the user
+            // touches an include override.
+            if r.defaultIncludeState != .include {
+                out += "    default_include_state: \(r.defaultIncludeState.rawValue)\n"
+            }
+            // include_checks.mdx §5.3 — flat list of overrides;
+            // `inherit` is never written. Empty list omits the
+            // block entirely (matching the §5.5 "absence is inherit"
+            // rule for whole-root emptiness too).
+            if !r.includeOverrides.isEmpty {
+                out += "    include_overrides:\n"
+                for o in r.includeOverrides where o.state != .inherit {
+                    out += "      - path: \(quoteIfNeeded(o.path))\n"
+                    out += "        state: \(o.state.rawValue)\n"
+                }
             }
         }
         return out
@@ -82,6 +133,8 @@ public enum DirectoriesYAML {
     // MARK: - Decode
 
     public static func decode(_ text: String) throws -> DirectoriesFile {
+        let _trace = PerformanceLog.shared.start("LocalStorage.DirectoriesYAMLDecode")
+        defer { _trace.finish() }
         let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         var schemaVersion = DirectoriesFile.currentSchemaVersion
         var roots: [RootDirectory] = []
@@ -98,12 +151,24 @@ public enum DirectoriesYAML {
         var inRootDirs = false
         var inFilter = false
         var inItems = false
+        // include_checks.mdx §5 — per-root include block.
+        var currentDefaultInclude: IncludeState = .include
+        var currentOverrides: [IncludeOverrideEntry] = []
+        var inOverrides = false
+        var currentOverride: IncludeOverrideEntry?
 
+        func flushCurrentOverride() {
+            if let o = currentOverride {
+                currentOverrides.append(o)
+                currentOverride = nil
+            }
+        }
         func flushCurrentItem() {
             if let it = currentItem { items.append(it); currentItem = nil }
         }
         func flushCurrentRoot() {
             flushCurrentItem()
+            flushCurrentOverride()
             guard let p = currentRootPath else { return }
             currentRootFilter.match = match
             currentRootFilter.items = items
@@ -112,7 +177,9 @@ public enum DirectoriesYAML {
                 path: url,
                 filter: currentRootFilter,
                 lastWalked: currentLastWalked,
-                tree: nil
+                tree: nil,
+                defaultIncludeState: currentDefaultInclude,
+                includeOverrides: currentOverrides
             ))
             currentRootPath = nil
             currentRootFilter = .empty
@@ -121,6 +188,9 @@ public enum DirectoriesYAML {
             match = .any
             inFilter = false
             inItems = false
+            currentDefaultInclude = .include
+            currentOverrides = []
+            inOverrides = false
         }
 
         for (idx, rawLine) in lines.enumerated() {
@@ -165,21 +235,61 @@ public enum DirectoriesYAML {
                 inItems = false
                 if body == "filter:" {
                     inFilter = true
+                    inOverrides = false
+                    flushCurrentOverride()
                     continue
                 }
                 if body == "filter: {}" {
                     inFilter = false
                     continue
                 }
+                if body == "include_overrides:" {
+                    inFilter = false
+                    inOverrides = true
+                    flushCurrentOverride()
+                    continue
+                }
+                if body == "include_overrides: []" {
+                    inFilter = false
+                    inOverrides = false
+                    flushCurrentOverride()
+                    currentOverrides = []
+                    continue
+                }
                 inFilter = false
+                flushCurrentOverride()
+                inOverrides = false
                 if let (k, v) = parseKeyValue(body) {
                     switch k {
                     case "path":
                         currentRootPath = v
                     case "last_walked":
                         currentLastWalked = parseISO8601(v)
+                    case "default_include_state":
+                        if let s = IncludeState(rawValue: v), s != .inherit {
+                            currentDefaultInclude = s
+                        }
                     default: break
                     }
+                }
+                continue
+            }
+
+            // include_overrides items at indent 6.
+            if inOverrides, indent == 6, body.hasPrefix("- ") {
+                flushCurrentOverride()
+                let after = String(body.dropFirst(2))
+                var entry = IncludeOverrideEntry(path: "", state: .inherit)
+                if let (k, v) = parseKeyValue(after) {
+                    applyOverride(key: k, value: v, into: &entry)
+                }
+                currentOverride = entry
+                continue
+            }
+            if inOverrides, indent >= 8, var entry = currentOverride {
+                if let (k, v) = parseKeyValue(body) {
+                    applyOverride(key: k, value: v, into: &entry)
+                    currentOverride = entry
                 }
                 continue
             }
@@ -229,6 +339,21 @@ public enum DirectoriesYAML {
     }
 
     // MARK: - Helpers
+
+    /// include_checks.mdx §5.3 — `path` and `state` fields on one
+    /// `include_overrides[]` entry.
+    private static func applyOverride(
+        key: String,
+        value: String,
+        into entry: inout IncludeOverrideEntry
+    ) {
+        switch key {
+        case "path":  entry.path = value
+        case "state":
+            if let s = IncludeState(rawValue: value) { entry.state = s }
+        default: break
+        }
+    }
 
     private static func applyItem(
         key: String,

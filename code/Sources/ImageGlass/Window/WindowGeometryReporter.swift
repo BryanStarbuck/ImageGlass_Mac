@@ -73,6 +73,14 @@ public final class WindowGeometryReporter: NSObject, NSWindowDelegate {
     /// AND on every panel show/hide so the audit trail captures both
     /// "user dragged the window" and "user closed the panel."
     public func logCurrent(reason: String) {
+        // docs/performance.mdx §5.4 / §10.12 — `Window.ReportGeometry`.
+        // Wraps every geometry snapshot so the analyzer can see how
+        // often (and how expensively) the resize-burst path fires.
+        let _trace = PerformanceLog.shared.start(
+            "Window.ReportGeometry",
+            extra: [("reason", reason)]
+        )
+        defer { _trace.finish() }
         guard let window = self.window, let state = self.appState else { return }
         let frame = window.frame
         let content = window.contentLayoutRect.size

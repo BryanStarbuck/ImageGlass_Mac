@@ -93,6 +93,20 @@ public enum FormatLoader {
         }
 
         let format = FormatRegistry.shared.format(forURL: url)
+        // Resolve a stable action label per §5.2: when we know the format,
+        // emit `Image.Load.<id>` (uppercased) so the analyzer can bucket
+        // by format. Otherwise emit the generic `Image.LoadFormat`.
+        let action: String
+        let traceExtra: [(String, String)]
+        if let f = format {
+            action = "Image.Load.\(f.id.uppercased())"
+            traceExtra = [("path", path)]
+        } else {
+            action = "Image.LoadFormat"
+            traceExtra = [("path", path), ("format", "unknown")]
+        }
+        let _outerTrace = PerformanceLog.shared.start(action, extra: traceExtra)
+        defer { _outerTrace.finish() }
 
         // Spec §"Special Input Methods": .b64 files contain base64-encoded
         // image bytes. Decode the text, then re-enter the loader with the
@@ -134,6 +148,24 @@ public enum FormatLoader {
 
         let sniffedExt = hintedExtension ?? sniffExtension(from: data)
         let format = sniffedExt.flatMap { FormatRegistry.shared.format(forExtension: $0) }
+
+        // §5.2 outer trace. Same pattern as load(url:): bucket by resolved
+        // format when known, fall through to the generic label otherwise.
+        let action: String
+        let traceExtra: [(String, String)]
+        if let f = format {
+            action = "Image.Load.\(f.id.uppercased())"
+            traceExtra = [("source", "data"), ("bytes", String(data.count))]
+        } else {
+            action = "Image.LoadFormat"
+            traceExtra = [
+                ("source", "data"),
+                ("bytes", String(data.count)),
+                ("format", sniffedExt ?? "unknown"),
+            ]
+        }
+        let _outerTrace = PerformanceLog.shared.start(action, extra: traceExtra)
+        defer { _outerTrace.finish() }
 
         if let f = format, f.needsExternalDelegate {
             do {
@@ -283,9 +315,19 @@ public enum FormatLoader {
         let options: [CFString: Any] = [
             kCGImageSourceShouldCache: false
         ]
+        // §5.2 `Image.OpenSource` — the I/O + header-parse step.
+        let _openTrace = PerformanceLog.shared.start(
+            "Image.OpenSource",
+            extra: [
+                ("path", url.path),
+                ("format", format?.id ?? "unknown"),
+            ]
+        )
         guard let source = CGImageSourceCreateWithURL(url as CFURL, options as CFDictionary) else {
+            _openTrace.finish(reason: "error")
             throw FormatLoaderError.decodingFailed("CGImageSource init failed")
         }
+        _openTrace.finish()
         return try decode(source: source, format: format, sourceURL: url)
     }
 
@@ -297,9 +339,20 @@ public enum FormatLoader {
         let options: [CFString: Any] = [
             kCGImageSourceShouldCache: false
         ]
+        // §5.2 `Image.OpenSource` — header parse on an in-memory blob.
+        let _openTrace = PerformanceLog.shared.start(
+            "Image.OpenSource",
+            extra: [
+                ("source", "data"),
+                ("bytes", String(data.count)),
+                ("format", format?.id ?? "unknown"),
+            ]
+        )
         guard let source = CGImageSourceCreateWithData(data as CFData, options as CFDictionary) else {
+            _openTrace.finish(reason: "error")
             throw FormatLoaderError.decodingFailed("CGImageSource init failed")
         }
+        _openTrace.finish()
         return try decode(source: source, format: format, sourceURL: sourceURL)
     }
 
@@ -308,11 +361,27 @@ public enum FormatLoader {
         format: FormatInfo?,
         sourceURL: URL?
     ) throws -> LoadedImage {
+        // §5.2 `Image.Decode` — the pixel decode itself. For RAW + HEIC this
+        // is the dominant cost; we want it instrumented separately so the
+        // analyzer can subtract OpenSource from Load and see how much of the
+        // remainder is real decode vs. other overhead.
+        let _decodeTrace = PerformanceLog.shared.start(
+            "Image.Decode",
+            extra: [
+                ("format", format?.id ?? "unknown"),
+                ("path", sourceURL?.path ?? ""),
+            ]
+        )
         let frameCount = max(1, CGImageSourceGetCount(source))
         guard let cg = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+            _decodeTrace.finish(reason: "error")
             throw FormatLoaderError.decodingFailed("CGImageSourceCreateImageAtIndex returned nil")
         }
         let uti = CGImageSourceGetType(source) as String?
+        _decodeTrace.finish(extra: [
+            ("decoded_pixels", String(cg.width * cg.height)),
+            ("frames", String(frameCount)),
+        ])
         return LoadedImage(
             cgImage: cg,
             pixelWidth: cg.width,

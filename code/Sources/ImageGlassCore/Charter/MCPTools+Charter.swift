@@ -175,6 +175,20 @@ public extension MCPTools {
     /// Returns `nil` when `name` is not a charter tool so the caller can fall
     /// through to the base dispatcher.
     func callCharter(name: String, arguments: [String: Any?]) throws -> MCP.CallToolResult? {
+        // Charter tool names this dispatcher recognizes. Only trace when we
+        // are actually going to handle the call so we don't double-emit a
+        // start line for tools owned by the base dispatcher.
+        let charterToolNames: Set<String> = [
+            "list_rule_sets", "get_rule_set", "create_rule_set", "delete_rule_set",
+            "attach_rule_set", "detach_rule_set",
+            "set_inheritance", "get_effective_rules",
+            "get_audit_log", "get_last_diff",
+            "export_scope", "import_scope",
+        ]
+        let _trace: PerformanceTrace? = charterToolNames.contains(name)
+            ? PerformanceLog.shared.start("MCP.ToolCall.\(name)")
+            : nil
+        defer { _trace?.finish() }
         switch name {
 
         // -- Rule sets --

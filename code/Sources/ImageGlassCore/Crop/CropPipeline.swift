@@ -98,6 +98,13 @@ public enum CropPipeline {
         options: Options
     ) throws -> Result {
 
+        let sourceFormat = inputURL.pathExtension.lowercased()
+        let _trace = PerformanceLog.shared.start(
+            "Crop.Apply",
+            extra: [("source_format", sourceFormat)]
+        )
+        defer { _trace.finish() }
+
         guard let src = CGImageSourceCreateWithURL(inputURL as CFURL, nil) else {
             throw Error.sourceUnreadable(inputURL.path)
         }

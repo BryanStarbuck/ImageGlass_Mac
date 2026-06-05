@@ -462,28 +462,35 @@ at minimum:
 
 ### 4.5 Item ids
 
-The server assigns each item a **stable 6-character id** when
-it lands in `directories.yaml`. The id is the first 6 hex chars
-of `SHA1(pattern + kind.rawValue + negate + priority)`. The id
-is **stable across saves** — a re-write of the same item gets
-the same id. This lets `remove_filter_item` reference an item
-by id when the pattern is hard to express in plain text, and
-lets `list_filter_items` produce a stable identifier the LLM
-can pass back.
+Every filter item has a **stable 6-character id** derived from
+its content. The id is the first 6 hex chars of
+`SHA1(pattern + kind.rawValue + negate + priority)`. The id is
+**stable** — re-running the SHA on the same item yields the
+same id, on any machine, in any run.
 
-Ids are written into YAML on save:
+Ids are **derived on demand**, not stored. The reasons:
 
-```yaml
-items:
-  - id: a1b2c3
-    pattern: "*_dn_*"
-    kind: glob
-    negate: true
-```
+* `directories.yaml` stays byte-stable for the no-op round-trip
+  (no `id:` lines spuriously appear in a `git diff` after a
+  read-and-rewrite).
+* Hand-edits to `directories.yaml` cannot drift from their id
+  (the SHA recomputes from the post-edit content).
+* The id has nothing to remember between saves — it is a pure
+  function.
 
-The `id` field is **read but optional** — files that omit it
-load fine; the engine assigns ids as soon as it touches the
-item.
+The MCP surface always exposes the id:
+
+* `list_filter_items` returns each item with its derived `id`.
+* `get_directory` and `list_directories` include `id` per item
+  in the returned filter object.
+* `remove_filter_item` accepts `match.id` as an alternative to
+  `match.pattern` for unambiguous targeting.
+
+If a YAML file does carry an `id:` line (e.g. hand-written by
+a user or written by an older drafter version), the parser
+accepts it but silently ignores the stored value — the in-
+memory id always reflects the current `pattern + kind + negate
++ priority`.
 
 ### 4.6 Atomicity
 

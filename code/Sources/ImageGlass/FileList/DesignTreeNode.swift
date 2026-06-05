@@ -15,6 +15,15 @@ struct DesignTreeNode: View {
     @Bindable var nav: TreeNavigator
     @Binding var selected: String?
     let matches: (String) -> Bool
+    /// include_checks.mdx §2 — every row renders a swatch keyed off
+    /// the walker root the row belongs to. Passing the roots down to
+    /// every node lets the swatch resolve the relative path + state
+    /// without reaching into AppState.
+    var walkerRoots: [RootDirectory] = []
+    /// include_checks.mdx §3.1 / §5.6 — the swatch needs to update
+    /// `state.walkerRoots` in place after persisting; the AppState
+    /// handle is the cleanest way to give it that capability.
+    var appState: AppState? = nil
 
     /// Folder-row "active cursor" highlight when the arrow keys parked
     /// on this folder without changing the viewer's file. hotkeys.mdx §4.2.
@@ -35,7 +44,9 @@ struct DesignTreeNode: View {
                         ForEach(visibleChildren) { child in
                             DesignTreeNode(node: child, depth: depth + 1,
                                            nav: nav,
-                                           selected: $selected, matches: matches)
+                                           selected: $selected, matches: matches,
+                                           walkerRoots: walkerRoots,
+                                           appState: appState)
                         }
                     }
                 }
@@ -68,10 +79,24 @@ struct DesignTreeNode: View {
             onPath: containsSelected, expanded: expanded)
             .contentShape(Rectangle())
             .onTapGesture {
+                let willExpand = !expanded
+                let action = willExpand ? "FileTree.Expand" : "FileTree.Collapse"
+                let _trace = PerformanceLog.shared.start(
+                    action,
+                    extra: [("path", node.id), ("depth", String(depth))]
+                )
+                defer { _trace.finish() }
                 withAnimation(.easeOut(duration: 0.12)) {
                     nav.toggle(node.id, depth: depth)
                 }
                 nav.activeRow = node.id
+                // include_checks.mdx §3.5 — single-selection across
+                // rows. Tapping a folder clears `selectedFile` so the
+                // previously selected file no longer paints blue.
+                // Without this the file panel showed two highlighted
+                // rows at once (last-clicked file + newly-clicked
+                // folder).
+                selected = nil
             }
     }
 
@@ -82,6 +107,11 @@ struct DesignTreeNode: View {
             .contentShape(Rectangle())
             .onTapGesture {
                 if let p = node.fullPath {
+                    let _trace = PerformanceLog.shared.start(
+                        "FileTree.SelectionChange",
+                        extra: [("path", p), ("source", "designTree")]
+                    )
+                    defer { _trace.finish() }
                     selected = p
                     nav.activeRow = p
                 }
@@ -98,33 +128,75 @@ struct DesignTreeNode: View {
             : (onPath ? IG.accentC : (isDir ? IG.textC : IG.textC))
         let iconColor: Color = isSel ? .white
             : (isDir ? IG.accentC : IG.text2C)
-        return HStack(spacing: 7) {
-            if let expanded {
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(isSel ? Color.white : IG.text3C)
-                    .rotationEffect(.degrees(expanded ? 90 : 0))
-                    .frame(width: 12)
-            } else {
-                Spacer().frame(width: 12)
+        let rowHeight: CGFloat = isDir ? 28 : 30
+        // include_checks.mdx §2 — the leftmost swatch column. Sits
+        // flush with the panel's left padding (never indented per
+        // §2.1) so every row's swatch lines up in a single column.
+        return HStack(spacing: 6) {
+            includeSwatch(rowHeight: rowHeight)
+            HStack(spacing: 7) {
+                if let expanded {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(isSel ? Color.white : IG.text3C)
+                        .rotationEffect(.degrees(expanded ? 90 : 0))
+                        .frame(width: 12)
+                } else {
+                    Spacer().frame(width: 12)
+                }
+                Image(systemName: isDir ? "folder.fill" : iconName(node.kind))
+                    .font(.system(size: 13))
+                    .foregroundStyle(iconColor)
+                    .frame(width: 16)
+                Text(name)
+                    .font(.system(size: 12.5, weight: (isDir || onPath) ? .semibold : .regular))
+                    .foregroundStyle(nameColor)
+                    .lineLimit(1).truncationMode(.middle)
+                Spacer(minLength: 0)
             }
-            Image(systemName: isDir ? "folder.fill" : iconName(node.kind))
-                .font(.system(size: 13))
-                .foregroundStyle(iconColor)
-                .frame(width: 16)
-            Text(name)
-                .font(.system(size: 12.5, weight: (isDir || onPath) ? .semibold : .regular))
-                .foregroundStyle(nameColor)
-                .lineLimit(1).truncationMode(.middle)
-            Spacer(minLength: 0)
+            .padding(.leading, CGFloat(depth) * 14)
+            .padding(.horizontal, 8)
+            .frame(height: rowHeight)
+            .background(
+                isSel ? IG.selC : (onPath ? IG.accentC.opacity(0.12) : Color.clear),
+                in: RoundedRectangle(cornerRadius: 6)
+            )
         }
-        .padding(.leading, CGFloat(depth) * 14)
-        .padding(.horizontal, 8)
-        .frame(height: isDir ? 28 : 30)
-        .background(
-            isSel ? IG.selC : (onPath ? IG.accentC.opacity(0.12) : Color.clear),
-            in: RoundedRectangle(cornerRadius: 6)
-        )
+        .padding(.leading, 4)
+    }
+
+    /// §2.1 + §2.5 — render the swatch when we can resolve a walker
+    /// root for the row; render an inert spacer when we can't (a
+    /// legacy scope-driven row that has no walker root). The spacer
+    /// preserves column alignment in the mixed case. The swatch is
+    /// sized against the file-icon height — not the row — so it does
+    /// not bloat the row's vertical extent (§2.1).
+    @ViewBuilder
+    private func includeSwatch(rowHeight: CGFloat) -> some View {
+        if let absPath = node.fullPath ?? (node.isDirectory ? node.id : nil),
+           let root = IncludeStateController.root(for: absPath, in: walkerRoots),
+           let app = appState {
+            IncludeColumnSwatch(
+                absolutePath: absPath,
+                root: root,
+                isRoot: IncludeStateController.isRoot(
+                    absolutePath: absPath, in: walkerRoots
+                ),
+                onCycle: { next in
+                    _ = IncludeStateController.setState(
+                        absolutePath: absPath,
+                        state: next,
+                        appState: app
+                    )
+                }
+            )
+            .frame(width: IncludeColumnSwatch.swatchSide,
+                   height: IncludeColumnSwatch.swatchSide)
+        } else {
+            Spacer()
+                .frame(width: IncludeColumnSwatch.swatchSide,
+                       height: IncludeColumnSwatch.swatchSide)
+        }
     }
 
     /// True when this node's subtree contains the currently selected file.

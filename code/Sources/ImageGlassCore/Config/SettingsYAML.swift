@@ -31,6 +31,8 @@ public enum SettingsYAML {
     }
 
     public static func encode<T: Encodable>(_ value: T) throws -> String {
+        let _trace = PerformanceLog.shared.start("Settings.YAMLEncode")
+        defer { _trace.finish() }
         let enc = JSONEncoder()
         enc.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         let data: Data

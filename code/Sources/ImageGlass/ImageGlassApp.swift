@@ -13,11 +13,23 @@ struct ImageGlassApp: App {
     // running `AppState`. See `AboutWindow.swift`.
     @NSApplicationDelegateAdaptor(AboutAppDelegate.self) private var aboutDelegate
 
+    /// Outer `AppLaunch.Total` trace. Started in `init()` (the earliest
+    /// measurable point of the process), finished from the main window's
+    /// first `.onAppear` after `AppLaunch.FirstFrame` is emitted. See
+    /// docs/performance.mdx §5.4.
+    private static let launchTrace: PerformanceTrace = PerformanceLog.shared.start("AppLaunch.Total")
+    private static var firstFrameFired: Bool = false
+
     // Intercept `--help` / `-h` / `/?` at process start so the user gets
     // a real CLI help message instead of a window opening; then parse the
     // remaining `/Name=Value` overrides and positional file args into the
     // initial AppState.
     init() {
+        // Touch `launchTrace` so the static-let starts the trace on the
+        // very first `App.init` (Swift lazy-initializes statics on first
+        // access). See docs/performance.mdx §5.4 / §7.8.
+        _ = Self.launchTrace
+
         let raw = Array(CommandLine.arguments.dropFirst())
         if CLIArguments.wantsHelp(raw) {
             print(CLIArguments.helpText())
@@ -34,10 +46,32 @@ struct ImageGlassApp: App {
         _state = State(wrappedValue: s)
     }
 
+    /// Called once from the main `WindowGroup`'s root view `.onAppear`.
+    /// Emits the `AppLaunch.FirstFrame` event and finishes the outer
+    /// `AppLaunch.Total` trace. Idempotent — second-window opens (e.g.
+    /// File ▸ New Window) do not re-fire the marker.
+    static func reportFirstFrame() {
+        guard !firstFrameFired else { return }
+        firstFrameFired = true
+        PerformanceLog.shared.event("AppLaunch.FirstFrame")
+        launchTrace.finish()
+    }
+
     var body: some Scene {
-        WindowGroup("ImageGlass") {
+        // `id` lets `@Environment(\.openWindow)` request a second
+        // instance from the File ▸ New Window menu item below. See
+        // `docs/use_cases/actions.mdx` §7. SwiftUI's `WindowGroup`
+        // natively supports multiple windows over the same scene; the
+        // `id:` is the addressable handle for `openWindow(id:)`.
+        WindowGroup("ImageGlass", id: "main") {
             ContentView(state: state)
                 .frame(minWidth: 900, minHeight: 600)
+                .onAppear {
+                    // docs/performance.mdx §5.4 — first frame marker.
+                    // Fires once, at the moment SwiftUI paints the
+                    // primary viewer surface for the first time.
+                    ImageGlassApp.reportFirstFrame()
+                }
                 .task {
                     registerBuiltinViewFactories(state: state)
                 }
@@ -90,13 +124,62 @@ struct ImageGlassApp: App {
                 .keyboardShortcut("R", modifiers: [.command])
             }
             CommandGroup(replacing: .newItem) {
+                // docs/use_cases/actions.mdx §7 — New Window. Spawns a
+                // second main `WindowGroup` instance via the SwiftUI
+                // `openWindow` environment action. Multi-window support
+                // is forward-compatible with the per-window state
+                // record described in §7.5.
+                NewWindowMenuItem(state: state)
+                Divider()
                 Button("Open…") { openFileDialog() }
                     .keyboardShortcut("o", modifiers: [.command])
                 Menu("Open Recent") {
                     OpenRecentMenu(state: state)
                 }
+                Divider()
+                // docs/use_cases/actions.mdx §2 — Rename Image. F2 is
+                // the Windows-style rename key; NSF2FunctionKey = 0xF705
+                // = 63237 in `NSEvent.SpecialKey` terms. Bound here so
+                // upstream-ImageGlass muscle memory carries over.
+                Button("Rename Image…") {
+                    _ = FileActions.renameViaSheet(state: state, source: .menuFile)
+                }
+                .keyboardShortcut(KeyEquivalent(Character(UnicodeScalar(0xF705)!)),
+                                  modifiers: [])
+                .disabled(state.selectedFile == nil)
+                // docs/use_cases/actions.mdx §3 — Move to Trash.
+                Button("Move Image to Trash") {
+                    _ = FileActions.moveToTrash(state: state, source: .keyCmdDelete)
+                }
+                .keyboardShortcut(.delete, modifiers: [.command])
+                .disabled(state.selectedFile == nil)
+                Divider()
+                // docs/use_cases/actions.mdx §5 — Copy File Path.
+                // ⌃⌘C is the cross-context twin of the bare `P`
+                // viewer key (handled in HotkeyHandlers).
+                Button("Copy File Path") {
+                    _ = FileActions.copyFilePath(state: state, source: .keyCtrlCmdC)
+                }
+                .keyboardShortcut("c", modifiers: [.control, .command])
+                .disabled(state.selectedFile == nil)
+                Divider()
+                // docs/use_cases/actions.mdx §6 — Print.
+                Button("Print…") {
+                    _ = FileActions.printImage(state: state, source: .keyCmdP)
+                }
+                .keyboardShortcut("p", modifiers: [.command])
+                .disabled(state.selectedFile == nil)
             }
             CommandGroup(after: .pasteboard) {
+                // docs/use_cases/actions.mdx §4 — Copy Image. The crop
+                // tool already binds ⌘C to "Copy crop"; here we route
+                // ⌥⌘C as the dedicated viewer-image copy so the two
+                // verbs do not collide while the crop sheet is open.
+                Button("Copy Image") {
+                    _ = FileActions.copyImageToClipboard(state: state, source: .keyCmdC)
+                }
+                .keyboardShortcut("c", modifiers: [.command, .option])
+                .disabled(state.selectedFile == nil)
                 Button("Paste Image / Path") { pasteFromClipboard() }
                     .keyboardShortcut("v", modifiers: [.command, .shift])
             }
@@ -235,7 +318,59 @@ struct ImageGlassApp: App {
             }
             .keyboardShortcut("o", modifiers: [.command, .option])
             .disabled(state.selectedFile == nil)
+
+            Divider()
+            // include_checks.mdx §7 — three explicit include states
+            // bound to ⌃1 / ⌃2 / ⌃3. Each item sets the state on the
+            // currently focused row (panel cursor or viewer
+            // selection). Disabled when no row is focused.
+            Button("Include") {
+                applyIncludeState(.include)
+            }
+            .keyboardShortcut("1", modifiers: [.control])
+            .disabled(focusedIncludeRow == nil)
+            Button("Inherit") {
+                applyIncludeState(.inherit)
+            }
+            .keyboardShortcut("2", modifiers: [.control])
+            // include_checks.mdx §1.0 / §7 — `Inherit` is disabled
+            // when the focused row is a root (roots are two-state).
+            .disabled(focusedIncludeRow == nil || focusedRowIsRoot)
+            Button("Don't Include") {
+                applyIncludeState(.exclude)
+            }
+            .keyboardShortcut("3", modifiers: [.control])
+            .disabled(focusedIncludeRow == nil)
         }
+    }
+
+    /// include_checks.mdx §4.1 — the row a state change should apply
+    /// to. Prefers the panel's tree-nav cursor (so the user can park
+    /// on a folder and toggle without picking a file), falls back to
+    /// the viewer's selected file.
+    private var focusedIncludeRow: String? {
+        state.treeNav.activeRow ?? state.selectedFile
+    }
+
+    /// include_checks.mdx §1.0 — true when the focused row is one of
+    /// the registered roots. Disables ⌃2 Inherit, which is the one
+    /// state the root cycle excludes.
+    private var focusedRowIsRoot: Bool {
+        guard let path = focusedIncludeRow else { return false }
+        return IncludeStateController.isRoot(absolutePath: path, in: state.walkerRoots)
+    }
+
+    /// Apply one of the three menu items' explicit states to the
+    /// focused row. Same code path as the swatch click and the `I`
+    /// hotkey — all three surfaces route through
+    /// `IncludeStateController.setState(...)`.
+    private func applyIncludeState(_ s: IncludeState) {
+        guard let path = focusedIncludeRow else { return }
+        _ = IncludeStateController.setState(
+            absolutePath: path,
+            state: s,
+            appState: state
+        )
     }
 
     /// Remove one registered root from `directories.yaml` and the live
@@ -398,9 +533,13 @@ struct ImageGlassApp: App {
                 }
             }
             Divider()
-            Button("Zoom In")     { state.viewer.zoomIn() }
+            Button("Zoom In") {
+                state.viewer.zoomIn(stepPercent: state.settings.viewer.zoom_step_percent)
+            }
                 .keyboardShortcut("+", modifiers: [.command])
-            Button("Zoom Out")    { state.viewer.zoomOut() }
+            Button("Zoom Out") {
+                state.viewer.zoomOut(stepPercent: state.settings.viewer.zoom_step_percent)
+            }
                 .keyboardShortcut("-", modifiers: [.command])
             Button("Actual Size") { state.viewer.zoomToActual() }
                 .keyboardShortcut("0", modifiers: [.command])
@@ -412,6 +551,16 @@ struct ImageGlassApp: App {
             // focus.
             Button("Zoom to Width") { state.viewer.zoomToWidth() }
                 .keyboardShortcut("9", modifiers: [.command, .option])
+            // hotkeys.mdx §7 — menu twins for the bare `C` and `N`.
+            // No menu chord; the bare-letter binding lives on the viewer.
+            Button("Center") { state.viewer.centerImage() }
+            Button("Normalize Zoom") {
+                let lastRaw = UserDefaults.standard.string(forKey: ViewerState.lastZoomModeKey)
+                state.viewer.normalizeZoom(
+                    mode: state.settings.viewer.default_zoom_on_open,
+                    lastMode: lastRaw.flatMap(ZoomMode.init(rawValue:))
+                )
+            }
             Divider()
             Button("Rotate 90° CW")  { state.viewer.rotateClockwise() }
                 .keyboardShortcut("r", modifiers: [.command, .shift])
@@ -897,6 +1046,30 @@ struct ImageGlassApp: App {
         alert.addButton(withTitle: "Cancel")
         let confirmed = alert.runModal() == .alertFirstButtonReturn
         state.svg.setAllowScripts(true, confirmed: confirmed)
+    }
+}
+
+/// `docs/use_cases/actions.mdx` §7 — File ▸ New Window. Lives in its own
+/// `View` so it can hold the `@Environment(\.openWindow)` value, which
+/// is not directly accessible inside an `App`'s `.commands` body. The
+/// shortcut is `⌘N`. The audit line is emitted by the action closure
+/// so a debugger can correlate the keystroke with the opened window.
+private struct NewWindowMenuItem: View {
+    @Bindable var state: AppState
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        Button("New Window") {
+            let corr = MCPAuditLogger.newCorrelationId()
+            openWindow(id: "main")
+            MCPAuditLogger.shared.log([
+                ("tool", "window.new"),
+                ("source", FileActions.Source.keyCmdN.rawValue),
+                ("corr", corr),
+                ("ok", "true"),
+            ])
+        }
+        .keyboardShortcut("n", modifiers: [.command])
     }
 }
 

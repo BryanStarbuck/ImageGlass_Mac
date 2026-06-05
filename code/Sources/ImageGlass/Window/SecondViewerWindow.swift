@@ -21,6 +21,9 @@ final class SecondViewerWindowController {
     var isVisible: Bool { window?.isVisible == true }
 
     func show(state: AppState) {
+        // docs/performance.mdx §5.4 / §10.12 — `Window.SecondViewer.Show`.
+        let _trace = PerformanceLog.shared.start("Window.SecondViewer.Show")
+        defer { _trace.finish() }
         if let existing = window {
             Self.placeOnMainWindowScreen(existing)
             existing.makeKeyAndOrderFront(nil)
@@ -46,6 +49,9 @@ final class SecondViewerWindowController {
     }
 
     func hide() {
+        // docs/performance.mdx §5.4 / §10.12 — `Window.SecondViewer.Hide`.
+        let _trace = PerformanceLog.shared.start("Window.SecondViewer.Hide")
+        defer { _trace.finish() }
         window?.orderOut(nil)
     }
 

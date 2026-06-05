@@ -49,6 +49,16 @@ enum IG {
     static let imgEdge    = dyn(NSColor(white: 0, alpha: 0.10), NSColor(white: 1, alpha: 0.08))
     static let mcpGreen   = hex(0x34C759)
 
+    // include_checks.mdx §2.3 — the four-variant Include column.
+    // Saturated greens/reds for explicit decisions; muted grays for
+    // inherited ones. Light + dark pairs swap luminance only — the
+    // glyph color is constant so the polarity (green check vs. red X)
+    // stays readable in both appearances.
+    static let includeGreen      = dyn(hex(0x2E7D32), hex(0x43A047))
+    static let excludeRed        = dyn(hex(0xC62828), hex(0xE53935))
+    static let inheritIncludeBg  = dyn(hex(0xB0B0B0), hex(0x5C5C5C))
+    static let inheritExcludeBg  = dyn(hex(0xEDEDED), hex(0x3A3A3A))
+
     // MARK: - SwiftUI Color accessors
 
     static var textC: Color       { Color(nsColor: text) }
@@ -68,4 +78,8 @@ enum IG {
     static var glassC: Color      { Color(nsColor: glass) }
     static var glassLineC: Color  { Color(nsColor: glassLine) }
     static var mcpGreenC: Color   { Color(nsColor: mcpGreen) }
+    static var includeGreenC: Color     { Color(nsColor: includeGreen) }
+    static var excludeRedC: Color       { Color(nsColor: excludeRed) }
+    static var inheritIncludeBgC: Color { Color(nsColor: inheritIncludeBg) }
+    static var inheritExcludeBgC: Color { Color(nsColor: inheritExcludeBg) }
 }

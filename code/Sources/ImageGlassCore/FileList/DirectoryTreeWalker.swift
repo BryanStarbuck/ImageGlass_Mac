@@ -62,6 +62,8 @@ public final class DirectoryTreeWalker: @unchecked Sendable {
     /// Returns immediately. The eventual completion writes an
     /// `app=directory.walk` line carrying `corr`.
     public func scheduleWalk(root: URL, filter: RootFilter, corr: String) {
+        let _trace = PerformanceLog.shared.start("DirectoryWalk.Schedule", extra: [("root", root.path), ("corr", corr)])
+        defer { _trace.finish() }
         queue.async { [weak self] in
             guard let self else { return }
             self.inflight[root]?.cancel()
@@ -76,6 +78,8 @@ public final class DirectoryTreeWalker: @unchecked Sendable {
     /// Drop the root from the in-memory graph and cancel any in-flight
     /// walk. Idempotent — calling on an unknown root is a no-op.
     public func removeRoot(path: URL) {
+        let _trace = PerformanceLog.shared.start("DirectoryWalk.Remove", extra: [("root", path.path)])
+        defer { _trace.finish() }
         queue.async { [weak self] in
             guard let self else { return }
             self.inflight[path]?.cancel()
@@ -92,6 +96,8 @@ public final class DirectoryTreeWalker: @unchecked Sendable {
     /// (positive = more files now visible).
     @discardableResult
     public func refilter(root: URL, filter: RootFilter) -> Int {
+        let _trace = PerformanceLog.shared.start("DirectoryWalk.Refilter", extra: [("root", root.path)])
+        defer { _trace.finish() }
         var delta = 0
         queue.sync {
             guard var r = self.roots[root] else { return }
@@ -112,6 +118,8 @@ public final class DirectoryTreeWalker: @unchecked Sendable {
     /// visible-count deltas. See §6.
     @discardableResult
     public func refilterAll(filter: RootFilter) -> Int {
+        let _trace = PerformanceLog.shared.start("DirectoryWalk.RefilterAll")
+        defer { _trace.finish() }
         var delta = 0
         queue.sync {
             for (path, var r) in self.roots {
@@ -146,14 +154,20 @@ public final class DirectoryTreeWalker: @unchecked Sendable {
     // MARK: - Walk
 
     private func runWalk(root: URL, filter: RootFilter, corr: String) async {
+        let _trace = PerformanceLog.shared.start("DirectoryWalk.Run", extra: [("root", root.path), ("corr", corr)])
+        var _fileCount = 0
+        defer { _trace.finish(extra: [("file_count", String(_fileCount))]) }
         // Log walk start immediately so a hung walk is diagnosable even
         // if the completion line never appears.
         logger.logTreeWalkStart(path: root.path, corr: corr)
 
         // Wallclock for the audit line. The walk itself runs off the
-        // queue so multiple roots walk in parallel.
+        // queue so multiple roots walk in parallel. The top-level of
+        // the root fans out across CPU cores via `walkParallel` — see
+        // docs/performance.mdx §7.2 / §10.2.
         let walkStart = Date()
-        let result = Self.walkSync(root: root, filter: filter)
+        let result = await Self.walkParallel(root: root, filter: filter)
+        _fileCount = result.fileCount
         let elapsedMs = Int(Date().timeIntervalSince(walkStart) * 1000.0)
 
         // Commit to the in-memory map and the on-disk last_walked.
@@ -208,6 +222,8 @@ public final class DirectoryTreeWalker: @unchecked Sendable {
     /// log reflects what the walker found on disk, not just what the
     /// current filter exposes.
     private func traverseAndLog(_ node: DirectoryNode, at url: URL, corr: String) {
+        let _trace = PerformanceLog.shared.start("Tree.Traverse.Log", extra: [("path", url.path)])
+        defer { _trace.finish() }
         switch node {
         case .directory(_, let children):
             logger.logTreeNode(type: "directory", path: url.path, corr: corr)
@@ -238,12 +254,147 @@ public final class DirectoryTreeWalker: @unchecked Sendable {
         return WalkResult(tree: tree, fileCount: fileCount, firstImage: firstImage)
     }
 
+    /// Parallel variant of `walkSync`. Lists the top-level children of
+    /// `root` and walks each top-level subdirectory in its own task via
+    /// `TaskGroup`. Top-level files are classified inline. The
+    /// per-subtree walk inside each task remains the synchronous
+    /// `walkDir`, so lex-ordered traversal and the visible-count
+    /// accounting are preserved at the subtree level.
+    ///
+    /// `firstImage` is re-derived from the final tree in
+    /// depth-first lexicographic order so the parallel and the
+    /// sequential implementations always agree on which file gets
+    /// auto-selected. See `docs/performance.mdx` §7.2.
+    public static func walkParallel(root: URL, filter: RootFilter) async -> WalkResult {
+        let _outer = PerformanceLog.shared.start(
+            "DirectoryWalk.Parallel",
+            extra: [("root", root.path)]
+        )
+        defer { _outer.finish() }
+
+        let fm = FileManager.default
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: root.path, isDirectory: &isDir), isDir.boolValue else {
+            return WalkResult(tree: nil, fileCount: 0, firstImage: nil)
+        }
+        let contents: [URL]
+        do {
+            contents = try fm.contentsOfDirectory(
+                at: root,
+                includingPropertiesForKeys: [.isDirectoryKey],
+                options: [.skipsHiddenFiles]
+            )
+        } catch {
+            return WalkResult(
+                tree: .directory(name: root.lastPathComponent, children: []),
+                fileCount: 0,
+                firstImage: nil
+            )
+        }
+        let sorted = contents.sorted { $0.lastPathComponent < $1.lastPathComponent }
+
+        // Partition: top-level files are handled inline (cheap), top-level
+        // subdirectories fan out one task each.
+        struct ChildSlot: Sendable {
+            let index: Int
+            let entry: URL
+            let isDir: Bool
+        }
+        var slots: [ChildSlot] = []
+        slots.reserveCapacity(sorted.count)
+        for (i, entry) in sorted.enumerated() {
+            var childIsDir: ObjCBool = false
+            fm.fileExists(atPath: entry.path, isDirectory: &childIsDir)
+            slots.append(ChildSlot(index: i, entry: entry, isDir: childIsDir.boolValue))
+        }
+
+        var children: [DirectoryNode?] = Array(repeating: nil, count: sorted.count)
+        var fileCount = 0
+
+        for slot in slots where !slot.isDir {
+            guard let kind = FileKind.classify(path: slot.entry.path) else { continue }
+            let passes = filter.evaluate(filename: slot.entry.lastPathComponent)
+            children[slot.index] = .file(
+                name: slot.entry.lastPathComponent,
+                kind: kind,
+                passesFilter: passes
+            )
+            if passes { fileCount += 1 }
+        }
+
+        struct SubtreeResult: Sendable {
+            let index: Int
+            let node: DirectoryNode?
+            let fileCount: Int
+        }
+
+        // Spawn one task per top-level subdirectory. Swift's runtime
+        // schedules these across the global concurrent pool, which is
+        // sized to `ProcessInfo.processInfo.activeProcessorCount`. On a
+        // 16-core Apple Silicon machine that is a 16× speed-up for
+        // wide roots; on a 4-core machine it is a 4× speed-up.
+        await withTaskGroup(of: SubtreeResult.self) { group in
+            for slot in slots where slot.isDir {
+                let entry = slot.entry
+                let idx = slot.index
+                let f = filter
+                group.addTask {
+                    var fc = 0
+                    var fi: URL?
+                    let node = walkDir(
+                        at: entry,
+                        filter: f,
+                        fileCount: &fc,
+                        firstImage: &fi
+                    )
+                    return SubtreeResult(index: idx, node: node, fileCount: fc)
+                }
+            }
+            for await result in group {
+                children[result.index] = result.node
+                fileCount += result.fileCount
+            }
+        }
+
+        let finalChildren = children.compactMap { $0 }
+        let tree = DirectoryNode.directory(
+            name: root.lastPathComponent,
+            children: finalChildren
+        )
+
+        // Derive `firstImage` in lex order from the final tree so the
+        // parallel and sequential walkers always pick the same file.
+        let firstImage = Self.firstImageInOrder(in: tree, at: root)
+
+        return WalkResult(tree: tree, fileCount: fileCount, firstImage: firstImage)
+    }
+
+    /// Depth-first lexicographic search for the first `.image` file
+    /// whose `passesFilter` is true. Used by `walkParallel` to recover
+    /// the same `firstImage` the sequential walker would have produced.
+    private static func firstImageInOrder(in node: DirectoryNode, at url: URL) -> URL? {
+        switch node {
+        case .directory(_, let children):
+            for child in children {
+                let childURL = url.appendingPathComponent(child.name)
+                if let found = firstImageInOrder(in: child, at: childURL) {
+                    return found
+                }
+            }
+            return nil
+        case .file(_, let kind, let passes):
+            return (kind == .image && passes) ? url : nil
+        }
+    }
+
     private static func walkDir(
         at url: URL,
         filter: RootFilter,
         fileCount: inout Int,
         firstImage: inout URL?
     ) -> DirectoryNode? {
+        let _trace = PerformanceLog.shared.start("DirectoryWalk.SingleDir", extra: [("path", url.path)])
+        defer { _trace.finish() }
         let fm = FileManager.default
         var isDir: ObjCBool = false
         guard fm.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue else {

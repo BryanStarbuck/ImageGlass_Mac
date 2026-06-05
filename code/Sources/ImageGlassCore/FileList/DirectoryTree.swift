@@ -80,7 +80,8 @@ public enum FileKind: String, Sendable, Codable {
 }
 
 /// One item in `filter.items[]` (`list_of_files.mdx` §3A.2;
-/// `mcp_and_filters_on_dirs.mdx` §3 adds `priority`).
+/// `mcp_and_filters_on_dirs.mdx` §3 adds `priority`, §4.5 adds the
+/// stable id).
 public struct RootFilterItem: Sendable, Equatable, Codable {
     public enum ItemKind: String, Sendable, Codable {
         case glob, substring, regex
@@ -105,6 +106,95 @@ public struct RootFilterItem: Sendable, Equatable, Codable {
         self.kind = kind
         self.negate = negate
         self.priority = max(-1000, min(1000, priority))
+    }
+
+    /// Stable id derived from `pattern + kind + negate + priority`.
+    /// Spec `mcp_and_filters_on_dirs.mdx` §4.5: SHA1 over those four
+    /// fields, first 6 hex chars. Re-writing the same item yields the
+    /// same id, so `remove_filter_item` can reference items by id
+    /// even when the LLM has not seen the YAML.
+    ///
+    /// Computed (not stored) so the id stays consistent if the item
+    /// is mutated in place and re-saved — the id moves with the
+    /// item's identity.
+    public var id: String {
+        var seed = pattern
+        seed += "\u{1F}" + kind.rawValue
+        seed += "\u{1F}" + (negate ? "1" : "0")
+        seed += "\u{1F}" + String(priority)
+        return RootFilterItem.sha1Hex6(seed)
+    }
+
+    /// First 6 hex chars of SHA-1(s). Pure-Swift Foundation-only
+    /// implementation so the core target keeps a minimal dependency
+    /// surface.
+    static func sha1Hex6(_ s: String) -> String {
+        let bytes = [UInt8](s.utf8)
+        let digest = sha1(bytes)
+        let hex = digest.prefix(3).map { String(format: "%02x", $0) }.joined()
+        return hex
+    }
+
+    /// Minimal SHA-1 over a byte buffer. The standard library does
+    /// not expose SHA-1 without CryptoKit (which we'd otherwise have
+    /// to import for one call). 20-byte digest, big-endian per FIPS
+    /// 180-4.
+    static func sha1(_ message: [UInt8]) -> [UInt8] {
+        var h0: UInt32 = 0x67452301
+        var h1: UInt32 = 0xEFCDAB89
+        var h2: UInt32 = 0x98BADCFE
+        var h3: UInt32 = 0x10325476
+        var h4: UInt32 = 0xC3D2E1F0
+
+        var msg = message
+        let originalBitLength = UInt64(message.count) * 8
+        msg.append(0x80)
+        while msg.count % 64 != 56 { msg.append(0x00) }
+        for i in (0..<8).reversed() {
+            msg.append(UInt8((originalBitLength >> (UInt64(i) * 8)) & 0xff))
+        }
+
+        for chunkStart in stride(from: 0, to: msg.count, by: 64) {
+            var w = [UInt32](repeating: 0, count: 80)
+            for i in 0..<16 {
+                let base = chunkStart + i * 4
+                w[i] = (UInt32(msg[base]) << 24)
+                     | (UInt32(msg[base + 1]) << 16)
+                     | (UInt32(msg[base + 2]) << 8)
+                     |  UInt32(msg[base + 3])
+            }
+            for i in 16..<80 {
+                let v = w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16]
+                w[i] = (v << 1) | (v >> 31)
+            }
+
+            var a = h0, b = h1, c = h2, d = h3, e = h4
+            for i in 0..<80 {
+                let f: UInt32
+                let k: UInt32
+                switch i {
+                case 0..<20:  f = (b & c) | ((~b) & d); k = 0x5A827999
+                case 20..<40: f = b ^ c ^ d;            k = 0x6ED9EBA1
+                case 40..<60: f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDC
+                default:      f = b ^ c ^ d;            k = 0xCA62C1D6
+                }
+                let temp = ((a << 5) | (a >> 27)) &+ f &+ e &+ k &+ w[i]
+                e = d; d = c
+                c = (b << 30) | (b >> 2)
+                b = a; a = temp
+            }
+            h0 = h0 &+ a; h1 = h1 &+ b; h2 = h2 &+ c
+            h3 = h3 &+ d; h4 = h4 &+ e
+        }
+
+        var out: [UInt8] = []
+        for h in [h0, h1, h2, h3, h4] {
+            out.append(UInt8((h >> 24) & 0xff))
+            out.append(UInt8((h >> 16) & 0xff))
+            out.append(UInt8((h >> 8) & 0xff))
+            out.append(UInt8(h & 0xff))
+        }
+        return out
     }
 }
 
@@ -227,6 +317,59 @@ public indirect enum DirectoryNode: Sendable, Equatable {
     }
 }
 
+/// docs/use_cases/include_checks.mdx §1 / §4.3 — three-state per-row
+/// "include" decision attached to every visible row in the directory
+/// panel. The user manipulates only these three values; the runtime
+/// inheritance resolver in `RootDirectory.effectiveState(for:)`
+/// collapses `inherit` to one of `include` / `exclude` at render time.
+///
+/// The on-disk identifier for `dontInclude` is `exclude` so the YAML
+/// stays one unambiguous token and matches the existing `include` /
+/// `exclude` vocabulary used elsewhere in the project.
+public enum IncludeState: String, Sendable, Codable, CaseIterable {
+    case include
+    case inherit
+    case exclude
+
+    /// Cycle order from §3 — the order a swatch click or the `I`
+    /// hotkey advances through on a sub-directory or file row.
+    public var next: IncludeState {
+        switch self {
+        case .include: return .inherit
+        case .inherit: return .exclude
+        case .exclude: return .include
+        }
+    }
+
+    /// include_checks.mdx §1.0 / §3 header / §4.3 — two-step cycle
+    /// for ROOT rows. A root has no ancestor and so cannot inherit;
+    /// the cycle is the binary flip `include ↔ exclude`. A root
+    /// that somehow holds `.inherit` (corrupt YAML / unmigrated v1
+    /// row) is coerced to `.include` on the first press.
+    public var nextForRoot: IncludeState {
+        switch self {
+        case .include: return .exclude
+        case .exclude: return .include
+        case .inherit: return .include
+        }
+    }
+}
+
+/// One entry in the per-root `include_overrides[]` block
+/// (include_checks.mdx §5.3). `path` is stored **relative** to the
+/// root using forward slashes; `state` is one of `include` /
+/// `exclude` (a row whose effective state is `inherit` has no
+/// entry — §5.5).
+public struct IncludeOverrideEntry: Sendable, Equatable, Codable {
+    public var path: String
+    public var state: IncludeState
+
+    public init(path: String, state: IncludeState) {
+        self.path = path
+        self.state = state
+    }
+}
+
 /// One root in `directories.yaml`. The on-disk shape is a flat
 /// projection; the `tree` field is populated by the walker.
 public struct RootDirectory: Sendable, Equatable {
@@ -234,16 +377,122 @@ public struct RootDirectory: Sendable, Equatable {
     public var filter: RootFilter
     public var lastWalked: Date?
     public var tree: DirectoryNode?       // populated by the walker
+    /// include_checks.mdx §5.2 — root-level default applied when no
+    /// ancestor in the override walk is explicit. Allowed values:
+    /// `.include` / `.exclude`. `.inherit` would leave the walk with
+    /// no answer and is rejected at the store layer.
+    public var defaultIncludeState: IncludeState
+    /// include_checks.mdx §5.3 — flat list of per-path overrides. A
+    /// row whose effective state is `inherit` has **no** entry; the
+    /// absence of an entry IS `inherit`.
+    public var includeOverrides: [IncludeOverrideEntry]
 
     public init(
         path: URL,
         filter: RootFilter = .empty,
         lastWalked: Date? = nil,
-        tree: DirectoryNode? = nil
+        tree: DirectoryNode? = nil,
+        defaultIncludeState: IncludeState = .include,
+        includeOverrides: [IncludeOverrideEntry] = []
     ) {
         self.path = path
         self.filter = filter
         self.lastWalked = lastWalked
         self.tree = tree
+        self.defaultIncludeState = defaultIncludeState
+        self.includeOverrides = includeOverrides
+    }
+
+    /// include_checks.mdx §6.1 — inheritance resolver. Walks up the
+    /// supplied **relative** path looking for the nearest explicit
+    /// ancestor override. Returns the root default when no ancestor
+    /// is explicit. Never returns `.inherit`.
+    public func effectiveState(for relativePath: String) -> IncludeState {
+        // Build the lookup once per call. Cheap on JFK/UX-scale
+        // (few-hundred overrides). The non-cached path in §6.3 is
+        // the explicit design choice.
+        var map: [String: IncludeState] = [:]
+        for o in includeOverrides {
+            map[Self.normalize(o.path)] = o.state
+        }
+        let normalized = Self.normalize(relativePath)
+        // Walk up: row itself, then each ancestor, then the root ("").
+        var current = normalized
+        while true {
+            if let s = map[current], s != .inherit { return s }
+            if current.isEmpty { break }
+            if let slash = current.lastIndex(of: "/") {
+                current = String(current[..<slash])
+            } else {
+                current = ""
+            }
+        }
+        return defaultIncludeState == .inherit ? .include : defaultIncludeState
+    }
+
+    /// include_checks.mdx §6.2 — the panel's two-pass render value.
+    public func decision(for relativePath: String) -> EffectiveIncludeDecision {
+        let explicit = explicitState(for: relativePath)
+        let resolved = effectiveState(for: relativePath)
+        return EffectiveIncludeDecision(explicit: explicit, resolved: resolved)
+    }
+
+    /// The row's own stored state — `.inherit` when no override entry
+    /// matches the path. Distinct from the resolver, which always
+    /// returns include/exclude.
+    public func explicitState(for relativePath: String) -> IncludeState {
+        let normalized = Self.normalize(relativePath)
+        for o in includeOverrides where Self.normalize(o.path) == normalized {
+            return o.state
+        }
+        return .inherit
+    }
+
+    /// Normalize a relative path: drop leading/trailing slashes,
+    /// collapse runs of `/`. The walker hands the panel relative
+    /// paths in a known shape so this is mostly defensive.
+    static func normalize(_ raw: String) -> String {
+        var s = raw
+        while s.hasPrefix("/") { s.removeFirst() }
+        while s.hasSuffix("/") { s.removeLast() }
+        while s.contains("//") {
+            s = s.replacingOccurrences(of: "//", with: "/")
+        }
+        return s
+    }
+}
+
+/// include_checks.mdx §6.2 — render-time view-model bundling the
+/// explicit state (what the row itself says) with the resolved state
+/// (what the inheritance walk produced).
+public struct EffectiveIncludeDecision: Sendable, Equatable {
+    public let explicit: IncludeState
+    public let resolved: IncludeState
+
+    public init(explicit: IncludeState, resolved: IncludeState) {
+        self.explicit = explicit
+        self.resolved = resolved
+    }
+
+    /// True iff the row's own state is `.inherit` and the panel
+    /// should render one of the muted-gray "Inherit" variants.
+    public var isInherited: Bool { explicit == .inherit }
+}
+
+/// Utility for resolving the *absolute* path of a `DirectoryNode` row
+/// against its root, then projecting it into the root-relative form
+/// the include-override map keys on. Used by the panel and the
+/// slideshow to ask `root.effectiveState(for: relativePath)`.
+public enum IncludePath {
+    /// `absolutePath` must already be a fully-resolved path under
+    /// `root.path`; returns an empty string when they are equal
+    /// (the root itself).
+    public static func relative(absolutePath: String, root: URL) -> String {
+        let rp = root.path
+        if absolutePath == rp { return "" }
+        if absolutePath.hasPrefix(rp + "/") {
+            return String(absolutePath.dropFirst(rp.count + 1))
+        }
+        return absolutePath
     }
 }

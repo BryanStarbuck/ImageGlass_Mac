@@ -21,6 +21,8 @@ public enum InitialConfigSeeder {
     /// caller can log them.
     @discardableResult
     public static func seedIfMissing(directory: URL? = nil) -> [URL] {
+        let _trace = PerformanceLog.shared.start("Config.Seed")
+        defer { _trace.finish() }
         let dir = directory ?? AppPaths.macAppSupportDir
         var seeded: [URL] = []
 

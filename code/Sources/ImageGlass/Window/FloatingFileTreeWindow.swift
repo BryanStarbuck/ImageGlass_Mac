@@ -24,6 +24,9 @@ final class FloatingFileTreeWindowController {
     /// Create-or-foreground. Idempotent: a second call with the window
     /// already on screen just brings it to the front.
     func show(state: AppState) {
+        // docs/performance.mdx §5.4 / §10.12 — `Window.FloatingFileTree.Show`.
+        let _trace = PerformanceLog.shared.start("Window.FloatingFileTree.Show")
+        defer { _trace.finish() }
         if let existing = window {
             Self.placeOnMainWindowScreen(existing)
             existing.makeKeyAndOrderFront(nil)
@@ -86,6 +89,9 @@ final class FloatingFileTreeWindowController {
     /// Hide without releasing — keeps the cached `NSWindow` so the next
     /// `show()` brings the same frame back instantly.
     func hide() {
+        // docs/performance.mdx §5.4 / §10.12 — `Window.FloatingFileTree.Hide`.
+        let _trace = PerformanceLog.shared.start("Window.FloatingFileTree.Hide")
+        defer { _trace.finish() }
         window?.orderOut(nil)
     }
 

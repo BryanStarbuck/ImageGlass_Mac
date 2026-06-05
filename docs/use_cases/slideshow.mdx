@@ -1,6 +1,6 @@
 ---
 title: Use Case — Slideshow Mode (S key + Settings interval)
-description: Scenario-by-scenario specification for slideshow mode. Pressing `S` (no modifier) on the main viewer toggles slideshow on or off; while running, the controller advances to the next image after the configured interval, re-applies the slideshow zoom mode to every advanced image, and loops at the end of the file list. The interval is sourced from `settings.slideshow.interval_seconds` (default 4.0 s) and is editable in two places that share the same binding — a horizontal slider AND an editable text box — inside Settings (⌘,) ▸ Slideshow ▸ Timing. Each scenario lists ordered user actions, the expected on-screen and on-disk result, and an explicit verify step that proves the slideshow advanced, looped, re-zoomed, and persisted correctly. Every state change is journaled to `log.log` so an external observer can replay the session.
+description: Scenario-by-scenario specification for slideshow mode. Pressing `S` (no modifier) on the main viewer toggles slideshow on or off; while running, the controller advances to the next image after the configured interval, re-applies the slideshow zoom mode to every advanced image, and loops at the end of the file list. The interval is sourced from `settings.slideshow.interval_seconds` (default 4.0 s) and is editable in two places that share the same binding — a horizontal slider AND an editable text box — inside Settings (⌘,) ▸ Slideshow ▸ Timing. The slideshow shares **one global cursor** with the main viewer and the directory panel — `AppState.selectedFile` — so a user click in the file tree during a running slideshow re-anchors the cursor, and the next advance steps from the clicked file, not from where the timer happened to be. Advance order follows the **file tree's visible top-down order** (depth-first across walker roots, lexicographic within each folder) so successive slides walk a folder before crossing into the next one. Items whose include state is *exclude* or *inherit-exclude* are skipped from navigation entirely. The bare-letter hotkeys `N` (next image) and `P` (previous image) use the same cursor and the same order, both while a slideshow is running and while it isn't. Each scenario lists ordered user actions, the expected on-screen and on-disk result, and an explicit verify step that proves the slideshow advanced, looped, re-zoomed, and persisted correctly. Every state change is journaled to `log.log` so an external observer can replay the session.
 ---
 
 # Use Case — Slideshow Mode
@@ -96,6 +96,170 @@ playback when those kinds are current.
 
 ---
 
+## 0A. The Currently Selected Image — Single Global Cursor
+
+The app has exactly **one** "currently selected image" at any time.
+That cursor lives on `AppState.selectedFile` (an absolute POSIX
+path or `nil` when nothing is loaded) and every UI surface reads
+the **same** value:
+
+* The **main viewer canvas** loads the file at `selectedFile`.
+* The **slideshow window's canvas** (when running) loads the file
+  at `selectedFile` — the slideshow does **not** maintain a
+  separate cursor.
+* The **directory / filename panel** highlights the row whose
+  full path equals `selectedFile`, and (per `selectedFile.didSet`)
+  the panel auto-expands every ancestor folder of that row so the
+  highlight is actually rendered. The highlight tracks the cursor
+  whether the cursor moved because the user clicked the row, hit
+  `↑` / `↓` / `N` / `P`, dropped a file from Finder, the slideshow
+  advanced, or an MCP `select_file` call landed.
+* The **arrow-key tree cursor** (`treeNav.activeRow`) is mirrored
+  to `selectedFile` on every selection change, so an immediate
+  `↑` / `↓` press after a click resumes navigation from the
+  clicked row.
+
+### 0A.1 The rule, exact
+
+Any code path that mutates the cursor writes through
+`AppState.selectedFile` (and only that). No view, controller, or
+timer holds a private "current index" that can drift from the
+cursor. In particular:
+
+1. The **slideshow controller** reads `appState.selectedFile`
+   **at every tick** to decide which file is "current" and what
+   the next file should be. It does not cache the index from
+   `start()` or from the previous advance.
+2. The **N / P hotkeys** (§10A) call `appState.selectNext()` /
+   `appState.selectPrevious()`, which read `selectedFile` and
+   write the new value back.
+3. The **panel click handler** sets `appState.selectedFile = path`
+   and nothing else.
+
+The consequence: any UI gesture that moves the cursor is
+**immediately visible** to the next slideshow advance, the next
+`N` / `P` press, and every panel highlight, with no extra wiring.
+
+### 0A.2 Verify the single-cursor invariant
+
+* Click the row for `tour/mountains/peak.heic` in the panel.
+* On screen: the row highlights blue; the viewer canvas reloads
+  with `peak.heic`; the breadcrumb (if visible) updates.
+* In state: `AppState.selectedFile == ".../tour/mountains/peak.heic"`
+  and `treeNav.activeRow == ".../tour/mountains/peak.heic"`.
+* Press `↓` once. The panel highlight and the viewer both advance
+  to the next visible row, which **must** be the next item in the
+  file tree's top-down order (§1A) — not whatever was "next" in
+  a stale `resolvedFiles` index.
+
+---
+
+## 1A. Ordering — Navigation Follows the File Tree's Visible Order
+
+The list the slideshow walks (and that `N` / `P` step through) is
+the **file tree's visible, top-down order**. Concretely:
+
+* Walker roots in `directories.yaml` order (top-to-bottom in the
+  Directories panel).
+* Within each root, a **depth-first** descent: every file in a
+  folder is visited before stepping into the next sibling folder.
+* Within a folder, **lexicographic** order of file names (the
+  same order the directory panel renders).
+* Folders themselves are **not** navigation targets — only files
+  produce a slide. Empty folders and folders whose only contents
+  are non-image files are stepped past silently.
+
+The implementation handle for this list is
+`AppState.orderedNavigationFiles`, which delegates to
+`DirectoryFilenamePanel.flattenVisible(walkerRoots)` when walker
+roots exist and falls back to the legacy `resolvedFiles` only
+when no walker roots are configured.
+
+### 1A.1 Worked example
+
+Reference fixture: `~/Pictures/tour/` from §0. Extended for this
+section to make the ordering rule observable:
+
+```
+tour/
+├── beach/
+│   ├── 001.jpg
+│   ├── 002.jpg
+│   ├── 003.jpg
+│   └── notes_old.png
+├── desert/
+│   ├── 011.jpg
+│   ├── 012.jpg
+│   └── 013.jpg
+└── mountains/
+    ├── peak.heic
+    └── peak.jpg
+```
+
+The navigation list, top-down, is exactly:
+
+```
+beach/001.jpg
+beach/002.jpg
+beach/003.jpg
+beach/notes_old.png
+desert/011.jpg
+desert/012.jpg
+desert/013.jpg
+mountains/peak.heic
+mountains/peak.jpg
+```
+
+A slideshow that starts on `beach/002.jpg` advances through
+`003.jpg`, then `notes_old.png`, then crosses into `desert/`
+starting with `011.jpg`, and so on. It does **not** jump from
+`002.jpg` directly to `mountains/peak.heic` (that would be
+out-of-order with respect to the visible tree).
+
+### 1A.2 Skip rule — exclude / inherit-exclude
+
+A file is in the navigation list **iff** its tree node's
+`passesFilter` flag is true. The walker computes `passesFilter`
+from the file's include-state plus its ancestor folders'
+include-states, per `include_checks.mdx` §3:
+
+| Include state | Effective | In nav list? |
+| --- | --- | --- |
+| `include` (explicit) | yes | **yes** |
+| `inherit` with an `include` ancestor | yes | **yes** |
+| `inherit` with no override anywhere | depends on root default | follows root |
+| `exclude` (explicit) | no | **no — skipped** |
+| `inherit` with an `exclude` ancestor | no | **no — skipped** |
+
+Slideshow advance, `N`, `P`, `↑`, `↓`, and the folder-jump
+shortcuts all walk the **same** filtered list, so a cycle through
+the slideshow visits exactly the files the panel highlights as
+included — never a skipped file.
+
+When the user toggles a file or a folder's include state
+**during** a running slideshow (the `I` hotkey from
+`include_checks.mdx` §4), the navigation list is recomputed
+before the next advance. If the **currently displayed** file
+just became excluded, the slideshow keeps it on screen for the
+remainder of the current countdown (the user can still see what
+they just excluded) and steps to the next included file on the
+next tick.
+
+### 1A.3 Verify the ordering rule
+
+* Use the §1A.1 fixture. Click `beach/002.jpg` in the panel.
+  Press `S`. Wait `interval_seconds`.
+* Expected: the next slide is `beach/003.jpg`. Wait again — next
+  is `beach/notes_old.png`. Wait again — next is
+  `desert/011.jpg` (crossing folders only after exhausting
+  `beach/`).
+* If the next slide is `mountains/*` or any `desert/` file before
+  `beach/` is exhausted, the advance is using the wrong list and
+  §1A is failing. Verify `AppState.orderedNavigationFiles` is
+  what the controller reads.
+
+---
+
 ## 1. First-Time Slideshow Start — `S` Toggles On
 
 ### 1.1 Preconditions
@@ -182,8 +346,14 @@ playback when those kinds are current.
 
 * Exactly at the wall-clock interval boundary
   (`startInstant + 4.0 s`, within ≤ 50 ms scheduler jitter), the
-  controller advances `AppState.selectedFile` to the next item in
-  `resolvedFiles` (`002.jpg`).
+  controller reads `AppState.selectedFile` (`001.jpg`), looks it
+  up in `AppState.orderedNavigationFiles` (§1A), and advances
+  `AppState.selectedFile` to the next item in that list
+  (`002.jpg`). The controller **does not** use a cached index
+  from `start()` — every tick rereads `selectedFile`, so a click
+  in the directory panel during the countdown re-anchors the
+  cursor and the next advance steps from the clicked file
+  (see §2A).
 * The slideshow window's `ImageCanvasView` reloads with `002.jpg`.
 * The canvas re-applies the slideshow zoom mode (`.fit`) — see
   §6 for the exact rule. Even if scenario 2.5 had panned or
@@ -226,6 +396,104 @@ playback when those kinds are current.
 The controller continues to advance once per interval:
 `002.jpg → notes_old.png → peak.heic → peak.jpg → …`. After
 `peak.jpg`, the loop behavior of scenario 7 takes over.
+
+---
+
+## 2A. Click During Slideshow Re-Anchors the Cursor
+
+This is the bug-driven contract that prompted §0A and §1A.
+A user click in the directory / filename panel during a running
+slideshow **must** move the slideshow cursor, and the **next**
+advance must step from the clicked file, not from where the
+controller was before the click.
+
+### 2A.1 The rule, exact
+
+1. The directory panel's row click handler runs
+   `state.selectedFile = path` and nothing else (see
+   `DirectoryFilenamePanel.swift` row tap binding).
+2. `AppState.selectedFile.didSet` mirrors the new path into
+   `treeNav.activeRow` and reveals every ancestor folder so the
+   row is highlighted.
+3. The slideshow controller's tick handler — on every fire —
+   reads `appState.selectedFile` and computes the new "next" by
+   `orderedNavigationFiles.firstIndex(of: selectedFile) + 1`.
+   The previous "next" (the one the user would have seen if they
+   hadn't clicked) is discarded.
+4. The countdown is **not** restarted by the click. The user is
+   choosing **which** image will display next, not adding time
+   to the current slide. (If the user also wants to pause and
+   inspect, they can press `S` to stop, then `S` again to
+   restart.)
+
+The same rule applies to MCP `select_file` calls and to drops
+from Finder while a slideshow is running: any path that lands on
+`AppState.selectedFile` becomes the slideshow's new anchor for
+the next advance.
+
+### 2A.2 Worked example — the illustration from the bug report
+
+Use a 5-folder fixture, 10 images each, named `dirN/img-K.jpg`
+where N is the folder index 1…5 and K is the global image index
+1…50. The navigation list (per §1A) is `img-1.jpg, img-2.jpg, …,
+img-50.jpg` in order.
+
+* Start the slideshow on `img-1.jpg`. Let it run until
+  `img-15.jpg` is on screen and the countdown reads ~2.0 s.
+* Click `img-2.jpg` in the panel.
+
+Expected, step by step:
+
+* Immediately: the viewer canvas swaps to `img-2.jpg`. The panel
+  highlight moves to the `img-2.jpg` row. `AppState.selectedFile
+  == ".../dir1/img-2.jpg"`.
+* Countdown continues from ~2.0 s — the click did not restart
+  the timer.
+* At countdown == 0, the controller reads `selectedFile`
+  (`img-2.jpg`), finds it at index 1 in `orderedNavigationFiles`,
+  and advances to `orderedNavigationFiles[2]` — which is
+  `img-3.jpg`.
+* Next advance: `img-4.jpg`. Then `img-5.jpg`. The slideshow has
+  effectively rewound to image 2 and proceeds from there. It
+  does **not** resume at `img-16.jpg` (the position before the
+  click) — that position was discarded the moment the click
+  changed `selectedFile`.
+
+### 2A.3 Verify
+
+* On screen: the post-click slide is `img-3.jpg`, not
+  `img-16.jpg`.
+* In state, immediately after the advance:
+  `AppState.selectedFile == ".../dir1/img-3.jpg"`.
+* On disk:
+
+  ```
+  ts=… app=slideshow.advance from=…/dir1/img-2.jpg to=…/dir1/img-3.jpg interval=4.0 zoom_mode=fit corr=…
+  ```
+
+  Note `from=…/img-2.jpg` — the audit log proves the controller
+  stepped from the **clicked** file, not from `img-15.jpg`.
+
+### 2A.4 Edge case — click the file already on screen
+
+If the user clicks the row that is already current, `didSet`
+short-circuits (`oldValue != selectedFile` is false) and nothing
+happens. The slideshow continues from the same position.
+
+### 2A.5 Edge case — click a file currently excluded
+
+If the user clicks a row whose `passesFilter == false` (only
+possible if the panel is showing folder skeletons that contain
+excluded files via a future surface — today, excluded files are
+not rendered as clickable rows), the click is honored:
+`selectedFile` becomes the clicked path and the viewer displays
+it. The **next advance**, however, sees that the file is not in
+`orderedNavigationFiles` (`.firstIndex == nil`), falls into the
+"current not in list" branch, and re-enters the list at index 0.
+This is the same behavior as opening an ad-hoc file via drag-
+drop or `L` (load from clipboard) while a slideshow is running:
+the slideshow re-anchors to the start of the navigable list on
+the next tick.
 
 ---
 
@@ -611,8 +879,8 @@ restart required.
 
 ### 7.3 Expected result — loop ON
 
-* The controller wraps. `AppState.selectNext(wrap: true)` returns
-  the first file (`001.jpg`).
+* The controller wraps. The next slide is the first file of
+  `AppState.orderedNavigationFiles` (§1A), `001.jpg`.
 * `001.jpg` is loaded with the slideshow zoom mode re-applied
   (§6).
 * The countdown re-arms.
@@ -818,6 +1086,99 @@ then the controller resumes the interval timer).
 
 ---
 
+## 10A. `N` / `P` — Next / Previous Image (Bare Letters)
+
+`N` (next image) and `P` (previous image) are the bare-letter
+companions to `↓` / `↑`. They use the same single global cursor
+(§0A), the same navigation list (§1A), and the same skip rule
+(§1A.2) as the slideshow, so the behavior is consistent across
+all three navigation surfaces.
+
+These two bindings replace earlier assignments on the same keys:
+the v0 `N`-for-Normalize-zoom moves to `M`, and the v0
+`P`-for-Copy-Path moves to `⇧P` (Shift + P). The hotkeys spec
+(`hotkeys.mdx` §5 + §5A) is updated in lockstep.
+
+### 10A.1 The rule, exact
+
+A bare `N` press, when no modifier is held and no text input is
+first responder (focus-aware per §5):
+
+1. Calls `appState.selectNext(wrap: settings.viewer.wrap_at_ends)`.
+2. `selectNext` reads `appState.orderedNavigationFiles` (§1A),
+   finds `selectedFile` in the list, advances the index by 1,
+   and writes the new path back to `selectedFile`.
+3. The viewer canvas reloads with the new file; the panel
+   highlight moves; the breadcrumb updates. All three surfaces
+   stay in sync via the same `selectedFile.didSet` plumbing
+   used by every other selection mutation.
+4. If the **slideshow is running**, the press counts as user
+   navigation: the new `selectedFile` becomes the new anchor for
+   the next slideshow advance (§2A), and the countdown is
+   **not** restarted. This is symmetric with a panel-row click.
+5. If `selectedFile` is `nil` (empty viewer), `selectNext`
+   selects the first file of the navigation list.
+6. If `selectedFile` is the last file:
+   * `wrap_at_ends == true` (default): wrap to the first file.
+   * `wrap_at_ends == false`: no-op; the cursor stays put.
+
+`P` is the symmetric previous-image binding — same list, same
+focus rule, same wrap behavior, decrementing the index instead.
+
+### 10A.2 Excluded items are skipped
+
+`orderedNavigationFiles` already filters out files whose
+`passesFilter == false` (excluded explicitly, or excluded by
+inheritance from a folder, per §1A.2). `N` and `P` therefore
+step **only** through included files. There is no separate skip
+loop in the hotkey handler — the list is the filter.
+
+A concrete check: in the §1A.1 fixture, if the user excludes
+the entire `desert/` folder (set its include state to *exclude*
+via the `I` hotkey on the folder row), then `orderedNavigationFiles`
+becomes `[beach/001.jpg, beach/002.jpg, beach/003.jpg,
+beach/notes_old.png, mountains/peak.heic, mountains/peak.jpg]`.
+Pressing `N` from `beach/notes_old.png` advances to
+`mountains/peak.heic` — `desert/*.jpg` is skipped.
+
+### 10A.3 Focus-awareness
+
+Same rule as `S` (§5): a key-down with no modifier on
+`kVK_ANSI_N` or `kVK_ANSI_P` fires the navigation **only** when
+the current first responder is not an editable text input. While
+typing in the Settings search field or any other text field,
+`n` and `p` insert their characters normally and do not move
+the cursor.
+
+### 10A.4 Verify
+
+Use the §1A.1 fixture. Click `beach/002.jpg`.
+
+* Press `N`. Expected: `selectedFile` becomes `beach/003.jpg`;
+  the viewer and panel highlight move there.
+* Press `N` again. Expected: `selectedFile` becomes
+  `beach/notes_old.png`.
+* Press `N` again. Expected: `selectedFile` becomes
+  `desert/011.jpg` (folder crossing per §1A).
+* Press `P`. Expected: `selectedFile` returns to
+  `beach/notes_old.png`.
+* Toggle `desert/` to *exclude* (focus the folder row, press
+  `I` until the chip reads "exclude"). Now press `N` from
+  `beach/notes_old.png`. Expected: `selectedFile` becomes
+  `mountains/peak.heic`, skipping all of `desert/`.
+* Click into a Settings text field, type `n`. Expected: the
+  character `n` is inserted at the cursor; `selectedFile` does
+  not change.
+
+Audit log:
+
+```
+ts=… app=select_next from=…/beach/002.jpg to=…/beach/003.jpg source=key:N corr=…
+ts=… app=select_prev from=…/beach/notes_old.png to=…/beach/003.jpg source=key:P corr=…
+```
+
+---
+
 ## 11. Pacing — Drift and Stability
 
 The interval is wall-clock-based, not "interval-from-last-tick"-based,
@@ -911,15 +1272,34 @@ vice versa.
 
 A run of this spec passes when **all of**:
 
+* §0A — the app has exactly one cursor (`AppState.selectedFile`);
+  every selection-changing surface (panel click, `↑` / `↓` /
+  `N` / `P`, drag-drop, MCP `select_file`, slideshow advance)
+  writes through that field, and the directory panel highlight,
+  the viewer canvas, and the slideshow window all read from it.
+* §1A — the navigation list `AppState.orderedNavigationFiles`
+  is the file tree's depth-first top-down visible order. Files
+  whose `passesFilter == false` (excluded or inherit-excluded)
+  are absent from the list, so slideshow / `N` / `P` step past
+  them without a separate skip loop.
 * §1 — pressing `S` with a non-empty file list starts the
   slideshow, opens the slideshow window, applies the slideshow
   zoom mode (`.fit`), and reads `interval_seconds` from
   `settings.json`. `slideshow.toggle on=true source=key:S` is
   in `log.log`.
 * §2 — exactly at `start + interval_seconds` (±50 ms), the
-  controller advances to the next image and re-arms the
-  countdown. A `slideshow.advance` line is written with
+  controller reads `AppState.selectedFile`, finds it in
+  `AppState.orderedNavigationFiles`, advances to the next item
+  in **that** list (not the legacy `resolvedFiles`), and re-arms
+  the countdown. A `slideshow.advance` line is written with
   `zoom_mode=fit`.
+* §2A — a click on a panel row during a running slideshow
+  re-anchors `AppState.selectedFile` to the clicked file, and
+  the **next** advance steps from the clicked file (not from
+  the position the timer would have advanced to). The countdown
+  is not restarted. The `slideshow.advance` audit line proves
+  it via the `from=` field — `from` is the **clicked** file,
+  not the pre-click position.
 * §3 — pressing `S` while running stops the slideshow, closes
   the slideshow window, leaves `AppState.selectedFile` on the
   last-displayed image, and leaves the main viewer's
@@ -955,6 +1335,14 @@ A run of this spec passes when **all of**:
   `⇧⌘S` (Save / Save As) continue to work without conflict.
   `source=` fields in `log.log` distinguish the three slideshow
   trigger paths.
+* §10A — bare `N` and `P` step `AppState.selectedFile` through
+  `AppState.orderedNavigationFiles` (next / previous). The keys
+  are focus-aware (suppressed in editable text inputs), respect
+  `settings.viewer.wrap_at_ends`, skip excluded and
+  inherit-excluded files, and behave identically whether or
+  not a slideshow is running. The earlier `N`-for-Normalize
+  binding moves to `M`; the earlier `P`-for-Copy-Path binding
+  moves to `⇧P`.
 * §11 — over 10 advances, wall-clock elapsed is within ±200 ms
   of `10 × interval_seconds`.
 * §12 — MCP `set_slideshow` produces results identical to the

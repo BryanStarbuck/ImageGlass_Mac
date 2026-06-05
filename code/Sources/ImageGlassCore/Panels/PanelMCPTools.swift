@@ -178,6 +178,8 @@ public struct PanelMCPTools: Sendable {
     // MARK: - Dispatch
 
     public func call(name: String, arguments: [String: Any?]) throws -> MCP.CallToolResult {
+        let _trace = PerformanceLog.shared.start("MCP.ToolCall.\(name)")
+        defer { _trace.finish() }
         do {
             switch name {
             case "list_panels":          return try listPanels()

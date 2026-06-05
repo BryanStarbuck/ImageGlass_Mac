@@ -52,6 +52,19 @@ public final class ExternalToolLauncher {
         filePath: String?,
         integrationEnv: [String: String] = [:]
     ) throws -> Process {
+        // §5.6 `ExternalTool.Launch` — measures argv assembly + subprocess
+        // spawn. `process.run()` returns once the OS fork/exec succeeds,
+        // not when the child has done meaningful work, so this elapsed
+        // captures "how long until the child is alive".
+        let _trace = PerformanceLog.shared.start(
+            "ExternalTool.Launch",
+            extra: [
+                ("tool", tool.id),
+                ("integration", tool.integration ? "1" : "0"),
+            ]
+        )
+        defer { _trace.finish() }
+
         let exe = ExternalToolLauncher.resolvedExecutable(for: tool)
         guard FileManager.default.fileExists(atPath: exe) else {
             throw ExternalToolError.executableMissing(exe)

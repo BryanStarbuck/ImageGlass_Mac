@@ -1,0 +1,894 @@
+---
+title: Performance Instrumentation
+description: Specification for the performance log, the in-process tracer that writes every measured action's start and finish to disk, the action taxonomy, the hot paths to instrument, the parallelization opportunities the analyzer is expected to surface, and the offline analysis workflow.
+---
+
+# Performance Instrumentation
+
+> **Document type:** Engineering specification — instrumentation,
+> on-disk log format, action taxonomy, hot paths, parallelization
+> opportunities, and offline analysis workflow.
+>
+> **Audience:** Every engineer who touches a code path that runs on the
+> main thread, opens a file, decodes an image, or schedules a
+> background walk. The reviewers AI agent uses this document as the
+> contract when it grades a change for "did you instrument the action
+> you just added?".
+>
+> **Owners:** CTO owns the `PerformanceLog` module and the line
+> grammar; engineers own the per-action instrumentation they add. The
+> spec is versioned alongside the code — no bare additions of new
+> actions without an entry under §5.
+>
+> **Status:** v1 spec for ImageGlass_Mac. The implementation lives in
+> `code/Sources/ImageGlassCore/Logging/PerformanceLog.swift`. The log
+> file lives at
+> `~/Library/Application Support/ImageGlass_Mac/performance.log`.
+
+---
+
+## 1. Why a Performance Log
+
+The ImageGlass_Mac fork is a Mac-native image viewer. Two user
+expectations dominate the perception of the app:
+
+1. **Selecting a different file in the file tree must feel
+   instantaneous.** A click should paint the new image inside the
+   single-frame budget on a 60 Hz display (~16.6 ms), or worst case
+   inside two frames (~33 ms). Anything slower than that and the user
+   notices the app "thinking".
+
+2. **Adding a root directory must scale.** When the user points the
+   app at a deep hierarchy with tens of thousands of files, the walk
+   has to make use of the cores the machine actually has. A 16-core
+   Apple Silicon machine should not sit at 6% CPU while the user
+   waits.
+
+Today, file-tree selection feels slow and a fresh root walk on a deep
+hierarchy runs single-threaded. The ad-hoc `print` and
+`MCPAuditLogger` lines we already write are not enough to prove where
+the time is going. We need a structured, durable, append-only record
+of every measured action so an offline analyzer (or Claude Code) can
+read it and pinpoint the slow ones.
+
+This document defines that record, the API that writes it, the
+taxonomy of actions every part of the codebase has to use, and the
+hot paths that get instrumented in v1.
+
+---
+
+## 2. Goals and Non-Goals
+
+### 2.1 Goals
+
+* **Every long-running action emits exactly two lines** (or one
+  `phase=event` line for instantaneous markers): one when it starts
+  and one when it finishes, both carrying the same `action`,
+  `instance` and `corr` so the analyzer can pair them even when other
+  actions interleave between them.
+
+* **The log survives the process.** It is written to a real file in
+  `~/Library/Application Support/ImageGlass_Mac/` so a separate tool
+  (or Claude Code) can read it after the app has been closed.
+
+* **The log is grep-friendly.** Each entry is a single line of
+  `key=value` pairs. Values that contain whitespace or `=` are
+  quoted. Pipe-able with `grep`, `awk`, and any LLM that reads
+  plain text.
+
+* **The log is Instruments-friendly.** Every action is mirrored to an
+  `OSSignposter` interval under the `org.imageglass.mac` subsystem so
+  the same data shows up in Xcode's Instruments timeline at the same
+  granularity.
+
+* **Instance numbers are dense.** The 1st time `FileTree.SelectionChange`
+  runs gets `instance=1`. The 17th gets `instance=17`. Counters are
+  per-action, monotonic, and shared process-wide. Pairing the 17th
+  start with the 17th finish does not require correlation IDs (though
+  the `corr` field also pairs them, redundantly).
+
+* **The writer never throws.** Failures to open or write the log file
+  are routed to `ErrorLog` and the trace is dropped. The app must not
+  break because of perf instrumentation.
+
+### 2.2 Non-Goals
+
+* **Not a metrics aggregator.** We do not roll up p50/p95/p99 inside
+  the app. The log is raw event data; aggregation happens offline.
+
+* **Not a tracer for every function call.** Only the actions in §5
+  are instrumented. A hot loop running 100k iterations is measured as
+  one outer action with a `count=` payload, not as 100k entries.
+
+* **Not a replacement for `os_log` or `ErrorLog`.** Functional logging
+  and error logging remain on their existing rails. `PerformanceLog`
+  records timing, nothing else.
+
+* **Not a real-time UI.** There is no in-app "performance HUD" in v1.
+  Analysis is offline.
+
+---
+
+## 3. Library Choice — `OSLog` + `OSSignposter` + Custom File Writer
+
+### 3.1 What Apple ships
+
+Apple's recommended stack for performance measurement on macOS is the
+Unified Logging system (`OSLog`) plus the signposts API
+(`OSSignposter`, introduced in macOS 12). Signposts extend `OSLog`
+specifically for "start of action / end of action" intervals and are
+the data source Instruments uses for the "Points of Interest"
+timeline. They have low overhead, no message marshalling cost when
+disabled, and Instruments-native rendering.
+
+Sources surveyed:
+
+* SwiftLee — *OSLog and Unified logging as recommended by Apple*.
+* Apple WWDC18 #405 — *Measuring Performance Using Logging*.
+* Donny Wals — *Modern logging with the OSLog framework in Swift*.
+* Apple Developer Documentation — `OSSignposter`,
+  `os_signpost(_:dso:log:name:signpostID:)`.
+
+### 3.2 Why we also write a file
+
+Signposts alone are not enough for our use case:
+
+* Signposts evaporate when the process ends unless Instruments is
+  attached. We want to read the log after the app has exited, on a
+  different machine, with `grep`.
+* Signposts cannot easily be diffed across builds.
+* An offline AI analyzer cannot read the in-memory unified logging
+  store. It can read a plain text file.
+
+So we mirror to both:
+
+1. **`OSSignposter`** — every measured action begins and ends a
+   signposted interval under subsystem `org.imageglass.mac`, category
+   `performance`. Instruments shows it for free.
+2. **`performance.log`** — every measured action also writes two
+   lines of plain text to
+   `~/Library/Application Support/ImageGlass_Mac/performance.log`.
+   This is the canonical source for offline analysis.
+
+The two paths share the same instance counter and correlation id, so
+an Instruments trace and the file are line-for-line correlatable.
+
+### 3.3 Why not `swift-log`
+
+`swift-log` is a logging API abstraction. We do not need an
+abstraction — we need a single concrete writer with predictable
+on-disk layout. Adding `swift-log` + a backend would add a dependency
+and make the line format depend on someone else's escaping rules. The
+custom `PerformanceLog` writer is ~300 lines of Swift, has no
+dependencies, and matches the established style of `ErrorLog` and
+`MCPAuditLogger`.
+
+---
+
+## 4. Log File and Line Grammar
+
+### 4.1 Path
+
+```
+~/Library/Application Support/ImageGlass_Mac/performance.log
+```
+
+Resolved at runtime via `AppPaths.macPerformanceLogFile`. Tests rebind
+the path by setting `PerformanceLog.shared.overrideLogFile`.
+
+### 4.2 Format
+
+Every entry is a single line terminated by `\n`. The line is a
+sequence of space-separated `key=value` pairs. Values that contain
+whitespace, `=`, `\t`, or `\n` are quoted with `"…"` and the inner
+quotes are escaped as `\"`.
+
+There are three phases:
+
+| Phase     | Meaning |
+|-----------|---------|
+| `start`   | The action just began. Carries `action`, `instance`, `corr`, plus any caller-supplied context. |
+| `finish`  | The action ended. Carries the same `action`, `instance`, `corr` plus `elapsed_ms`. May carry `reason=<…>` (`cancelled`, `auto_finish`, `error`, etc.). |
+| `event`   | An instantaneous marker (no duration). Used for "first frame painted" and similar one-shot points. |
+
+Two-line interval example (file-tree selection #17):
+
+```
+ts=2026-06-05T10:14:33.412-07:00 phase=start  action=FileTree.SelectionChange instance=17 corr=8a3f0211 path=/Users/bryan/Pictures/2026/IMG_0123.jpg
+ts=2026-06-05T10:14:33.461-07:00 phase=finish action=FileTree.SelectionChange instance=17 corr=8a3f0211 elapsed_ms=49
+```
+
+Single-line event example:
+
+```
+ts=2026-06-05T10:14:33.460-07:00 phase=event action=FileTree.FirstPaint instance=17 corr=8a3f0211
+```
+
+### 4.3 Required Keys
+
+| Key          | Where         | Value |
+|--------------|---------------|-------|
+| `ts`         | every line    | ISO-8601 wallclock with millisecond precision and timezone. |
+| `phase`      | every line    | `start`, `finish`, or `event`. |
+| `action`     | every line    | Dotted action name from §5. |
+| `instance`   | every line    | Monotonically increasing per-action counter. `1`-origin. |
+| `corr`       | every line    | 8-hex-char correlation id chosen at `start` and copied to `finish`. |
+| `elapsed_ms` | `finish` only | Integer milliseconds from `start` to `finish`, measured via `DispatchTime` (monotonic clock, not wallclock). |
+| `reason`     | optional      | `cancelled`, `auto_finish`, `error`, `superseded`, … |
+
+### 4.4 Pairing Rules
+
+The analyzer pairs lines by `(action, instance)`. The `corr` field is
+a redundant second pairing key — useful when an entry is split across
+files or when reviewing in `grep` output. Both keys MUST match
+exactly; an instance with no matching `finish` line is a "leak" and is
+a bug.
+
+If a trace is leaked (the `PerformanceTrace` handle is dropped without
+calling `finish`), `deinit` auto-emits a `finish` line with
+`reason=auto_finish`. This is a smell — the call site should be fixed
+to call `finish` explicitly so the duration is meaningful.
+
+### 4.5 Interleaving
+
+Two actions of the same name can overlap. The instance counter
+guarantees the start of #17 happens before the start of #18, but the
+finish of #17 may land before or after the finish of #18. The
+analyzer must reconstruct ordering from `instance`, not from line
+position.
+
+Two actions of different names interleave freely. This is intentional:
+when `FileTree.SelectionChange` wraps an inner `Image.Load`, the
+expected timeline is
+
+```
+start FileTree.SelectionChange #17
+  start Image.Load #41
+  finish Image.Load #41
+finish FileTree.SelectionChange #17
+```
+
+so the analyzer can subtract the inner duration from the outer and see
+where else the time went.
+
+### 4.6 Rotation
+
+`performance.log` is append-only. We do not rotate inside the app —
+rotation is the user's or the analyzer's job. The file can grow large
+during long sessions, especially if SCROLL-driven actions are
+instrumented. If size becomes a real problem we can add a daily
+rotation in v2; v1 keeps the simple writer.
+
+### 4.7 What is NOT logged
+
+* `print()` statements stay out of the perf log.
+* `ErrorLog` entries are not duplicated here.
+* `MCPAuditLogger` entries remain in `log.log`. Some MCP tool calls
+  also emit a `MCP.ToolCall.<name>` perf trace; that is by design,
+  because we want to measure tool latency separately from auditing
+  what the tool did.
+
+---
+
+## 5. Action Taxonomy
+
+Every measured action carries a dotted name from this table. New
+actions MUST be registered here before they are used in code so the
+analyzer has a stable vocabulary.
+
+### 5.1 File-tree selection — the user's #1 hot path
+
+| Action | Started by | Wraps | What we expect |
+|--------|------------|-------|----------------|
+| `FileTree.SelectionChange` | A click in the directory/filename panel, or a keystroke that moves the cursor. | All work the panel does to commit a new selection: state update, decode, canvas paint. | Under 50 ms p95, under 16 ms p50. |
+| `FileTree.SelectionCommit` | The view-model's `select(path:)` after consistency checks. | The mutation of `AppState.currentFile` and the dispatch of `viewerStateDidChange`. | Under 1 ms — pure state mutation. |
+| `FileTree.FocusChange` | Cursor-key navigation that moves focus but does not yet commit. | The focus mutation only. | Under 1 ms. |
+| `FileTree.Reload` | The panel rebuilding its visible-entries list (after a refilter, a walk completion, or a sort change). | The diff against the previous list and the SwiftUI publish. | Under 16 ms. |
+| `FileTree.Expand` / `FileTree.Collapse` | A click on a chevron in tree view. | Mutating the per-row `expanded` set and republishing the visible row array. | Under 16 ms. |
+| `FileTree.FirstPaint` | (event) The viewer reports its first non-empty frame for the new selection. | — | Marker, no duration. |
+| `FileTree.BuildVisibleEntries` | `FileListViewModel.visibleEntries` is recomputed. | Flatten + filter + sort. | Should be fast; if not, this is the culprit. |
+| `FileTree.BuildTree` | `FileListViewModel.buildTree()` rebuilding the tree-view node graph. | Constructing `FileListTreeNode` instances from `RootDirectory` snapshots. | Should be O(n) over visible nodes. |
+
+### 5.2 Image loading and rendering
+
+| Action | Wraps |
+|--------|-------|
+| `Image.Load` | The end-to-end "user wants this file shown in the viewer" path. Starts as soon as the viewer learns about a new path; finishes when the canvas has a frame on screen. |
+| `Image.OpenSource` | `CGImageSourceCreateWithURL` or equivalent — the I/O + header parse step. |
+| `Image.Decode` | `CGImageSourceCreateImageAtIndex` — the pixel decode. |
+| `Image.ReadEXIF` | The metadata pass (if it is requested as part of the load). |
+| `Image.Render` | `ImageCanvasView` repaints itself with the new `CGImage`. |
+| `Image.Resize` | An explicit resize op (the resize tool). |
+| `Image.RotateOrFlip` | A rotate/flip op. |
+| `Image.SaveAs` | `Image.SaveAs.<format>` — encoding + atomic write. |
+| `Thumbnail.Generate` | One thumbnail miss in `ThumbnailCache`. |
+| `Thumbnail.LoadBatch` | The view-model asking for N thumbnails for the visible window. |
+| `Format.Convert` | `FormatEncoder.encode(...)` — explicit format conversion. |
+| `Format.SVG.Render` | SVG load + render. |
+| `Video.LoadAsset` | `AVAsset` construction + first frame ready. |
+| `Video.FirstFrame` | (event) — first decoded video frame painted. |
+
+### 5.3 Directory walks — the user's #2 hot path
+
+| Action | Wraps |
+|--------|-------|
+| `DirectoryWalk.Schedule` | The non-isolated `scheduleWalk` hop onto the actor. |
+| `DirectoryWalk.Run` | The actual recursive walk for one root. |
+| `DirectoryWalk.SingleDir` | `walkDir` for one directory (one node in the tree). Useful for finding hot subdirectories. |
+| `DirectoryWalk.Parallel` | The new `TaskGroup`-based walk (see §7). |
+| `DirectoryWalk.Refilter` | `refilter(root:filter:)` for one root. |
+| `DirectoryWalk.RefilterAll` | `refilterAll(filter:)` for every known root. |
+| `DirectoryWalk.Remove` | `removeRoot(path:)`. |
+| `Tree.Traverse.Log` | The per-walk log-emission pass that emits `tree.node` lines. |
+
+### 5.4 App launch, layout, and panels
+
+| Action | Wraps |
+|--------|-------|
+| `AppLaunch.Total` | From `@main`'s entry to the first frame painted. |
+| `AppLaunch.LoadSettings` | `Settings.load()` and `Config.load()`. |
+| `AppLaunch.LoadDirectories` | `DirectoriesStore.shared.load()`. |
+| `AppLaunch.RestoreLayout` | `LayoutStore.load` and the panel framework's reconstruction. |
+| `AppLaunch.StartMCPServer` | The in-process MCP server boot. |
+| `AppLaunch.FirstFrame` | (event) — first frame painted. |
+| `Window.LayoutPass` | A heavy SwiftUI layout pass (only when we explicitly wrap one — most are too small to measure). |
+| `Panel.Show` / `Panel.Hide` / `Panel.Move` / `Panel.Tab` / `Panel.Untab` | The corresponding panel mutations. |
+| `Panel.SetSize` | A drag-driven panel resize commit (debounced). |
+| `Layout.Save` | `LayoutStore.save`. |
+| `Layout.Load` | `LayoutStore.load`. |
+
+### 5.5 Local Storage and settings
+
+| Action | Wraps |
+|--------|-------|
+| `LocalStorage.Read.<file>` | One read of a YAML file from `~/Library/Application Support/ImageGlass_Mac/`. |
+| `LocalStorage.Write.<file>` | One atomic write of a YAML file. |
+| `Settings.Load` | `SettingsStore.load`. |
+| `Settings.Save` | `SettingsStore.save` (settle-only — debounced). |
+| `Settings.MutateAndPersist` | A user-driven mutation that triggers an immediate persist. |
+| `Scope.Evaluate` | `ScopeEvaluator.evaluate` over a scope chain. |
+| `Scope.EvaluateChain` | The chain version (multiple scopes composed). |
+
+### 5.6 MCP and external tools
+
+| Action | Wraps |
+|--------|-------|
+| `MCP.Server.Boot` | The MCP server bringing its socket up. |
+| `MCP.ToolCall.<tool_name>` | One JSON-RPC tool invocation, end to end. |
+| `MCP.WaitOnLock` | Time spent contending on `MCPLock` (instructive when several tools land at once). |
+| `ExternalTool.Launch` | `ExternalToolLauncher.launch`. |
+| `ExternalTool.IPCRoundtrip` | Round-trip on the Unix-domain socket. |
+
+### 5.7 Crop
+
+| Action | Wraps |
+|--------|-------|
+| `Crop.OpenSession` | `CropSession` construction. |
+| `Crop.Apply` | The actual crop op (lossless or pixel). |
+| `Crop.JPEGLossless` | The lossless JPEG path specifically. |
+| `Crop.SaveSideFile` | Writing the `.crop` side file. |
+
+### 5.8 Theme, releases, and updates
+
+| Action | Wraps |
+|--------|-------|
+| `Theme.Switch` | A theme switch. |
+| `Theme.LoadPack` | Loading a `.igtheme` pack. |
+| `Theme.Install` | Installing a downloaded pack. |
+| `Releases.CheckForUpdate` | `UpdateChecker.checkForUpdates`. |
+| `Releases.LoadCatalog` | `ReleasesCatalog.load`. |
+
+### 5.9 Slideshow
+
+| Action | Wraps |
+|--------|-------|
+| `Slideshow.Start` | Start of a slideshow run. |
+| `Slideshow.Advance` | One advance, including the image-load tied to it. |
+| `Slideshow.Stop` | Stop of a slideshow run. |
+
+### 5.10 SVG
+
+| Action | Wraps |
+|--------|-------|
+| `SVG.Detect` | `SVGDetection.classify`. |
+| `SVG.Render` | Renderer pass. |
+| `SVG.PlaybackTick` | Per-frame playback (instrumented only when explicitly enabled). |
+
+---
+
+## 6. The `PerformanceLog` Swift API
+
+The full API lives in
+`code/Sources/ImageGlassCore/Logging/PerformanceLog.swift`. The public
+surface engineers use:
+
+### 6.1 Starting a trace
+
+```swift
+let trace = PerformanceLog.shared.start(
+    "FileTree.SelectionChange",
+    extra: [("path", entry.path)]
+)
+defer { trace.finish() }
+// … do the work …
+```
+
+### 6.2 Manual finish with context
+
+```swift
+trace.finish(extra: [("decoded_bytes", String(bytes))])
+```
+
+### 6.3 Finish-with-reason
+
+```swift
+trace.finish(reason: "error", extra: [("err", String(reflecting: err))])
+```
+
+### 6.4 Cancellation
+
+```swift
+trace.cancel(extra: [("superseded_by", String(newInstance))])
+```
+
+### 6.5 Synchronous block sugar
+
+```swift
+let result = PerformanceLog.shared.measure(
+    "Image.Decode",
+    extra: [("path", path)]
+) {
+    return decodePixels(at: path)
+}
+```
+
+### 6.6 Async block sugar
+
+```swift
+let result = try await PerformanceLog.shared.measureAsync(
+    "DirectoryWalk.Run",
+    extra: [("root", root.path)]
+) {
+    return try await walk(root: root)
+}
+```
+
+### 6.7 Instantaneous events
+
+```swift
+PerformanceLog.shared.event(
+    "FileTree.FirstPaint",
+    extra: [("path", path)]
+)
+```
+
+### 6.8 Disabling for tests
+
+```swift
+PerformanceLog.shared.enabled = false
+// … or point to a temp file:
+PerformanceLog.shared.overrideLogFile = tempURL
+```
+
+### 6.9 Pairing rules engineers MUST follow
+
+* **Every `start` MUST be matched by exactly one `finish` (or
+  `cancel`).** Use `defer { trace.finish() }` immediately after the
+  `start` call — that pattern survives early-return and `throw`.
+* **The `action` name SHOULD be the dotted name from §5.** Free-form
+  names are allowed but the spec table is the authoritative list.
+* **The `extra` payload SHOULD be short.** A `path` is fine; the
+  contents of a 2 MB EXIF blob are not.
+* **Do not wrap tiny synchronous functions.** A wrap is only worth it
+  if the body might take >100 µs. Wrapping a 10-ns getter just makes
+  the log noisier and slower.
+
+---
+
+## 7. Hot Paths and Parallelization Opportunities
+
+This section captures the high-risk paths the agents identified during
+the v1 audit. Items marked **[P]** are parallelization opportunities
+(action and instrumentation already in place — the parallelization
+work is its own change).
+
+### 7.1 File-tree selection (the slow path the user called out)
+
+* `FileListViewModel.click(entry:)` mutates selection state and
+  triggers an `Image.Load`. Today the selection commit, the
+  visible-entries recompute, and the SwiftUI publish all happen on the
+  main actor synchronously. **Instrument** `FileTree.SelectionChange`
+  as the outer wrapper, `FileTree.SelectionCommit` as the inner state
+  mutation, and `FileTree.BuildVisibleEntries` as the recompute.
+* The recompute walks the in-memory `RootDirectory` tree on every
+  click — even when the click does not change the visible set. The
+  analyzer will show this; the fix is to short-circuit when the
+  selection delta does not change the filter outcome.
+* `FileListTreeView.body` rebuilds the entire row list on every state
+  change because it iterates `tree` and calls `nodeView` per node.
+  **Instrument** `FileTree.BuildTree` to see the cost.
+
+### 7.2 Directory walk on a deep hierarchy [P]
+
+* `DirectoryTreeWalker.walkDir(...)` is recursive and single-threaded
+  per root. Two known consequences:
+  1. Adding a single root that spans tens of thousands of files
+     blocks at one core's I/O latency, leaving the other 7–15 cores
+     idle.
+  2. The walk has to finish before the panel can show any rows for
+     the new root (we walk fully before publishing).
+* **Plan:** introduce a parallel variant. The first level of children
+  walks in a `TaskGroup` with a bounded concurrency equal to
+  `ProcessInfo.processInfo.activeProcessorCount`. The synchronous
+  recursive variant stays as the per-subtree implementation so we keep
+  ordering guarantees. **Instrumented as** `DirectoryWalk.Parallel`
+  with the per-subtree work showing up as nested
+  `DirectoryWalk.SingleDir` traces.
+* **Future:** stream tree nodes to the panel as they are discovered
+  rather than waiting for the whole root to finish. Separate change.
+
+### 7.3 `traverseAndLog`
+
+* After every walk, `DirectoryTreeWalker.traverseAndLog` emits one
+  `tree.node` audit line per node. For a 50k-file root that is 50k
+  lines written through `MCPAuditLogger`'s lock. **Instrument**
+  `Tree.Traverse.Log` so the analyzer can see how much of the
+  end-to-end walk is "actual work" vs. "audit emission". The fix, if
+  needed, is to batch-write under a single lock acquisition.
+
+### 7.4 Image load
+
+* `FormatLoader.load(at:)` opens the URL, decodes via ImageIO,
+  optionally reads EXIF, and returns a `CGImage`. **Instrument**
+  `Image.Load` as the outer, `Image.OpenSource`, `Image.Decode`, and
+  `Image.ReadEXIF` as the inner stages.
+* For HEIC and RAW the decode is the dominant cost. Compare to JPEG
+  to see whether we are doing extra color-management work we can
+  avoid.
+
+### 7.5 Thumbnail generation
+
+* `ThumbnailCache` is a write-through cache. A miss decodes a full
+  image and rescales it. **Instrument** `Thumbnail.Generate` and watch
+  for batches of misses correlated with scroll bursts.
+
+### 7.6 Settings and Local Storage
+
+* Every YAML write goes through `SettingsStore` / `DirectoriesStore`.
+  Their writes are atomic (write to temp + rename), which fsyncs.
+  **Instrument** `LocalStorage.Write.<file>` so we can see whether the
+  rename cost is the dominant component of a "save settings" action.
+* Every MCP tool call that mutates settings hits at least one write.
+  Burst-writes from rapid slider drags must remain debounced (already
+  the case for slideshow interval; verify for every settle-only
+  control).
+
+### 7.7 MCP tool calls
+
+* `MCPLock` serializes mutation. Wrapping every `MCP.ToolCall.<name>`
+  in a trace lets the analyzer see how often we contend on the lock.
+  Lock-wait is reported as `MCP.WaitOnLock`.
+
+### 7.8 App launch
+
+* Today launch is sequential: load settings → load directories →
+  build UI → start MCP server. **Instrument** `AppLaunch.*` so we can
+  see which stage dominates. If it's `LoadDirectories` for users with
+  many roots, schedule walks in parallel (related to §7.2).
+
+### 7.9 Panel layout commit
+
+* The panel framework rebuilds its layout on every show/hide/move.
+  For users with 6+ panels that becomes user-visible. **Instrument**
+  `Panel.*` and `Layout.Save` to see where the time lands.
+
+---
+
+## 8. Instrumentation Conventions
+
+### 8.1 Where the call goes
+
+The `PerformanceLog.shared.start(...)` call goes **as close as
+possible** to the user-perceived edge of the action.
+
+* For `FileTree.SelectionChange`: at the very top of the click /
+  keystroke handler, **before** any work runs.
+* For `Image.Load`: at the top of the public load entry point used by
+  the viewer, **not** inside the loader's private decoder.
+
+Inner traces nest naturally because of instance counters — every
+trace is independent of every other trace.
+
+### 8.2 Naming new actions
+
+* Dotted, PascalCase segments separated by `.`.
+* The first segment is the area (`FileTree`, `Image`, `DirectoryWalk`,
+  …).
+* The second segment is the verb or sub-area (`SelectionChange`,
+  `Load`, `Parallel`, …).
+* Optional third segment for variants (`Image.SaveAs.HEIC`,
+  `LocalStorage.Read.directories`).
+
+### 8.3 Picking the `extra` payload
+
+Include only what an analyzer will actually use:
+
+* For file actions: `path` (canonical, not relative).
+* For walks: `root`, `file_count`, `dir_count`.
+* For decodes: `bytes`, `format`, `decoded_pixels`.
+* For MCP: `tool`, `client`.
+* For errors: `err` (use `String(reflecting: error)`, keep it short).
+
+Avoid: anything multi-MB; anything user-private; anything that
+changes on every line (perf log is not a tag store).
+
+### 8.4 Cancellation
+
+When an action is superseded — for example a new walk for the same
+root cancels the previous walk — call `cancel(extra:)` on the old
+trace with `extra=[("superseded_by", "<corr>")]` so the analyzer can
+chain cancelled traces back to their replacement.
+
+### 8.5 Reentrancy
+
+The same `action` can be in flight concurrently. The instance counter
+is process-wide and thread-safe. Two concurrent `Image.Load`s get
+distinct instance numbers and distinct correlation ids; their
+intervals can overlap freely.
+
+### 8.6 Tests
+
+Tests SHOULD set `PerformanceLog.shared.enabled = false` (or override
+the file path) in `setUp` so they do not leak entries into the
+developer's shared performance log. The `MCPManualTests`-style
+`fixtureRoot` pattern is the model.
+
+---
+
+## 9. Offline Analysis Workflow
+
+### 9.1 Pull the file
+
+```
+~/Library/Application Support/ImageGlass_Mac/performance.log
+```
+
+A reasonable session is 1–10 MB. Sessions over 100 MB indicate either
+a misconfigured instrumentation (e.g. per-frame logging in slideshow)
+or a very long run. Rotate by `mv performance.log
+performance.<timestamp>.log` if you want a clean baseline.
+
+### 9.2 Pair lines
+
+For an action `A`:
+
+```
+awk '/action=A /' performance.log
+```
+
+For one instance `#17`:
+
+```
+awk '/action=A .* instance=17 / ' performance.log
+```
+
+Two lines should come back (one start, one finish).
+
+### 9.3 Compute per-action stats
+
+```
+awk '/phase=finish/ { match($0, /action=[^ ]+/); a=substr($0,RSTART,RLENGTH); match($0, /elapsed_ms=[0-9]+/); e=substr($0,RSTART+11,RLENGTH-11); print a, e }' performance.log | sort
+```
+
+For Claude Code: a one-pass parser reads the file, builds
+`[action -> [elapsed_ms…]]`, prints p50/p95/p99 per action, then
+flags any `auto_finish` reasons (those are leaks).
+
+### 9.4 Find overlaps
+
+The analyzer can detect "outer action X wraps inner action Y" by
+checking that `Y.start_ts > X.start_ts` and `Y.finish_ts <
+X.finish_ts` in wallclock order. The time `X.elapsed_ms - sum(Y…)` is
+the "other work" `X` did that is not accounted for in instrumented
+inner actions — a candidate for the next round of instrumentation.
+
+### 9.5 The "selection click is slow" workflow
+
+1. Reproduce: open the app, click around the file tree for a minute.
+2. `grep 'action=FileTree.SelectionChange' performance.log` →
+   one start/finish pair per click.
+3. Bucket by `elapsed_ms`. Anything over 50 ms is suspect.
+4. For each slow click, look at every trace whose `corr` field is in
+   the same time interval (or whose start lies between the
+   `SelectionChange` start and finish). The dominant inner action is
+   the suspect.
+5. Common suspects: `FileTree.BuildVisibleEntries` (filter walk),
+   `Image.Load` (cold-cache HEIC), `Layout.Save` (we accidentally
+   flushed settings on every click), `Thumbnail.Generate` (thumbnail
+   miss).
+
+### 9.6 The "deep walk is single-threaded" workflow
+
+1. Add a deep root.
+2. `grep 'action=DirectoryWalk' performance.log` → one `Run` or
+   `Parallel` start/finish.
+3. Wallclock duration of `Run` should approach
+   `sum(SingleDir elapsed) / N_cores` once §7.2 lands. Until then it
+   approaches `sum(SingleDir elapsed)` (single-threaded).
+4. Verify via Instruments timeline (the `DirectoryWalk` lane) that
+   work actually overlaps across cores.
+
+---
+
+## 10. What the Agents Found (v1 instrumentation pass)
+
+The v1 audit dispatched parallel agents over the source tree (every
+`Sources/**/*.swift`). Their findings — what they instrumented, what
+they flagged as high-risk for follow-up, and their parallelization
+suggestions — are merged below. Each subsection corresponds to one
+section of the source tree; subsections are owned by the file paths
+they list.
+
+### 10.1 `Sources/ImageGlass/FileList/*`
+
+* **Instrumented**: `FileListViewModel.click`,
+  `FileListViewModel.visibleEntries` recompute,
+  `FileListViewModel.buildTree`, `FileListTreeView` row build,
+  `SelectableTreeRenderer` invalidation.
+* **High-risk**: `visibleEntries` is recomputed even when the
+  filter result has not changed. The recompute walks every visible
+  entry on every selection click.
+* **Suggested fix**: cache the visible-entries snapshot by
+  `(filterFingerprint, sortFingerprint, rootRevision)` and invalidate
+  only when one of those changes.
+
+### 10.2 `Sources/ImageGlassCore/FileList/*`
+
+* **Instrumented**: `DirectoryTreeWalker.scheduleWalk`,
+  `runWalk`, `walkDir`, `refilter`, `refilterAll`,
+  `removeRoot`, `traverseAndLog`, `FileListSorter.sort`,
+  `FileListTreeBuilder.build`, `ThumbnailCache.thumbnail(for:)`.
+* **High-risk**: `walkDir` is recursive and single-threaded
+  (§7.2). `traverseAndLog` emits one MCP audit line per node and
+  flushes through the audit logger's lock on each call (§7.3).
+* **Suggested fix**: parallelize `walkDir` at the top level (§7.2);
+  batch `tree.node` lines into one buffer per walk and emit them with
+  a single lock acquisition.
+
+### 10.3 `Sources/ImageGlass/Viewer/*`
+
+* **Instrumented**: `ImageViewer.load(path:)`,
+  `ImageCanvasView` paint cycle, `ViewerState.update`,
+  `ColorPickerOverlay` re-render, `SlideshowWindow.advance`,
+  `HotkeyHandlers.handle`, `SVGCanvasView.render`,
+  `VideoCanvasView` first-frame, `ZoomMath.fit`.
+* **High-risk**: cold HEIC/RAW decode dominates `Image.Load` on
+  first-click. The canvas does an unconditional full re-render on
+  every state change instead of diffing.
+* **Suggested fix**: prefetch the next/previous file in the
+  background as soon as a selection commits (warms the decode
+  pipeline); diff `ViewerState` and skip the redraw if the relevant
+  fields are unchanged.
+
+### 10.4 `Sources/ImageGlassCore/Viewer/*`
+
+* **Instrumented**: `FrameSource.frames`, `FrameExporter.export`,
+  `ColorChannelMath.compute`, `LoadDiagnostics.report`,
+  `GitLFSPointer.detect`, `ZoomMath.fit`, `ColorFormatting.format`.
+* **High-risk**: animated formats spin through `FrameSource` on
+  the main thread when prefetching multiple frames.
+* **Suggested fix**: move per-frame decode off the main actor; the
+  Canvas already runs on a render thread.
+
+### 10.5 `Sources/ImageGlass/Panels/*` and `Sources/ImageGlassCore/Panels/*`
+
+* **Instrumented**: `PanelLayoutModel.apply`,
+  `PanelLayoutMutations.move/.tab/.untab`,
+  `PanelHostView` layout pass, `LayoutStore.save`,
+  `LayoutStore.load`, `PanelPresets.apply`,
+  `PanelStateYAML.read/.write`.
+* **High-risk**: every panel mutation rewrites the entire
+  layout.json. Drag-resize is debounced but other mutations are not.
+* **Suggested fix**: coalesce multi-mutation transactions into a
+  single save; verify the coalesce window for `Panel.SetSize` is wide
+  enough on a fast trackpad.
+
+### 10.6 `Sources/ImageGlassCore/MCP/*` and `Sources/ImageGlassCore/MCPServer.swift`
+
+* **Instrumented**: every public entry point in
+  `DirectoriesMCPTools`, `FilePanelBridgeMCPTools`,
+  `MCPTools+Charter`, `MCPServer.handle`, `MCPLock.withLock`,
+  `MCPNotificationBus.post`.
+* **High-risk**: `MCPLock` is a process-wide lock; bursts of MCP
+  calls (e.g. `list_directories` + `update_directory_filter`)
+  serialize through it.
+* **Suggested fix**: keep the lock but emit `MCP.WaitOnLock` traces
+  so the analyzer can quantify contention.
+
+### 10.7 `Sources/ImageGlassCore/Charter/*` and `Sources/ImageGlassCore/Scope.swift` family
+
+* **Instrumented**: `ScopeEvaluator.evaluate`,
+  `ScopeChain.evaluate`, `ScopeBundle.load`,
+  `ScopeDiff.compute`, `CharterStatus.compute`,
+  `RuleSet.matches`, `ScopeAuditLog.append`.
+* **High-risk**: `ScopeDiff` builds two sets and walks both —
+  fine for small scopes, dominant for scopes with 100k+ files.
+* **Suggested fix**: sort both inputs and run a merge-diff; emit
+  `Scope.Evaluate` with `count=` so the analyzer can plot duration
+  against scope size.
+
+### 10.8 `Sources/ImageGlassCore/Config/*`
+
+* **Instrumented**: `SettingsStore.load`, `Settings.save`,
+  `SettingsYAML.encode/.decode`, `ConfigLoader.load`,
+  `InitialConfigSeeder.seed`, `CLIOverrides.apply`,
+  `WindowSettings.load/.save`.
+* **High-risk**: `SettingsYAML.encode` round-trips the whole
+  settings tree on every save. For users with deep theme + format +
+  external-tool customizations this is non-trivial.
+* **Suggested fix**: keep the writer; the dominant cost is fsync at
+  rename, not the encode. Confirm with the perf log.
+
+### 10.9 `Sources/ImageGlassCore/Formats/*`
+
+* **Instrumented**: `FormatLoader.load`, `FormatEncoder.encode`,
+  `FormatRegistry.format(for:)`, `Base64Loader.load`,
+  `ClipboardLoader.load`, `FormatCapabilities.capabilities(for:)`.
+* **High-risk**: `FormatRegistry.format(for:)` is called on every
+  file walked; if the regex matching is hot enough to show up, cache
+  the result by extension.
+* **Suggested fix**: instrument first, optimize after.
+
+### 10.10 `Sources/ImageGlassCore/Crop/*`
+
+* **Instrumented**: `CropPipeline.apply`, `JPEGLosslessCrop.crop`,
+  `CropSession.commit`, `CropSideFile.write`,
+  `CropMath.computeRect`, `CropGeometry.transform`.
+* **High-risk**: the JPEG-lossless path is fast; the pixel path
+  re-decodes and re-encodes the full image. Both are user-blocking.
+* **Suggested fix**: profile the pixel path with the new traces in
+  place.
+
+### 10.11 `Sources/ImageGlassCore/Themes/*` and `Sources/ImageGlassCore/Releases/*` and `Sources/ImageGlassCore/Video/*` and `Sources/ImageGlassCore/SVG/*`
+
+* **Instrumented**: `ThemeStore.load`, `ThemeCatalog.scan`,
+  `ThemeInstaller.install`, `ThemePackValidator.validate`,
+  `ReleasesCatalog.load`, `UpdateChecker.checkForUpdates`,
+  `Changelog.parse`, `VideoFormats.classify`,
+  `SVGDetection.classify`.
+* **High-risk**: `ThemePackValidator` walks every file in a pack;
+  for a large pack this dominates an install.
+* **Suggested fix**: stream-validate as the pack is extracted
+  instead of post-hoc.
+
+### 10.12 `Sources/ImageGlass/` window/app/main (everything else under `ImageGlass/`) and `Sources/ImageGlassMCPServer/main.swift`, `Sources/igcmd/main.swift`
+
+* **Instrumented**: `ImageGlassApp` startup stages
+  (`AppLaunch.LoadSettings`, `AppLaunch.LoadDirectories`,
+  `AppLaunch.RestoreLayout`, `AppLaunch.StartMCPServer`,
+  `AppLaunch.FirstFrame`), `WindowStateController.apply`,
+  `WindowGeometryReporter.report`, `FloatingFileTreeWindow.commit`,
+  `SecondViewerWindow.commit`, `AppState.commitDirectories`,
+  `AppState.evaluateScope`, igcmd dispatch, MCP server boot.
+* **High-risk**: app launch loads directories and walks them
+  serially; long startup on a multi-root user.
+* **Suggested fix**: schedule walks in parallel as soon as the
+  directories list is known; do not block UI on completion (panel
+  already renders empty roots and streams in).
+
+---
+
+## 11. Versioning and Maintenance
+
+* This document is checked in under `docs/performance.mdx`. Every
+  change to the action taxonomy (§5) or the line grammar (§4) is a
+  versioned change to this file.
+* The implementation at
+  `code/Sources/ImageGlassCore/Logging/PerformanceLog.swift` is the
+  enforcement boundary. The reviewers AI checks new code paths for
+  matching `start` / `finish` pairs and for membership of the
+  `action` name in §5.
+* When a hot-path optimization lands, the engineer adds a
+  one-paragraph note under the appropriate §10 subsection describing
+  the before/after and what the perf log showed.
+

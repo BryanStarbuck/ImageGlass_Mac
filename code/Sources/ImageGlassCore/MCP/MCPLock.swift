@@ -22,7 +22,20 @@ public final class MCPLock: @unchecked Sendable {
 
     /// Run a block while holding the lock. The block can throw; the error
     /// surfaces back to the caller.
+    ///
+    /// Instrumented per `docs/performance.mdx` §5.6 / §7.7: the time spent
+    /// waiting on the queue is reported as `MCP.WaitOnLock`, and the time
+    /// the body actually runs while holding the queue as `MCP.LockHeld`.
+    /// Together they let the offline analyzer quantify contention bursts
+    /// (multiple MCP tools landing concurrently) separately from genuinely
+    /// long-running per-tool work.
     public func withLock<T>(_ body: () throws -> T) rethrows -> T {
-        try queue.sync { try body() }
+        let waitTrace = PerformanceLog.shared.start("MCP.WaitOnLock")
+        return try queue.sync {
+            waitTrace.finish()
+            let heldTrace = PerformanceLog.shared.start("MCP.LockHeld")
+            defer { heldTrace.finish() }
+            return try body()
+        }
     }
 }

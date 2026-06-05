@@ -29,7 +29,11 @@ public struct DirectoriesMCPTools: Sendable {
         // voice intents like "also exclude _WIP_" land as a single
         // append rather than re-issuing the whole filter.
         "add_filter_item",
+        "remove_filter_item",
         "list_filter_items",
+        // §6 — hide-empty-directories UI preference.
+        "set_hide_empty_directories",
+        "get_hide_empty_directories",
     ]
 
     public init(
@@ -164,32 +168,42 @@ public struct DirectoriesMCPTools: Sendable {
             .init(
                 name: "update_directory_filter",
                 description: """
-                    Replace the per-root filter on one root. Applied to the \
-                    in-memory tree only (§3A.7) — no filesystem walk. See \
-                    mcp_file.mdx §7.
+                    Replace the per-root filter. Either supply legacy \
+                    `path` (one root) or new `targets` (mcp_and_filters_on_dirs.mdx \
+                    §4.3): "all" / single path / array of paths. The two \
+                    forms are mutually exclusive — sending both returns \
+                    err=conflicting_arguments. In-memory re-evaluation \
+                    only (list_of_files.mdx §3A.7) — no filesystem walk.
                     """,
                 inputSchema: AnyCodable([
                     "type": "object",
                     "properties": [
-                        "path": ["type": "string"],
+                        "path":   ["type": "string"],
+                        "targets": [
+                            "description": "'all', a single absolute path, or an array of absolute paths.",
+                        ] as [String: Any],
                         "filter": filterSchema,
                         "client": ["type": "string"],
                     ] as [String: Any],
-                    "required": ["path", "filter"],
+                    "required": ["filter"],
                     "additionalProperties": false,
                 ])
             ),
             .init(
                 name: "set_global_filter",
                 description: """
-                    Apply the same filter to every existing root in \
-                    directories.yaml. In-memory re-evaluation only \
-                    (§3A.7). See mcp_file.mdx §6.
+                    Apply the same filter to every existing root (legacy), \
+                    or — when `targets` (mcp_and_filters_on_dirs.mdx §4.3) \
+                    is supplied — to just those roots. In-memory \
+                    re-evaluation only (§3A.7). See mcp_file.mdx §6.
                     """,
                 inputSchema: AnyCodable([
                     "type": "object",
                     "properties": [
                         "filter": filterSchema,
+                        "targets": [
+                            "description": "Optional. 'all' (default), single path, or array of paths.",
+                        ] as [String: Any],
                         "client": ["type": "string"],
                     ] as [String: Any],
                     "required": ["filter"],
@@ -270,7 +284,9 @@ public struct DirectoriesMCPTools: Sendable {
                 name: "list_filter_items",
                 description: """
                     Return the filter items currently in effect, grouped \
-                    by root and sorted highest-priority-first. \
+                    by root and sorted highest-priority-first. Each item \
+                    carries its derived 6-char `id` (§4.5) so a follow-up \
+                    `remove_filter_item` can target it unambiguously. \
                     `targets` defaults to "all" (every root). See \
                     mcp_and_filters_on_dirs.mdx §4.2 / §5E.
                     """,
@@ -281,6 +297,74 @@ public struct DirectoriesMCPTools: Sendable {
                             "description": "'all', a single absolute path, or an array of absolute paths.",
                         ] as [String: Any],
                     ] as [String: Any],
+                    "additionalProperties": false,
+                ])
+            ),
+            .init(
+                name: "remove_filter_item",
+                description: """
+                    REMOVE filter items matching the criterion from the \
+                    targeted root(s). `match` accepts one of `id` (exact \
+                    match against the §4.5 derived id), `pattern` (exact \
+                    pattern string), or `regex` (regex over each item's \
+                    pattern). `targets` is "all" (default), a single \
+                    canonical path, or an array of paths. Atomic across \
+                    targets (§4.6). See mcp_and_filters_on_dirs.mdx §4.2 / \
+                    §5D.
+                    """,
+                inputSchema: AnyCodable([
+                    "type": "object",
+                    "properties": [
+                        "targets": [
+                            "description": "'all', a single absolute path, or an array of absolute paths.",
+                        ] as [String: Any],
+                        "match": [
+                            "type": "object",
+                            "description": "Exactly one of `id`, `pattern`, or `regex` must be supplied.",
+                            "properties": [
+                                "id":      ["type": "string"],
+                                "pattern": ["type": "string"],
+                                "regex":   ["type": "string"],
+                            ] as [String: Any],
+                        ] as [String: Any],
+                        "client": ["type": "string"],
+                    ] as [String: Any],
+                    "required": ["match"],
+                    "additionalProperties": false,
+                ])
+            ),
+            .init(
+                name: "set_hide_empty_directories",
+                description: """
+                    Toggle the panel's "Hide Empty Directories" UI \
+                    preference (mcp_and_filters_on_dirs.mdx §6). When \
+                    enabled, directory rows whose recursive descendants \
+                    contain zero `passesFilter == true` files are skipped \
+                    in the tree view. Root rows always render. The \
+                    preference is stored in a plain-text flag file under \
+                    the app-support dir and synced to the running app via \
+                    the same Darwin notification + kqueue path used by \
+                    `directories.yaml`.
+                    """,
+                inputSchema: AnyCodable([
+                    "type": "object",
+                    "properties": [
+                        "enabled": ["type": "boolean"],
+                        "client":  ["type": "string"],
+                    ] as [String: Any],
+                    "required": ["enabled"],
+                    "additionalProperties": false,
+                ])
+            ),
+            .init(
+                name: "get_hide_empty_directories",
+                description: """
+                    Read the current `hide_empty_directories` preference. \
+                    Returns `{ enabled: true|false }`.
+                    """,
+                inputSchema: AnyCodable([
+                    "type": "object",
+                    "properties": [:] as [String: Any],
                     "additionalProperties": false,
                 ])
             ),
@@ -301,7 +385,10 @@ public struct DirectoriesMCPTools: Sendable {
         case "reveal_directory":         return try revealDirectory(arguments)
         case "refresh_directory":        return try refreshDirectory(arguments)
         case "add_filter_item":          return try addFilterItem(arguments)
+        case "remove_filter_item":       return try removeFilterItem(arguments)
         case "list_filter_items":        return try listFilterItems(arguments)
+        case "set_hide_empty_directories":  return try setHideEmptyDirectories(arguments)
+        case "get_hide_empty_directories":  return try getHideEmptyDirectories(arguments)
         default:
             return .text("Unknown directory tool: \(name)", isError: true)
         }
@@ -310,6 +397,8 @@ public struct DirectoriesMCPTools: Sendable {
     // MARK: - Tool implementations
 
     private func listDirectories(_ args: [String: Any?]) throws -> MCP.CallToolResult {
+        let _trace = PerformanceLog.shared.start("MCP.ToolCall.list_directories")
+        defer { _trace.finish() }
         let file = (try? store.load()) ?? DirectoriesFile()
         let body: [String: Any] = [
             "root_directories": file.roots.map(rootJSON),
@@ -318,6 +407,8 @@ public struct DirectoriesMCPTools: Sendable {
     }
 
     private func getDirectory(_ args: [String: Any?]) throws -> MCP.CallToolResult {
+        let _trace = PerformanceLog.shared.start("MCP.ToolCall.get_directory")
+        defer { _trace.finish() }
         let raw = try requireString(args, "path")
         let canonical = try DirectoriesStore.canonicalize(raw, mustExist: false)
         let file = (try? store.load()) ?? DirectoriesFile()
@@ -328,8 +419,13 @@ public struct DirectoriesMCPTools: Sendable {
     }
 
     private func addDirectory(_ args: [String: Any?]) throws -> MCP.CallToolResult {
-        let corr = MCPAuditLogger.newCorrelationId()
         let client = (args["client"] as? String) ?? "claude-code"
+        let _trace = PerformanceLog.shared.start(
+            "MCP.ToolCall.add_directory",
+            extra: [("client", client)]
+        )
+        defer { _trace.finish() }
+        let corr = MCPAuditLogger.newCorrelationId()
         let raw: String
         do {
             raw = try requireString(args, "path")
@@ -410,8 +506,13 @@ public struct DirectoriesMCPTools: Sendable {
     }
 
     private func removeDirectory(_ args: [String: Any?]) throws -> MCP.CallToolResult {
-        let corr = MCPAuditLogger.newCorrelationId()
         let client = (args["client"] as? String) ?? "claude-code"
+        let _trace = PerformanceLog.shared.start(
+            "MCP.ToolCall.remove_directory",
+            extra: [("client", client)]
+        )
+        defer { _trace.finish() }
+        let corr = MCPAuditLogger.newCorrelationId()
         let raw: String
         do { raw = try requireString(args, "path") } catch {
             logger.logDirectoryToolCall(
@@ -444,8 +545,13 @@ public struct DirectoriesMCPTools: Sendable {
     }
 
     private func clearDirectories(_ args: [String: Any?]) throws -> MCP.CallToolResult {
-        let corr = MCPAuditLogger.newCorrelationId()
         let client = (args["client"] as? String) ?? "claude-code"
+        let _trace = PerformanceLog.shared.start(
+            "MCP.ToolCall.clear_directories",
+            extra: [("client", client)]
+        )
+        defer { _trace.finish() }
+        let corr = MCPAuditLogger.newCorrelationId()
         let before = ((try? store.load()) ?? DirectoriesFile()).roots
         do { try store.clearAll() } catch {
             logger.logDirectoryToolCall(
@@ -468,19 +574,42 @@ public struct DirectoriesMCPTools: Sendable {
     }
 
     private func updateDirectoryFilter(_ args: [String: Any?]) throws -> MCP.CallToolResult {
-        let corr = MCPAuditLogger.newCorrelationId()
         let client = (args["client"] as? String) ?? "claude-code"
-        let raw: String
-        do { raw = try requireString(args, "path") } catch {
+        let _trace = PerformanceLog.shared.start(
+            "MCP.ToolCall.update_directory_filter",
+            extra: [("client", client)]
+        )
+        defer { _trace.finish() }
+        let corr = MCPAuditLogger.newCorrelationId()
+
+        // Spec §4.3: mixing legacy `path` and new `targets` is a hard
+        // error so the LLM can't get surprising behavior from a half-
+        // migrated payload. Either one is fine on its own.
+        let hasPath    = (args["path"]    as? String).map { !$0.isEmpty } ?? false
+        let hasTargets = args["targets"] != nil
+        if hasPath && hasTargets {
+            logger.logDirectoryToolCall(
+                toolName: "update_directory_filter", path: nil, client: client,
+                corr: corr, ok: false, err: "conflicting_arguments"
+            )
+            return .text(
+                "`path` and `targets` are mutually exclusive (§4.3).",
+                isError: true
+            )
+        }
+        if !hasPath && !hasTargets {
             logger.logDirectoryToolCall(
                 toolName: "update_directory_filter", path: nil, client: client,
                 corr: corr, ok: false, err: "missing_path"
             )
-            return .text("Missing `path`.", isError: true)
+            return .text(
+                "Either `path` or `targets` is required.", isError: true
+            )
         }
+
         guard let rawFilter = args["filter"] as? [String: Any?] else {
             logger.logDirectoryToolCall(
-                toolName: "update_directory_filter", path: raw, client: client,
+                toolName: "update_directory_filter", path: nil, client: client,
                 corr: corr, ok: false, err: "missing_filter"
             )
             return .text("Missing `filter`.", isError: true)
@@ -488,55 +617,118 @@ public struct DirectoriesMCPTools: Sendable {
         let filter: RootFilter
         do { filter = try parseFilter(rawFilter) } catch let e as DirectoriesStoreError {
             logger.logDirectoryToolCall(
-                toolName: "update_directory_filter", path: raw, client: client,
+                toolName: "update_directory_filter", path: nil, client: client,
                 corr: corr, ok: false, err: e.auditCode
             )
             return .text(e.description, isError: true)
         }
-        let ok: Bool
-        let canonical = try DirectoriesStore.canonicalize(raw, mustExist: false)
-        do { ok = try store.updateFilter(path: raw, filter: filter) } catch {
+
+        // Resolve the targeted roots. Legacy `path` is rewritten as
+        // a single-target call so the rest of the dispatch is uniform.
+        var file = (try? store.load()) ?? DirectoriesFile()
+        let targets: [URL]
+        do {
+            if hasPath {
+                let canonical = try DirectoriesStore.canonicalize(
+                    args["path"] as! String, mustExist: false
+                )
+                guard file.roots.contains(where: { $0.path == canonical }) else {
+                    logger.logDirectoryToolCall(
+                        toolName: "update_directory_filter",
+                        path: canonical.path, client: client,
+                        corr: corr, ok: false, err: "unknown_root"
+                    )
+                    return .text("Not a registered root: \(canonical.path)", isError: true)
+                }
+                targets = [canonical]
+            } else {
+                targets = try resolveTargets(args["targets"] as Any?, file: file)
+            }
+        } catch let e as DirectoriesStoreError {
             logger.logDirectoryToolCall(
-                toolName: "update_directory_filter", path: canonical.path, client: client,
-                corr: corr, ok: false, err: "io"
+                toolName: "update_directory_filter", path: nil, client: client,
+                corr: corr, ok: false, err: e.auditCode
             )
-            return .text("Failed to update filter: \(error)", isError: true)
-        }
-        if !ok {
-            logger.logDirectoryToolCall(
-                toolName: "update_directory_filter", path: canonical.path, client: client,
-                corr: corr, ok: false, err: "unknown_root"
-            )
-            return .text("Not a registered root: \(canonical.path)", isError: true)
+            return .text(e.description, isError: true)
         }
 
-        // In-memory refilter + audit. §3A.7 — no re-walk.
+        if targets.isEmpty {
+            logger.logDirectoryToolCall(
+                toolName: "update_directory_filter", path: nil, client: client,
+                corr: corr, ok: true, extra: [("status", "no_roots")]
+            )
+            return .text(prettyJSON([
+                "ok": true,
+                "corr": corr,
+                "app_running": appIsRunning(),
+                "targets_applied": [] as [String],
+                "items": filter.items.count,
+                "visible_delta": 0,
+            ] as [String: Any]))
+        }
+
+        // Apply the filter to every targeted root, save once
+        // (atomic — §4.6), then refilter each.
+        for url in targets {
+            guard let idx = file.roots.firstIndex(where: { $0.path == url }) else {
+                logger.logDirectoryToolCall(
+                    toolName: "update_directory_filter",
+                    path: url.path, client: client,
+                    corr: corr, ok: false, err: "unknown_root"
+                )
+                return .text("Not a registered root: \(url.path)", isError: true)
+            }
+            file.roots[idx].filter = filter
+        }
+        do { try store.save(file) } catch {
+            logger.logDirectoryToolCall(
+                toolName: "update_directory_filter", path: nil, client: client,
+                corr: corr, ok: false, err: "storage_write_failed"
+            )
+            return .text("Failed to save filter: \(error)", isError: true)
+        }
+
         let walkStart = Date()
-        let delta = walker.refilter(root: canonical, filter: filter)
+        var totalDelta = 0
+        for url in targets {
+            totalDelta += walker.refilter(root: url, filter: filter)
+        }
         let elapsedMs = Int(Date().timeIntervalSince(walkStart) * 1000.0)
+
         logger.logDirectoryToolCall(
-            toolName: "update_directory_filter", path: canonical.path, client: client,
+            toolName: "update_directory_filter",
+            path: targets.count == 1 ? targets[0].path : nil, client: client,
             corr: corr, ok: true,
             extra: [
                 ("items", String(filter.items.count)),
                 ("negate_items", String(filter.negateCount)),
+                ("roots", String(targets.count)),
             ]
         )
         logger.logDirectoryRefilter(
-            roots: 1, visibleDelta: delta, elapsedMs: elapsedMs, corr: corr
+            roots: targets.count, visibleDelta: totalDelta,
+            elapsedMs: elapsedMs, corr: corr
         )
+        postDirectoriesChanged()
         return .text(prettyJSON([
-            "path": canonical.path,
+            "ok": true,
+            "corr": corr,
+            "app_running": appIsRunning(),
+            "targets_applied": targets.map { $0.path },
             "items": filter.items.count,
             "negate_items": filter.negateCount,
-            "visible_delta": delta,
-            "corr": corr,
+            "visible_delta": totalDelta,
         ] as [String: Any]))
     }
 
     private func setGlobalFilter(_ args: [String: Any?]) throws -> MCP.CallToolResult {
-        let corr = MCPAuditLogger.newCorrelationId()
         let client = (args["client"] as? String) ?? "claude-code"
+        let _trace = PerformanceLog.shared.start(
+            "MCP.ToolCall.set_global_filter",
+            extra: [("client", client)]
+        )
+        defer { _trace.finish() }
+        let corr = MCPAuditLogger.newCorrelationId()
         guard let rawFilter = args["filter"] as? [String: Any?] else {
             logger.logDirectoryToolCall(
                 toolName: "set_global_filter", path: nil, client: client,
@@ -552,33 +744,90 @@ public struct DirectoriesMCPTools: Sendable {
             )
             return .text(e.description, isError: true)
         }
-        let n: Int
-        do { n = try store.setGlobalFilter(filter) } catch {
+
+        // Spec §4.3: legacy `set_global_filter()` without targets ⇒
+        // every root. With targets ⇒ narrow to those. We never accept
+        // both `targets` and (the absence of `targets`); that
+        // combinatoric does not exist on this tool.
+        var file = (try? store.load()) ?? DirectoriesFile()
+        let targets: [URL]
+        do {
+            targets = try resolveTargets(args["targets"] as Any?, file: file)
+        } catch let e as DirectoriesStoreError {
             logger.logDirectoryToolCall(
                 toolName: "set_global_filter", path: nil, client: client,
-                corr: corr, ok: false, err: "io"
+                corr: corr, ok: false, err: e.auditCode
+            )
+            return .text(e.description, isError: true)
+        }
+
+        if targets.isEmpty {
+            logger.logDirectoryToolCall(
+                toolName: "set_global_filter", path: nil, client: client,
+                corr: corr, ok: true, extra: [("status", "no_roots")]
+            )
+            return .text(prettyJSON([
+                "ok": true,
+                "corr": corr,
+                "app_running": appIsRunning(),
+                "targets_applied": [] as [String],
+                "items": filter.items.count,
+                "visible_delta": 0,
+            ] as [String: Any]))
+        }
+
+        // Apply to every targeted root + save once (atomic — §4.6).
+        for url in targets {
+            guard let idx = file.roots.firstIndex(where: { $0.path == url }) else {
+                logger.logDirectoryToolCall(
+                    toolName: "set_global_filter", path: url.path,
+                    client: client, corr: corr, ok: false, err: "unknown_root"
+                )
+                return .text("Not a registered root: \(url.path)", isError: true)
+            }
+            file.roots[idx].filter = filter
+        }
+        do { try store.save(file) } catch {
+            logger.logDirectoryToolCall(
+                toolName: "set_global_filter", path: nil, client: client,
+                corr: corr, ok: false, err: "storage_write_failed"
             )
             return .text("Failed to set global filter: \(error)", isError: true)
         }
+
         let walkStart = Date()
-        let delta = walker.refilterAll(filter: filter)
+        var totalDelta = 0
+        for url in targets {
+            totalDelta += walker.refilter(root: url, filter: filter)
+        }
         let elapsedMs = Int(Date().timeIntervalSince(walkStart) * 1000.0)
+
         logger.logDirectoryToolCall(
             toolName: "set_global_filter", path: nil, client: client,
-            corr: corr, ok: true, extra: [("items", String(filter.items.count))]
+            corr: corr, ok: true,
+            extra: [
+                ("items", String(filter.items.count)),
+                ("roots", String(targets.count)),
+            ]
         )
         logger.logDirectoryRefilter(
-            roots: n, visibleDelta: delta, elapsedMs: elapsedMs, corr: corr
+            roots: targets.count, visibleDelta: totalDelta,
+            elapsedMs: elapsedMs, corr: corr
         )
+        postDirectoriesChanged()
         return .text(prettyJSON([
-            "roots": n,
-            "items": filter.items.count,
-            "visible_delta": delta,
+            "ok": true,
             "corr": corr,
+            "app_running": appIsRunning(),
+            "targets_applied": targets.map { $0.path },
+            "items": filter.items.count,
+            "visible_delta": totalDelta,
         ] as [String: Any]))
     }
 
     private func revealDirectory(_ args: [String: Any?]) throws -> MCP.CallToolResult {
+        let _trace = PerformanceLog.shared.start("MCP.ToolCall.reveal_directory")
+        defer { _trace.finish() }
         let corr = MCPAuditLogger.newCorrelationId()
         let raw: String
         do { raw = try requireString(args, "path") } catch {
@@ -606,8 +855,13 @@ public struct DirectoriesMCPTools: Sendable {
     }
 
     private func refreshDirectory(_ args: [String: Any?]) throws -> MCP.CallToolResult {
-        let corr = MCPAuditLogger.newCorrelationId()
         let client = (args["client"] as? String) ?? "claude-code"
+        let _trace = PerformanceLog.shared.start(
+            "MCP.ToolCall.refresh_directory",
+            extra: [("client", client)]
+        )
+        defer { _trace.finish() }
+        let corr = MCPAuditLogger.newCorrelationId()
         let file = (try? store.load()) ?? DirectoriesFile()
         let targets: [RootDirectory]
         if let raw = args["path"] as? String, !raw.isEmpty {
@@ -642,12 +896,18 @@ public struct DirectoriesMCPTools: Sendable {
     private func rootJSON(_ r: RootDirectory) -> [String: Any] {
         var items: [[String: Any]] = []
         for it in r.filter.items {
-            var d: [String: Any] = ["pattern": it.pattern]
+            // `id` is always included in the JSON projection (spec
+            // §4.5) so the LLM has a stable handle for follow-up
+            // `remove_filter_item(match: { id })` calls.
+            var d: [String: Any] = [
+                "id":      it.id,
+                "pattern": it.pattern,
+            ]
             if it.kind != .glob { d["kind"] = it.kind.rawValue }
             if it.negate { d["negate"] = true }
             // mcp_and_filters_on_dirs.mdx §3.6 — non-default priority
             // is surfaced on read; default 0 is omitted to keep the
-            // YAML/JSON payload small for the common case.
+            // JSON payload small for the common case.
             if it.priority != 0 { d["priority"] = it.priority }
             items.append(d)
         }
@@ -726,8 +986,13 @@ public struct DirectoriesMCPTools: Sendable {
     // (mcp_and_filters_on_dirs.mdx §4.1 / §4.2 / §5)
 
     private func addFilterItem(_ args: [String: Any?]) throws -> MCP.CallToolResult {
-        let corr = MCPAuditLogger.newCorrelationId()
         let client = (args["client"] as? String) ?? "claude-code"
+        let _trace = PerformanceLog.shared.start(
+            "MCP.ToolCall.add_filter_item",
+            extra: [("client", client)]
+        )
+        defer { _trace.finish() }
+        let corr = MCPAuditLogger.newCorrelationId()
 
         guard let rawItem = args["item"] as? [String: Any?] else {
             logger.logDirectoryToolCall(
@@ -856,6 +1121,8 @@ public struct DirectoriesMCPTools: Sendable {
     }
 
     private func listFilterItems(_ args: [String: Any?]) throws -> MCP.CallToolResult {
+        let _trace = PerformanceLog.shared.start("MCP.ToolCall.list_filter_items")
+        defer { _trace.finish() }
         let corr = MCPAuditLogger.newCorrelationId()
         let file = (try? store.load()) ?? DirectoriesFile()
         let targets: [URL]
@@ -872,7 +1139,13 @@ public struct DirectoriesMCPTools: Sendable {
             // (mcp_and_filters_on_dirs.mdx §4.2 — list_filter_items).
             let sorted = r.filter.items.sorted(by: { $0.priority > $1.priority })
             itemsByRoot[r.path.path] = sorted.map { it in
-                var d: [String: Any] = ["pattern": it.pattern]
+                // Spec §4.5 — every item carries its derived id so a
+                // follow-up `remove_filter_item(match: { id })` can
+                // pick it out unambiguously.
+                var d: [String: Any] = [
+                    "id":      it.id,
+                    "pattern": it.pattern,
+                ]
                 if it.kind != .glob { d["kind"] = it.kind.rawValue }
                 if it.negate { d["negate"] = true }
                 if it.priority != 0 { d["priority"] = it.priority }
@@ -901,6 +1174,260 @@ public struct DirectoriesMCPTools: Sendable {
             && a.kind == b.kind
             && a.negate == b.negate
             && a.priority == b.priority
+    }
+
+    // MARK: - remove_filter_item (mcp_and_filters_on_dirs.mdx §4.2 / §5D)
+
+    private func removeFilterItem(_ args: [String: Any?]) throws -> MCP.CallToolResult {
+        let client = (args["client"] as? String) ?? "claude-code"
+        let _trace = PerformanceLog.shared.start(
+            "MCP.ToolCall.remove_filter_item",
+            extra: [("client", client)]
+        )
+        defer { _trace.finish() }
+        let corr = MCPAuditLogger.newCorrelationId()
+
+        guard let rawMatch = args["match"] as? [String: Any?] else {
+            logger.logDirectoryToolCall(
+                toolName: "remove_filter_item", path: nil, client: client,
+                corr: corr, ok: false, err: "missing_match"
+            )
+            return .text("Missing `match`.", isError: true)
+        }
+
+        // Build the predicate. Exactly one of id / pattern / regex
+        // must be supplied (spec §4.2). We validate exclusivity
+        // strictly so an LLM that sends both can't get surprising
+        // behavior.
+        let idMatch     = rawMatch["id"]      as? String
+        let patternMatch = rawMatch["pattern"] as? String
+        let regexMatch  = rawMatch["regex"]   as? String
+        let supplied    = [idMatch, patternMatch, regexMatch].compactMap { $0 }
+        if supplied.count != 1 {
+            logger.logDirectoryToolCall(
+                toolName: "remove_filter_item", path: nil, client: client,
+                corr: corr, ok: false, err: "invalid_match"
+            )
+            return .text(
+                "`match` must contain exactly one of `id`, `pattern`, or `regex`.",
+                isError: true
+            )
+        }
+
+        // Pre-compile the regex when that's the discriminator so the
+        // failure shape matches `add_filter_item` (err=invalid_regex).
+        var compiledRegex: NSRegularExpression?
+        if let rx = regexMatch {
+            do { compiledRegex = try NSRegularExpression(pattern: rx) }
+            catch {
+                logger.logDirectoryToolCall(
+                    toolName: "remove_filter_item", path: nil, client: client,
+                    corr: corr, ok: false, err: "invalid_regex"
+                )
+                return .text(
+                    "Invalid match regex \"\(rx)\": \(error.localizedDescription)",
+                    isError: true
+                )
+            }
+        }
+
+        var file = (try? store.load()) ?? DirectoriesFile()
+        let targets: [URL]
+        do {
+            targets = try resolveTargets(args["targets"] as Any?, file: file)
+        } catch let e as DirectoriesStoreError {
+            logger.logDirectoryToolCall(
+                toolName: "remove_filter_item", path: nil, client: client,
+                corr: corr, ok: false, err: e.auditCode
+            )
+            return .text(e.description, isError: true)
+        }
+
+        if targets.isEmpty {
+            // `targets: "all"` against an empty directories.yaml ⇒
+            // nothing to do. Same response shape as add_filter_item.
+            logger.logDirectoryToolCall(
+                toolName: "remove_filter_item", path: nil, client: client,
+                corr: corr, ok: true, extra: [("status", "no_roots")]
+            )
+            return .text(prettyJSON([
+                "ok": true,
+                "corr": corr,
+                "app_running": appIsRunning(),
+                "targets_applied": [] as [String],
+                "items_removed": 0,
+            ] as [String: Any]))
+        }
+
+        // Build the predicate as a closure so the same logic applies
+        // across every target. Each branch is one of id, pattern,
+        // regex — exactly one is non-nil per the validation above.
+        let predicate: (RootFilterItem) -> Bool = { item in
+            if let id = idMatch        { return item.id == id }
+            if let p  = patternMatch   { return item.pattern == p }
+            if let re = compiledRegex {
+                let range = NSRange(item.pattern.startIndex..<item.pattern.endIndex,
+                                    in: item.pattern)
+                return re.firstMatch(in: item.pattern, range: range) != nil
+            }
+            return false
+        }
+
+        var perRootRemoved: [Int] = []
+        var rootsTouched: [URL] = []
+        for url in targets {
+            guard let idx = file.roots.firstIndex(where: { $0.path == url }) else {
+                logger.logDirectoryToolCall(
+                    toolName: "remove_filter_item", path: url.path,
+                    client: client, corr: corr, ok: false, err: "unknown_root"
+                )
+                return .text("Not a registered root: \(url.path)", isError: true)
+            }
+            let before = file.roots[idx].filter.items.count
+            file.roots[idx].filter.items.removeAll(where: predicate)
+            let removed = before - file.roots[idx].filter.items.count
+            perRootRemoved.append(removed)
+            if removed > 0 { rootsTouched.append(url) }
+        }
+        let totalRemoved = perRootRemoved.reduce(0, +)
+        if totalRemoved == 0 {
+            // Pure no-op — no YAML write, no refilter, no
+            // notification. The LLM still gets a clean ok=true so it
+            // can say "nothing matched."
+            logger.logDirectoryToolCall(
+                toolName: "remove_filter_item",
+                path: targets.count == 1 ? targets[0].path : nil,
+                client: client, corr: corr, ok: true,
+                extra: [
+                    ("items_removed", "0"),
+                    ("status", "no_match"),
+                ]
+            )
+            return .text(prettyJSON([
+                "ok": true,
+                "corr": corr,
+                "app_running": appIsRunning(),
+                "targets_applied": targets.map { $0.path },
+                "items_removed": 0,
+            ] as [String: Any]))
+        }
+
+        do { try store.save(file) } catch {
+            logger.logDirectoryToolCall(
+                toolName: "remove_filter_item", path: nil, client: client,
+                corr: corr, ok: false, err: "storage_write_failed"
+            )
+            return .text("Failed to save filter: \(error)", isError: true)
+        }
+
+        var visibleDelta = 0
+        for url in rootsTouched {
+            let f = file.roots.first(where: { $0.path == url })?.filter ?? .empty
+            visibleDelta += walker.refilter(root: url, filter: f)
+        }
+
+        logger.logDirectoryToolCall(
+            toolName: "remove_filter_item",
+            path: targets.count == 1 ? targets[0].path : nil,
+            client: client, corr: corr, ok: true,
+            extra: [
+                ("targets", targets.count == 1 ? targets[0].path : "\(targets.count)"),
+                ("items_removed", String(totalRemoved)),
+                ("roots_touched", String(rootsTouched.count)),
+            ]
+        )
+        logger.logDirectoryRefilter(
+            roots: rootsTouched.count, visibleDelta: visibleDelta,
+            elapsedMs: 0, corr: corr
+        )
+        postDirectoriesChanged()
+        return .text(prettyJSON([
+            "ok": true,
+            "corr": corr,
+            "app_running": appIsRunning(),
+            "targets_applied": targets.map { $0.path },
+            "items_removed": totalRemoved,
+            "visible_delta": visibleDelta,
+        ] as [String: Any]))
+    }
+
+    // MARK: - hide_empty_directories prefs (§6)
+
+    /// Path to the plain-text flag file the preference is stored in.
+    /// One line, literal "true" or "false". Lives in
+    /// `~/Library/Application Support/ImageGlass_Mac/`.
+    static func hideEmptyDirsFile() -> URL {
+        AppPaths.macAppSupportDir.appendingPathComponent("hide_empty_directories.txt")
+    }
+
+    private func readHideEmptyDirs() -> Bool {
+        let url = Self.hideEmptyDirsFile()
+        guard let data = try? Data(contentsOf: url),
+              let s = String(data: data, encoding: .utf8) else { return false }
+        return s.trimmingCharacters(in: .whitespacesAndNewlines) == "true"
+    }
+
+    private func writeHideEmptyDirs(_ enabled: Bool) throws {
+        try? AppPaths.ensureMacDirectories()
+        let url = Self.hideEmptyDirsFile()
+        let s = enabled ? "true" : "false"
+        try Data(s.utf8).write(to: url, options: .atomic)
+    }
+
+    private func setHideEmptyDirectories(_ args: [String: Any?]) throws -> MCP.CallToolResult {
+        let client = (args["client"] as? String) ?? "claude-code"
+        let _trace = PerformanceLog.shared.start(
+            "MCP.ToolCall.set_hide_empty_directories",
+            extra: [("client", client)]
+        )
+        defer { _trace.finish() }
+        let corr = MCPAuditLogger.newCorrelationId()
+        guard let enabled = args["enabled"] as? Bool else {
+            logger.logDirectoryToolCall(
+                toolName: "set_hide_empty_directories", path: nil,
+                client: client, corr: corr, ok: false, err: "missing_enabled"
+            )
+            return .text("Missing `enabled` (boolean).", isError: true)
+        }
+        do { try writeHideEmptyDirs(enabled) } catch {
+            logger.logDirectoryToolCall(
+                toolName: "set_hide_empty_directories", path: nil,
+                client: client, corr: corr, ok: false, err: "storage_write_failed"
+            )
+            return .text("Failed to write preference: \(error)", isError: true)
+        }
+        logger.logDirectoryToolCall(
+            toolName: "set_hide_empty_directories", path: nil,
+            client: client, corr: corr, ok: true,
+            extra: [("enabled", enabled ? "true" : "false")]
+        )
+        // Same notification path as YAML changes — the app's kqueue
+        // watcher is already listening to the same directory, so
+        // the flag file lands in the same reconcile loop.
+        postDirectoriesChanged()
+        return .text(prettyJSON([
+            "ok": true,
+            "corr": corr,
+            "app_running": appIsRunning(),
+            "enabled": enabled,
+        ] as [String: Any]))
+    }
+
+    private func getHideEmptyDirectories(_ args: [String: Any?]) throws -> MCP.CallToolResult {
+        let _trace = PerformanceLog.shared.start("MCP.ToolCall.get_hide_empty_directories")
+        defer { _trace.finish() }
+        let corr = MCPAuditLogger.newCorrelationId()
+        let enabled = readHideEmptyDirs()
+        logger.logDirectoryToolCall(
+            toolName: "get_hide_empty_directories", path: nil,
+            client: "claude-code", corr: corr, ok: true,
+            extra: [("enabled", enabled ? "true" : "false")]
+        )
+        return .text(prettyJSON([
+            "ok": true,
+            "corr": corr,
+            "enabled": enabled,
+        ] as [String: Any]))
     }
 
     /// Parse the on-wire filter shape into a `RootFilter`. Throws

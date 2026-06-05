@@ -98,6 +98,11 @@ public enum LoadDiagnostics {
     /// Order matters: cheaper / more specific checks come first so a Git
     /// LFS pointer in an iCloud folder reports "git-lfs", not "cloud".
     public static func diagnose(url: URL) -> LoadDiagnosis {
+        let _trace = PerformanceLog.shared.start(
+            "Image.LoadDiagnostics",
+            extra: [("path", url.path)]
+        )
+        defer { _trace.finish() }
         let fm = FileManager.default
         let path = url.path
 

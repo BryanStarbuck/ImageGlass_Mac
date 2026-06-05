@@ -52,6 +52,11 @@ public struct ThemeInstaller: Sendable {
     /// replaced atomically (extract to a temp dir, then swap).
     @discardableResult
     public func install(archive archiveURL: URL) throws -> ThemePack {
+        let _trace = PerformanceLog.shared.start(
+            "Theme.Install",
+            extra: [("pack", archiveURL.lastPathComponent)]
+        )
+        defer { _trace.finish() }
         guard FileManager.default.fileExists(atPath: unzipBinary.path) else {
             throw ThemePackError.unzipUnavailable
         }
@@ -84,6 +89,11 @@ public struct ThemeInstaller: Sendable {
     /// for theme authors testing locally without re-zipping each iteration).
     @discardableResult
     public func install(folder folderURL: URL) throws -> ThemePack {
+        let _trace = PerformanceLog.shared.start(
+            "Theme.Install",
+            extra: [("pack", folderURL.lastPathComponent)]
+        )
+        defer { _trace.finish() }
         try ensureInstallRoot()
 
         let stagedPack = try ThemePack.load(fromFolder: folderURL)
@@ -169,6 +179,11 @@ public struct ThemeInstaller: Sendable {
     /// destination URL for convenience.
     @discardableResult
     public func exportPack(folder folderURL: URL, to destination: URL) throws -> URL {
+        let _trace = PerformanceLog.shared.start(
+            "Theme.ExportPack",
+            extra: [("pack", folderURL.lastPathComponent)]
+        )
+        defer { _trace.finish() }
         guard FileManager.default.fileExists(atPath: zipBinary.path) else {
             throw ThemePackError.zipUnavailable
         }

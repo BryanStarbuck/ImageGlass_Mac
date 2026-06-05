@@ -215,6 +215,11 @@ public final class CropController {
     /// swap its source. The caller is responsible for pushing onto the
     /// window's `UndoManager`.
     public func applyAndReplace() throws -> CGImage {
+        let _trace = PerformanceLog.shared.start(
+            "Crop.Apply",
+            extra: [("mode", "replace")]
+        )
+        defer { _trace.finish() }
         guard var r = rect else { throw CropError.noSelection }
         guard let path = activeImagePath else { throw CropError.noActiveImage }
         let url = URL(fileURLWithPath: AppPaths.expandTilde(path))
@@ -230,6 +235,11 @@ public final class CropController {
 
     @discardableResult
     public func applySaveInPlace() throws -> URL {
+        let _trace = PerformanceLog.shared.start(
+            "Crop.Apply",
+            extra: [("mode", "save_in_place")]
+        )
+        defer { _trace.finish() }
         guard let path = activeImagePath else { throw CropError.noActiveImage }
         let url = URL(fileURLWithPath: AppPaths.expandTilde(path))
         let format = outputFormatForSource(url: url)
@@ -241,6 +251,11 @@ public final class CropController {
     /// Returns the URL the user picked, or nil if they canceled.
     @discardableResult
     public func applySaveAs() throws -> URL? {
+        let _trace = PerformanceLog.shared.start(
+            "Crop.Apply",
+            extra: [("mode", "save_as")]
+        )
+        defer { _trace.finish() }
         guard let path = activeImagePath else { throw CropError.noActiveImage }
         guard rect != nil else { throw CropError.noSelection }
         let sourceURL = URL(fileURLWithPath: AppPaths.expandTilde(path))

@@ -54,6 +54,11 @@ public final class LocalStorage {
     // MARK: - Read / Write
 
     public func loadScope(_ name: String) throws -> Scope {
+        let _trace = PerformanceLog.shared.start(
+            "LocalStorage.Read",
+            extra: [("file", "\(name).json")]
+        )
+        defer { _trace.finish() }
         let url = scopeURL(for: name)
         let data = try Data(contentsOf: url)
         var scope = try decoder.decode(Scope.self, from: data)
@@ -62,6 +67,11 @@ public final class LocalStorage {
     }
 
     public func saveScope(_ scope: Scope) throws {
+        let _trace = PerformanceLog.shared.start(
+            "LocalStorage.Write",
+            extra: [("file", "\(scope.name).json")]
+        )
+        defer { _trace.finish() }
         try AppPaths.ensureDirectories()
         let url = scopeURL(for: scope.name)
         let data = try encoder.encode(scope)

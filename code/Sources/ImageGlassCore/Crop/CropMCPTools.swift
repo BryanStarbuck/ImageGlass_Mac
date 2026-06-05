@@ -91,6 +91,8 @@ public struct CropMCPTools {
     // MARK: - Tool bodies
 
     private func cropImage(_ args: [String: Any?]) throws -> MCP.CallToolResult {
+        let _trace = PerformanceLog.shared.start("MCP.ToolCall.crop_image")
+        defer { _trace.finish() }
         let inputPath = try requireString(args, "input_path")
         let x = try requireInt(args, "x")
         let y = try requireInt(args, "y")
@@ -147,6 +149,8 @@ public struct CropMCPTools {
     }
 
     private func getCropSelection() -> MCP.CallToolResult {
+        let _trace = PerformanceLog.shared.start("MCP.ToolCall.get_crop_selection")
+        defer { _trace.finish() }
         let s = session.snapshot()
         let rectField: Any
         if let r = s.rect {
@@ -162,6 +166,8 @@ public struct CropMCPTools {
     }
 
     private func setCropSelection(_ args: [String: Any?]) throws -> MCP.CallToolResult {
+        let _trace = PerformanceLog.shared.start("MCP.ToolCall.set_crop_selection")
+        defer { _trace.finish() }
         let x = try requireInt(args, "x")
         let y = try requireInt(args, "y")
         let w = try requireInt(args, "width")

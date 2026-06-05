@@ -44,6 +44,15 @@ struct DirectoryFilenamePanel: View {
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            // hotkeys.mdx §3 — arrows + zoom letters fire when the
+            // Directory Panel has focus too. Wrapping the inner Group
+            // (not the whole VStack containing the search field) so a
+            // user typing in the filter still gets letter keys for
+            // text input. `focusEffectDisabled` keeps the focus halo
+            // from drawing over the panel chrome.
+            .focusable()
+            .focusEffectDisabled()
+            .imageGlassHotkeys(state: state, viewer: state.viewer)
             Divider().overlay(IG.sidebarLineC)
             footer
         }
@@ -366,13 +375,16 @@ struct DirectoryFilenamePanel: View {
             guard let tree = root.tree else { return nil }
             return Self.buildView(node: tree, parentPath: root.path)
         }
+        let walkerRootsSnapshot = state.walkerRoots
         return ScrollView {
             LazyVStack(spacing: 2) {
                 ForEach(roots) { root in
                     DesignTreeNode(node: root, depth: 0,
                                    nav: state.treeNav,
                                    selected: $state.selectedFile,
-                                   matches: matchesSearch)
+                                   matches: matchesSearch,
+                                   walkerRoots: walkerRootsSnapshot,
+                                   appState: state)
                 }
             }
             .padding(.horizontal, 8)
