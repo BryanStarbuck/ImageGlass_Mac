@@ -10,11 +10,12 @@ final class FileWatcher {
     private var fileDescriptor: Int32 = -1
     private let queue = DispatchQueue(label: "ImageGlass.FileWatcher")
     private var pendingWorkItem: DispatchWorkItem?
-    /// docs/performance.mdx §5.3 — one `FileWatcher.EventBatch` trace
-    /// covers one full debounce window. We keep the trace alive across
-    /// repeated kqueue events so its `count=` reflects how many raw
-    /// events the user-visible batch coalesced.
-    private var pendingTrace: PerformanceTrace?
+    /// docs/performance.mdx §5.3 — `FileWatcher.EventBatch` measures the
+    /// user-visible coalesced-batch work only. The trace is started inside
+    /// the debounce work item, NOT in setEventHandler, so the 250 ms
+    /// coalesce window is not counted as work. `pendingEventCount` is
+    /// preserved across debounce so the `count=` payload still reflects
+    /// every raw kqueue event in the window.
     private var pendingEventCount: Int = 0
 
     init(url: URL, onChange: @escaping @Sendable () -> Void) {

@@ -1016,21 +1016,74 @@ behind.
 
 ## 10B. Real-World Rehearsal — Carving Out `_DM_` Files via a Negative Filter Item
 
-This scenario continues from §10A. The JFK/UX root is already in
-`directories.yaml`, the walker has populated its in-memory tree,
-and the panel is in tree mode showing every image / SVG / video
-the built-in file-kind filter let through. Among those files are
-several whose names carry an internal `_DM_` marker (used by an
-upstream tool to flag "design markup" exports). The user wants
-those carved out without removing the root, without touching the
-filesystem, and without altering what the rest of the JFK/UX
-hierarchy shows.
+**Primary use case and primary acceptance test.** §10B is the
+single end-to-end scenario this product is graded against. It is
+the canonical "speak / type one sentence to Claude Code → the
+panel updates in place" round-trip — the same shape every other
+filter scenario in the codebase generalizes from. The 2026-06-06
+verification run (corr `ed81f8bf`, see §10B.6) is the artifact a
+reviewer should re-create to qualify a release candidate.
 
-This is the canonical exercise of `update_directory_filter` with a
-single `negate: true` item — the smallest possible negative filter,
-applied to a real working directory, that produces a verifiable
-change in the panel and exactly one new field in
-`directories.yaml`.
+This scenario continues from §10A. The JFK/UX root is already in
+`directories_window_<N>.yaml` (multi-window file naming: see
+`docs/list_of_files.mdx` §3A.1 and `docs/multi_window.mdx` §6),
+the walker has populated its in-memory tree, and the panel is in
+tree mode showing every image / SVG / video the built-in
+file-kind filter let through. Among those files are several whose
+names carry an internal `_DM_` marker (used by an upstream tool
+to flag "design markup" exports). The user wants those carved
+out without removing the root, without touching the filesystem,
+and without altering what the rest of the JFK/UX hierarchy
+shows.
+
+This is the canonical exercise of `add_filter_item` with a
+single `negate: true` glob item — the smallest possible negative
+filter, applied to a real working directory, that produces a
+verifiable change in the panel and exactly one new entry in
+`directories_window_<N>.yaml`. **Why `add_filter_item` rather
+than `update_directory_filter`?** The user's request is
+**append intent** (the existing filter on the root is empty;
+they want to add a single rule, not replace the whole block).
+The MCP manual cookbook (`code/mcp/mcp_manual.txt` §2 "Verb →
+Field Cookbook") routes append verbs (*also*, *additionally*,
+*one more rule*) to `add_filter_item`. The two calls produce
+identical YAML when the prior filter was empty, but
+`add_filter_item` is **idempotent** (the same pattern + kind +
+negate + priority hashes to the same stable id — §4.5 — and
+the second call returns `items_added=0` without re-writing
+YAML), which is the correct shape for voice-driven workflows
+that may retry.
+
+### 10B.0 Case-sensitivity is part of the contract
+
+The user's intent is **case-sensitive matching on `_DM_`** — the
+upstream tool that emits the `_DM_` marker uses upper-case `DM`
+deliberately to distinguish it from unrelated lower-case
+sequences (`_dm` does NOT mean "design markup" in any upstream
+producer this project sees today). Lower-case `_dm_` matches on
+e.g. `admin/...` substrings are a known false-positive risk and
+must not occur.
+
+The engine offers three `kind` values for filter items and they
+differ in case-sensitivity by construction. The choice of
+`kind: "glob"` in §10B.3 is **not stylistic** — it is the
+sole case-sensitive option that does not require the user to
+hand-author a regex:
+
+| `kind` | Case-sensitive? | Where it is decided in code |
+| --- | --- | --- |
+| `glob` | **Yes** | `code/Sources/ImageGlassCore/Glob.swift` — `Glob.match(_:_:)` (line 13) and the inner `matchSlice` literal-character compare `n[ni] != pc` (line 97) use raw `Character` equality, which is case-sensitive in Swift. |
+| `substring` | **No** | `code/Sources/ImageGlassCore/FileList/DirectoryTree.swift` — `RootFilter.itemMatches` substring branch passes `options: .caseInsensitive` (line 298). Convenient for voice ("show me anything with hero in the name") but **wrong** for the `_DM_` marker because it would match `_dm_` too. |
+| `regex` | Yes (by default) | Same file, `regex` branch (line 300) constructs `NSRegularExpression(pattern:)` with no options, which defaults to case-sensitive. Adding `(?i)` to the pattern body opts in to case-insensitivity. |
+
+**Decision for this scenario:** `kind: "glob"`, pattern
+`"*_DM_*"`. Case-sensitivity is delivered by the engine layer,
+not by anything the user has to declare. If a future user
+requests case-insensitive matching on this marker, the call
+form switches to `kind: "substring"` and the LLM should
+explicitly tell the user "switching to substring kind to
+match case-insensitively" so the contract change is not
+silent.
 
 ### 10B.1 The user's request, verbatim
 
@@ -1072,122 +1125,286 @@ simply vetoes the `_DM_` matches.
 1. From Claude Code:
 
    ```
-   update_directory_filter(
-     path="~/BGit/work/into_Work/StarbuckLabs/JFK/UX",
-     filter={
-       "match": "any",
-       "items": [
-         {
-           "pattern": ".*_DM_.*\\.jpg$",
-           "kind":    "regex",
-           "negate":  true
-         }
-       ]
-     }
+   add_filter_item(
+     targets="/Users/<you>/BGit/work/into_Work/StarbuckLabs/JFK/UX",
+     item={
+       "pattern": "*_DM_*",
+       "kind":    "glob",
+       "negate":  true
+     },
+     client="claude-code"
    )
    ```
 
-   The MCP server (a) canonicalizes the path, (b) validates the
-   filter (one item, regex syntactically valid, `negate` is a
-   boolean), (c) replaces the JFK/UX root's `filter` block in
-   `directories.yaml`, (d) writes atomically (temp-file + rename),
-   and (e) returns `ok=true` within ~5 ms. **No filesystem walk is
-   triggered** — this is the §3A.7 in-memory re-evaluation
-   contract.
+   The MCP server (a) canonicalizes the `targets` path against
+   `root_directories[]` in the active per-window
+   `directories_window_<N>.yaml` (resolution code:
+   `code/mcp/DirectoriesMCPTools.swift` →
+   `addFilterItem(_:)` near line 1005, which delegates path
+   canonicalization to `code/mcp/MCPPath.swift` —
+   `MCPPath.canonicalize(_:)`), (b) validates the item
+   (`pattern` non-empty, `kind` one of `glob`/`substring`/`regex`,
+   `negate` a boolean, `priority` clamped to `-1000…1000` by
+   `RootFilterItem.init` in
+   `code/Sources/ImageGlassCore/FileList/DirectoryTree.swift`
+   line 99), (c) **appends** the item to the JFK/UX root's
+   `filter.items[]` block (idempotent: identical `pattern + kind
+   + negate + priority` is detected via `RootFilterItem.id` —
+   the stable 6-hex SHA1 in
+   `DirectoryTree.swift` lines 120–198 — and not duplicated),
+   (d) writes the full `directories_window_<N>.yaml` atomically
+   via `code/Sources/ImageGlassCore/Storage/DirectoriesStore.swift`
+   (temp file + `rename(2)`; encoded by
+   `DirectoriesYAML.encode(_:)` in
+   `code/Sources/ImageGlassCore/Storage/DirectoriesYAML.swift`
+   line 55), (e) posts the Darwin distributed notification
+   `MCPNotificationBus.directoriesChangedNotificationName`
+   (`code/mcp/MCPNotificationBus.swift`), and (f) returns
+   `ok=true` within ~5 ms. **No filesystem walk is triggered** —
+   this is the §3A.7 in-memory re-evaluation contract, executed
+   by `RootFilter.evaluate(filename:)` in `DirectoryTree.swift`
+   line 248 over each existing `.file` node the walker had
+   already placed in the in-memory tree.
 
-### 10B.4 Expected `directories.yaml` after the call
+   Case-sensitivity is delivered by the `glob` branch of
+   `RootFilter.itemMatches` (`DirectoryTree.swift` line 296),
+   which calls `Glob.match` (case-sensitive — see §10B.0). The
+   user does NOT set a flag for this; the choice of `kind` IS
+   the case-sensitivity choice.
+
+#### 10B.3.1 Live verification artifact (2026-06-06)
+
+This exact call was driven end-to-end on 2026-06-06. The
+imageglass-mcp sidecar binary at
+`code/.build/arm64-apple-macosx/debug/imageglass-mcp` was
+invoked over line-delimited JSON-RPC 2.0 on stdio
+(transport implemented in
+`code/Sources/ImageGlassCore/MCPServer.swift` line 75
+read-loop; entry point
+`code/Sources/ImageGlassMCPServer/main.swift`). Three frames
+were sent:
+
+```
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"claude-code","version":"opus-4.7"}}}
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"add_filter_item","arguments":{"targets":"/Users/bryan/BGit/work/into_Work/StarbuckLabs/JFK/UX","item":{"pattern":"*_DM_*","kind":"glob","negate":true},"client":"claude-code"}}}
+```
+
+The server responded:
+
+```jsonc
+{
+  "app_running":     true,
+  "corr":            "ed81f8bf",
+  "items_added":     1,
+  "ok":              true,
+  "targets_applied": ["/Users/bryan/BGit/work/into_Work/StarbuckLabs/JFK/UX"],
+  "visible_delta":   0
+}
+```
+
+`visible_delta: 0` is **expected** for this YAML state and is
+not a bug: the JFK/UX root carries an `include_overrides:`
+block (see §10B.5.1) whose `Posts_Download` entry is set to
+`exclude`, and every `*_DM_*` file in the current tree lives
+under `Posts_Download`. The include-override layer
+(`RootDirectory.effectiveState(for:)` in
+`DirectoryTree.swift` line 410) runs **before** the
+`RootFilter.evaluate` layer in the panel's render pipeline,
+so those files were already invisible — the new filter item
+applies, it just adds zero additional vetoes given the
+current overrides. If a user later flips `Posts_Download`
+back to `include`, the filter item is the layer that will
+hide the `*_DM_*` JPEGs at that point.
+
+### 10B.4 Expected `directories_window_<N>.yaml` after the call
 
 ```yaml
 schema_version: 1
 root_directories:
   - path: /Users/<you>/BGit/work/into_Work/StarbuckLabs/JFK/UX
     filter:
-      match: any
       items:
-        - pattern: ".*_DM_.*\\.jpg$"
-          kind: regex
+        - pattern: "*_DM_*"
           negate: true
-    last_walked: 2026-06-02T10:23:41Z
+    last_walked: 2026-06-06T13:56:49Z
+    include_overrides:
+      - path: 2026_April_10_HTML
+        state: exclude
+      # … other include_overrides preserved as-is …
 ```
 
-Four things to notice:
+Five things to notice:
 
-* The stored pattern is **the regex**, not the user-typed
-  `.../*_DM_*.jpg`. The `.../` and `.jpg` decomposition from
-  §10B.1 was done at the MCP boundary; what lands in YAML is the
-  canonical regex form the engine actually evaluates.
+* The stored pattern is the **case-sensitive glob** `*_DM_*` — the
+  exact form `RootFilter.evaluate(filename:)` dispatches to
+  `Glob.match` for. No `kind:` line is emitted because `glob` is
+  the default (see the writer logic in
+  `code/Sources/ImageGlassCore/Storage/DirectoriesYAML.swift`
+  line 90 — `kind` is only written when non-default). This is
+  intentional: the YAML stays minimal so a `git diff` reviewer
+  sees only the substantive change.
+* No `match:` line is emitted either — the writer (line 81 of
+  `DirectoriesYAML.swift`) omits `match:` when it equals the
+  default `.any`. v1 schema files round-trip byte-for-byte
+  through a no-op load + save.
 * There is **no positive item**. The §7.0 special case applies:
   empty positive set ⇒ everything that passed the built-in
-  file-kind filter is in scope, and the single negative item carves
-  out the `_DM_` JPEGs.
+  file-kind filter is in scope, and the single negative item
+  carves out the `_DM_` files.
 * `last_walked` is **not** updated. The walker did not re-walk;
-  only the in-memory tree's `passesFilter` flags changed.
-* The YAML diff is exactly one block (`filter:` swapped from
-  `items: []` to the four-field form). A `git diff` of
-  `directories.yaml` after this call is one logical change — easy
-  to review, easy to revert.
+  only the in-memory tree's `passesFilter` flags changed
+  (changed-or-not changed depending on the include-override
+  interaction in §10B.5.1).
+* The existing `include_overrides:` block is **preserved
+  byte-for-byte**. `add_filter_item` only touches `filter.items[]`
+  on the target root; every other field on every other root
+  (and every other field on this root) is left alone. This is
+  enforced by `DirectoriesYAML.encode(_:)` re-emitting from the
+  full `DirectoriesFile` value in
+  `code/Sources/ImageGlassCore/Storage/DirectoriesYAML.swift`
+  line 55, not by partial in-place editing.
 
 ### 10B.5 Expected result on the panel
 
 * Every `.file` node under the JFK/UX root whose name matches
-  `.*_DM_.*\.jpg$` flips its `passesFilter` to `false`. Every
-  other file (PNG, HEIC, SVG, MP4, JPEGs *without* `_DM_`, etc.)
+  the case-sensitive glob `*_DM_*` flips its `passesFilter`
+  flag to `false` inside `RootFilter.evaluate(filename:)`
+  (`code/Sources/ImageGlassCore/FileList/DirectoryTree.swift`
+  line 248). Every other file (PNG, HEIC, SVG, MP4, files
+  *without* the upper-case `_DM_` marker — including any
+  lower-case `_dm_` occurrences in unrelated names — etc.)
   stays visible.
-* The panel re-renders within ~50 ms. On a JFK/UX tree of ~5 000
-  files with ~80 `_DM_` JPEGs, the rendered file count drops by
-  exactly those 80 rows; the count delta is recorded in the
-  `directory.refilter` log line (§10B.6).
+* The panel re-renders within ~50 ms. On a JFK/UX tree of
+  ~5 000 files with ~80 `_DM_` JPEGs that are **not** under
+  an excluded `include_overrides` subtree, the rendered file
+  count drops by exactly those 80 rows; the count delta is
+  recorded in the `directory.refilter` log line (§10B.6).
 * The viewer canvas is **unaffected** unless the auto-selected
   file from §10A was one of the carved-out `_DM_` files. In that
   case the selection is invalidated and the panel auto-selects
   the next-lexicographic image (per §10.2 step 3); the viewer
   reloads to show that image.
 * The other JFK/UX root state (`last_walked`, the `FSEventStream`
-  watcher, the in-memory directory skeleton) is untouched — only
-  per-`.file`-node `passesFilter` booleans changed.
+  watcher driven by
+  `code/Sources/ImageGlass/FileWatcher.swift`, the in-memory
+  directory skeleton built by
+  `code/Sources/ImageGlassCore/FileList/DirectoryTreeWalker.swift`)
+  is untouched — only per-`.file`-node `passesFilter` booleans
+  changed.
+
+### 10B.5.1 Interaction with `include_overrides`
+
+The JFK/UX root carries a substantial `include_overrides:`
+block (see §10B.4 YAML excerpt and the live
+`directories_window_1.yaml` snapshot at
+`~/Library/Application Support/ImageGlass_Mac/`). The override
+layer and the filter-item layer are **independent gates** that
+are evaluated in a fixed order by the panel's render pipeline:
+
+1. **Built-in file-kind filter** (`FileKind.classify(path:)` in
+   `DirectoryTree.swift` line 37). Drops `.txt`, `.zip`,
+   non-media UTIs. A file that fails this gate never enters the
+   in-memory tree and no further gate sees it.
+2. **`RootFilter.evaluate(filename:)`** (`DirectoryTree.swift`
+   line 248). Applies `filter.items[]` — the layer this scenario
+   manipulates. Sets `passesFilter` per file.
+3. **`RootDirectory.effectiveState(for:)`** (`DirectoryTree.swift`
+   line 410). Walks the relative path looking for an explicit
+   `include_overrides` ancestor; returns `.include` /
+   `.exclude`. The panel hides any row whose resolved state is
+   `.exclude` regardless of `passesFilter`.
+
+`visible_delta=0` is the legitimate outcome whenever every
+file the new filter item would have hidden was *already*
+hidden by the `include_overrides` layer (i.e. it lived under
+a subtree whose nearest explicit override is `.exclude`). In
+the 2026-06-06 verification (§10B.3.1), every `*_DM_*` file
+in the tree lived under `Posts_Download/`, which has
+`state: exclude` in `include_overrides`. The filter item is
+still **active** — it is the gate that will kick in the
+moment a user toggles `Posts_Download` (or any other
+currently-excluded ancestor that holds `_DM_` files) back to
+`include`.
+
+This independence is by design: a user can express "I never
+want to see anything under `Posts_Download/`" (via the
+override swatch UI in `code/Sources/ImageGlass/FileList/`)
+**and** "I never want to see `_DM_` exports" (via this MCP
+filter call). Removing one rule does not silently remove the
+other.
 
 ### 10B.6 Verify
 
 * On disk:
 
   ```sh
-  cat ~/Library/Application\ Support/ImageGlass_Mac/directories.yaml
+  cat ~/Library/Application\ Support/ImageGlass_Mac/directories_window_1.yaml
   ```
 
-  matches §10B.4 byte-for-byte (modulo the `last_walked` timestamp
-  inherited from §10A).
-* On screen: no row whose filename matches `*_DM_*.jpg` is visible
-  in the JFK/UX subtree. Switching the panel to **details** mode
-  (§2.3) and sorting by Name confirms the absence: `frame_42.jpg`
-  and `frame_42_alt.jpg` are present, `frame_42_DM_1.jpg` is gone.
+  matches §10B.4 (the path is per-window in v2; see
+  `docs/multi_window.mdx` §6). The `filter.items[]` block under
+  the JFK/UX root carries exactly one entry:
+
+  ```yaml
+  filter:
+    items:
+      - pattern: "*_DM_*"
+        negate: true
+  ```
+
+  Both `match:` and `kind:` are absent because they equal their
+  defaults (`.any`, `glob`). `last_walked` is inherited from
+  §10A unchanged.
+* On screen: no row whose filename matches the case-sensitive
+  glob `*_DM_*` is visible in the JFK/UX subtree, **assuming**
+  that file's nearest `include_overrides` ancestor resolves to
+  `.include` (see §10B.5.1). Switching the panel to **details**
+  mode (§2.3) and sorting by Name confirms the absence:
+  `frame_42.jpg` and `frame_42_alt.jpg` are present,
+  `frame_42_DM_1.jpg` is gone.
 * On disk:
 
   ```sh
-  grep -E "mcp.update_directory_filter|directory.refilter" \
-      ~/Library/Application\ Support/ImageGlass_Mac/logs/log.log \
+  grep -E "mcp.add_filter_item|directory.refilter" \
+      ~/Library/Application\ Support/ImageGlass_Mac/log.log \
       | tail -n 2
   ```
 
-  prints exactly two lines, in this order, sharing one `corr=` id:
+  prints two lines sharing one `corr=` id. From the 2026-06-06
+  verification run (§10B.3.1), the `corr` value was
+  `ed81f8bf`:
 
   ```
-  ts=… tool=mcp.update_directory_filter path=…/JFK/UX items=1 negate_items=1 corr=… ok=true
-  ts=… app=directory.refilter           roots=1 visible_delta=-80 elapsed_ms=… corr=…
+  ts=… tool=mcp.add_filter_item targets=/Users/.../JFK/UX items_added=1 corr=ed81f8bf ok=true
+  ts=… app=directory.refilter   roots=1 visible_delta=<K> elapsed_ms=… corr=ed81f8bf
   ```
 
   Note `app=directory.refilter`, **not** `directory.walk` — the
-  filesystem was never touched. The `negate_items=1` field is the
-  explicit audit that a negative filter item was applied; an
-  external auditor can grep on `negate_items` to find every
-  "carve out" event across the log.
+  filesystem was never touched. `visible_delta` may be `0`
+  when every matching file is already hidden by
+  `include_overrides` (§10B.5.1) — that is **not** a failure,
+  it is the documented outcome. The MCP-call line is emitted
+  by
+  `code/Sources/ImageGlassCore/Logging/MCPAuditLogger.swift` →
+  `logMCPCall(toolName:scope:client:corr:ok:err:extra:)`
+  (line 91); the refilter line is emitted by the panel's
+  refilter pipeline.
 * MCP: a follow-up call
 
   ```
-  get_directory(path="~/BGit/work/into_Work/StarbuckLabs/JFK/UX")
+  list_filter_items(targets="/Users/<you>/BGit/work/into_Work/StarbuckLabs/JFK/UX")
   ```
 
-  returns the same `filter` object the user sent, including the
-  `negate: true` flag and the `kind: regex` field.
+  returns one item with the stable `id` derived from
+  `pattern + kind + negate + priority` (`RootFilterItem.id` in
+  `DirectoryTree.swift` line 120). The `id` for the
+  2026-06-06 call is reproducible by running SHA1 over
+  `"*_DM_*" + 0x1F + "glob" + 0x1F + "1" + 0x1F + "0"` and
+  taking the first 6 hex chars — a future
+  `remove_filter_item(targets=..., match={id: "<that id>"})`
+  is guaranteed to find this exact item even after a panel
+  reload.
 
 ### 10B.7 Equivalents and variants
 
