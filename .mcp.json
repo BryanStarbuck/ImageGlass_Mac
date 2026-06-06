@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "imageglass-mcp": {
+      "type": "stdio",
+      "command": "scripts/mcp-server.sh"
+    }
+  }
+}

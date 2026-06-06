@@ -35,6 +35,20 @@ bootstrap: check-tools deps build
     @echo "    just mcp        # launch the MCP server on stdio"
     @echo "    just test       # run the test suite"
     @echo
+    @echo "  MCP registration:"
+    @echo "    The project ships .mcp.json — Claude Code picks it up automatically."
+    @echo "    If you need to re-register manually: just mcp-register"
+    @echo
+
+# Register the imageglass-mcp server with Claude Code using the current
+# repo path. .mcp.json handles this automatically on new machines; run
+# this only if the registration somehow gets stale.
+mcp-register:
+    @echo "==> registering imageglass-mcp with Claude Code"
+    claude mcp add imageglass-mcp \
+        --transport stdio \
+        "$(pwd)/scripts/mcp-server.sh"
+    @echo "==> done — restart Claude Code to pick up the new registration"
 
 # Print the versions of every required tool. Fails fast on a missing one.
 check-tools:
