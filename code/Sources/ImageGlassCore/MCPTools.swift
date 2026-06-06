@@ -7,7 +7,7 @@ import Foundation
 /// and the GUI picks the change up on the next scope evaluation.
 ///
 /// Validation, scope-name policy, and path normalization are layered in via
-/// helpers in `MCP/` so this file stays focused on dispatch.
+/// helpers in `code/mcp/` so this file stays focused on dispatch.
 public struct MCPTools {
 
     public let storage: LocalStorage

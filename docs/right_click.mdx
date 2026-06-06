@@ -1,0 +1,1274 @@
+---
+title: Right-Click Context Menus
+description: Authoritative product + engineering specification for every right-click (and `⌃`-click and `MenuKey` and `⇧F10`) context menu in ImageGlass_Mac. Enumerates each surface the user can right-click — file rows, folder rows, root rows, panel empty space, panel header, image canvas, video canvas, SVG canvas, gallery strip, image info overlay, floating file tree window, toolbar items, panel tabs, status bar — and for every surface fixes the menu's item order, item text, ellipsis convention, separators, sub-menus, hotkey twins, disabled-state rules, MCP twins, audit-log shape, selection semantics on unselected rows, multi-select behavior, accessibility (VoiceOver labels, menu navigation), localization keys, performance budget, and the exact Swift source files that wire the menu into the SwiftUI / AppKit surfaces. The menu bar (`menus.mdx`), the hotkey set (`hotkeys.mdx`), the file actions (`use_cases/actions.mdx`), and the include-checks column (`use_cases/include_checks.mdx`) are referenced verbatim — context menus are convenience surfaces, never the canonical home for a verb.
+---
+
+# Right-Click Context Menus
+
+> **Document type:** Product + engineering specification.
+> **Audience:** Engineering (implementation, wiring), Product (text,
+> grouping, item order, discoverability), Design (chrome, separators,
+> sub-menu depth), QA (acceptance criteria, multi-select matrix).
+> **Owners:** CPO for surface inventory, item text, ordering, ellipsis
+> rules, and submenu depth budget. CTO for the SwiftUI
+> `.contextMenu { … }` vs AppKit `NSMenu` / `menu(for:)` bridging, the
+> activation-event routing, the audit-log contract, and the
+> single-source-of-truth invariants between menus and verbs.
+> **Status:** v1 spec for the Mac-native fork. This document is the
+> single source of truth for **right-click** behavior. It defers to
+> `menus.mdx` for menu-bar text and to `use_cases/actions.mdx` for
+> the verb implementations; this document only specifies where each
+> verb appears in which context menu and how the context menu is
+> brought up.
+
+---
+
+## 1. Purpose
+
+A modern Mac image viewer earns its "feels native" claim partly in
+its main viewer chrome and partly in the **context menus**. A
+right-click on the wrong surface, with the wrong text, in the wrong
+order, with the wrong disabled-state behavior, is the single most
+common reason a user files a "this doesn't feel like a Mac app"
+issue. This spec exists to eliminate that.
+
+It enumerates every right-click surface in the fork, fixes the menu
+that appears on each surface, names every item, sets the order, sets
+the separators, sets the sub-menus, and pins down the exact Swift
+file that hosts the wiring. A reviewer reading this document should
+be able to:
+
+* Walk every surface and predict the menu before opening it.
+* Locate the source code that owns the menu in under one minute.
+* Confirm the verb's canonical home is the menu bar (not the context
+  menu) — context menus only mirror, never invent.
+* Verify the disabled-state, multi-select, and missing-file
+  edge-case behavior in one sitting.
+
+This document inherits, and never duplicates, the following:
+
+* The **canonical menu-bar text and ordering** of every verb — see
+  [`menus.mdx`](./menus.mdx). When a context-menu item appears here
+  with text different from the menu bar, that is a bug.
+* The **keyboard-shortcut twin** of every menu item — see
+  [`hotkeys.mdx`](./hotkeys.mdx). Right-click surfaces do not invent
+  new shortcuts; they display the existing shortcut beside the
+  item.
+* The **file-action verbs** (Rename, Move to Trash, Copy Image,
+  Copy File Path, Print, New Window) — see
+  [`use_cases/actions.mdx`](./use_cases/actions.mdx). Context menus
+  invoke these through `FileActions.*` with `source = .context`.
+* The **include-checks column** (the per-row Include / Inherit /
+  Don't Include state) — see
+  [`use_cases/include_checks.mdx`](./use_cases/include_checks.mdx).
+  Context menus expose the same three states the column toggles,
+  with the same hotkeys (`⌃1` / `⌃2` / `⌃3`) shown beside the items.
+* The **MCP tool surface** — see [`mcp.mdx`](./mcp.mdx). Every
+  context-menu verb either has a direct MCP twin or is one of the
+  small handful of GUI-only verbs (e.g. *Quick Look*) called out in
+  §6 below.
+* The **Local Storage on-disk model** — see
+  [`local_storage.mdx`](./local_storage.mdx). Menu items that
+  mutate scopes / overrides / criteria write through the same
+  atomic-replace pipeline.
+* The **audit-log shape** — see
+  [`error_handling.mdx`](./error_handling.mdx) §4.2. Every menu
+  item that fires a verb emits one `key=value` audit line with
+  `source=menu:context`.
+
+If any of the above and this document disagree, the linked document
+wins for the verb implementation and ordering; **this document
+wins** for the context-menu surface (which surface, which items,
+which order, which separators).
+
+---
+
+## 2. Design Principles
+
+These are the eight non-negotiables that govern every menu in §7.
+
+1. **Convenience surface, not canonical home.** Context menus
+   re-state items that already exist in the menu bar. They never
+   introduce a new verb that lacks a menu-bar entry. The user can
+   always do the thing without a right-click; the right-click is
+   the shortcut.
+2. **One verb, one phrasing, everywhere.** The item text in the
+   context menu is **byte-for-byte identical** to the menu-bar
+   item, except for the *Image* / *File* qualifier the menu bar
+   adds for disambiguation (e.g., the menu bar says *Move Image to
+   Trash*; the context menu on a panel row says *Move to Trash*,
+   because the row is the disambiguator). The qualifier rules are
+   spelled out in §4.4.
+3. **Item order matches user intent frequency, not menu-bar
+   alphabetical order.** The most likely next action goes at the
+   top. Destructive items go at the bottom, behind a separator. A
+   user habituating to right-click should be able to mouse to the
+   common verb without scanning.
+4. **Ellipses obey Apple's HIG.** An item that opens a sheet, an
+   `NSAlert`, an `NSOpenPanel`, an `NSSavePanel`, or any other
+   modal that asks for input gets `…` (U+2026, one character — not
+   `...`). An item that acts immediately does not. Sub-menu
+   parents get `▸` (rendered automatically by AppKit). This rule is
+   enforced at the linter level; the build fails if `...` appears
+   in a context-menu item name.
+5. **Sub-menu depth is at most one level.** A right-click never
+   leads to a sub-menu that itself contains another sub-menu. If a
+   second level is needed (e.g., a chooser within a chooser), the
+   item opens a sheet instead. Two levels of cascading menus is a
+   Windows pattern that ages badly on Mac.
+6. **Shortcut twins are always shown.** Every item that has a
+   keyboard shortcut from `hotkeys.mdx` displays the shortcut on
+   the right-hand side of the menu row. The shortcut display uses
+   the system glyphs (`⌘`, `⇧`, `⌥`, `⌃`) — never the spelled-out
+   words. This is what `NSMenuItem.keyEquivalent` produces by
+   default; SwiftUI's `Button` inside `.contextMenu { … }` does
+   **not** show the shortcut on macOS today, which is why the
+   panel-row context menus are implemented with an AppKit
+   `NSMenu` bridge (§7.6.7 / §9.2) rather than a pure-SwiftUI
+   `.contextMenu` modifier.
+7. **Activation surface is the right-click; selection is the
+   right-click target.** A right-click on an unselected row
+   **selects that row first** and then opens the menu against it.
+   The user does not have to left-click and then right-click. Multi-
+   select is preserved if the right-click lands on an already-
+   selected row (§5).
+8. **Every fire emits one audit line.** No matter which surface
+   fired the verb, a single `MCPAuditLogger.shared.log([…])` line
+   lands in `~/Library/Application Support/ImageGlass_Mac/log.log`
+   with `source=menu:context`, the verb's `tool=…`, and a fresh
+   correlation id. A second line for the resulting state change
+   (e.g., a file rename emitting `tool=file.rename`) follows on
+   the same correlation id so a debugger can collate them.
+
+---
+
+## 3. Activation Events
+
+Right-click is not a single event on macOS. The OS routes four
+different gestures into the same `menu(for:)` / `.contextMenu { }`
+codepath, and the spec must handle all four.
+
+### 3.1 The four activation channels
+
+| Channel | Event | Notes |
+|---|---|---|
+| Right mouse button down | `NSEvent.EventType.rightMouseDown` | A two-button mouse, a trackpad with right-click enabled, or an Apple Magic Mouse with secondary-click set to right side. |
+| `⌃`-click (Control-click) | `leftMouseDown` with `event.modifierFlags.contains(.control)` | The pre-multi-button-mouse Mac convention. Still the only way some users right-click. |
+| Trackpad secondary-click | Native two-finger click on a trackpad with the macOS preference set | Routes through the same `rightMouseDown` synthesis as a physical right button. |
+| Keyboard *Menu* key | `keyDown` with `event.charactersIgnoringModifiers == "\u{1B}"` *(reserved)*; in practice `⇧F10` is bound to the same handler when the user enables it | Some Apple keyboards (and most third-party Mac keyboards) have a Menu key. macOS does not bind it by default; we bind `⇧F10` as the documented alternative so the keyboard-only user can open the context menu on the focused row. |
+
+All four channels enter the same handler. The handler does **not**
+branch on which channel fired it — there is one menu per surface,
+not four.
+
+### 3.2 The menu hot-zone and the row that owns the menu
+
+* In the Directory Panel tree, the hot-zone is the full **row**
+  (depth-indented filename cluster + the include swatch). A right-
+  click anywhere on the row opens the row's menu. The disclosure
+  triangle is **not** a separate hot-zone; right-clicking the
+  triangle still opens the row's menu (and the chevron's normal
+  left-click expand behavior is preserved on left-click).
+* In the file list panels (List / Grid / Strip / Details / Column),
+  the hot-zone is the **cell**: in Grid it's the thumbnail plus its
+  label; in Strip it's the thumbnail; in Details/Column it's the
+  table row. The existing `.contextMenu { }` modifier on
+  `FileListItemView` already follows this rule; the spec only
+  expands its contents (§7.6).
+* On the image canvas, the hot-zone is the **entire viewport** —
+  every pixel under the canvas, including the area outside the
+  drawn image. The picker overlay, color picker reticle, frame
+  navigator and other transient overlays do **not** swallow the
+  right-click; they pass it through to the canvas.
+* On the empty area of a panel (between rows, below the last row),
+  the hot-zone is the empty area and produces the **panel-empty**
+  menu (§7.4).
+* On the panel header strip (the "FILES" label + List/Tree picker
+  + filter field), the hot-zone produces the **panel-header** menu
+  (§7.5). A right-click in the filter field itself does **not**
+  fire this menu — text fields use the standard system editing
+  menu (Cut / Copy / Paste / …) provided by AppKit, never our
+  custom menu.
+
+### 3.3 Right-click on a row that is not currently selected
+
+Apple's Finder behavior: a right-click on an unselected row
+**selects that row** before opening the menu. Our panels follow
+suit:
+
+* The right-clicked row becomes the new selection (single-select)
+  before the menu opens. The viewer canvas loads the row's file
+  (if it's a file). The `treeNav.activeRow` cursor lands on the
+  row. This happens **before** the menu is shown so the menu's
+  disabled-state computation (e.g., "is the target a file or a
+  folder?") sees the correct value.
+* If the right-clicked row is already part of a multi-select
+  group, the multi-select is preserved and the menu operates on
+  the group (§5).
+* The right-click does **not** scroll the row into view; if the
+  user managed to right-click a row that is partially clipped at
+  the panel edge, the menu still opens but the row's visible
+  portion does not change. This is the conservative behavior —
+  jumping the viewport on a right-click is surprising.
+
+### 3.4 Right-click on an empty area inside a row's hot-zone
+
+Some panel rows (e.g., a deeply indented file row) have empty
+horizontal space to the right of the filename. A right-click in
+that space still hits the row's hot-zone and opens the row's menu,
+not the panel-empty menu (§7.4). The rule: empty space *between
+rows* is panel-empty; empty space *within* a row is the row.
+
+### 3.5 Cancelling the menu
+
+* `Escape` dismisses the menu without firing anything. No audit
+  log line is emitted (the user never crossed the commit
+  boundary).
+* Clicking outside the menu dismisses it the same way.
+* Selecting a sub-menu parent and then `Escape` dismisses the
+  sub-menu but keeps the parent menu open, then a second `Escape`
+  dismisses both. This is standard `NSMenu` behavior — we do not
+  customize it.
+
+---
+
+## 4. Item Text Conventions
+
+These rules govern the exact text the user sees on every item.
+
+### 4.1 Title case
+
+Every item is **title case**: all major words capitalized
+(*Open in New Window*, not *Open in new window*). Articles, short
+prepositions, and conjunctions ("a", "an", "the", "in", "of",
+"on", "to", "for", "and", "or", "by", "as") stay lowercase unless
+they are the first or last word.
+
+### 4.2 Ellipsis (`…`) policy
+
+* Use `…` (U+2026) when the item opens a dialog, sheet, file
+  picker, save panel, or any other surface that asks for further
+  input.
+* Do not use `…` when the item acts immediately, even if the
+  action is destructive (a confirm dialog is **not** "further
+  input" — it is a yes/no gate, not a parameter prompt).
+* Sub-menu parents never get `…`; AppKit draws the `▸` glyph.
+* The lint check at build time matches `Sources/**/*.swift` for
+  the literal three-dot string `"..."` inside a context-menu
+  builder and fails the build.
+
+### 4.3 Verb form
+
+* Item text is an **imperative verb phrase**: *Reveal in Finder*,
+  *Remove Directory*, *Re-evaluate Scope*, *Move to Trash*.
+* Avoid the noun form (*"Reveal in Finder Action"*) and the
+  gerund (*"Revealing in Finder"*).
+* Avoid "Click to …" prefixes; the user already knows clicking is
+  what fires the verb.
+
+### 4.4 Qualifier rules
+
+The menu bar disambiguates by qualifying the verb (*File ▸ Rename
+**Image**…*, *File ▸ **Move Image to Trash***) because the menu
+bar has no row context. A context menu's surface *is* the context,
+so the qualifier is dropped unless dropping it would create
+ambiguity:
+
+| Menu-bar text | Context-menu text on a file row | Context-menu text on a folder row |
+|---|---|---|
+| *Rename Image…* | *Rename…* | *Rename Folder…* (different verb — see §7.2) |
+| *Move Image to Trash* | *Move to Trash* | *Move Folder to Trash* |
+| *Copy Image* | *Copy Image* (qualifier kept — could be confused with *Copy File Path*) | *Copy as Image* (disabled on folder; see §7.2) |
+| *Copy File Path* | *Copy File Path* | *Copy Folder Path* |
+| *Print Image…* | *Print…* | n/a (disabled) |
+| *New Window* | n/a (no per-row New Window verb) | n/a |
+| *Reveal in Finder* | *Reveal in Finder* | *Reveal in Finder* |
+
+The qualifier rule is enforced once at the menu-builder layer
+(`ContextMenuBuilders.swift`) so it cannot drift between surfaces.
+
+### 4.5 Right-aligned shortcut display
+
+Every item that has a shortcut from `hotkeys.mdx` shows the
+shortcut on the right side of the menu row. The shortcut is
+drawn using the system modifier glyphs:
+
+* `⌘` = Command
+* `⇧` = Shift
+* `⌥` = Option
+* `⌃` = Control
+
+Single-letter and arrow keys are drawn as plain glyphs (`Z`, `→`,
+`Space`). The `Space` and `Esc` words are rendered as words; the
+arrows are rendered as glyphs (`↑` `↓` `←` `→`); Return is `↵`,
+Delete is `⌫`, Forward-Delete is `⌦`.
+
+### 4.6 Sub-menu naming
+
+A sub-menu parent ends in a space and then `▸` is drawn by
+AppKit. The parent name is a **noun** describing what the sub-menu
+contains (*Open With ▸*, *Show Channels ▸*, *Sort By ▸*, *Move to
+Scope ▸*) — not a verb. The leaf items inside the sub-menu are
+imperative verb phrases.
+
+### 4.7 Disabled-item text
+
+A disabled item shows the same text as enabled, in the system's
+disabled foreground color. The item also publishes a `help`
+property (tooltip) explaining why it is disabled (e.g.,
+*"Disabled because no file is selected."*). Tooltips on disabled
+menu items require the AppKit `NSMenu` path; the SwiftUI
+`.contextMenu` path does not currently expose them, which is one
+more reason the panel-row context menus go through AppKit.
+
+---
+
+## 5. Multi-Select Behavior
+
+The Directory Panel tree is **single-select** in v1 (see
+`dir_ui.mdx` §5.1). The file list panels (List / Grid / Strip /
+Details / Column) support multi-select via `⌘`-click and
+`⇧`-click. Multi-select context-menu rules:
+
+* If the right-click lands on a row that is part of the current
+  multi-select, the menu's verbs operate on the **whole
+  selection**.
+* If the right-click lands on a row that is *not* part of the
+  current multi-select, the multi-select is **cleared**, the
+  clicked row becomes the single selection, and the menu operates
+  on just that row.
+* The menu's item text **pluralizes** when the selection count is
+  greater than 1: *Move to Trash* → *Move 3 Files to Trash*,
+  *Reveal in Finder* → *Reveal 3 Files in Finder*. This pluralizes
+  by setting the item's title at build time, not by toggling a
+  separate enable/disable state.
+* Verbs that operate naturally on one file at a time (Rename, Set
+  As Wallpaper) are **disabled** on multi-select. The disabled
+  tooltip reads "Disabled — pick a single file to rename." (or
+  similar).
+* The implementation reuses the `FileActions.*` verbs in a loop —
+  see `use_cases/actions.mdx` §11.1 for the forward-compatible
+  shape. v1 keeps the loop in the menu handler; v2 promotes it to
+  a batch tool with a `paths: [String]` argument.
+
+The Directory Panel tree's row context menu (§7.1) always operates
+on the single right-clicked row; the multi-select rules above
+apply only to the file list panels.
+
+---
+
+## 6. The Surface Inventory
+
+The fork has **fifteen** distinct right-click surfaces. The next
+section specifies each one. The summary table:
+
+| # | Surface | Source file (host) | SwiftUI vs. AppKit path |
+|---|---|---|---|
+| 7.1 | Directory Panel file row (tree) | `code/Sources/ImageGlass/FileList/DesignTreeNode.swift` | AppKit `NSMenu` via `NSMenuBridge` representable |
+| 7.2 | Directory Panel folder row (tree) | `code/Sources/ImageGlass/FileList/DesignTreeNode.swift` | AppKit `NSMenu` |
+| 7.3 | Directory Panel root row (tree) | `code/Sources/ImageGlass/FileList/DesignTreeNode.swift` | AppKit `NSMenu` |
+| 7.4 | Directory Panel empty space | `code/Sources/ImageGlass/DirectoryFilenamePanel.swift` | AppKit `NSMenu` |
+| 7.5 | Directory Panel header strip | `code/Sources/ImageGlass/DirectoryFilenamePanel.swift` | AppKit `NSMenu` |
+| 7.6 | File list panels (List/Grid/Strip/Details/Column) | `code/Sources/ImageGlass/FileList/FileListGridView.swift`, `FileListStripView.swift`, `FileListDetailsView.swift`, `FileListColumnView.swift`, `FileListTreeView.swift` | SwiftUI `.contextMenu { }` (existing) extended in this spec |
+| 7.7 | Image canvas (viewer) | `code/Sources/ImageGlass/Viewer/ImageCanvasView.swift` (override `menu(for:)`) | AppKit `NSMenu` |
+| 7.8 | Video canvas | `code/Sources/ImageGlass/Viewer/Video/VideoCanvasView.swift` | AppKit `NSMenu` |
+| 7.9 | SVG canvas | `code/Sources/ImageGlass/Viewer/SVG/SVGCanvasView.swift` | AppKit `NSMenu` (for native render) / `WKWebView` (for animated SVG — see §7.9 caveat) |
+| 7.10 | Image info overlay (on-image text overlay) | `code/Sources/ImageGlass/Viewer/ImageInfoOverlay.swift` | SwiftUI `.contextMenu { }` |
+| 7.11 | Gallery / Thumbnail strip | `code/Sources/ImageGlass/FileList/FileListStripView.swift` | SwiftUI `.contextMenu { }` (extended) |
+| 7.12 | Floating File Tree window | `code/Sources/ImageGlass/Window/FloatingFileTreeWindow.swift` | inherits §7.1/§7.2/§7.3/§7.4 — same DesignTreeNode reuse |
+| 7.13 | Toolbar item | `code/Sources/ImageGlass/Window/Toolbar.swift` (planned) | AppKit `NSToolbar` standard *Customize* menu — see §7.13 |
+| 7.14 | Panel header / tab | `code/Sources/ImageGlass/Panels/PanelHostController.swift` (planned) | AppKit `NSMenu` |
+| 7.15 | Status bar / footer | `code/Sources/ImageGlass/DirectoryFilenamePanel.swift` (footer) and `code/Sources/ImageGlass/Viewer/ImageViewer.swift` (canvas footer) | SwiftUI `.contextMenu { }` |
+
+The "host" column is where the right-click event lands. The menu
+**content** is built by `ContextMenuBuilders.swift` (the single
+canonical builder file — see §9.1) so the order, separators, and
+text are not duplicated across hosts.
+
+---
+
+## 7. Per-Surface Specification
+
+Each subsection below specifies one surface. The shape is the
+same: a table of items in order, with the shortcut shown beside
+each item, plus prose for non-obvious rules.
+
+The text in each row's *Item* column is the exact string that
+ships. Do not paraphrase it during code review.
+
+### 7.1 Context Menu — File Row in the Directory Panel (Tree)
+
+**Surface:** Right-click on a file row in the left Directory Panel
+tree view. The row may be at any indent depth; the menu does not
+change with depth.
+
+**Host source:** `code/Sources/ImageGlass/FileList/DesignTreeNode.swift`
+— the `fileRow` view gets an `NSMenuBridge` attached. The bridge
+builds the menu via `ContextMenuBuilders.fileRow(state:path:)`.
+
+**Pre-fire:** `DesignTreeNode.onRightClick(path)` calls
+`state.selectedFile = path`, `nav.activeRow = path`, then opens
+the menu. (§3.3)
+
+**Items, in order:**
+
+| # | Item | Shortcut | Verb / source | Notes |
+|---|---|---|---|---|
+| 1 | Open | ↵ | `state.selectedFile = path` (already done by §3.3, the menu item is a no-op here but kept for muscle memory) | First item per HIG: the most likely action. |
+| 2 | Open in New Window | ⌘N | `FileActions.newWindow(openPath: path, source: .context)` | Spec `actions.mdx` §7. |
+| 3 | Open in Floating Viewer | — | `SecondViewerWindow.shared.show(path: path)` | Mirror of the existing Second Viewer surface (see `code/Sources/ImageGlass/Window/SecondViewerWindow.swift`). |
+| 4 | Open With ▸ | — | submenu — see §7.1.1 | |
+| 5 | Quick Look | Space *(in panel)* | `NSWorkspace.openQuickLook(path)` (custom shim around `qlmanage` is not used; we use `QLPreviewPanel`). | macOS-standard Quick Look. The bare Space hotkey is reserved for slideshow when the viewer is focused; in the panel context, Space opens Quick Look — see `hotkeys.mdx` §3 routing. |
+| — | *(separator)* | | | |
+| 6 | Reveal in Finder | ⌘R | `NSWorkspace.shared.activateFileViewerSelecting([url])` | |
+| 7 | Copy Image | ⌘C | `FileActions.copyImageToClipboard(state:source:.context)` | `actions.mdx` §4. |
+| 8 | Copy File Path | ⌃⌘C | `FileActions.copyFilePath(state:source:.context)` | `actions.mdx` §5. The bare `⇧P` is shown next to the menu-bar twin only. |
+| — | *(separator)* | | | |
+| 9 | Include in Scope | ⌃1 | `IncludeStateController.setState(path, .include, app)` | `include_checks.mdx` §7. Item carries a checkmark when this row's *explicit* state (not the resolved state) is `.include`. |
+| 10 | Inherit Include State | ⌃2 | `IncludeStateController.setState(path, .inherit, app)` | Checkmark when explicit state is `.inherit`. Disabled on the root rows (§1.0 of `include_checks.mdx`). |
+| 11 | Don't Include in Scope | ⌃3 | `IncludeStateController.setState(path, .exclude, app)` | Checkmark when explicit state is `.exclude`. |
+| — | *(separator)* | | | |
+| 12 | Show in File List | — | `state.panelViewMode = .list` then `model.scrollTo(path)` (FileList panel) | Cross-panel convenience: hop the user from the tree to the flat List view with the same row selected. |
+| 13 | Show Metadata | ⌥⌘I | (toggles `state.metadataOverlayVisible` if implemented; v1 falls back to opening the on-canvas info overlay via `viewer.imageInfoOverlayVisible.toggle()`) | The metadata panel ships in v2; this item routes to the on-canvas overlay in v1. |
+| — | *(separator)* | | | |
+| 14 | Set As Desktop Picture | — | `NSWorkspace.shared.setDesktopImageURL(url, for: NSScreen.main!)` | Disabled when the file's UTI is not in `kUTTypeImage`. |
+| 15 | Rename… | F2 | `FileActions.renameViaSheet(state:source:.context)` | `actions.mdx` §2. |
+| 16 | Move to Trash | ⌘⌫ | `FileActions.moveToTrash(state:source:.context)` | `actions.mdx` §3. Always the **last** item; HIG places destructive verbs at the bottom. |
+
+#### 7.1.1 Sub-menu — Open With ▸
+
+Built from `ExternalToolStorage.shared.list()` plus the system's
+default-app list for the file's UTI.
+
+| # | Item | Notes |
+|---|---|---|
+| 1 | <default app name> (default) | E.g., *Preview (default)*. Fired via `NSWorkspace.shared.open(url)`. The "default" suffix is grayed-but-readable. |
+| — | *(separator)* | |
+| 2…N | Other registered handlers for this UTI | One row per app from `NSWorkspace.shared.urlsForApplications(toOpen: url)`. Fired via `NSWorkspace.shared.open([url], withApplicationAt: appURL, configuration: …)`. |
+| — | *(separator)* | |
+| N+1…M | Tools registered with `register_external_tool` | One row per tool from `ExternalToolStorage.shared.list()`. Fired via `ExternalToolLauncher().launch(tool, filePath: path)`. |
+| — | *(separator)* | |
+| last | App Store… | `NSWorkspace.shared.open(URL(string: "macappstore://")!)` — Apple-standard pattern when no app is registered for the UTI. |
+| last | Other… | Opens `NSOpenPanel` scoped to `.applicationBundle` so the user can pick any app on disk. The chosen app is **not** persisted as a default — that is a system-level setting reachable via Finder ▸ Get Info. |
+
+The sub-menu is built lazily on hover (`NSMenuDelegate.menuNeedsUpdate`)
+so the system app-list query (a slow IO operation on cold disk)
+does not block the parent menu's open animation.
+
+#### 7.1.2 Disabled-state rules
+
+* If the file does not exist on disk (the panel is showing a
+  stale row), items 6, 7, 12, 13, 14, 15, 16 are disabled with
+  tooltip *"This file no longer exists on disk."* Items 1–5 and
+  8 are still enabled — opening, opening with, and copying the
+  path are reasonable verbs even on a missing file (Copy Path
+  returns `ok=true note=missing` per `actions.mdx` §5.6).
+* If the file's UTI is not `kUTTypeImage`, items 7 (Copy Image)
+  and 14 (Set As Desktop Picture) are disabled.
+
+### 7.2 Context Menu — Folder (Subdirectory) Row in the Directory Panel
+
+**Surface:** Right-click on a non-root folder row in the left
+Directory Panel tree view.
+
+**Host source:** Same as §7.1 — the `directoryRow` view in
+`DesignTreeNode.swift` gets the same bridge; the bridge dispatches
+to `ContextMenuBuilders.folderRow(state:path:)`.
+
+**Items, in order:**
+
+| # | Item | Shortcut | Notes |
+|---|---|---|---|
+| 1 | Open in Floating File Tree | ⌃⌥⌘F | `FloatingFileTreeWindowController.shared.show(state:)` then scroll the floating tree to this folder. |
+| 2 | Expand Subtree | ⌥→ | `nav.expandSubtree(folderPath: path)` — recursive expand, matches Finder ⌥-click on the disclosure triangle. |
+| 3 | Collapse Subtree | ⌥← | `nav.collapseSubtree(folderPath: path)`. |
+| — | *(separator)* | | |
+| 4 | Reveal in Finder | ⌘R | `NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: path)`. |
+| 5 | Copy Folder Path | ⌃⌘C | `FileActions.copyFilePath(state:source:.context)` — the target rule (`actions.mdx` §1.1) resolves the cursor's folder for the Copy Path verb. |
+| 6 | Open in Terminal | — | `NSWorkspace.shared.open([URL(fileURLWithPath: path)], withApplicationAt: terminalURL, …)` — falls back to AppleScript bridge when `terminalURL` is missing (rare; Terminal.app is system-bundled). |
+| — | *(separator)* | | |
+| 7 | Include in Scope | ⌃1 | Same as §7.1 item 9, scoped to this folder (and everything inside via inheritance). |
+| 8 | Inherit Include State | ⌃2 | Same as §7.1 item 10. |
+| 9 | Don't Include in Scope | ⌃3 | Same as §7.1 item 11. |
+| 10 | Edit Filter for This Folder… | — | Opens the per-folder filter sheet — see `mcp_and_filters_on_dirs.mdx` §5. v1 ships a read-only summary; v2 ships the editor. |
+| — | *(separator)* | | |
+| 11 | Add Subfolder As Root | — | `DirectoriesStore.shared.addRoot(path: path)`. Useful to "promote" a deep folder you frequently work in. |
+| 12 | Remove Folder from Scope | — | Adds an `exclude` glob to the parent root's filter that vetoes this folder — see `include_checks.mdx` §9 for the compose rule. Disabled when this folder is itself a root (root rows offer *Remove Directory*, §7.3). |
+| — | *(separator)* | | |
+| 13 | Move Folder to Trash | ⇧⌘⌫ | `FileManager.default.trashItem(at: url, …)` wrapped in a confirm dialog. `⇧⌘⌫` is the "with-shift" variant; the bare `⌘⌫` is reserved for files (§7.1 item 16) so the keystroke on a focused folder does not accidentally trash the user's folder. |
+
+#### 7.2.1 Verbs not on folders
+
+The following file verbs are deliberately **absent** from the
+folder menu (they would not be meaningful): Copy Image, Print,
+Rename (folder rename ships in v2 — see §15), Set As Desktop
+Picture, Open With.
+
+### 7.3 Context Menu — Root Directory Row in the Directory Panel
+
+**Surface:** Right-click on a top-level root row (the entry the
+user added with *Add Directory…*).
+
+**Host source:** Same as §7.1 — the `directoryRow` view in
+`DesignTreeNode.swift` dispatches to
+`ContextMenuBuilders.rootRow(state:rootPath:)` when
+`IncludeStateController.isRoot(absolutePath:, in:)` returns true.
+
+**Items, in order:**
+
+| # | Item | Shortcut | Notes |
+|---|---|---|---|
+| 1 | Refresh This Root | — | `DirectoryTreeWalker.shared.scheduleWalk(root:, filter:, corr:)`. |
+| 2 | Refresh All Roots | — | `refreshAllWalkerRoots()` (existing in `DirectoryFilenamePanel.swift`). |
+| — | *(separator)* | | |
+| 3 | Reveal in Finder | ⌘R | |
+| 4 | Open in Terminal | — | |
+| 5 | Copy Folder Path | ⌃⌘C | |
+| — | *(separator)* | | |
+| 6 | Include in Scope | ⌃1 | Toggles `defaultIncludeState = .include`. Per `include_checks.mdx` §1.0, root rows are two-state — *Inherit* is **disabled** here. |
+| 7 | Inherit Include State | ⌃2 | **Disabled** on roots — tooltip *"A root has no ancestor to inherit from."* |
+| 8 | Don't Include in Scope | ⌃3 | Toggles `defaultIncludeState = .exclude`. |
+| — | *(separator)* | | |
+| 9 | Edit Filter for This Root… | — | Opens the per-root filter sheet. Same source as §7.2 item 10. |
+| 10 | Clear Filter on This Root | — | `DirectoriesStore.shared.updateFilter(path:, filter: .empty)`. Disabled when the filter is already empty. |
+| — | *(separator)* | | |
+| 11 | Move Root Up | — | Reorders the root in `directories.yaml`. The order is what the panel renders top-to-bottom. |
+| 12 | Move Root Down | — | |
+| 13 | Move Root to Top | — | |
+| 14 | Move Root to Bottom | — | |
+| — | *(separator)* | | |
+| 15 | Remove Directory from Scope | ⇧⌘⌫ | `DirectoriesStore.shared.removeRoot(path:)`. The directory on disk is **not** touched — only the entry in `directories.yaml` is removed. Tooltip on hover: *"Removes this directory from the scope. Files on disk are not affected."* |
+
+The four *Move Root…* items reorder the YAML in place. They are
+disabled at the corresponding endpoints (Move Up disabled when the
+root is already top; Move Down disabled when bottom; the
+*to-Top* / *to-Bottom* variants disabled likewise). The MCP twin
+is a planned `reorder_root` tool — not yet shipped; v1 menu items
+mutate the YAML directly through `DirectoriesStore` extension
+methods added by this spec.
+
+### 7.4 Context Menu — Empty Space in the Directory Panel
+
+**Surface:** Right-click in the empty area below the last row, or
+between rows in a sparse tree.
+
+**Host source:** `DirectoryFilenamePanel.swift` — a transparent
+overlay `NSView` is layered behind the rows; the overlay owns the
+menu. The overlay's `menu(for:)` returns the
+`ContextMenuBuilders.panelEmpty(state:)` menu.
+
+**Items, in order:**
+
+| # | Item | Shortcut | Notes |
+|---|---|---|---|
+| 1 | Add Directory… | ⌘D | `addDirectoryFromPicker()` (existing). |
+| 2 | Add Directory From Clipboard | — | Reads a path from the pasteboard string type; if it points to a folder, adds it as a root. Disabled when the clipboard contains no folder path. |
+| — | *(separator)* | | |
+| 3 | Switch View ▸ | — | submenu — *Tree*, *List*, *Grid*, *Strip*, *Details*, *Column*. Active mode carries a checkmark. Fires `state.panelViewMode = mode`. |
+| 4 | Sort By ▸ | — | submenu — *Name*, *Date Modified*, *Date Created*, *Size*, *Kind*, plus separator and *Ascending* / *Descending*. Active sort carries a checkmark. |
+| — | *(separator)* | | |
+| 5 | Refresh All Roots | — | `refreshAllWalkerRoots()`. |
+| 6 | Re-evaluate Active Scope | ⌘R | `state.reevaluateActive()`. |
+| 7 | Clear All Directories | — | `DirectoriesStore.shared.clearAll()` wrapped in a confirm dialog: *"Remove all directories from the scope? Files on disk are not affected."* |
+| — | *(separator)* | | |
+| 8 | Reveal Local Storage in Finder | ⌥⌘G | `NSWorkspace.shared.activateFileViewerSelecting([AppPaths.macDirectoriesFile])`. |
+
+### 7.5 Context Menu — Directory Panel Header
+
+**Surface:** Right-click on the panel header strip (the area
+holding the "FILES" label, the refresh button, the segmented
+List/Tree control, the filter field). The filter field itself
+provides its own standard text-edit menu — the rule from §3.2
+keeps our custom menu off text fields.
+
+**Host source:** `DirectoryFilenamePanel.swift` `header` view.
+
+**Items, in order:**
+
+| # | Item | Shortcut | Notes |
+|---|---|---|---|
+| 1 | Switch View ▸ | — | Mirror of §7.4 item 3. |
+| 2 | Sort By ▸ | — | Mirror of §7.4 item 4. |
+| — | *(separator)* | | |
+| 3 | Hide Panel | ⌘L | `LayoutCoordinator.shared.togglePanel("file_panel")`. |
+| 4 | Move Panel ▸ | — | submenu — *Left* / *Right* / *Top* / *Bottom* / *Float*. Active dock has a checkmark. Maps to `LayoutCoordinator.shared.movePanel("file_panel", to: …)`. |
+| 5 | Reset Panel Width | — | Sets the panel's group `size` back to its preset default (280 for the Browser preset). |
+| — | *(separator)* | | |
+| 6 | Customize Panel Header… | — | Opens Settings → Panels (v2 surface; v1 ships disabled with tooltip *"Coming in v2."*). |
+
+### 7.6 Context Menu — File List Panel Rows (List / Grid / Strip / Details / Column)
+
+**Surface:** Right-click on a file cell in any of the five file
+list view modes that the file panel exposes via `panelViewMode`.
+
+**Host source:**
+* `code/Sources/ImageGlass/FileList/FileListGridView.swift` (the existing
+  `contextMenu(for:)` is **replaced** by a call to
+  `ContextMenuBuilders.fileListItem(model:entry:)`).
+* `code/Sources/ImageGlass/FileList/FileListStripView.swift` (same swap).
+* `code/Sources/ImageGlass/FileList/FileListDetailsView.swift` (added).
+* `code/Sources/ImageGlass/FileList/FileListColumnView.swift` (added).
+* `code/Sources/ImageGlass/FileList/FileListTreeView.swift` (added, applies
+  to the in-panel flat-tree variant, distinct from the docked
+  Directory Panel's tree).
+
+These views use SwiftUI's `.contextMenu { }` modifier because they
+do not need keyboard-shortcut display in the menu (the shortcut is
+already shown in the menu bar). The builder is a SwiftUI
+`@ViewBuilder` returning `some View` rather than a `NSMenu`.
+
+**Items, in order** (identical across all five view modes — the
+menu does not branch on view mode):
+
+| # | Item | Shortcut | Notes |
+|---|---|---|---|
+| 1 | Open in Viewer | ↵ | `model.click(entry.path)`. |
+| 2 | Open in New Window | ⌘N | `FileActions.newWindow(openPath: entry.path, source: .context)`. |
+| 3 | Open in Floating Viewer | — | `SecondViewerWindow.shared.show(path: entry.path)`. |
+| 4 | Open With ▸ | — | Same submenu as §7.1.1. |
+| 5 | Quick Look | Space | `QLPreviewPanel.shared().display(entry.url)`. |
+| — | *(separator)* | | |
+| 6 | Reveal in Finder | ⌘R | `NSWorkspace.shared.activateFileViewerSelecting([entry.url])`. |
+| 7 | Copy Image | ⌘C | |
+| 8 | Copy File Path | ⌃⌘C | |
+| — | *(separator)* | | |
+| 9 | Show in Tree View | — | `state.panelViewMode = .tree` then auto-scroll the tree to the row. Inverse of §7.1 item 12. |
+| 10 | Show Metadata | ⌥⌘I | Same as §7.1 item 13. |
+| — | *(separator)* | | |
+| 11 | Set As Desktop Picture | — | |
+| 12 | Rename… | F2 | |
+| 13 | Move to Trash | ⌘⌫ | Pluralizes per §5. |
+
+#### 7.6.1 Multi-select pluralization examples
+
+* Selection of 4 files → item 6 reads *Reveal 4 Files in Finder*.
+* Selection of 3 files → item 7 reads *Copy 3 Images*. (Note:
+  multi-image copy concatenates the images vertically into a
+  single PNG on the clipboard — same convention as Preview.app.)
+* Selection of 3 files → item 12 *Rename…* is **disabled**.
+
+#### 7.6.7 Why the docked Directory Panel uses AppKit and the FileList views use SwiftUI
+
+The docked Directory Panel needs to show the keyboard shortcut on
+the right side of each menu item (so the user learns the
+shortcut). SwiftUI's `.contextMenu` does not render keyboard
+shortcuts on macOS as of Sonoma/Sequoia (only iOS does via
+`.keyboardShortcut`). The AppKit `NSMenuItem.keyEquivalent` does.
+That is the only material difference; the menu items themselves
+are identical.
+
+The FileList views skip the shortcut display because they sit in
+the lighter Grid / Strip surfaces where the menu is a quick
+convenience, not the primary teach-the-shortcut surface.
+
+### 7.7 Context Menu — Image Canvas (Viewer)
+
+**Surface:** Right-click anywhere on the image canvas viewport,
+whether on the rendered image or on the canvas background.
+
+**Host source:** `code/Sources/ImageGlass/Viewer/ImageCanvasView.swift`
+— override `menu(for event: NSEvent) -> NSMenu?` to return the
+menu built by `ContextMenuBuilders.imageCanvas(state:viewer:)`.
+
+**Items, in order:**
+
+| # | Item | Shortcut | Notes |
+|---|---|---|---|
+| 1 | Next Image | → | Advances `state.selectedFile` via the existing arrow handler in `AppState`. |
+| 2 | Previous Image | ← | |
+| — | *(separator)* | | |
+| 3 | Zoom to Fit | Z | `viewer.zoomToFit()`. Checkmark when current `zoomMode == .fit`. |
+| 4 | Zoom to Width | W | `viewer.zoomToWidth()`. Checkmark when current `zoomMode == .width`. |
+| 5 | Actual Size | N (normalize) | `viewer.zoomToActual()`. |
+| 6 | Lock Zoom | ⌃⌘L | Toggles `viewer.zoomMode = .lock` and back. |
+| — | *(separator)* | | |
+| 7 | Rotate Left | ⌘L *(viewer scope)* | `viewer.rotateCounterClockwise()`. (Note: `⌘L` in the menu bar is *Rotate Left*; `⌘L` globally is *Hide Panel*. The two never collide because the panel focus context is the disambiguator — see `hotkeys.mdx` §3 / `menus.mdx` §7.) |
+| 8 | Rotate Right | ⌘K | `viewer.rotateClockwise()`. |
+| 9 | Flip Horizontal | ⌥⌘H | `viewer.toggleFlipHorizontal()`. Checkmark when `flipHorizontal == true`. |
+| 10 | Flip Vertical | ⌥⌘V | `viewer.toggleFlipVertical()`. Checkmark when `flipVertical == true`. |
+| — | *(separator)* | | |
+| 11 | Show Channels ▸ | — | submenu — *All*, *Red*, *Green*, *Blue*, *Alpha*, *Luminance*. Active channel has a checkmark. |
+| 12 | Color Picker | ⇧⌘K | Toggles `viewer.showColorPicker`. Checkmark when on. |
+| — | *(separator)* | | |
+| 13 | Copy Image | ⌘C | |
+| 14 | Copy File Path | ⌃⌘C | Bare `⇧P` is the in-viewer twin — `actions.mdx` §5. |
+| 15 | Reveal in Finder | ⌘R | |
+| 16 | Show in Directory Panel | — | Scrolls the docked panel to the current `state.selectedFile`, auto-expanding ancestors. |
+| 17 | Show Metadata | ⌥⌘I | Toggles the on-image info overlay. |
+| — | *(separator)* | | |
+| 18 | Save As… | ⇧⌘S | Opens `NSSavePanel` and writes the current image (with rotation/flip applied) to the chosen path. |
+| 19 | Convert To ▸ | — | submenu — *PNG*, *JPEG*, *HEIC*, *TIFF*, *WebP*, *AVIF*, *JXL*. Each leaf opens `NSSavePanel` with the matching `UTType.preferredFilenameExtension`. |
+| 20 | Open With ▸ | — | Same submenu as §7.1.1. |
+| 21 | Print… | ⌘P | |
+| — | *(separator)* | | |
+| 22 | Set As Desktop Picture | — | |
+| 23 | Move to Trash | ⌘⌫ | Always last. |
+
+#### 7.7.1 When there is no image loaded
+
+When `state.selectedFile == nil` and the canvas shows the empty-
+state placeholder, the menu is **suppressed** — `menu(for:)`
+returns `nil`. There is no useful verb when there is no target.
+The exception is the *Next Image* / *Previous Image* items when
+the panel's resolved list is non-empty; we still suppress because
+the user has likely arrowed off the end of the list deliberately.
+This conservative behavior keeps the menu honest.
+
+### 7.8 Context Menu — Video Canvas
+
+**Surface:** Right-click on the AVKit video viewport (`AVPlayerView`).
+
+**Host source:** `code/Sources/ImageGlass/Viewer/Video/VideoCanvasView.swift`.
+The video view extends the §7.7 image menu with playback verbs at
+the top:
+
+| # | Item | Shortcut | Notes |
+|---|---|---|---|
+| 1 | Play / Pause | Space | Mirrors AVKit's built-in chrome. |
+| 2 | Restart | — | Seek to 0. |
+| 3 | Loop | — | Toggles loop playback. Checkmark when on. |
+| 4 | Mute | M | Toggle. |
+| — | *(separator)* | | |
+| 5 | Playback Speed ▸ | — | submenu — *0.25×*, *0.5×*, *1×*, *1.5×*, *2×*, *4×*. |
+| — | *(separator)* | | |
+| 6…N | *(everything from §7.7 items 1 onward, minus the Rotate / Flip / Show Channels / Color Picker / Convert To items which do not apply to video)* | | |
+
+### 7.9 Context Menu — SVG Canvas
+
+**Surface:** Right-click on the SVG viewport.
+
+**Host source:** `code/Sources/ImageGlass/Viewer/SVG/SVGCanvasView.swift`.
+
+**Caveat:** when the SVG is rendered through `WKWebView` (the
+animated-SVG path — see `svg.mdx` §4), `WKWebView` intercepts the
+right-click and shows the web-content menu (*Open in Browser*,
+*Inspect Element*). We suppress that via a `WKUIDelegate`
+returning `nil` from `webView(_:contextMenuConfigurationForElement:…)`
+and route the right-click to our own menu instead.
+
+The menu is the §7.7 menu with two extras at the top:
+
+| # | Item | Shortcut | Notes |
+|---|---|---|---|
+| 1 | Use Native Renderer | — | Toggle. When on, switches to the static Core Graphics renderer (faster, no animation). Checkmark when on. |
+| 2 | Use Web Renderer | — | Toggle. Inverse of (1). |
+| — | *(separator)* | | |
+| 3…N | *(everything from §7.7)* | | |
+
+### 7.10 Context Menu — On-Image Info Overlay
+
+**Surface:** Right-click on the small EXIF/file-info text overlay
+that floats over the image (toggled with `⌘I`).
+
+**Host source:** `code/Sources/ImageGlass/Viewer/ImageInfoOverlay.swift`.
+
+| # | Item | Notes |
+|---|---|---|
+| 1 | Copy All Info | Copies the entire visible block to the pasteboard as plain text. |
+| 2 | Copy Selected Line | Copies just the line under the cursor. |
+| — | *(separator)* | |
+| 3 | Customize Fields… | Opens Settings → Viewer → Image Info (v2 surface; v1 ships disabled). |
+| 4 | Hide Overlay | ⌘I | Toggles `viewer.imageInfoOverlayVisible = false`. |
+
+### 7.11 Context Menu — Gallery / Thumbnail Strip
+
+**Surface:** Right-click on a thumbnail in the bottom gallery
+strip. Owned by `FileListStripView`. Items identical to §7.6
+(the strip is a special view mode of the file list panel).
+
+### 7.12 Context Menu — Floating File Tree Window
+
+**Surface:** Right-click on any row inside the floating "File
+Tree" window (`FloatingFileTreeWindowController`).
+
+**Host source:** Shares `DesignTreeNode.swift` with §7.1–§7.3.
+The same menu builders fire — the floating window is a second
+host of the same component. No code duplication.
+
+### 7.13 Context Menu — Toolbar Item
+
+**Surface:** Right-click on a toolbar item.
+
+**Host source:** `NSToolbar` provides its own standard menu —
+*Customize Toolbar…*, *Icon and Text*, *Icon Only*, *Text Only*,
+*Use Small Size*. We do **not** override this; it is what every
+Mac app ships and what every Mac user expects.
+
+### 7.14 Context Menu — Panel Header / Tab
+
+**Surface:** Right-click on the chrome of a docked panel (the tab
+strip when the panel is tabbed with another, or the panel's
+draggable header). The panel framework (`panels.mdx` §5.5)
+already defines the tab-right-click behavior; this spec confirms
+the items:
+
+| # | Item | Notes |
+|---|---|---|
+| 1 | Move to ▸ | submenu *Left* / *Right* / *Top* / *Bottom* / *Float*. |
+| 2 | Tab With ▸ | submenu listing every other visible panel. Selecting one moves this panel into that panel's tab group. |
+| 3 | Hide Panel | |
+| — | *(separator)* | |
+| 4 | Reset Position | Returns to the panel's preset default position. |
+| 5 | Reset Size | Returns to the panel's preset default size. |
+
+### 7.15 Context Menu — Status Bar / Footer
+
+**Surface:** Right-click on the bottom-of-window status bar or on
+the panel footer (file count + scope label).
+
+**Host source:** Footer view inside `DirectoryFilenamePanel.swift`
+and the viewer's `ImageViewer.swift` status row.
+
+| # | Item | Notes |
+|---|---|---|
+| 1 | Copy Status Text | Copies the rendered footer text (file count + scope label) to the pasteboard. |
+| 2 | Show Status Bar | Toggle. Checkmark when on. |
+| — | *(separator)* | |
+| 3 | Re-evaluate Active Scope | Same as §7.4 item 6. |
+| 4 | Reveal Local Storage in Finder | Same as §7.4 item 8. |
+
+---
+
+## 8. Selection Semantics — Worked Examples
+
+### 8.1 Right-click an unselected file row
+
+* **Before:** `state.selectedFile = "~/Pictures/a.jpg"`. The user
+  right-clicks `~/Pictures/b.jpg` in the tree.
+* **§3.3 fires:** `state.selectedFile = "~/Pictures/b.jpg"`,
+  `treeNav.activeRow = "~/Pictures/b.jpg"`. The canvas loads
+  `b.jpg`.
+* **The menu opens** and reports the b.jpg target.
+* **Item 16 *Move to Trash* fires.** `b.jpg` goes to Trash. The
+  selection advances per `actions.mdx` §3.4.
+* **Audit log:**
+
+  ```
+  ts=… tool=file.trash from=…/b.jpg trash=…/.Trash/b.jpg
+   source=menu:context corr=<id> ok=true
+  ```
+
+### 8.2 Right-click an already-selected row in a multi-select
+
+* **Before:** Three files selected in the Grid view —
+  `a.jpg`, `b.jpg`, `c.jpg`. The user right-clicks on `b.jpg`.
+* **§3.3 / §5:** Multi-select preserved. Menu opens with
+  pluralized item text: *Reveal 3 Files in Finder*, *Copy 3
+  Images*, *Move 3 Files to Trash*. Rename is disabled.
+* **Item *Move 3 Files to Trash* fires.** Three single audit log
+  lines are emitted, one per file, on a single shared correlation
+  id so the batch is collatable.
+
+### 8.3 Right-click on the canvas with no image loaded
+
+* `menu(for:)` returns `nil`. The system shows no menu. No audit
+  line.
+
+### 8.4 Right-click on a file row whose underlying file was deleted in Finder seconds ago
+
+* The walker has not yet emitted the FSEvents removal. The row is
+  still in the tree.
+* The menu opens. Items that need a present-on-disk file (Reveal,
+  Copy Image, Print, Rename, Set As Desktop Picture, Move to
+  Trash, Show Metadata) are disabled with tooltip *"This file no
+  longer exists on disk."* per §7.1.2.
+* Items that can still be useful (Open With, Copy File Path) are
+  enabled. *Copy File Path* records `note=missing` in the audit
+  log per `actions.mdx` §5.6.
+
+---
+
+## 9. Implementation Notes
+
+### 9.1 The single canonical menu builder file
+
+All menu *contents* live in
+`code/Sources/ImageGlass/ContextMenus/ContextMenuBuilders.swift`.
+This is the only file that decides what items appear in each
+menu. The hosts (DesignTreeNode, DirectoryFilenamePanel,
+ImageCanvasView, etc.) call into one of:
+
+```swift
+ContextMenuBuilders.fileRow(state:path:) -> NSMenu
+ContextMenuBuilders.folderRow(state:path:) -> NSMenu
+ContextMenuBuilders.rootRow(state:rootPath:) -> NSMenu
+ContextMenuBuilders.panelEmpty(state:) -> NSMenu
+ContextMenuBuilders.panelHeader(state:) -> NSMenu
+ContextMenuBuilders.imageCanvas(state:viewer:) -> NSMenu
+ContextMenuBuilders.statusBar(state:) -> NSMenu
+ContextMenuBuilders.fileListItem(model:entry:) -> some View
+```
+
+A SwiftUI host calls `fileListItem` and embeds the returned view
+inside `.contextMenu { }`. An AppKit host calls one of the
+`NSMenu` builders and returns it from `menu(for:)` (canvas) or
+attaches it to the host view's `menu` property (rows, empty
+space, header).
+
+### 9.2 Wiring rows to a per-row NSMenu
+
+SwiftUI views do not own AppKit `NSMenu`s natively. We bridge with
+an `NSViewRepresentable` whose `NSView` subclass:
+
+* Forwards `acceptsFirstMouse` / `mouseDown` / etc. to the SwiftUI
+  parent (no event interception) — so left-click selection and
+  the include-swatch button still work.
+* Overrides `menu(for event: NSEvent) -> NSMenu?` to build and
+  return the per-row menu.
+* Calls a `preselect` closure before opening the menu so §3.3
+  fires.
+
+The bridge view is **invisible** — it sits as a `.overlay` on
+each row view with `.allowsHitTesting(false)` everywhere except
+the right-click path (which AppKit dispatches independent of
+SwiftUI hit-testing). Concretely, `acceptsFirstMouse(for:)`
+returns `false` so left-clicks pass through; `menu(for:)` runs
+for right-clicks.
+
+The bridge is implemented in
+`code/Sources/ImageGlass/ContextMenus/ContextMenuBridge.swift`.
+
+### 9.3 Wiring the image canvas
+
+`ImageCanvasView` is already an `NSView` subclass. Override
+`menu(for event: NSEvent) -> NSMenu?` directly:
+
+```swift
+override func menu(for event: NSEvent) -> NSMenu? {
+    guard let state = hostState, state.selectedFile != nil,
+          let viewer = hostViewer else { return nil }
+    return ContextMenuBuilders.imageCanvas(state: state, viewer: viewer)
+}
+```
+
+The `hostState` / `hostViewer` references are stamped on the
+canvas by `CanvasHost.makeNSView` (see
+`code/Sources/ImageGlass/Viewer/ImageViewer.swift`).
+
+### 9.4 Audit logging
+
+Every menu item handler ends with a single
+`MCPAuditLogger.shared.log([…])` line. The handler also calls
+through to the canonical verb (`FileActions.*`,
+`IncludeStateController.*`, `DirectoriesStore.*`,
+`viewer.zoomToFit()`, etc.) which itself emits its own audit
+line. The convention:
+
+* The menu handler emits **one** `tool=menu.click` line:
+  ```
+  ts=… tool=menu.click menu=<surface> item=<item-id>
+   source=menu:context corr=<id> ok=true
+  ```
+* The verb it dispatches emits **one** line with the verb's own
+  `tool=…` on the same `corr=<id>`. This pairs cleanly.
+* The surface ids are the §6 surface numbers, written as
+  `"directory_panel.file_row"`, `"directory_panel.folder_row"`,
+  `"directory_panel.root_row"`, `"directory_panel.empty"`,
+  `"directory_panel.header"`, `"file_list.item"`,
+  `"viewer.canvas"`, `"viewer.video"`, `"viewer.svg"`,
+  `"viewer.image_info_overlay"`, `"gallery.strip"`,
+  `"window.floating_file_tree"`, `"panel.header_tab"`,
+  `"status_bar"`. The item ids are kebab-case verb names
+  (`"open"`, `"open-in-new-window"`, `"reveal-in-finder"`,
+  `"copy-image"`, `"copy-file-path"`, `"include"`, `"inherit"`,
+  `"dont-include"`, `"rename"`, `"move-to-trash"`,
+  `"open-with.<bundle-id>"`, `"open-with.tool.<tool-id>"`, …).
+
+### 9.5 Accessibility
+
+* Every `NSMenuItem` carries an `accessibilityLabel` matching its
+  title. Disabled items additionally publish
+  `accessibilityHint` with the disabled-reason tooltip.
+* `accessibilityIdentifier` is the same kebab-case id as the
+  audit log (`"reveal-in-finder"`, `"move-to-trash"`, …) so
+  XCUITest can address items by identifier without depending on
+  user-visible text. The id is the *menu-item* id, not the menu
+  surface id; the surface is derived from the menu's own
+  identifier.
+* VoiceOver pronounces the title and the shortcut. The system
+  handles this natively for `NSMenuItem`; we do not customize.
+
+### 9.6 Localization
+
+* Every string in `ContextMenuBuilders.swift` goes through
+  `NSLocalizedString(_:tableName:bundle:value:comment:)`.
+* The strings live in
+  `code/Sources/ImageGlass/Resources/en.lproj/ContextMenus.strings`.
+* The `comment` argument is a one-line description of the
+  surface and item id so a localizer can sort by surface.
+* The pluralization in §5 uses `String.localizedStringWithFormat`
+  with a `.stringsdict` file (`ContextMenus.stringsdict`) — not
+  string concatenation. The plural rules for English live in the
+  dict; other locales add their own entries.
+
+### 9.7 Performance budget
+
+* The menu must open within **16 ms** (1 frame at 60 Hz) of the
+  right-click event. The bulk of that is the `NSMenu` `popUp`
+  call; the menu *contents* construction must be **under 1 ms**.
+* The *Open With ▸* submenu's app-list query
+  (`NSWorkspace.urlsForApplications(toOpen:)`) is the only
+  expensive call. It runs lazily in `menuNeedsUpdate(_:)` on
+  hover, never on parent-menu open.
+* The Quick Look preview opens through the system's own
+  `QLPreviewPanel` infrastructure — we do not own its latency.
+
+### 9.8 Linting
+
+A SwiftSyntax-based linter at `tests/lint/ContextMenuLint.swift`
+fails the build when:
+
+* A literal `"..."` (three dots) appears inside a menu builder.
+* A menu item title contains a leading or trailing whitespace.
+* A menu item title is not in title case (heuristic: any "word"
+  not in the stoplist starts with a lowercase letter).
+* A new menu surface is added without updating the §6 inventory
+  table (the linter parses this MDX file and cross-references the
+  surface ids in `ContextMenuBuilders.swift`).
+
+These rules are enforced because the human review window is too
+narrow to catch text drift across fifteen surfaces.
+
+---
+
+## 10. MCP Surface
+
+Right-click verbs **do not** introduce new MCP tools beyond the
+ones already documented in the linked specs. The mapping:
+
+| Context-menu item | MCP tool |
+|---|---|
+| Open in New Window | `new_window` (`actions.mdx` §9.6) |
+| Reveal in Finder | (no MCP twin — purely UI) |
+| Copy Image | `copy_image_to_clipboard` |
+| Copy File Path | `copy_file_path` |
+| Rename… | `rename_file` |
+| Move to Trash | `delete_file` |
+| Print… | `print_current_image` |
+| Add Directory… | `add_directory` |
+| Remove Directory from Scope | `remove_directory` |
+| Refresh This Root / Refresh All Roots | `refresh_directory` |
+| Include / Inherit / Don't Include | `set_include_state` / `set_default_include_state` (`include_checks.mdx` §11) |
+| Edit Filter for This Root… | `set_filter` / `update_directory_filter` |
+| Re-evaluate Active Scope | `evaluate_scope` |
+| Reveal Local Storage in Finder | (no MCP twin — purely UI) |
+| Move to / Tab With / Hide Panel / Reset Position | `move_panel` / `tab_panels` / `hide_panel` / `apply_layout_preset` |
+| Zoom to Fit / Width / Actual / Lock | (no MCP twin in v1 — viewer-state RPCs are deferred per `mcp.mdx` §2 *Non-Goals*) |
+
+When a context-menu item lacks an MCP twin, the spec is honest
+about it — the GUI is the only surface for that verb. We do not
+invent ad-hoc tools to mirror every menu.
+
+---
+
+## 11. Disabled-State Matrix
+
+This table is the at-a-glance reference for whether each verb is
+enabled across the surface×target matrix. *Y* = enabled; *N* =
+disabled with tooltip.
+
+| Verb | File row (image) | File row (non-image) | Folder row | Root row | Empty space | Canvas (image loaded) | Canvas (empty) |
+|---|---|---|---|---|---|---|---|
+| Open | Y | Y | n/a | n/a | n/a | n/a | n/a |
+| Open in New Window | Y | Y | Y | Y | n/a | Y | n/a |
+| Open With | Y | Y | n/a | n/a | n/a | Y | n/a |
+| Reveal in Finder | Y | Y | Y | Y | n/a | Y | n/a |
+| Copy Image | Y | N | n/a | n/a | n/a | Y | n/a |
+| Copy File Path | Y | Y | Y | Y | n/a | Y | n/a |
+| Quick Look | Y | Y | Y | Y | n/a | n/a | n/a |
+| Include / Don't Include | Y | Y | Y | Y | n/a | n/a | n/a |
+| Inherit | Y | Y | Y | **N** (§7.3 item 7) | n/a | n/a | n/a |
+| Edit Filter | n/a | n/a | Y | Y | n/a | n/a | n/a |
+| Add Directory | n/a | n/a | n/a | n/a | Y | n/a | n/a |
+| Remove Directory | n/a | n/a | n/a | Y | n/a | n/a | n/a |
+| Refresh | n/a | n/a | n/a | Y | Y | n/a | n/a |
+| Re-evaluate Scope | n/a | n/a | n/a | n/a | Y | n/a | n/a |
+| Rename | Y | Y | Y *(v2)* | **N** | n/a | n/a | n/a |
+| Move to Trash | Y | Y | Y | n/a (use Remove Directory) | n/a | Y | n/a |
+| Set As Desktop Picture | Y | N | n/a | n/a | n/a | Y | n/a |
+| Print | Y | N | n/a | n/a | n/a | Y | n/a |
+| Save As | n/a | n/a | n/a | n/a | n/a | Y | n/a |
+| Convert To | n/a | n/a | n/a | n/a | n/a | Y | n/a |
+| Rotate / Flip | n/a | n/a | n/a | n/a | n/a | Y | n/a |
+| Color Picker / Channels | n/a | n/a | n/a | n/a | n/a | Y | n/a |
+| Show Metadata | Y | Y | n/a | n/a | n/a | Y | n/a |
+
+---
+
+## 12. Telemetry — `menu.open` and `menu.click`
+
+Every successful right-click that produces a menu emits one
+`menu.open` line. Every click on an item emits one `menu.click`
+line. The two share a correlation id so the open-to-click latency
+can be measured offline.
+
+```
+ts=2026-06-06T14:23:11.412Z tool=menu.open menu=directory_panel.file_row
+ path=/Users/you/Pictures/2026/06/IMG_0001.heic items=16 selected=1
+ source=event:right-click corr=R-ab12cd34 ok=true
+
+ts=2026-06-06T14:23:12.001Z tool=menu.click menu=directory_panel.file_row
+ item=move-to-trash source=menu:context corr=R-ab12cd34 ok=true
+
+ts=2026-06-06T14:23:12.012Z tool=file.trash from=/Users/you/…/IMG_0001.heic
+ trash=/Users/you/.Trash/IMG_0001.heic source=menu:context corr=R-ab12cd34
+ ok=true
+```
+
+The `menu.open` line carries the **count of items** so a P95
+opens-with-N-items dashboard is one query away. The `selected`
+field is the multi-select count for surfaces that support it (§5).
+
+---
+
+## 13. Accessibility — Keyboard-Only Operation
+
+A user who never touches a mouse must be able to open and use
+every context menu via keyboard alone:
+
+1. **Open the menu** — `⇧F10` is the documented binding. (macOS
+   has no system-wide context-menu key; the spec adds `⇧F10`
+   because most third-party Mac keyboards lack a Menu key.)
+   `⇧F10` fires the same `menu(for:)` chain as a right-click,
+   with the activation point set to the focused row's center.
+2. **Navigate** — `↑` / `↓` move between items; `→` opens a
+   sub-menu; `←` returns to the parent; `↵` (Return) commits the
+   highlighted item; `Esc` dismisses.
+3. **Mnemonic letters** — Apple deprecated `&`-style mnemonics
+   long ago; we do not introduce them.
+4. **VoiceOver** — handled automatically by AppKit / SwiftUI; the
+   §9.5 identifiers are the stable hooks XCUITest scripts use.
+
+The keyboard binding is registered globally on the main window
+via `NSEvent.addLocalMonitorForEvents(matching: .keyDown)` in
+`code/Sources/ImageGlass/ContextMenus/ContextMenuKeyboardOpener.swift`.
+
+---
+
+## 14. Edge Cases
+
+### 14.1 Sandboxed builds
+
+In sandboxed builds, `NSWorkspace.shared.urlsForApplications(toOpen:)`
+returns only apps the user has previously authorized via the
+power-box. The *Open With ▸* submenu surfaces *fewer* entries but
+the menu still functions; the *Other…* item routes through the
+power-box `NSOpenPanel`, which the sandbox does permit.
+
+The *Set As Desktop Picture* item requires the
+`com.apple.security.assets.user-selected.read-only` entitlement
+plus a `NSDesktopFolderUsageDescription` Info.plist key. Without
+either, the item is disabled with tooltip *"Disabled — desktop
+access not authorized."*
+
+### 14.2 Multi-window
+
+Every window has its own menu surface; the menu always operates
+on the **right-clicked window's** `AppState`, not the frontmost
+one. The `WindowState`-aware `AppState` injection is already in
+place via the `bindToFrontmostWindow(_:)` path (see
+`code/Sources/ImageGlass/Window/WindowState.swift`).
+
+### 14.3 Per-window scope dispatch
+
+Mutations through `DirectoriesStore.shared` route to the right
+window's per-window file via `frontmostResolver` (see
+`code/Sources/ImageGlassCore/Storage/DirectoriesStore.swift` lines
+25–36). A right-click on window B's panel mutates window B's
+YAML, not window A's.
+
+### 14.4 The clipboard does not contain a folder path (Add Directory From Clipboard)
+
+The item is disabled. Tooltip: *"Disabled — the clipboard does
+not contain a folder path."* The check is cheap
+(`pb.string(forType: .string).flatMap { … isDir }`) and runs in
+`menuNeedsUpdate(_:)` on hover so it does not delay the parent
+menu's open.
+
+### 14.5 The image canvas is in slideshow mode
+
+Slideshow does **not** suppress the menu. The right-click pauses
+the slideshow (same way a left-click does), opens the menu, and
+the slideshow stays paused until the user clicks *Slideshow* in
+the menu bar again or presses `Space`. The pause is logged with
+`tool=slideshow.pause source=menu:context`.
+
+### 14.6 The user right-clicks during a drag
+
+`NSMenu.popUp(positioning:at:in:)` cancels the in-flight drag
+(AppKit's documented behavior). The right-click then opens the
+menu normally. No special handling needed; the spec confirms the
+behavior so QA does not file a regression.
+
+---
+
+## 15. Non-Goals (v1)
+
+* **Customizable menus.** v1 ships a fixed surface inventory and
+  fixed per-surface menus. A future *Settings → Customize Context
+  Menus* sheet that lets the user add or remove items is
+  reserved.
+* **Folder rename.** The §7.2 menu shows *Rename Folder…* in the
+  matrix; the v1 ship has the item **disabled** with tooltip
+  *"Coming in v2."* `FileActions.renameFolder` is the planned
+  v2 verb.
+* **Right-click for image regions.** A future *Crop Region* /
+  *Save Region As* surface on the canvas after a marquee
+  selection is reserved. v1 only has the canvas-wide menu.
+* **Right-click on a panel divider.** Today's right-click on a
+  divider is owned by `NSSplitView` and we do not override it.
+* **Stable, rebindable menu order.** v1 fixes the order; a v2
+  Settings sheet may allow per-user reordering.
+* **Right-click cancel inside an open menu re-fires the previous
+  menu.** Not a target; the menu just dismisses.
+
+---
+
+## 16. Acceptance Criteria for v1
+
+The right-click surface is considered v1-complete when:
+
+1. Each of the fifteen surfaces in §6 opens its specified menu
+   on a right-click, on `⌃`-click, on trackpad secondary-click,
+   and on the `⇧F10` keyboard binding.
+2. Item order, text, separators, shortcut display, and ellipsis
+   match §7 byte-for-byte; the linter passes.
+3. Disabled-state rules (§7 individual subsections + §11
+   matrix) match.
+4. Multi-select pluralization (§5) fires on the File List
+   panels.
+5. §3.3 selection-on-right-click fires on every row surface.
+6. Every menu fire emits the `menu.open` line; every commit
+   emits the `menu.click` line plus the verb's own audit line on
+   a shared correlation id (§9.4 / §12).
+7. The Quick Look item opens `QLPreviewPanel` against the right
+   file in under 100 ms (system budget; not our latency).
+8. The image canvas menu is suppressed when no image is loaded
+   (§7.7.1).
+9. The on-canvas `WKWebView`'s native web-content menu is
+   suppressed in favor of our menu when the SVG renderer is in
+   web mode (§7.9).
+10. XCUITest scripts can address every item by its kebab-case
+    `accessibilityIdentifier` and the suite passes on a clean
+    install.
+
+---
+
+## 17. References
+
+* [`menus.mdx`](./menus.mdx) — canonical menu-bar text and ordering.
+* [`hotkeys.mdx`](./hotkeys.mdx) — keyboard shortcut twins.
+* [`use_cases/actions.mdx`](./use_cases/actions.mdx) — the file-action verbs.
+* [`use_cases/include_checks.mdx`](./use_cases/include_checks.mdx) — Include / Inherit / Don't Include.
+* [`use_cases/mcp_and_filters_on_dirs.mdx`](./use_cases/mcp_and_filters_on_dirs.mdx) — per-folder filters.
+* [`mcp.mdx`](./mcp.mdx) — MCP tool surface.
+* [`local_storage.mdx`](./local_storage.mdx) — on-disk model.
+* [`panels.mdx`](./panels.mdx) — panel framework, dock/float/tab.
+* [`dir_ui.mdx`](./dir_ui.mdx) — Directory Panel behavior.
+* [`list_of_files.mdx`](./list_of_files.mdx) — file list panels.
+* [`error_handling.mdx`](./error_handling.mdx) — audit log format.
+* Apple Human Interface Guidelines — *Menus* / *Context Menus* sections.
+* `code/Sources/ImageGlass/ContextMenus/ContextMenuBuilders.swift` (this spec's primary code home).
+* `code/Sources/ImageGlass/ContextMenus/ContextMenuBridge.swift` (SwiftUI ↔ AppKit `menu(for:)` bridge).
+* `code/Sources/ImageGlass/ContextMenus/ContextMenuActions.swift` (the per-item handlers).
+* `code/Sources/ImageGlass/ContextMenus/ContextMenuKeyboardOpener.swift` (`⇧F10` binding).

@@ -4,7 +4,7 @@ import Foundation
 /// `docs/use_cases/mcp_and_filters_on_dirs.mdx` §7).
 ///
 /// The canonical source is the plain-text file at
-/// `Sources/ImageGlassCore/MCP/mcp_manual.txt`, bundled by SwiftPM as a
+/// `code/mcp/mcp_manual.txt`, bundled by SwiftPM as a
 /// resource on the `ImageGlassCore` target. The string returned by
 /// `text` is fed verbatim into:
 ///   * `initialize.instructions` on the MCP handshake (§7.3).

@@ -116,6 +116,9 @@ final class AboutAppDelegate: NSObject, NSApplicationDelegate {
         // Recenter the SwiftUI window on the cursor's screen if it restored
         // a frame to a monitor the user isn't looking at.
         Self.installFirstWindowRelocator()
+        // docs/right_click.mdx §13 — keyboard-only ⇧F10 context menu.
+        // Idempotent; safe to call once at launch.
+        ContextMenuKeyboardOpener.shared.install()
         // Single-line charter audit so a silent regression shows up in logs.
         NSLog("%@", CharterStatus.summary())
     }
@@ -202,4 +205,14 @@ extension Notification.Name {
     /// one or more file URLs from outside the SwiftUI window. Payload:
     ///   `userInfo["urls"]: [URL]`
     static let imageGlassOpenURLs = Notification.Name("ImageGlassOpenURLs")
+
+    /// docs/right_click.mdx §7.1 item 2 — *Open in New Window*. Posted
+    /// by `ContextMenuActions.openInNewWindow(...)` so the SwiftUI
+    /// `WindowGroup` root (which owns the `@Environment(\.openWindow)`
+    /// action) can spawn the new window via the canonical
+    /// `ImageGlassWindowActions.openNewImageWindow(...)` path. Payload
+    /// is empty — the pre-selected file path is staged in
+    /// `PendingNewWindowSelection.shared.path` and consumed by the
+    /// new window's bootstrap.
+    static let imageGlassOpenNewWindow = Notification.Name("ImageGlassOpenNewWindow")
 }

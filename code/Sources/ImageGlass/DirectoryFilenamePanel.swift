@@ -32,6 +32,12 @@ struct DirectoryFilenamePanel: View {
     var body: some View {
         VStack(spacing: 0) {
             header
+                // docs/right_click.mdx §7.5 — panel-header right-click.
+                .overlay(ContextMenuBridge(
+                    menuBuilder: { ContextMenuBuilders.panelHeader(state: state) },
+                    surface: .panelHeader,
+                    targetPath: nil
+                ))
             Divider().overlay(IG.sidebarLineC)
             Group {
                 if storedRootCount == 0 && state.resolvedFiles.isEmpty {
@@ -44,6 +50,15 @@ struct DirectoryFilenamePanel: View {
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            // docs/right_click.mdx §7.4 — empty-space right-click.
+            // Layered behind the row content; row overlays in
+            // DesignTreeNode win on hit-testing for right-clicks that
+            // land on a row.
+            .background(ContextMenuBridge(
+                menuBuilder: { ContextMenuBuilders.panelEmpty(state: state) },
+                surface: .panelEmpty,
+                targetPath: nil
+            ))
             // hotkeys.mdx §3 — arrows + zoom letters fire when the
             // Directory Panel has focus too. Wrapping the inner Group
             // (not the whole VStack containing the search field) so a

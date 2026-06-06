@@ -163,9 +163,21 @@ final class WindowStateController: NSObject {
     }
 
     /// Spec §7.4. Apply `last_selected_file` to `AppState.selectedFile`
-    /// once the active scope has resolved its file list.
+    /// once the active scope has resolved its file list. Also drains
+    /// `PendingNewWindowSelection` — when the user fired *Open in New
+    /// Window* from a context menu (docs/right_click.mdx §7.1 item 2),
+    /// the staged path takes precedence over the saved selection so
+    /// the freshly-spawned window opens with the file the user clicked.
     private func restoreSelection() {
         guard let state = appState else { return }
+        // docs/right_click.mdx §9.3 — context-menu New Window override.
+        if let pending = PendingNewWindowSelection.shared.take() {
+            let abs = AppPaths.expandTilde(pending)
+            if FileManager.default.fileExists(atPath: abs) {
+                state.openExternalFile(url: URL(fileURLWithPath: abs))
+                return
+            }
+        }
         guard let path = state.settings.window.last_selected_file else { return }
         let resolved = state.resolvedFiles
         if resolved.contains(path) {

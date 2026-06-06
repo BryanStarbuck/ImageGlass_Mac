@@ -75,6 +75,13 @@ struct ImageGlassApp: App {
                 .task {
                     registerBuiltinViewFactories(state: state)
                 }
+                // docs/right_click.mdx §7.1 item 2 — bridge the context
+                // menu's *Open in New Window* notification into the
+                // canonical `ImageGlassWindowActions.openNewImageWindow`
+                // path that needs `@Environment(\.openWindow)`. The
+                // pre-selected file path is staged separately in
+                // `PendingNewWindowSelection.shared`.
+                .modifier(NewWindowBridgeModifier(state: state))
         }
         .commands {
             // Replace the standard "About ImageGlass" item with our own
@@ -1069,6 +1076,28 @@ struct ImageGlassApp: App {
         alert.addButton(withTitle: "Cancel")
         let confirmed = alert.runModal() == .alertFirstButtonReturn
         state.svg.setAllowScripts(true, confirmed: confirmed)
+    }
+}
+
+/// docs/right_click.mdx §7.1 item 2 — observer that listens for the
+/// `imageGlassOpenNewWindow` notification posted by the right-click
+/// *Open in New Window* verb and dispatches through the canonical
+/// `ImageGlassWindowActions.openNewImageWindow` path. This is a
+/// `ViewModifier` so it can capture the `@Environment(\.openWindow)`
+/// value the underlying action requires. Mounted once on the
+/// `WindowGroup` root view.
+private struct NewWindowBridgeModifier: ViewModifier {
+    @Bindable var state: AppState
+    @Environment(\.openWindow) private var openWindow
+
+    func body(content: Content) -> some View {
+        content.onReceive(NotificationCenter.default
+            .publisher(for: .imageGlassOpenNewWindow)) { _ in
+                ImageGlassWindowActions.openNewImageWindow(
+                    openWindow: openWindow,
+                    source: "menu:context"
+                )
+            }
     }
 }
 

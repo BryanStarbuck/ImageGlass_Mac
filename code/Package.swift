@@ -32,13 +32,15 @@ let package = Package(
     targets: [
         .target(
             name: "ImageGlassCore",
-            path: "Sources/ImageGlassCore",
+            path: ".",
+            exclude: ["mcp/mcp_manual.txt"],
+            sources: ["Sources/ImageGlassCore", "mcp"],
             resources: [
                 // docs/use_cases/mcp_and_filters_on_dirs.mdx §7.4 — the
                 // canonical source of the MCP self-describing manual.
                 // Surfaced at runtime as `initialize.instructions` and the
                 // `imageglass-mcp://manual` resource.
-                .copy("MCP/mcp_manual.txt"),
+                .copy("mcp/mcp_manual.txt"),
             ]
         ),
         .executableTarget(

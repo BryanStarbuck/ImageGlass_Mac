@@ -75,8 +75,10 @@ struct DesignTreeNode: View {
     private var directoryRow: some View {
         // `onTheSelectedPath` tints every ancestor folder of the current
         // image so the containing folder is obvious at a glance.
-        row(name: node.name, isDir: true, isSel: isCursorRow,
-            onPath: containsSelected, expanded: expanded)
+        let folderPath = node.id
+        let isRoot = walkerRoots.contains { $0.path.path == folderPath }
+        return row(name: node.name, isDir: true, isSel: isCursorRow,
+                   onPath: containsSelected, expanded: expanded)
             .contentShape(Rectangle())
             .onTapGesture {
                 let willExpand = !expanded
@@ -98,10 +100,12 @@ struct DesignTreeNode: View {
                 // folder).
                 selected = nil
             }
+            .overlay(rowContextMenuBridge(folderPath: folderPath, isRoot: isRoot))
     }
 
     private var fileRow: some View {
         let isSel = (node.fullPath != nil) && node.fullPath == selected
+        let filePath = node.fullPath ?? node.id
         return row(name: node.name, isDir: false, isSel: isSel,
                    onPath: false, expanded: nil)
             .contentShape(Rectangle())
@@ -116,6 +120,66 @@ struct DesignTreeNode: View {
                     nav.activeRow = p
                 }
             }
+            .overlay(fileRowContextMenuBridge(filePath: filePath))
+    }
+
+    // MARK: - Context menu bridges (docs/right_click.mdx §7.1 / §7.2 / §7.3)
+
+    /// File-row right-click overlay. Pre-selection per §3.3, then build
+    /// via `ContextMenuBuilders.fileRow(state:path:)`.
+    @ViewBuilder
+    private func fileRowContextMenuBridge(filePath: String) -> some View {
+        if let app = appState {
+            ContextMenuBridge(
+                menuBuilder: {
+                    ContextMenuBuilders.fileRow(state: app, path: filePath)
+                },
+                preselect: {
+                    app.selectedFile = filePath
+                    app.treeNav.activeRow = filePath
+                },
+                surface: .fileRow,
+                targetPath: filePath
+            )
+            .allowsHitTesting(true)
+        }
+    }
+
+    /// Folder / root row right-click overlay. Dispatches to either
+    /// `folderRow` or `rootRow` builder based on whether this is a
+    /// registered walker root.
+    @ViewBuilder
+    private func rowContextMenuBridge(folderPath: String, isRoot: Bool) -> some View {
+        if let app = appState {
+            if isRoot {
+                let rootURL = URL(fileURLWithPath: folderPath)
+                ContextMenuBridge(
+                    menuBuilder: {
+                        ContextMenuBuilders.rootRow(state: app,
+                                                    rootPath: rootURL)
+                    },
+                    preselect: {
+                        app.treeNav.activeRow = folderPath
+                    },
+                    surface: .rootRow,
+                    targetPath: folderPath
+                )
+                .allowsHitTesting(true)
+            } else {
+                ContextMenuBridge(
+                    menuBuilder: {
+                        ContextMenuBuilders.folderRow(state: app,
+                                                     path: folderPath)
+                    },
+                    preselect: {
+                        app.treeNav.activeRow = folderPath
+                    },
+                    surface: .folderRow,
+                    targetPath: folderPath
+                )
+                .allowsHitTesting(true)
+            }
+        }
     }
 
     /// `isSel` = this is the selected file (solid accent fill).

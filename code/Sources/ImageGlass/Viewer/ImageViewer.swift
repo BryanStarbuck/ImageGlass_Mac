@@ -272,6 +272,11 @@ private struct CanvasHost: NSViewRepresentable {
 
     func makeNSView(context: Context) -> ImageCanvasView {
         let v = ImageCanvasView()
+        // docs/right_click.mdx §7.7 / §9.3 — stamp host references so
+        // the canvas's `menu(for:)` can resolve the right AppState +
+        // ViewerState without a global.
+        v.hostState = state
+        v.hostViewer = viewer
         v.onUserTransform = { pan, zoom, mode in
             viewer.panOffset = pan
             viewer.lockedZoom = zoom

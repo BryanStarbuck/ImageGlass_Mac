@@ -132,6 +132,13 @@ final class ImageCanvasView: NSView {
     override var isFlipped: Bool { false }
     override var acceptsFirstResponder: Bool { true }
 
+    /// docs/right_click.mdx §7.7 / §9.3 — stamped by `CanvasHost`
+    /// so `menu(for:)` can build the context menu without reaching
+    /// into AppState through a global. Weak so the canvas does not
+    /// retain the SwiftUI observable graph past its own lifetime.
+    weak var hostState: AppState?
+    weak var hostViewer: ViewerState?
+
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
@@ -140,6 +147,25 @@ final class ImageCanvasView: NSView {
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:)") }
+
+    /// docs/right_click.mdx §7.7 / §9.3 — right-click on the viewport
+    /// returns the canvas menu when an image is loaded. Suppressed when
+    /// `selectedFile == nil` per §7.7.1 (no useful verb with no target).
+    override func menu(for event: NSEvent) -> NSMenu? {
+        guard let state = hostState, let viewer = hostViewer,
+              state.selectedFile != nil else { return nil }
+        let menu = MainActor.assumeIsolated {
+            ContextMenuBuilders.imageCanvas(state: state, viewer: viewer)
+        }
+        if let menu {
+            MainActor.assumeIsolated {
+                ContextMenuActions.recordOpen(menu: .viewerCanvas,
+                                              itemCount: menu.items.count,
+                                              targetPath: state.selectedFile)
+            }
+        }
+        return menu
+    }
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
