@@ -287,6 +287,19 @@ public final class AppState {
 
     public init() {}
 
+    deinit {
+        heartbeatTimer?.invalidate()
+        if let t = directoriesChangedToken {
+            DistributedNotificationCenter.default().removeObserver(t)
+        }
+        if let t = firstImageFoundToken {
+            NotificationCenter.default.removeObserver(t)
+        }
+        if let t = directoryDidChangeToken {
+            NotificationCenter.default.removeObserver(t)
+        }
+    }
+
     /// Apply parsed launch arguments. Safe to call from the app entry point
     /// before `bootstrap()` runs.
     public func applyLaunchArguments(_ args: ImageGlassLaunchArguments) {
@@ -798,17 +811,33 @@ public final class AppState {
 
         let scopeName = scope.name
         scopeFSTask = Task { [weak self] in
-            guard let self else { return }
-            if let prev = previousScope, prev != scopeName {
-                await FileSystemWatcher.shared.unwatch(scope: prev)
+            // Do NOT guard-let self at the top of this task: a single
+            // `guard let self` here would promote the weak capture to a
+            // strong local that spans the entire `for await` loop body,
+            // creating a retain cycle between AppState (which owns
+            // scopeFSTask) and the long-lived Task (which would then hold
+            // AppState strongly for the duration of the loop).
+            // Instead, the preamble (unwatch/watch/events) uses a scoped
+            // `if let self` that releases the strong reference as soon as
+            // those three awaits complete. The loop re-checks `self` on
+            // every iteration so it is only held strongly for the duration
+            // of one reevaluateActive() call, not for the entire loop.
+            if let self {
+                if let prev = previousScope, prev != scopeName {
+                    await FileSystemWatcher.shared.unwatch(scope: prev)
+                }
+                await FileSystemWatcher.shared.watch(scope: scopeName, roots: roots)
             }
-            await FileSystemWatcher.shared.watch(scope: scopeName, roots: roots)
             let stream = await FileSystemWatcher.shared.events(for: scopeName)
             for await _ in stream {
                 if Task.isCancelled { break }
                 // Spec §6 stage 4 — every batch triggers a single
                 // scope re-evaluation. `reevaluateActive()` already
                 // serializes overlapping walks via `walkTask`.
+                // Re-resolve self on every iteration: if AppState was
+                // deallocated mid-stream, break cleanly instead of
+                // extending its lifetime through another walk cycle.
+                guard let self else { break }
                 await self.reevaluateActive()
             }
         }

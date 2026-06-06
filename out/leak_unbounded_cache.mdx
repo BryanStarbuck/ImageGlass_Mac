@@ -1,0 +1,87 @@
+# Leak Report: Unbounded `instanceCounters` in `PerformanceLog`
+
+## Name
+
+**Ever-Growing Instance Counter Map** — `PerformanceLog.instanceCounters`
+
+## File + Line Range
+
+`/Users/bryanstarbuck/BGit/tools_local/ImageGlass_Mac/code/Sources/ImageGlassCore/Logging/PerformanceLog.swift`
+Lines **60–66** (declaration) and **178–180** (write site):
+
+## Why It Leaks
+
+`PerformanceLog.shared` is a singleton that lives for the entire process
+lifetime. Its `instanceCounters` dictionary maps action-name strings to an
+ever-increasing integer count. On every call to `start(_:extra:)` a new
+entry is inserted (or an existing entry's count incremented); entries are
+**never removed**. The dictionary therefore accumulates one `String → Int`
+entry for every distinct action name ever emitted and holds them forever.
+
+In production the MCP server dispatches dozens of distinct action names
+(one per tool: `MCP.ToolCall.add_directory`, `MCP.ToolCall.set_sort`, …),
+the scope evaluator emits its own names, the walker emits more, and the
+panel framework emits still more. Across an interactive session these
+accumulate without bound. The companion dictionaries `samplingOneInN` and
+`droppedSinceSummary` have the same structural shape and the same growth
+pattern; `droppedSinceSummary` does get zeroed per-key when the summary
+threshold fires, but the key itself is never removed. None of the three
+dictionaries has a maximum-size cap, eviction policy, or trim path.
+
+## Evidence
+
+```swift
+// PerformanceLog.swift — instance variable declarations (lines 60-71)
+private var instanceCounters: [String: Int] = [:]       // ← grows forever
+private var samplingOneInN: [String: Int] = [:]         // ← grows forever (user-controlled)
+private var droppedSinceSummary: [String: Int] = [:]    // ← keys never removed
+
+// PerformanceLog.swift — write site inside start(_:extra:) (lines 178-180)
+lock.lock()
+let count = (instanceCounters[action] ?? 0) + 1
+instanceCounters[action] = count          // ← unconditional insert, no eviction
+let sampled = decideSampledLocked(action: action, instance: count)
+lock.unlock()
+```
+
+The dictionary is only ever written to in `start()` and never trimmed
+anywhere else in the file. A search for `instanceCounters.remove`,
+`instanceCounters.removeAll`, or any size check against `instanceCounters`
+returns zero results.
+
+## Fix
+
+Cap `instanceCounters` at a maximum number of distinct action names. When
+the cap would be exceeded, silently saturate the counter at its last value
+(the counter's purpose is instance numbering for log-pair correlation, not
+cardinality tracking, so a stable large number is fully adequate). A limit
+of 512 distinct action names is generous — the current codebase emits
+fewer than 60 distinct names.
+
+The same guard is applied to `droppedSinceSummary` to prevent its keys
+from accumulating when many transient action names pass through sampling.
+`samplingOneInN` is explicitly managed by callers via `setSampling` /
+`clearSampling` so it is left under caller control (it is intentional state,
+not an unbounded cache).
+
+The fix is minimal: add a size check before each unconditional insert.
+
+## Severity
+
+**Medium**
+
+Each entry is a `String` key (typically 20–40 UTF-8 bytes) and an `Int`
+value (8 bytes on 64-bit). With fewer than 100 distinct action names in
+the current codebase the absolute memory cost is small — kilobytes, not
+megabytes. However:
+
+- The singleton is shared across the full process lifetime with no release path.
+- If future development adds many short-lived dynamic action names (e.g.,
+  per-path or per-scope variants) the dictionary could grow into the tens
+  of thousands of entries and become a meaningful allocation.
+- The missing cap is a structural correctness issue: any unbounded
+  accumulation in a long-lived singleton should have an explicit bound.
+
+Severity is Medium rather than High because the current action-name set is
+small and static, so real-world impact today is low. The fix is trivial and
+has no functional trade-off.

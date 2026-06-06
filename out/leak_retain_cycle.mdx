@@ -1,0 +1,139 @@
+# Retain Cycle: `AppState` ↔ `scopeFSTask` Infinite-Loop Task
+
+## Name
+
+**Eternal Task Self-Lock** — an indefinitely-running `Task` that recaptures
+`AppState` strongly via a `guard let self` rebinding inside a `for await`
+loop, while `AppState` simultaneously holds the `Task` as a stored property.
+
+---
+
+## File + Line Range
+
+`Sources/ImageGlass/AppState.swift`, lines **800–814**
+(inside `rebuildSourceWatchers()`)
+
+---
+
+## Why It Leaks
+
+Swift's `guard let self = self` (or the shorthand `guard let self`) inside a
+Task closure takes the optional `weak self` capture and **re-binds it as a
+strong local variable named `self`**. That strong local reference is then
+kept alive for the entire duration of the scope in which the guard appears —
+which in this case is the **body of a `for await` loop that never terminates
+on its own**.
+
+The object graph at runtime:
+
+```
+AppState ──(strong)──▶ scopeFSTask (Task<Void, Never>)
+    ▲                         │
+    │                         │ Task closure captures:
+    │                   [weak self] ──▶ resolves to strong `self`
+    │                         │        via `guard let self`
+    └─────────────────────────┘
+```
+
+`AppState` owns `scopeFSTask`. The `Task` body (line 800) opens with
+`[weak self]`, which is correct — but on line 801 `guard let self else {
+return }` re-promotes that weak optional into a **strong** local `self` that
+lives for the remainder of the scope. The remainder of the scope is a
+`for await _ in stream { ... }` loop (lines 807–813) that runs indefinitely,
+blocked on each iteration waiting for the next `FileSystemWatcher` event.
+
+Because the loop never exits (the stream ends only when the Task is
+cancelled externally), the strong `self` captured on line 801 is never
+released. And because `AppState` holds `scopeFSTask`, `AppState` cannot be
+released either. Neither object is ever freed while the app is running
+normally.
+
+A secondary consequence: every filesystem change event calls
+`await self.reevaluateActive()` (line 812) through the strong `self` capture,
+which keeps `AppState`'s entire object graph (walker roots, resolved files,
+watchers, etc.) alive indefinitely and re-enters an async scope that itself
+re-stores `self` into `AppState.walkTask`.
+
+---
+
+## Evidence — Exact Code That Causes the Cycle
+
+```swift
+// AppState.swift lines 800–814 (rebuildSourceWatchers)
+scopeFSTask = Task { [weak self] in
+    guard let self else { return }          // ← strong re-bind of self here
+    if let prev = previousScope, prev != scopeName {
+        await FileSystemWatcher.shared.unwatch(scope: prev)
+    }
+    await FileSystemWatcher.shared.watch(scope: scopeName, roots: roots)
+    let stream = await FileSystemWatcher.shared.events(for: scopeName)
+    for await _ in stream {                 // ← loop runs indefinitely
+        if Task.isCancelled { break }
+        await self.reevaluateActive()       // ← strong self used here
+    }
+}
+```
+
+`self` (AppState) strongly holds `scopeFSTask`.
+`scopeFSTask` strongly holds `self` (via the `guard let self` rebinding).
+The loop keeps the task — and therefore the strong `self` — alive forever.
+
+---
+
+## Fix
+
+Move the `guard let self` check **inside** the loop body so the strong
+reference is only created for each single iteration, not for the entire
+infinite-loop scope. Use `[weak self]` in the `for await` body directly, and
+guard at each use point rather than once at the top of the long-running task.
+
+The corrected code:
+
+```swift
+scopeFSTask = Task { [weak self] in
+    // Do NOT guard let self here — that would hold self strongly
+    // for the entire duration of the for-await loop.
+    if let self {
+        if let prev = previousScope, prev != scopeName {
+            await FileSystemWatcher.shared.unwatch(scope: prev)
+        }
+        await FileSystemWatcher.shared.watch(scope: scopeName, roots: roots)
+    }
+    let stream = await FileSystemWatcher.shared.events(for: scopeName)
+    for await _ in stream {
+        if Task.isCancelled { break }
+        // Re-capture self weakly on every iteration. If AppState was
+        // released, the task exits cleanly rather than perpetuating
+        // the cycle through another reevaluateActive() call.
+        guard let self else { break }
+        await self.reevaluateActive()
+    }
+}
+```
+
+Key change: the single top-level `guard let self` that spanned the entire
+`for await` loop is removed. The `unwatch` / `watch` / `events` preamble is
+guarded with an `if let self` that releases the strong reference as soon as
+the preamble completes. Inside the loop, `guard let self else { break }` is
+re-evaluated each iteration — the strong reference lasts only for one call
+to `reevaluateActive()` and is released at the bottom of each loop body.
+
+---
+
+## Severity
+
+**High**
+
+- `AppState` is the root model object of the entire application. Anything
+  it transitively holds (all `FileWatcher` instances, the panel layout model,
+  walker roots, resolved file lists, the settings store, the theme store, the
+  crop controller, the video/SVG playback controllers) is also leaked.
+- The leak is permanent for the lifetime of the process — there is no code
+  path that releases `scopeFSTask` while the app is running normally (it is
+  replaced by a new task only when `rebuildSourceWatchers()` is called again,
+  which stores a new task into the same property, but the old task's strong
+  `self` capture is already live inside the running loop).
+- Because `reevaluateActive()` is called on every filesystem change event,
+  the retained `AppState` graph is actively exercised (mutated) through the
+  cycle, compounding memory pressure during any sustained filesystem activity
+  (slideshow rendering, large directory walks, etc.).

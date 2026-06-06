@@ -57,6 +57,12 @@ public final class PerformanceLog: @unchecked Sendable {
     /// Monotonic per-action counter. Key is the action name; value is
     /// the count of `start()` calls so far. The "instance number" of a
     /// trace is its count at the moment of `start`.
+    ///
+    /// Bounded at `maxDistinctActions` entries. Once the cap is reached,
+    /// new action names are silently dropped (their counter stays at 0
+    /// and they receive instance number 1 forever). Instance numbers are
+    /// only used for log-pair correlation, so a stable large number or
+    /// a fixed 1 is fully adequate.
     private var instanceCounters: [String: Int] = [:]
 
     /// Per-action sampling rate. Value N means "emit one in every N
@@ -67,8 +73,15 @@ public final class PerformanceLog: @unchecked Sendable {
 
     /// Per-action counter of pairs dropped under sampling since the
     /// last summary line was emitted. Flushed by an internal threshold
-    /// or by `flush()`.
+    /// or by `flush()`. Bounded at `maxDistinctActions` entries.
     private var droppedSinceSummary: [String: Int] = [:]
+
+    /// Maximum number of distinct action names stored in `instanceCounters`
+    /// and `droppedSinceSummary`. The current codebase emits fewer than 60
+    /// distinct names; 512 is a generous headroom cap that prevents the
+    /// dictionaries from growing without bound if future callers introduce
+    /// many dynamic action names.
+    private let maxDistinctActions = 512
 
     /// Drop threshold at which we emit one `phase=sampled_summary` line
     /// per action so the analyzer can see the true call rate even when
@@ -176,8 +189,19 @@ public final class PerformanceLog: @unchecked Sendable {
         // instances. The sampling decision is made inside the same
         // critical section so the start/finish pair stays atomic.
         lock.lock()
-        let count = (instanceCounters[action] ?? 0) + 1
-        instanceCounters[action] = count
+        let count: Int
+        if let prev = instanceCounters[action] {
+            count = prev + 1
+            instanceCounters[action] = count
+        } else if instanceCounters.count < maxDistinctActions {
+            count = 1
+            instanceCounters[action] = count
+        } else {
+            // Cap reached: do not insert a new key; assign instance 1.
+            // Instance numbers are only used for log-pair correlation so
+            // a stable value is adequate.
+            count = 1
+        }
         let sampled = decideSampledLocked(action: action, instance: count)
         lock.unlock()
 
@@ -244,8 +268,16 @@ public final class PerformanceLog: @unchecked Sendable {
     ) {
         guard enabled else { return }
         lock.lock()
-        let count = (instanceCounters[action] ?? 0) + 1
-        instanceCounters[action] = count
+        let count: Int
+        if let prev = instanceCounters[action] {
+            count = prev + 1
+            instanceCounters[action] = count
+        } else if instanceCounters.count < maxDistinctActions {
+            count = 1
+            instanceCounters[action] = count
+        } else {
+            count = 1
+        }
         let sampled = decideSampledLocked(action: action, instance: count)
         lock.unlock()
         if !sampled {
@@ -323,8 +355,13 @@ public final class PerformanceLog: @unchecked Sendable {
     /// line if we've crossed the threshold for this action.
     private func recordDroppedStart(action: String) {
         lock.lock()
-        let dropped = (droppedSinceSummary[action] ?? 0) + 1
-        droppedSinceSummary[action] = dropped
+        let prev = droppedSinceSummary[action] ?? 0
+        let dropped = prev + 1
+        // Only insert a new key when within the cap; existing keys are
+        // always updated so the summary threshold still fires for known actions.
+        if prev > 0 || droppedSinceSummary.count < maxDistinctActions {
+            droppedSinceSummary[action] = dropped
+        }
         let shouldEmit = dropped >= droppedSummaryThreshold
         if shouldEmit { droppedSinceSummary[action] = 0 }
         lock.unlock()

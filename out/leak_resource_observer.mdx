@@ -1,0 +1,90 @@
+# Leak: Undead Heartbeat — `Timer` Never Invalidated in `AppState`
+
+## Name
+
+**Undead Heartbeat** — a repeating `Timer` that is scheduled into the main `RunLoop` and never invalidated when `AppState` is torn down.
+
+---
+
+## File + Line Range
+
+`/Users/bryanstarbuck/BGit/tools_local/ImageGlass_Mac/code/Sources/ImageGlass/AppState.swift`
+
+- Declaration: **line 278** (`private var heartbeatTimer: Timer?`)
+- Start path: **lines 1131–1135** (`startHeartbeatTimer()`)
+- Missing teardown: `AppState` has **no `deinit`** — confirmed by `grep -n deinit AppState.swift` returning zero results.
+
+---
+
+## Why It Leaks
+
+`Timer.scheduledTimer(withTimeInterval:repeats:block:)` adds the created `Timer` to the **current thread's `RunLoop`** with the `.common` run-loop modes. The run loop holds a **strong reference** to the timer for its entire lifetime. The only way to release that strong reference and stop the timer is to call `timer.invalidate()`.
+
+`AppState.startHeartbeatTimer()` calls `heartbeatTimer?.invalidate()` before creating a fresh timer — so re-arming is safe. But `AppState` declares **no `deinit`**, so when an `AppState` instance is released (e.g., in unit tests that instantiate `AppState`, run `bootstrap()`, then let the instance fall out of scope) the timer keeps firing every 30 seconds forever. The `RunLoop` never learns the timer should stop; `heartbeatTimer` is simply garbage-collected from `AppState`'s perspective while the `RunLoop` keeps a live handle.
+
+The timer closure itself uses `[weak self]` so it does not create a retain cycle that keeps `AppState` alive — but that is orthogonal to the resource leak. The OS timer handle allocated by the `RunLoop` is never freed and the closure is dispatched every 30 s indefinitely.
+
+**Secondary leak (same missing `deinit`):** Three `NSObjectProtocol` observer tokens also go uncleaned:
+
+| Property | Center | Added in |
+|---|---|---|
+| `directoriesChangedToken` | `DistributedNotificationCenter` | `startDirectoriesFileWatcher()` |
+| `firstImageFoundToken` | `NotificationCenter` | `startDirectoryTreeWalkerObserver()` |
+| `directoryDidChangeToken` | `NotificationCenter` | `startDirectoryTreeWalkerObserver()` |
+
+Apple's docs for the block-based `addObserver(forName:object:queue:using:)` API state explicitly: *"You must call `removeObserver(_:)` before the observer or any object specified in the observer notification is deallocated."* Failing to do so leaves the closures registered in the notification center indefinitely — the closures capture `[weak self]`, so `AppState` itself is not retained, but the `NSObjectProtocol` opaque tokens are heap-allocated objects that the notification center holds strongly and that are never freed.
+
+---
+
+## Evidence
+
+```swift
+// AppState.swift — declaration (line 278)
+private var heartbeatTimer: Timer?
+
+// AppState.swift — startHeartbeatTimer() (lines 1131–1135)
+private func startHeartbeatTimer() {
+    heartbeatTimer?.invalidate()
+    heartbeatTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+        Task { @MainActor [weak self] in self?.writeHeartbeat() }
+    }
+}
+
+// AppState.swift — no deinit exists anywhere in the file
+// grep -n deinit AppState.swift  →  (empty)
+```
+
+The re-arm guard (`heartbeatTimer?.invalidate()`) proves the author knew invalidation was necessary — it was simply not applied in the teardown path because no teardown path exists.
+
+---
+
+## Fix
+
+Add a `deinit` to `AppState` that invalidates the timer and removes all three observer tokens.
+
+```swift
+deinit {
+    heartbeatTimer?.invalidate()
+    if let t = directoriesChangedToken {
+        DistributedNotificationCenter.default().removeObserver(t)
+    }
+    if let t = firstImageFoundToken {
+        NotificationCenter.default.removeObserver(t)
+    }
+    if let t = directoryDidChangeToken {
+        NotificationCenter.default.removeObserver(t)
+    }
+}
+```
+
+This `deinit` is placed immediately after `public init() {}` (line 288) for discoverability alongside the initializer.
+
+---
+
+## Severity
+
+**High**
+
+- The `Timer` leaks a system-level run-loop source that fires indefinitely at 30-second intervals, performing file I/O (`heartbeat.txt`) on the main actor long after the owning object is logically gone.
+- In the unit-test suite, every test that calls `bootstrap()` on a fresh `AppState` and then discards the instance adds another immortal timer to the process's main run loop, accumulating with each test.
+- The `DistributedNotificationCenter` token for `directoriesChangedToken` is system-wide; leaked subscriptions there can receive and dispatch cross-process notifications into closures that reference dead state long after the app conceptually moved on.
