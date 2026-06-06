@@ -1,0 +1,1301 @@
+---
+title: File System Change Notifications
+description: Product and engineering specification for how ImageGlass_Mac subscribes to macOS file system change events, debounces and coalesces them, and propagates the resulting updates through the scope engine, the file panel, and the viewer canvas. Covers the FSEvents vs. kqueue/DispatchSource vs. NSFilePresenter vs. NSMetadataQuery decision, the chosen hybrid architecture, the chain of internal processing for every scenario the OS can throw at us, and the corner cases that must not regress.
+---
+
+# File System Change Notifications
+
+> **Document type:** Product + engineering specification.
+> **Audience:** Engineering (file-watcher implementation, scope
+> engine, viewer, MCP server) and Product (behavior contract for
+> what the user sees when other applications mutate files on disk).
+> **Owners:** PM for the user-visible behavior in every scenario;
+> CTO for the API choice, threading model, and failure semantics.
+> **Status:** v1 spec for the Mac-native fork. This document is the
+> authoritative reference cited by `list_of_files.mdx`,
+> `local_storage.mdx`, `mcp.mdx`, `error_handling.mdx`, and
+> `performance.mdx`.
+
+Cross-references:
+
+* [File List Panel](./list_of_files.mdx) — the panel that re-renders
+  in response to the events specified here.
+* [Local Storage](./local_storage.mdx) — the scope definitions and
+  resolved file lists that the watcher updates.
+* [MCP Server](./mcp.mdx) — the integration surface that can request
+  forced rescans and observe live change events.
+* [Error Handling](./error_handling.mdx) — how the surface reports
+  drops, unmounts, and permission revocations.
+* [Performance](./performance.mdx) — the budgets the watcher must
+  stay within (event-to-paint latency, CPU, memory).
+
+The Mac stack used throughout: **Swift 6 + Swift Concurrency**
+(`actor`, `AsyncStream`), **CoreServices FSEvents** (`FSEventStream*`
+C API, called from Swift via a thin wrapper) as the primary tree
+watcher, **GCD `DispatchSource.makeFileSystemObjectSource`**
+(kqueue-backed) for the single currently-displayed file,
+**`NSFileCoordinator` + `NSFilePresenter`** for cooperative edits
+with other Apple-aware apps, and **`NSMetadataQuery`** for iCloud
+Documents and other File Provider-backed locations.
+
+---
+
+## 1. Purpose and Scope
+
+Other applications on the user's Mac mutate the files we are
+displaying. Photoshop re-saves a JPEG. Finder renames a folder.
+`rsync` adds 800 new RAW files to a watched directory. Time
+Machine restores an entire tree. iCloud Drive materializes a
+placeholder. The user drags a file into the Trash. An external
+SSD is unmounted while the panel is showing files from it.
+
+In every one of these cases, ImageGlass_Mac must:
+
+1. **Notice** the change quickly (target: ≤250 ms from kernel event
+   to UI tick).
+2. **Re-resolve** the affected scope (add new matches, drop removed
+   matches, refresh metadata on modified matches).
+3. **Update** the file panel without losing the user's selection,
+   scroll position, or sort order any more than the change itself
+   demands.
+4. **Update** the viewer canvas if the currently-previewed file
+   itself changed, was deleted, or was renamed.
+5. **Persist** the new resolved file list back to Local Storage so
+   that the on-disk record stays in sync with what's on screen.
+6. **Notify** the MCP server's subscribed clients (so Claude Code
+   sees the same change a human user would).
+
+This document specifies the API choices, the runtime architecture,
+the debounce/coalesce policy, the per-scenario response chain, the
+corner cases, and the failure modes. It does **not** specify
+thumbnail caching behavior (see `list_of_files.mdx` §7) or the on-
+disk shape of scope records (see `local_storage.mdx` §5).
+
+### 1.1 Non-goals
+
+* **Real-time content diffing.** We do not compare image bytes
+  across modifications. A "modified" event invalidates caches and
+  re-reads the file; we do not show a diff view.
+* **Undo of external modifications.** We are an observer of the
+  file system, not a versioning layer. If Photoshop overwrites a
+  file, our copy of the old bytes is gone.
+* **Watching files outside the active scopes.** The watcher only
+  subscribes to directories that are referenced by a loaded scope
+  in Local Storage (plus the directory containing the currently-
+  displayed file, even if that file is opened ad-hoc and not part
+  of any scope).
+* **Background-only operation.** When the app is fully terminated,
+  we are not running. We catch up on relaunch via FSEvents'
+  historical event-ID replay (§5.4); we do not register a
+  background launch agent.
+
+---
+
+## 2. Why This Is Hard on macOS
+
+macOS has at least five distinct APIs for "tell me when files
+change," none of which alone is the right answer for an image
+viewer. Picking the wrong one — or picking only one — produces
+predictable failure modes:
+
+* **A single `FSEventStream` per scope** is the right primitive for
+  watching a tree, but its events are **directory-granular by
+  default**: the callback says "something in `/Users/bryan/Photos/`
+  changed," not "`IMG_1234.HEIC` was modified." Even with
+  `kFSEventStreamCreateFlagFileEvents`, the per-file flags are
+  hints (created / removed / modified / renamed / inode-metadata-
+  changed), not authoritative diffs. We always have to re-stat to
+  know the truth.
+
+* **`DispatchSource.makeFileSystemObjectSource`** (kqueue-backed)
+  is the right primitive for "tell me the moment *this one open
+  file* is written, renamed, deleted, or has its attributes
+  changed." It is wrong for trees: every watched node costs a file
+  descriptor and a kernel registration, it does not recurse, and
+  Apple explicitly says do not use it for large hierarchies.
+
+* **`NSFileCoordinator` + `NSFilePresenter`** is the right primitive
+  for cooperating with other Apple-aware apps that also use file
+  coordination (TextEdit, Pages, Preview, document-based apps). It
+  is invisible to apps that bypass coordination — which includes
+  the entire Unix toolchain (`mv`, `cp`, `rsync`, `git`), most
+  third-party photo editors, and most command-line image
+  processors. So it is necessary but not sufficient.
+
+* **`NSMetadataQuery`** with the `NSMetadataQueryUbiquitousDocumentsScope`
+  is the right primitive for iCloud Documents (and any File
+  Provider extension that publishes via Spotlight): it tells us
+  when iCloud has finished downloading a placeholder so we can
+  show the real image. FSEvents alone will not reliably observe a
+  placeholder transitioning to materialized.
+
+* **Polling** (re-`stat`ing every file on a timer) is the wrong
+  primitive almost always, but it is the **only** option on some
+  network shares (specifically SMB to non-macOS servers, and some
+  NAS appliances) where FSEvents does not propagate cross-machine
+  modifications.
+
+The corollary: **no single API covers our scenarios.** We need a
+small, layered watcher that picks the right mechanism per scope
+and per displayed file, and presents one uniform stream of change
+events to the rest of the app.
+
+---
+
+## 3. API Analysis and Decision
+
+### 3.1 Candidate APIs side by side
+
+| API | Layer | Granularity | Recursive | Cost per watch | Survives app restart? | Works on | Notes |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| **FSEvents** (`FSEventStreamCreate`) | CoreServices | Directory (file-level with `kFSEventStreamCreateFlagFileEvents`, hint-quality) | **Yes** | Low; one stream per scope root | **Yes** — replay via `sinceWhen` event ID | Local APFS/HFS+, mounted external drives, most network mounts when the *server* is also macOS (so the server-side FSEvents daemon publishes). | Designed precisely for "passively monitor a large tree." Coalesces events with a configurable latency. Apple recommends it for trees. |
+| **kqueue / `DispatchSource.makeFileSystemObjectSource`** | GCD wrapper over BSD kqueue | Per file descriptor | No | High; one FD + kernel registration per node | No | Any local FS | Right for one currently-open file. Wrong for trees. |
+| **`NSFilePresenter` / `NSFileCoordinator`** | Foundation | Per presented file or directory; sub-item callbacks on dirs | Yes (for directory presenters) | Medium | No | Anywhere — but only sees changes made through `NSFileCoordinator` by **other** processes | Necessary for safe interop with Apple document-based apps, invisible to non-coordinating writers (which is most of them). |
+| **`NSMetadataQuery`** with `NSMetadataQueryUbiquitousDocumentsScope` | Foundation, Spotlight-backed | Per query result | N/A (declarative) | Medium-low | No | iCloud Drive, Spotlight-indexed volumes | Only reliable way to observe placeholder→materialized transitions for iCloud. Useless if Spotlight is disabled for the volume. |
+| **`DispatchSource.makeTimerSource` polling** | GCD | What the polling code chooses | Yes, if you scan recursively | High CPU on large trees | N/A | Anywhere | Last-resort fallback for SMB to non-macOS servers and NAS appliances where FSEvents does not flow cross-host. |
+| **File Provider notifications** | FileProvider.framework | Per item | Per enumerator | Low | Yes | iCloud Drive, Dropbox/OneDrive/Google when their File Provider extension is installed | Useful long-term, but tied to FP extensions cooperating; we treat as bonus coverage on top of FSEvents and NSMetadataQuery. |
+
+### 3.2 Decision
+
+**Primary mechanism: `FSEventStream`, one stream per top-level
+watched directory of a loaded scope.** Configured with:
+
+* `kFSEventStreamCreateFlagFileEvents` — get per-file granularity
+  in the callback flags (still hint-quality; we always re-stat).
+* `kFSEventStreamCreateFlagWatchRoot` — receive notification if the
+  watched root itself is renamed or removed.
+* `kFSEventStreamCreateFlagNoDefer` — deliver the first event in a
+  batch immediately, then coalesce subsequent ones using
+  `latency`.
+* `kFSEventStreamCreateFlagUseCFTypes` — receive `CFArray` /
+  `CFString` paths rather than C strings.
+* `kFSEventStreamCreateFlagUseExtendedData` — receive inode
+  numbers along with paths (so we can detect rename-vs-recreate
+  and handle inode reuse).
+* Latency: **`0.20` seconds** in the foreground; **`1.0` second**
+  when the app is in the background.
+* Dispatched on a dedicated serial `DispatchQueue` named
+  `io.imageglass.fsevents` via
+  `FSEventStreamSetDispatchQueue` (we do **not** use the deprecated
+  `FSEventStreamScheduleWithRunLoop`).
+
+**Secondary mechanism: `DispatchSource.makeFileSystemObjectSource`**
+on the file descriptor of the **currently-displayed image**, and
+only that one file. Event mask: `[.write, .extend, .attrib,
+.rename, .delete, .revoke, .link]`. This gives us sub-50 ms
+notification when an external editor saves over the file the user
+is staring at, which would otherwise have to wait the FSEvents
+latency window (200 ms minimum).
+
+**Tertiary mechanism: `NSFilePresenter` on the same currently-
+displayed file**, implemented on a small `DisplayedFilePresenter`
+class. This handles the cooperating-app case: when Preview or a
+document-based app uses `NSFileCoordinator` to read or write our
+file, we get `relinquishPresentedItem(toWriter:)` /
+`presentedItemDidChange()` callbacks and can pause our reads
+during the foreign write to avoid torn reads.
+
+**Quaternary mechanism: `NSMetadataQuery`** with
+`NSMetadataQueryUbiquitousDocumentsScope`, filtered by the
+directories of any scope that intersects with `~/Library/Mobile
+Documents/` (iCloud Drive). Subscribes to
+`NSMetadataQueryDidUpdate` to learn about
+placeholder→materialized transitions.
+
+**Last-resort fallback: polling.** Only enabled per-scope when the
+watcher's startup probe (§4.4) detects that FSEvents on the
+target root is non-functional (SMB to non-macOS server, certain
+NAS firmware, fuse mounts). Period: 5 s in foreground, 30 s in
+background. Always announced to the user via a small badge on the
+scope ("polling — live updates may lag") so the degraded mode is
+visible, not silent.
+
+### 3.3 Why not just FSEvents?
+
+* **Latency on the focused file.** Even at the 0.2 s coalescing
+  window, FSEvents lets a 50 ms editor-save look like a 200 ms
+  stutter. The kqueue source on the displayed file shortens that.
+* **iCloud materialization.** FSEvents does not reliably fire when
+  a `.icloud` placeholder is replaced with the real file by the
+  iCloud daemon; Spotlight does, via `NSMetadataQuery`.
+* **Cooperative edits.** Without `NSFilePresenter`, we can race a
+  document-based writer mid-save and read a half-written file. The
+  presenter callback lets us back off until the writer signals
+  completion via `NSFileCoordinator`.
+* **Cross-host writes on SMB.** FSEvents does not see writes made
+  on the remote server by a non-macOS host. Polling is the only
+  honest fallback there.
+
+### 3.4 Why not just `NSFilePresenter` for everything?
+
+* **Most writers don't coordinate.** `mv`, `rsync`, `git checkout`,
+  Lightroom, Capture One, ComfyUI, ffmpeg, `cp -R` from Terminal,
+  Carbon Copy Cloner, and most other tools simply mutate the file
+  without going through `NSFileCoordinator`. A presenter-only
+  design would miss all of them.
+
+### 3.5 Why not File Provider enumerator notifications?
+
+* They work, but they require the source to be a File Provider
+  extension. iCloud, Dropbox, OneDrive, Google Drive all are. A
+  local folder is not. FSEvents covers both cases; FP enumerators
+  cover only one. We treat FP enumerator notifications as a
+  forward-looking bonus signal, not as a primary subscription.
+
+---
+
+## 4. Architecture
+
+### 4.1 Module layout
+
+```
+code/Sources/ImageGlass/FileSystem/
+  FileSystemWatcher.swift          // public actor; the only entry point
+  FSEventsScopeWatcher.swift       // one per scope, owns one FSEventStream
+  FocusedFileWatcher.swift         // one per currently-displayed file
+  ICloudMaterializationWatcher.swift // NSMetadataQuery wrapper
+  CoordinatedFilePresenter.swift   // NSFilePresenter for displayed file
+  PollingScopeWatcher.swift        // SMB/NAS fallback
+  ChangeEvent.swift                // the uniform event type
+  ChangeStream.swift               // AsyncStream<ChangeEvent>
+  FSEventsBridge.swift             // C-API wrapper around FSEvents
+```
+
+### 4.2 The uniform event type
+
+The whole point of the layered watcher is that the **rest of the
+app sees one event type**, regardless of which underlying API
+produced it:
+
+```swift
+public enum ChangeEvent: Sendable, Equatable {
+    case added(URL, inode: UInt64?)
+    case removed(URL, inode: UInt64?)
+    case modified(URL, inode: UInt64?)
+    case renamed(from: URL, to: URL, inode: UInt64?)
+    case attributesChanged(URL)
+    case rootDisappeared(URL)        // watched root deleted / unmounted
+    case rootReappeared(URL)         // watched root re-mounted
+    case historyDropped(scope: ScopeID, since: FSEventStreamEventId)
+    case materialized(URL)           // iCloud placeholder → real file
+    case dematerialized(URL)         // file evicted back to placeholder
+}
+```
+
+`renamed` is synthesized from a same-batch `removed` + `added` pair
+with matching inode when `kFSEventStreamCreateFlagUseExtendedData`
+gives us inodes; otherwise it falls through as separate
+`removed`/`added`.
+
+### 4.3 Public surface
+
+```swift
+public actor FileSystemWatcher {
+    public static let shared = FileSystemWatcher()
+
+    public func watch(scope: ScopeID, roots: [URL]) async throws
+    public func unwatch(scope: ScopeID) async
+    public func setFocusedFile(_ url: URL?) async
+    public func events(for scope: ScopeID) -> AsyncStream<ChangeEvent>
+    public func focusedFileEvents() -> AsyncStream<ChangeEvent>
+    public func forceRescan(scope: ScopeID) async
+}
+```
+
+The scope engine (see `local_storage.mdx` §6) calls
+`watch(scope:roots:)` whenever a scope is loaded or its `paths`
+list mutates. The viewer calls `setFocusedFile(_:)` whenever the
+displayed image changes. The MCP server's `fs.subscribe` tool maps
+directly onto `events(for:)`.
+
+### 4.4 Startup probe
+
+When `FSEventsScopeWatcher` is constructed for a root, it runs a
+one-time probe to decide whether FSEvents is functional:
+
+1. Stat the root URL; record its inode and `df`-style filesystem
+   type via `getmntinfo`.
+2. If the filesystem type is in the **known-bad list** (`smbfs`
+   when the server is not macOS, `cifs`, `fuse`, certain VPN-
+   tunneled `nfs`), refuse FSEvents and fall back to
+   `PollingScopeWatcher`.
+3. Otherwise, create the FSEventStream and write a tiny throwaway
+   marker file (`.imageglass-fsevent-probe-<uuid>`) into a hidden
+   subdirectory under the root (or `/tmp` for read-only roots),
+   wait up to 2 s for the event to arrive, then delete the marker.
+4. If the probe event arrives, FSEvents wins.
+5. If not, log, set a `pollingFallback` flag on the scope, and
+   show the polling badge in the UI.
+
+The probe runs once per `(root, volume-UUID)` pair and the result
+is cached in `~/T/_imageglass/fsevents_probe_cache.yaml` keyed by
+volume UUID so we don't re-probe on every launch for the same
+volume.
+
+### 4.5 Threading and queues
+
+| Queue | Purpose | QoS |
+| --- | --- | --- |
+| `io.imageglass.fsevents` (serial) | FSEvents callback delivery | `userInitiated` |
+| `io.imageglass.kqueue` (serial) | DispatchSource focused-file events | `userInteractive` |
+| `io.imageglass.presenter` (`OperationQueue`, maxConcurrent: 1) | NSFilePresenter callbacks | default |
+| `io.imageglass.spotlight` (serial) | NSMetadataQuery notifications | `utility` |
+| `io.imageglass.polling` (serial) | Polling-mode rescans | `utility` |
+| `MainActor` | Final UI updates to panel & viewer | n/a |
+
+All cross-queue handoff goes through the `FileSystemWatcher`
+actor, which is the single serialization point. The actor owns
+the in-flight debounce timer and the per-scope event buffer.
+
+---
+
+## 5. Debouncing, Coalescing, and Ordering
+
+### 5.1 Debounce window
+
+Raw events from FSEvents already get a 0.20 s in-stream
+coalescing window. On top of that, the `FileSystemWatcher` actor
+adds a **second debounce of 0.05 s** on the *aggregate* event
+buffer per scope before publishing to the panel. The reason: a
+single `cp -R` of 800 files generates dozens of FSEvents
+callbacks; the panel should re-render once at the end, not 30
+times during the copy.
+
+The focused-file watcher uses a much tighter window —
+**effectively 0 ms with a 16 ms maximum coalesce** — because the
+user is staring at that file and any visible stutter is wrong.
+
+### 5.2 Coalescing rules within a window
+
+Within one debounce window, events for the same `URL` collapse:
+
+| First | Second | Result |
+| --- | --- | --- |
+| `added` | `modified` | `added` |
+| `added` | `removed` | (dropped — the file came and went; we ignore) |
+| `modified` | `modified` | `modified` (one event) |
+| `removed` | `added` (same inode) | `modified` |
+| `removed` | `added` (different inode) | `removed` + `added` (real replace) |
+| `removed` | `removed` | `removed` |
+| `renamed` | `modified` (new URL) | `renamed` + `modified` |
+| `attributesChanged` | `modified` | `modified` (attribs implied) |
+
+### 5.3 Ordering guarantees
+
+* Events for one URL are delivered to subscribers in the order
+  they were observed by the kernel callback. We do not reorder.
+* Events for different URLs within one batch may be delivered in
+  any order. Subscribers must not assume cross-URL ordering.
+* `rootDisappeared` and `rootReappeared` are delivered ahead of
+  any other events in the same batch.
+
+### 5.4 Crash / launch replay via `lastEventId`
+
+The watcher persists the **last seen FSEvents event ID per scope
+root** to `~/T/_imageglass/fsevents_cursors.yaml` after every
+batch. On relaunch, each scope's stream is created with
+`sinceWhen:` set to that ID. The kernel replays everything that
+happened while we were dead.
+
+If the kernel rolled the event log (rare; happens after very long
+downtimes or on certain filesystems), the create call returns a
+`kFSEventStreamEventIdSinceNow` indication. In that case we emit a
+`historyDropped` event and **force a full rescan** of the scope
+to rebuild the resolved file list from scratch.
+
+---
+
+## 6. The Response Chain
+
+Every external file system event flows through the same five
+stages. Each scenario in §7 is described in terms of which stages
+fire and what they do.
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│ Stage 1: KERNEL                                                        │
+│   FSEvents / kqueue / Spotlight delivers raw events to our queue.      │
+├────────────────────────────────────────────────────────────────────────┤
+│ Stage 2: NORMALIZE                                                     │
+│   FSEventsScopeWatcher converts raw flags + paths + inodes into        │
+│   ChangeEvent values. Re-stats every affected path to confirm.         │
+├────────────────────────────────────────────────────────────────────────┤
+│ Stage 3: DEBOUNCE + COALESCE                                           │
+│   FileSystemWatcher actor buffers events per scope, applies §5.2       │
+│   rules, fires once per debounce window.                               │
+├────────────────────────────────────────────────────────────────────────┤
+│ Stage 4: SCOPE RESOLVE                                                 │
+│   ScopeEngine takes the coalesced batch, applies the scope's           │
+│   include/exclude criteria, computes added/removed/modified sets       │
+│   against the previously-resolved file list, writes the new list to    │
+│   Local Storage (directories.yaml).                                    │
+├────────────────────────────────────────────────────────────────────────┤
+│ Stage 5: UI + MCP                                                      │
+│   MainActor applies a structured diff to the file panel (preserving    │
+│   selection where possible). Viewer reacts if focused file changed.    │
+│   MCP server publishes fs.changed notifications to subscribed clients. │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+Per-scenario sections name the stages by number.
+
+---
+
+## 7. Scenarios
+
+Each scenario below specifies: **trigger**, **what the kernel
+gives us**, **per-stage response**, **what the user sees**, and
+**corner cases**.
+
+### 7.1 A new image appears in a watched directory
+
+**Trigger.** A user (or another app, or `cp`, or `rsync`, or a
+Lightroom import) drops `IMG_5102.HEIC` into a directory that is
+part of the active scope.
+
+**Stage 1.** FSEvents fires with the directory path and flags
+including `kFSEventStreamEventFlagItemCreated` and
+`kFSEventStreamEventFlagItemIsFile`. Inode is delivered via
+extended data.
+
+**Stage 2.** Normalize re-stats `IMG_5102.HEIC`. Confirms it
+exists, captures size, mtime, inode, UTI. Emits
+`.added(url, inode:)`.
+
+**Stage 3.** Buffered 50 ms. If the same batch contains an
+`.added` for a sibling `IMG_5103.HEIC` (typical batch import),
+both are kept and flushed together.
+
+**Stage 4.** ScopeEngine matches the new URL against the scope's
+include/exclude criteria. If accepted, appended to the resolved
+file list at the position dictated by the current sort. The new
+list is written to `directories.yaml`.
+
+**Stage 5.** Panel inserts a row at the sort-determined index.
+Selection is unchanged. If the panel is in strip mode and the
+inserted row is offscreen, no scroll happens. Thumbnail is
+queued for generation. MCP `fs.changed` fires with
+`{added: ["IMG_5102.HEIC"]}`.
+
+**Corner cases.**
+
+* **`.DS_Store`, `.localized`, dotfiles** — excluded by default
+  scope; `.added` is dropped at stage 4.
+* **Image that the user is about to import — race with thumbnail
+  daemon.** Thumbnail generation deliberately retries once with
+  100 ms backoff if `CGImageSourceCreateWithURL` returns
+  `incomplete`, which is what we get while a slow writer is still
+  appending.
+* **Sidecar files** (`.xmp`, `.aae`) — included in the resolved
+  list only if the user's scope criteria explicitly include them;
+  by default they are excluded.
+
+### 7.2 A watched image is deleted
+
+**Trigger.** User moves `IMG_4500.JPG` to Trash from Finder, or
+another app deletes it.
+
+**Stage 1.** FSEvents flags include
+`kFSEventStreamEventFlagItemRemoved`.
+
+**Stage 2.** Normalize stat returns ENOENT. Emits `.removed(url,
+inode:)` using the pre-deletion inode from the FSEvents extended
+data.
+
+**Stage 3.** Standard 50 ms debounce. If the user actually
+dragged five files to the Trash, all five `.removed` events
+arrive in one batch.
+
+**Stage 4.** ScopeEngine removes the URLs from the resolved file
+list. Writes the new list.
+
+**Stage 5.** Panel removes the rows with an animated row-delete.
+**Selection follows the rule in §7.5** if the deleted file was
+the current selection. MCP `fs.changed` fires with
+`{removed: ["IMG_4500.JPG"]}`.
+
+**Corner cases.**
+
+* **Move to Trash vs. permanent delete.** Both produce the same
+  FSEvents flag; we treat them identically. We do not show a
+  "deleted to Trash" toast.
+* **Trash itself is on a different volume.** Same behavior — the
+  file URL we were watching now resolves to ENOENT.
+
+### 7.3 The currently-displayed image is modified by another app
+
+**Trigger.** The user is viewing `panorama.tiff`. They flip to
+Photoshop, edit a layer, hit save (Photoshop does an atomic
+rename: write to tempfile, then `rename(tempfile, panorama.tiff)`,
+which on disk looks like delete + create with a new inode for the
+same path).
+
+**Stage 1.** Two events:
+* The focused-file `DispatchSource` source fires with
+  `[.delete, .rename]` on the old FD.
+* FSEvents fires with `[ItemRemoved, ItemCreated, ItemRenamed,
+  ItemModified, ItemIsFile]` on the parent directory.
+
+**Stage 2.** Normalize re-stats `panorama.tiff`. The path still
+exists but the inode differs from what we had. Synthesizes
+`.modified(url, inode: new)` (because path is unchanged from the
+user's perspective).
+
+**Stage 3.** Focused-file watcher fires immediately (≤16 ms
+window). FSEvents version arrives ~200 ms later; second one is
+dropped by the coalescer because the focused-file emission
+already updated state.
+
+**Stage 4.** ScopeEngine sees the URL is still a member of the
+scope; updates its cached size/mtime; does **not** change the
+ordering in the resolved list (mtime sorts re-render later as part
+of a normal redraw, see corner case below).
+
+**Stage 5.**
+* **Viewer.** Re-opens the file via `CGImageSourceCreateWithURL`
+  with a new source (we explicitly do not reuse the prior
+  source — its inode is gone). Re-renders the canvas. Preserves
+  zoom level, pan position, rotation, and color-management
+  settings. If the new image has different dimensions, zoom-to-
+  fit may re-apply per the user's "fit mode" setting; otherwise
+  the canvas re-centers.
+* **Panel.** Re-fetches the thumbnail. The thumbnail cache is
+  invalidated by inode change, not by path; this is correct.
+* **MCP** publishes `fs.changed` with
+  `{modified: ["panorama.tiff"]}`.
+
+**Corner cases.**
+
+* **Atomic-rename save vs. in-place write.** Both end in
+  `.modified` from the user's perspective. The inode-change
+  detection is purely an implementation detail used to invalidate
+  caches.
+* **Photoshop writes a `.psd` sidecar** when saving as flattened
+  TIFF. That appears as an unrelated `.added` for `.psd`, which
+  is either accepted or excluded by scope criteria.
+* **Half-saved file.** If our focused-file `.write` fires while
+  Photoshop is still streaming the new bytes,
+  `CGImageSourceCreateWithURL` returns `incomplete`. We delay
+  100 ms and retry once; if still incomplete, we wait for the
+  next FSEvents tick.
+* **The mtime-sorted file panel.** A modify changes mtime, which
+  changes the file's sort position. We do not re-sort the panel
+  during the modify event because re-sorting under the user's
+  pointer is jarring. Instead we move the row in the next idle
+  tick or when the user touches the sort header. (Setting:
+  `gallery.resortOnModify`, default `onIdle`.)
+
+### 7.4 The currently-displayed image is renamed
+
+**Trigger.** User renames `pano.tiff` to `panorama-final.tiff` in
+Finder.
+
+**Stage 1.** FSEvents emits `[ItemRenamed, ItemRemoved]` for
+the old path and `[ItemRenamed, ItemCreated]` for the new path,
+in the same batch. The `DispatchSource` source on the FD fires
+`.rename`.
+
+**Stage 2.** Normalize detects matching inode across the
+`.removed`/`.added` pair and synthesizes `.renamed(from:to:inode:)`.
+
+**Stage 3.** Single event into the actor's output stream.
+
+**Stage 4.** ScopeEngine swaps the URL in place in the resolved
+list (preserving its sort position when sorted by name, or its
+index when sorted by anything inode-stable).
+
+**Stage 5.**
+* **Viewer.** Title bar updates to the new filename. Open file
+  handle is still valid (`open` semantics keep the FD pointing at
+  the inode), so we do not re-decode the image.
+* **Panel.** Row label updates; selection stays on the same row.
+* **Focused-file watcher.** Replaces its URL binding to the new
+  path so future `setFocusedFile` reasoning is consistent.
+* **MCP** publishes `fs.changed` with
+  `{renamed: [{from: "pano.tiff", to: "panorama-final.tiff"}]}`.
+
+**Corner cases.**
+
+* **Rename across directories.** If the new directory is also
+  within the scope, this is still a `.renamed` — but the row
+  position in the resolved list may change depending on sort. If
+  the new directory is **outside** the scope, we degrade to
+  `.removed` (the file has left our view).
+* **Rename to a name that doesn't pass scope criteria** (e.g.,
+  `panorama.tiff` → `panorama.tiff.bak`). We treat it as
+  `.removed` from the scope and clear the viewer if it was the
+  focused file (§7.5 rule).
+
+### 7.5 The currently-displayed image is deleted
+
+**Trigger.** User views `summer.jpg`. While the panel is open
+they delete `summer.jpg` from Finder.
+
+**Stage 1.** Same as §7.2; the focused-file `DispatchSource`
+also fires `.delete`.
+
+**Stage 2.** Normalize emits `.removed`.
+
+**Stage 3.** Standard window.
+
+**Stage 4.** Resolved list loses the URL.
+
+**Stage 5. — viewer behavior (PM rule).**
+
+The viewer **does not** clear immediately to a blank canvas.
+Instead, on `.removed` of the focused file, the viewer:
+
+1. Picks a **successor** from the resolved list using the panel's
+   current sort: the next item after the deleted one, or, if the
+   deleted item was last, the previous one.
+2. Calls `setFocusedFile(successor)` and loads it.
+3. If the resolved list is now empty, the viewer shows the
+   "no image" placeholder (the same surface shown on first
+   launch with no scope loaded), not an error dialog.
+
+This matches the behavior of Preview.app and Pixea and matches
+user expectation that "deleting an image moves me to the next
+one."
+
+**Panel.** Removes the row. The new selection is the successor.
+
+**Corner cases.**
+
+* **Burst delete.** If the user multi-selects 12 images in the
+  panel and deletes them at once, the panel computes the
+  successor based on the **lowest index outside the deleted set**.
+  If the entire scope was selected, fall back to the "empty
+  scope" placeholder.
+* **The file was deleted by an external app while the panel was
+  not in focus.** Same logic. Successor selection happens on the
+  watcher event, regardless of focus.
+
+### 7.6 A subdirectory is added inside a hierarchical scope
+
+**Trigger.** Scope `Photos2025` includes `~/Pictures/2025/`
+recursively. User creates `~/Pictures/2025/December/` in Finder.
+
+**Stage 1.** FSEvents fires for `~/Pictures/2025/` with
+`[ItemCreated, ItemIsDir]` for the new subdir path. FSEvents
+automatically extends watching into the new subdirectory because
+we registered the parent recursively — we do not need to add
+another stream.
+
+**Stage 2.** Emits `.added(url:, inode:)` for the directory.
+
+**Stage 3.** Standard window.
+
+**Stage 4.** ScopeEngine recognizes the URL is a directory, not
+a file. It performs a **bounded enumeration** of the new subtree
+(up to 5,000 entries; if more, it queues a background full walk)
+and adds any matching files to the resolved list.
+
+**Stage 5.** Panel inserts the new rows in batch. If the tree-
+view mode is active, a new collapsible node appears in the
+hierarchy.
+
+**Corner cases.**
+
+* **The new subdirectory is created with thousands of files
+  already inside it via `mv` from elsewhere.** FSEvents delivers
+  one event for the directory creation and then a batch for the
+  individual files. Both classes of event hit Stage 4, which
+  deduplicates by URL so files are not added twice.
+* **The new subdirectory matches an exclude rule** (e.g.,
+  `.Trash`, `node_modules`, `.git`). Excluded at Stage 4; no
+  enumeration runs.
+
+### 7.7 A subdirectory is deleted (cascade)
+
+**Trigger.** User deletes `~/Pictures/2025/November/` containing
+180 images that were part of the resolved scope.
+
+**Stage 1.** FSEvents fires with `[ItemRemoved, ItemIsDir]` for
+the directory itself. Depending on filesystem semantics, the 180
+file removals may or may not arrive as individual events; on
+APFS we typically receive only the directory event.
+
+**Stage 2.** Normalize emits `.removed` for the directory URL.
+
+**Stage 3.** Standard window.
+
+**Stage 4. — important.** ScopeEngine cannot rely on per-file
+events because they may not fire. Instead, on `.removed` of any
+directory, it walks the **previously-resolved file list** and
+removes every URL whose path is a prefix-descendant of the deleted
+directory. This is O(n) over the resolved list, which is bounded.
+
+**Stage 5.** Panel removes all 180 rows in one diff. If the
+focused file was inside the deleted subtree, §7.5 successor logic
+fires.
+
+**Corner cases.**
+
+* **The deleted directory was the root of the scope.** We treat
+  it as `.rootDisappeared` (§7.10), not as a normal `.removed`.
+
+### 7.8 A subdirectory is renamed
+
+**Trigger.** User renames `~/Pictures/2025/November` to
+`~/Pictures/2025/Nov-archive`.
+
+**Stage 1.** FSEvents emits `.renamed`-class flags on both old
+and new directory paths, with matching inode.
+
+**Stage 2.** Synthesizes `.renamed(from:to:inode:)` for the
+directory.
+
+**Stage 3.** Standard window.
+
+**Stage 4.** ScopeEngine walks the resolved list, rewrites every
+URL whose prefix matches `from` to use `to` instead. Inodes are
+preserved; thumbnails do not need to be regenerated.
+
+**Stage 5.** Panel updates row labels for affected items in
+place. Tree-view mode renames the node. Selection is preserved
+because URLs are still recognizable by inode.
+
+**Corner cases.**
+
+* **Rename to outside the scope root.** Treated as a delete from
+  the scope; equivalent to §7.7.
+
+### 7.9 A bulk operation hits a scope (Time Machine restore, `rsync`,
+`git checkout`)
+
+**Trigger.** User runs `rsync -av /Volumes/Backup/Photos/ ~/Pictures/2025/`
+which writes 12,000 files into the scope over 45 seconds.
+
+**Stage 1.** FSEvents fires many callbacks during the operation.
+Each callback contains many events.
+
+**Stage 2.** Normalizes each callback into `ChangeEvent`s.
+
+**Stage 3. — the critical stage.** The actor's debouncer
+deliberately **lengthens its window adaptively** while a flood is
+in progress: every callback within 200 ms of the previous one
+extends the debounce. The flush only happens when the kernel goes
+quiet for 200 ms or the buffer hits 5,000 events, whichever comes
+first. This means a 45-second `rsync` produces roughly 9 flushes,
+not 9,000.
+
+**Stage 4.** Each flush re-resolves the scope against the
+accumulated batch. Adds and modifications are appended/updated;
+removes are subtracted.
+
+**Stage 5.** Panel applies one large diff per flush. The panel
+maintains scroll position by anchoring to the row above the
+current viewport's top edge.
+
+**Corner cases.**
+
+* **Memory.** The accumulated batch is bounded at 5,000 events;
+  excess events force a flush. Beyond 50,000 events in a single
+  flush we issue a `historyDropped` and run a full rescan
+  instead of trying to apply the diff.
+* **Generated event-flood warning.** If a single flood produces
+  more than 10,000 events in 60 seconds, the watcher emits a
+  one-time `flood` warning to the error surface (see
+  `error_handling.mdx`); no user-facing dialog.
+
+### 7.10 The watched root is moved, renamed, or deleted
+
+**Trigger.** User renames `~/Pictures/2025/` to `~/Pictures/2025-archive/`,
+or deletes it, or moves it to another volume.
+
+**Stage 1.** Because we registered with
+`kFSEventStreamCreateFlagWatchRoot`, FSEvents fires with
+`kFSEventStreamEventFlagRootChanged` for the stream's root path.
+
+**Stage 2.** The scope watcher captures this specially and emits
+`.rootDisappeared(url)`.
+
+**Stage 3.** This event bypasses normal debouncing (§5.3) and is
+delivered to subscribers ahead of any other queued events for
+that scope.
+
+**Stage 4.** ScopeEngine marks the scope as `unresolved` in
+`directories.yaml`. The previously-resolved file list is **not**
+cleared yet — it is moved to `last_known_files:` so the panel can
+optionally keep displaying it in a dimmed "stale" state.
+
+**Stage 5.** Panel renders the scope with a banner: "Source
+folder is no longer available. Showing the last known contents.
+Reselect the folder or wait for it to reappear." If the focused
+file was inside the missing root, the viewer falls back to the
+"no image" placeholder. MCP `fs.changed` fires with
+`{rootDisappeared: "~/Pictures/2025"}`.
+
+**Stage 6 (special).** A long-lived `kqueue` source on the root's
+**parent** (or a `NSMetadataQuery` watching for path appearance)
+is registered to detect reappearance. If a directory with the
+original path returns (possibly with a different inode), we emit
+`.rootReappeared` and trigger a full rescan.
+
+**Corner cases.**
+
+* **The root was renamed, not deleted.** FSEvents now delivers
+  the new path via `FSEventStreamGetPathsBeingWatched`-style
+  inspection (we re-stat to confirm inode equality). If matched,
+  we treat as `.renamed` of the root and rewrite the scope's
+  `paths` field in `directories.yaml`; no `.rootDisappeared`.
+* **Volume unmount.** Same trigger; covered by §7.11.
+
+### 7.11 A volume is unmounted or mounted
+
+**Trigger.** External SSD `/Volumes/Photos2025` is ejected while
+a scope rooted there is loaded; or, conversely, the same SSD is
+plugged back in.
+
+**Stage 1.** `NSWorkspace` posts `didUnmountNotification` /
+`didMountNotification`. FSEvents emits `RootChanged`. The
+`FocusedFileWatcher` kqueue source fires `.revoke` if the user
+was viewing a file from that volume.
+
+**Stage 2.** Watcher emits `.rootDisappeared` (unmount) or
+`.rootReappeared` (mount).
+
+**Stage 3–5.** Same as §7.10. On reappearance we trigger a full
+rescan to catch up on anything the kernel could not journal while
+the volume was absent.
+
+**Corner cases.**
+
+* **NSWorkspace `willUnmountNotification`** — we pre-emptively
+  close any open file handles to files on that volume so that the
+  unmount itself is not blocked by us holding an FD. The
+  `FocusedFileWatcher` is torn down; the viewer keeps showing the
+  decoded image in memory until the user navigates away.
+* **Reappears at a different mount point.** We match by volume
+  UUID, not path. If the volume is the same but mounted under a
+  new path, we rewrite the scope's `paths` field and treat as
+  `.rootReappeared`.
+
+### 7.12 An iCloud Drive placeholder is materialized
+
+**Trigger.** The scope includes `~/Library/Mobile Documents/iCloud~com~apple~CloudDocs/Photos/`.
+A file `family.heic` exists as a 0-byte `.icloud` placeholder.
+The user (or our prefetch) requests download; iCloud materializes
+the file.
+
+**Stage 1.** FSEvents may or may not fire (it does for the rename
+from `family.heic.icloud` to `family.heic`, but not always for
+the byte materialization). `NSMetadataQuery` **always** fires
+`NSMetadataQueryDidUpdate` with the item appearing in the
+materialized set.
+
+**Stage 2.** The `ICloudMaterializationWatcher` emits
+`.materialized(url)`. The FSEvents path, if any, is coalesced
+into the same event using URL equality.
+
+**Stage 3.** Standard window.
+
+**Stage 4.** ScopeEngine updates the resolved list entry to
+reflect that the file is now real (size, mtime, removes the
+"placeholder" badge in its metadata).
+
+**Stage 5.** Panel removes the cloud-with-arrow overlay from the
+row. If the file is the focused file and was previously rendered
+as a placeholder spinner, the viewer auto-loads the materialized
+bytes.
+
+**Corner cases.**
+
+* **Eviction.** iCloud may evict a file back to placeholder if
+  the user is low on disk space. We emit `.dematerialized(url)`;
+  the panel re-applies the placeholder overlay. The viewer keeps
+  any in-memory decoded copy.
+* **Conflict.** If iCloud detects an edit conflict, the user gets
+  a directory with both `family.heic` and `family (conflicted).heic`.
+  Both surface to us as `.added`; the conflicted copy joins the
+  scope normally.
+
+### 7.13 An app modifies our focused file via `NSFileCoordinator`
+(cooperating editor)
+
+**Trigger.** The user is viewing `notes.png` (rendered from a
+document-based app) and switches to that app to edit and re-save
+it. The editor uses `NSFileCoordinator` to perform the write.
+
+**Stage 1.** Our `CoordinatedFilePresenter` gets
+`relinquishPresentedItem(toWriter:)` first — before any FSEvents
+or kqueue events fire.
+
+**Stage 2.** Presenter signals to `FocusedFileWatcher` to
+**pause** focused-file event emission. No `.modified` is sent
+upstream yet. The viewer is told to hold its current decoded
+image (do not start a re-decode).
+
+**Stage 3.** Editor finishes. Presenter receives a
+`presentedItemDidChange()` call from the coordinator and then a
+reacquire callback.
+
+**Stage 4.** `FocusedFileWatcher` resumes and immediately emits
+`.modified(url)`. ScopeEngine updates metadata.
+
+**Stage 5.** Viewer re-decodes. Panel refreshes thumbnail.
+
+**Why this matters.** Without the presenter, our focused-file
+kqueue source would fire `.write` in the middle of the editor's
+atomic save and we would try to decode a half-written file. With
+the presenter, the editor's writer-relinquish handshake gives us
+a clean window.
+
+### 7.14 An app overwrites a file in place mid-decode
+
+**Trigger.** A poorly-behaved app writes to `large.tiff` while
+we are still decoding it for display.
+
+**Stage 1.** kqueue `.write` fires on our open FD; FSEvents
+emits `.modified`.
+
+**Stage 2.** `.modified` is emitted with the inode stayed the
+same (in-place write).
+
+**Stage 3.** Standard window.
+
+**Stage 4.** ScopeEngine updates mtime/size.
+
+**Stage 5.** Viewer cancels the in-flight decode (`Task.cancel()`
+on the decoder task) and starts a new one against the new bytes.
+The user may see a brief flash of an outdated partial render
+before the new render lands; this is an unavoidable consequence
+of an external in-place write and we do not try to hide it.
+
+**Corner cases.**
+
+* **The decoder fails on the partial bytes.** We emit an error
+  banner ("the file is being modified by another application;
+  retrying"). One retry, 100 ms delay. If still failing, the
+  viewer shows the "image unavailable" placeholder until the next
+  `.modified` event.
+
+### 7.15 Attributes change with no content change (chmod, chflags, xattrs)
+
+**Trigger.** `chmod 644 picture.jpg`, or Finder Get-Info sets a
+new color label or rating.
+
+**Stage 1.** FSEvents fires with
+`kFSEventStreamEventFlagItemXattrMod` or `*InodeMetaMod`. kqueue
+`.attrib` fires for the focused file.
+
+**Stage 2.** Emits `.attributesChanged(url)`.
+
+**Stage 3.** Standard window.
+
+**Stage 4.** ScopeEngine refreshes the URL's cached metadata
+(label, rating, owner) but does not touch the file's position in
+the resolved list unless the active sort is on a changed
+attribute (e.g., sort-by-label).
+
+**Stage 5.** Panel updates the label/rating glyph on the row.
+Viewer does **not** re-decode.
+
+### 7.16 Inode reuse after delete-then-recreate
+
+**Trigger.** A file is deleted; another file with the same name
+(but different content) is created at the same path within the
+same FSEvents batch. APFS sometimes reuses the inode.
+
+**Stage 1.** FSEvents emits `.removed` then `.added` on the same
+path, possibly with the same inode in extended data.
+
+**Stage 2.** **Critical guard.** We do not collapse `.removed`+
+`.added` into `.modified` based on inode alone. We additionally
+compare size and mtime; if either differs, we treat as
+remove+add (two events). If everything matches (e.g., a
+touch/save that re-created the file), we treat as `.modified`.
+
+**Stage 3–5.** Per the resolved event type.
+
+### 7.17 A symlink target changes
+
+**Trigger.** The scope includes `~/Pictures/latest -> ~/Pictures/2025/December/`.
+User repoints `latest` to `~/Pictures/2026/January/`.
+
+**Stage 1.** FSEvents fires with `.removed`+`.added` (or
+`.renamed`) on the symlink itself.
+
+**Stage 2.** Watcher resolves the symlink and emits an
+`.attributesChanged` for the link, plus `.removed`/`.added` for
+the affected resolved files (those that were reached via the old
+target but are not reached via the new one, and vice versa).
+
+**Stage 3–5.** Standard.
+
+**Corner case.** We follow symlinks **only when the scope
+opts in** (`followSymlinks: true` in the scope record). Default
+is `false` to avoid pathological cycles.
+
+### 7.18 App returns from background or sleep
+
+**Trigger.** User closes the lid for 4 hours; the app suspends.
+On wake, the watcher must reconcile what happened while we were
+inactive.
+
+**Stage 1.** No live events arrived while suspended.
+
+**Stage 2 (on resume).** The watcher re-creates each FSEventStream
+with `sinceWhen:` set to the persisted cursor (`§5.4`). The
+kernel replays everything in one big batch.
+
+**Stage 3.** The flood-protected debouncer (§7.9 logic) collapses
+the replay into a few flushes.
+
+**Stage 4–5.** Standard, but with much larger diffs than usual.
+
+**Corner case.** If the kernel cannot replay (cursor is past the
+journal horizon), we emit `.historyDropped` and force a full
+rescan.
+
+### 7.19 Fresh launch with a previously-loaded scope
+
+**Trigger.** App launches. Local Storage has scopes with
+previously-resolved file lists and FSEvents cursors.
+
+**Stage 1.** For each scope, create the FSEventStream with the
+persisted cursor.
+
+**Stage 2.** Two parallel walks happen:
+* **Baseline walk** — a fresh `FileManager.enumerator` over each
+  root, building "ground truth" of what's there right now.
+* **Replay** — FSEvents kernel replay from the cursor.
+
+**Stage 3.** The watcher diffs the baseline against the
+previously-resolved list and emits synthetic
+`.added`/`.removed`/`.modified` events for any deltas. The replay
+events are then merged in and deduplicated by URL.
+
+**Stage 4–5.** Standard.
+
+**Why both?** The cursor replay catches events the journal still
+remembers; the baseline catches anything older than the journal's
+horizon. Doing both is cheap (baseline is bounded by scope size)
+and avoids missed changes on launch.
+
+### 7.20 A file is modified while the panel is filtering it out
+
+**Trigger.** Scope is `*.jpg` only. A file `note.txt` in the
+scope's root is modified.
+
+**Stage 1.** FSEvents fires.
+
+**Stage 2.** Emits `.modified`.
+
+**Stage 3.** Standard window.
+
+**Stage 4.** ScopeEngine matches `note.txt` against the include
+criteria; it doesn't match; the event is dropped.
+
+**Stage 5.** No UI change. No MCP notification.
+
+### 7.21 A file changes from being included to excluded (extension swap)
+
+**Trigger.** `vacation.jpg` is renamed to `vacation.jpg.bak`.
+Scope includes `*.jpg` only.
+
+**Stage 1.** FSEvents emits `.renamed`.
+
+**Stage 2.** Synthesized as `.renamed(from: ".jpg", to: ".bak", inode:)`.
+
+**Stage 3.** Standard window.
+
+**Stage 4.** ScopeEngine: the `from` URL was in the resolved
+list; the `to` URL does not match. Emits internal "remove from
+resolved list" and writes back. No corresponding add.
+
+**Stage 5.** Panel deletes the row. Viewer applies §7.5 successor
+logic if the renamed file was focused.
+
+### 7.22 MCP-initiated forced rescan
+
+**Trigger.** Claude Code calls the MCP `fs.rescan` tool on a
+scope, possibly because it has reason to believe the file system
+diverged silently (e.g., user manually edited
+`directories.yaml`).
+
+**Stage 1.** N/A.
+
+**Stage 2.** N/A.
+
+**Stage 3.** N/A — bypasses debouncer.
+
+**Stage 4.** ScopeEngine throws away the resolved list and re-
+enumerates all roots from scratch. Diffs against what was there
+before; emits the consolidated event set.
+
+**Stage 5.** Panel applies the diff. MCP returns the diff
+summary to the caller.
+
+---
+
+## 8. Sandboxing, Permissions, and Security-Scoped Bookmarks
+
+If the app is built with the App Sandbox enabled (the App Store
+path, not our primary distribution channel — see CLAUDE.md), the
+watcher cannot register an FSEventStream on a directory the user
+has not granted access to. The required entitlements:
+
+* `com.apple.security.files.user-selected.read-write` — for any
+  directory the user picks via `NSOpenPanel`.
+* `com.apple.security.files.bookmarks.app-scope` — to persist the
+  granted access across launches.
+
+When a scope is created, the resolved directory URLs are
+converted to security-scoped bookmarks and stored in
+`directories.yaml` (base64-encoded in the `bookmark:` field next
+to the `path:`). On launch the watcher resolves each bookmark,
+calls `startAccessingSecurityScopedResource()`, then registers the
+FSEventStream against the resolved URL. Failure to resolve a
+bookmark (user moved the parent volume, revoked permission) is
+reported via `.rootDisappeared` and the user is prompted to
+re-grant access.
+
+For our primary Developer ID + notarized distribution channel
+(sandbox off), bookmarks are not strictly required but we store
+them anyway so that future App Store builds Just Work.
+
+**Full Disk Access** is **not** requested by default; the watcher
+does not need it for user-selected directories. If a scope's
+roots are under `~/Library/`, `/System/`, or other protected
+locations, FSEvents will silently drop events for those paths
+unless FDA is granted; we detect this at probe time (§4.4) and
+fall back to polling, and we show a "grant Full Disk Access for
+live updates" banner on that scope.
+
+---
+
+## 9. Failure Modes and Reporting
+
+| Failure | Detection | Surface |
+| --- | --- | --- |
+| Cursor past journal horizon (`historyDropped`) | `FSEventStreamGetLatestEventId` returns `kFSEventStreamEventIdSinceNow` | One-time banner: "catching up after extended inactivity"; full rescan runs. |
+| Probe fails (FSEvents non-functional on this filesystem) | §4.4 probe times out | Permanent badge on scope: "polling — live updates may lag". |
+| Bookmark resolution fails | `URL(resolvingBookmarkData:)` throws or is stale | Scope shown as `unresolved`; prompt to re-grant. |
+| FD exhaustion (kqueue) | `open()` returns EMFILE | Log; focused-file watcher disabled for current file; FSEvents still works. |
+| FSEvents callback delivers paths that no longer exist | Confirmed at Stage 2 re-stat | Treated as `.removed`. |
+| Spotlight disabled on volume hosting iCloud Drive | `NSMetadataQuery` returns no results during probe | Materialization detection falls back to FSEvents-only; user warned that placeholder transitions may lag. |
+| Sustained event flood (>10,000 events / 60 s) | Counter in actor | One-time `flood` warning to `error_handling` surface; no dialog. |
+
+All failures are logged via the project's standard logger to the
+file specified in CLAUDE.md (`~/_act3_logs/`-style); none of them
+ever block the UI.
+
+---
+
+## 10. Performance Budget
+
+| Metric | Budget | Measurement |
+| --- | --- | --- |
+| Kernel event → `ChangeEvent` emitted | <10 ms p95 | Stage 1+2 timing in watcher's instrumentation. |
+| `ChangeEvent` → panel paint | <250 ms p95 | Stage 3+4+5 wall clock for a single-file event. |
+| Focused-file modification → viewer re-render | <100 ms p95 | kqueue fire → first frame painted. |
+| Bulk batch (1,000 events) processing | <500 ms wall clock | Stage 3 flush time. |
+| Memory overhead per watched scope | <2 MB resident | Excluding the resolved file list itself, which is bounded separately. |
+| Idle CPU with 10 active scopes, no changes | <0.1% on Apple Silicon | sampled over 60 s. |
+
+These budgets are tracked by the perf harness in `perf/` and
+asserted in CI for every release candidate.
+
+---
+
+## 11. Testing Strategy
+
+* **Unit tests (Swift Testing + XCTest)** for every coalescing
+  rule in §5.2, every scenario in §7 simulated by feeding
+  synthetic `ChangeEvent` batches into the actor.
+* **Integration tests** that drive a real temp directory: `mkdir`,
+  `cp`, `rm`, `mv`, `chmod`, atomic-rename save, with assertions
+  on the events emitted within 1 s.
+* **iCloud test (manual)** — placeholder-to-materialized
+  transition exercised against a real iCloud account in CI's
+  `manual-icloud` job.
+* **Sandbox test** — a sandboxed build target exercises bookmark
+  persistence and revocation.
+* **SMB/NAS test (manual)** — exercises the polling fallback
+  against a Synology and a Samba-on-Linux share.
+* **Flood test** — `tools/event_flood.swift` writes 10,000 small
+  files into a watched directory in ten waves; the watcher must
+  not lose events and must respect the flood-protected debounce
+  rules.
+* **Replay test** — kill the app via `kill -9` mid-batch; relaunch
+  and assert that the post-launch synthetic event set equals the
+  events that would have been emitted had the app stayed alive.
+
+---
+
+## 12. MCP Surface
+
+The MCP server exposes the watcher via these tools (see
+`mcp.mdx` for the full surface):
+
+* `fs.subscribe(scope: ScopeID) -> AsyncStream<ChangeEvent>` —
+  bind to a scope's event stream. Each emitted event is
+  serialized to JSON and pushed over the MCP transport. The
+  client decides debouncing on its side.
+* `fs.rescan(scope: ScopeID) -> Diff` — force a full rescan
+  (§7.22). Returns the diff against the previously-resolved
+  list.
+* `fs.focus(url: URL?) -> ()` — set or clear the focused file.
+  Exposed primarily so Claude Code can swap the viewer without
+  going through the panel.
+* `fs.probe(root: URL) -> ProbeResult` — re-run the §4.4 probe
+  for a root. Returns `{api: "fsevents" | "polling", reason:
+  String}`.
+
+Subscriptions are per-MCP-client; multiple clients subscribed to
+the same scope each get their own copy of the event stream.
+
+---
+
+## 13. Open Questions / Future Work
+
+* **Smarter mtime-sort resort policy.** Today we don't resort
+  under the user's cursor; we resort on idle or on header click.
+  A v2 candidate is a "resort silently if the changed row is
+  offscreen" rule.
+* **Watch only the visible viewport's files via kqueue.** Today
+  we run one kqueue source for the focused file only. We could
+  extend to all currently-visible thumbnails for sub-50 ms grid
+  updates. Cost: ~30 file descriptors. Worth doing if profiling
+  shows the FSEvents 200 ms window is visibly slow in grid mode.
+* **Inotify-style move-tracking via inode bookkeeping.** macOS
+  doesn't expose move semantics as cleanly as Linux inotify does;
+  we already use inode-matching, but a more thorough bookkeeping
+  pass (track every inode in the resolved list, match by inode on
+  every event) could reduce spurious add/remove pairs on cross-
+  directory renames. Defer until we see user reports.
+* **File Provider extension API** for tighter integration with
+  Dropbox, Google Drive, OneDrive. Their File Provider extensions
+  expose enumerators we could subscribe to in addition to
+  FSEvents.
+
+---
+
+## 14. References
+
+The API analysis in §3 draws on:
+
+* Apple — *File System Events Programming Guide*: Kernel Queues
+  alternative —
+  https://developer.apple.com/library/archive/documentation/Darwin/Conceptual/FSEvents_ProgGuide/KernelQueues/KernelQueues.html
+* Apple — *Using the File System Events API* —
+  https://developer.apple.com/library/archive/documentation/Darwin/Conceptual/FSEvents_ProgGuide/UsingtheFSEventsFramework/UsingtheFSEventsFramework.html
+* Apple — *File System Events* (current developer docs) —
+  https://developer.apple.com/documentation/coreservices/file_system_events
+* Apple — *NSMetadataQuery* —
+  https://developer.apple.com/documentation/foundation/nsmetadataquery
+* Apple — *iCloud File Management* —
+  https://developer.apple.com/library/archive/documentation/FileManagement/Conceptual/FileSystemProgrammingGuide/iCloud/iCloud.html
+* Apple Developer Forums — *Using FileSystemEvent to monitor a
+  directory* — https://developer.apple.com/forums/thread/115387
+* SwiftRocks — *DispatchSource: Detecting changes in files and
+  folders in Swift* —
+  https://swiftrocks.com/dispatchsource-detecting-changes-in-files-and-folders-in-swift
+* alexwlchan — *Watching for file changes on macOS* (2026) —
+  https://alexwlchan.net/2026/watch-files-on-macos/
+* Khanlou — *File Coordination* —
+  https://khanlou.com/2019/03/file-coordination/
+* SKQueue — https://github.com/daniel-pedersen/SKQueue
+* SFSMonitor — https://github.com/ClassicalDude/SFSMonitor
+* fswatch — https://github.com/emcrisostomo/fswatch

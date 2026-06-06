@@ -57,6 +57,22 @@ public final class DirectoryTreeWalker: @unchecked Sendable {
     /// populated until the walk finishes.
     private var inflightFilter: [URL: RootFilter] = [:]
 
+    /// Result cache keyed by root URL. Short-circuits the FSEvents-driven
+    /// re-walk storm: when the walker's own audit-log writes (or anything
+    /// else under `~/Library/Application Support/ImageGlass_Mac/`) fire
+    /// FSEvents, AppState.reloadDirectoriesFromDisk can schedule a fresh
+    /// walk every time. Without this cache that costs minutes of
+    /// cloud-backed I/O per spurious event. A hit reuses the tree iff
+    /// the root's directory mtime AND the requested filter match what
+    /// is on file.
+    private struct WalkCacheEntry {
+        let filter: RootFilter
+        let rootMTime: Date?
+        let result: WalkResult
+        let storedAt: Date
+    }
+    private var walkCache: [URL: WalkCacheEntry] = [:]
+
     public init(
         store: DirectoriesStore = .shared,
         logger: MCPAuditLogger = .shared
@@ -85,6 +101,17 @@ public final class DirectoryTreeWalker: @unchecked Sendable {
             if self.inflight[root] != nil, self.inflightFilter[root] == filter {
                 return
             }
+            // Second short-circuit: a very recent cache entry (≤ 2 s old)
+            // with the same filter and unchanged root mtime is treated as
+            // already-fresh. Re-emit the didChange notification (callers
+            // expect it for every scheduleWalk) but skip the walk.
+            if let cached = self.walkCache[root],
+               cached.filter == filter,
+               Date().timeIntervalSince(cached.storedAt) <= 2.0,
+               cached.rootMTime == Self.directoryMTime(at: root) {
+                NotificationCenter.default.post(name: Self.didChangeNotification, object: root)
+                return
+            }
             self.inflight[root]?.cancel()
             self.inflightFilter[root] = filter
             let task = Task.detached(priority: .utility) { [weak self] in
@@ -106,6 +133,7 @@ public final class DirectoryTreeWalker: @unchecked Sendable {
             self.inflight[path] = nil
             self.inflightFilter[path] = nil
             self.roots[path] = nil
+            self.walkCache[path] = nil
             NotificationCenter.default.post(
                 name: Self.didChangeNotification, object: path
             )
@@ -187,7 +215,25 @@ public final class DirectoryTreeWalker: @unchecked Sendable {
         // the root fans out across CPU cores via `walkParallel` — see
         // docs/performance.mdx §7.2 / §10.2.
         let walkStart = Date()
-        let result = await Self.walkParallel(root: root, filter: filter)
+
+        // Cache short-circuit: if the cached entry's root mtime matches
+        // what's on disk right now, reuse the prior tree instead of
+        // re-walking. On a cloud-backed root (Dropbox / iCloud) this
+        // skips the entire multi-minute walk when an FSEvents storm
+        // fires while nothing on disk actually changed.
+        let currentMTime = Self.directoryMTime(at: root)
+        let cachedHit: WalkResult? = queue.sync { () -> WalkResult? in
+            guard let entry = self.walkCache[root],
+                  entry.filter == filter,
+                  entry.rootMTime == currentMTime else { return nil }
+            return entry.result
+        }
+        let result: WalkResult
+        if let hit = cachedHit {
+            result = hit
+        } else {
+            result = await Self.walkParallel(root: root, filter: filter)
+        }
         _fileCount = result.fileCount
         let elapsedMs = Int(Date().timeIntervalSince(walkStart) * 1000.0)
 
@@ -198,6 +244,12 @@ public final class DirectoryTreeWalker: @unchecked Sendable {
                 filter: filter,
                 lastWalked: Date(),
                 tree: result.tree
+            )
+            self.walkCache[root] = WalkCacheEntry(
+                filter: filter,
+                rootMTime: currentMTime,
+                result: result,
+                storedAt: Date()
             )
             self.inflight[root] = nil
             self.inflightFilter[root] = nil
@@ -345,24 +397,22 @@ public final class DirectoryTreeWalker: @unchecked Sendable {
             let fileCount: Int
         }
 
-        // Spawn one task per top-level subdirectory. Swift's runtime
-        // schedules these across the global concurrent pool, which is
-        // sized to `ProcessInfo.processInfo.activeProcessorCount`. On a
-        // 16-core Apple Silicon machine that is a 16× speed-up for
-        // wide roots; on a 4-core machine it is a 4× speed-up.
+        // Spawn one task per top-level subdirectory. Each task descends
+        // via the recursive `walkSubtreeParallel`, which further fans
+        // out inside the subtree gated by the global `walkLimiter`
+        // (≈ 80% of cores). On a deep cloud-backed root the long pole
+        // used to be a single subtree walking serially through thousands
+        // of cloud-stat'd subdirs; the recursive limiter parallelises
+        // that bottleneck while keeping total in-flight tasks bounded.
         await withTaskGroup(of: SubtreeResult.self) { group in
             for slot in slots where slot.isDir {
                 let entry = slot.entry
                 let idx = slot.index
                 let f = filter
                 group.addTask {
-                    var fc = 0
-                    var fi: URL?
-                    let node = walkDir(
+                    let (node, fc) = await walkSubtreeParallel(
                         at: entry,
-                        filter: f,
-                        fileCount: &fc,
-                        firstImage: &fi
+                        filter: f
                     )
                     return SubtreeResult(index: idx, node: node, fileCount: fc)
                 }
@@ -402,6 +452,160 @@ public final class DirectoryTreeWalker: @unchecked Sendable {
         case .file(_, let kind, let passes):
             return (kind == .image && passes) ? url : nil
         }
+    }
+
+    /// Lightweight mtime probe for the walk-result cache. Reads the
+    /// directory's contentModificationDate via the resource-values API.
+    /// Returns nil on failure so the cache check degrades to "always
+    /// miss" rather than returning stale data.
+    private static func directoryMTime(at url: URL) -> Date? {
+        return try? url.resourceValues(forKeys: [.contentModificationDateKey])
+            .contentModificationDate
+    }
+
+    /// Total in-flight walker tasks allowed across the whole process.
+    /// Sized to ~80% of the logical core count (user rule), capped so a
+    /// many-core machine still keeps a sane number of concurrent stat()s
+    /// against cloud-backed providers like Dropbox / iCloud. Lower bound
+    /// = 1 to keep the algorithm correct on a single-core machine.
+    private static let maxParallelWalkers: Int = {
+        let cores = ProcessInfo.processInfo.activeProcessorCount
+        let target = (cores * 4) / 5
+        return max(1, min(19, target))
+    }()
+
+    /// Minimum subdir count at which a level fans out into its own task
+    /// group. Spawning the group has nonzero overhead — folders with one
+    /// child dir recurse inline.
+    private static let minChildrenToFanOut: Int = 2
+
+    /// Process-wide non-blocking concurrency limiter for the recursive
+    /// walker. `tryAcquire` returns false instead of suspending when the
+    /// pool is full — the caller falls back to a synchronous walk for
+    /// that subtree. Using try-style acquire (no waiter queue) avoids
+    /// the limiter-deadlock where parent tasks hold slots while awaiting
+    /// children that can never get a slot.
+    actor WalkLimiter {
+        private let capacity: Int
+        private var inUse: Int = 0
+        init(capacity: Int) { self.capacity = capacity }
+        func tryAcquire() -> Bool {
+            if inUse < capacity {
+                inUse += 1
+                return true
+            }
+            return false
+        }
+        func release() {
+            if inUse > 0 { inUse -= 1 }
+        }
+    }
+
+    private static let walkLimiter = WalkLimiter(capacity: maxParallelWalkers)
+
+    /// Recursive parallel walker. Fans out subtree work via a
+    /// `TaskGroup` whenever the directory has ≥ `minChildrenToFanOut`
+    /// subdirectories AND the global `walkLimiter` has a free slot.
+    /// Subtrees that lose the limiter race recurse synchronously via
+    /// `walkDir` so the algorithm always makes forward progress. Lex
+    /// order is preserved by indexed slot writes.
+    private static func walkSubtreeParallel(
+        at url: URL,
+        filter: RootFilter
+    ) async -> (DirectoryNode?, Int) {
+        if Task.isCancelled { return (nil, 0) }
+        let started = DispatchTime.now()
+        let fm = FileManager.default
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue else {
+            return (nil, 0)
+        }
+        let contents: [URL]
+        do {
+            contents = try fm.contentsOfDirectory(
+                at: url,
+                includingPropertiesForKeys: [.isDirectoryKey],
+                options: [.skipsHiddenFiles]
+            )
+        } catch {
+            return (.directory(name: url.lastPathComponent, children: []), 0)
+        }
+        let sorted = contents.sorted { $0.lastPathComponent < $1.lastPathComponent }
+
+        var children: [DirectoryNode?] = Array(repeating: nil, count: sorted.count)
+        var fileCount = 0
+        var subdirSlots: [(Int, URL)] = []
+        subdirSlots.reserveCapacity(sorted.count)
+
+        for (idx, entry) in sorted.enumerated() {
+            let entryIsDir = (try? entry.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+            if entryIsDir {
+                subdirSlots.append((idx, entry))
+            } else {
+                guard let kind = FileKind.classify(path: entry.path) else { continue }
+                let passes = filter.evaluate(filename: entry.lastPathComponent)
+                children[idx] = .file(
+                    name: entry.lastPathComponent,
+                    kind: kind,
+                    passesFilter: passes
+                )
+                if passes { fileCount += 1 }
+            }
+        }
+
+        if subdirSlots.count < minChildrenToFanOut {
+            for (idx, childURL) in subdirSlots {
+                let (subNode, subCount) = await walkSubtreeParallel(at: childURL, filter: filter)
+                children[idx] = subNode
+                fileCount += subCount
+            }
+        } else {
+            struct SubResult: Sendable {
+                let index: Int
+                let node: DirectoryNode?
+                let fileCount: Int
+            }
+            await withTaskGroup(of: SubResult.self) { group in
+                for (idx, childURL) in subdirSlots {
+                    let f = filter
+                    group.addTask {
+                        let gotSlot = await walkLimiter.tryAcquire()
+                        if gotSlot {
+                            let (subNode, subCount) = await walkSubtreeParallel(at: childURL, filter: f)
+                            await walkLimiter.release()
+                            return SubResult(index: idx, node: subNode, fileCount: subCount)
+                        } else {
+                            var fc = 0
+                            var fi: URL?
+                            let subNode = walkDir(
+                                at: childURL,
+                                filter: f,
+                                fileCount: &fc,
+                                firstImage: &fi
+                            )
+                            return SubResult(index: idx, node: subNode, fileCount: fc)
+                        }
+                    }
+                }
+                for await result in group {
+                    children[result.index] = result.node
+                    fileCount += result.fileCount
+                }
+            }
+        }
+
+        let finalChildren = children.compactMap { $0 }
+        let elapsedNs = DispatchTime.now().uptimeNanoseconds &- started.uptimeNanoseconds
+        if elapsedNs >= singleDirSlowThresholdNs {
+            PerformanceLog.shared.event(
+                "DirectoryWalk.SingleDir",
+                extra: [
+                    ("path", url.path),
+                    ("elapsed_ms", String(elapsedNs / 1_000_000)),
+                ]
+            )
+        }
+        return (.directory(name: url.lastPathComponent, children: finalChildren), fileCount)
     }
 
     /// Threshold (ms) above which a single-directory walk emits a perf

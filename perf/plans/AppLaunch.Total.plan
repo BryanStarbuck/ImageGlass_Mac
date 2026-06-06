@@ -1,0 +1,107 @@
+AppLaunch.Total — cold-launch optimization plan
+================================================
+
+Baseline (M-series, perf_report.csv):
+  AppLaunch.Total          avg 430 ms (4 runs, 400–448 ms)
+  AppLaunch.LoadDirectories avg  32 ms  (subset, but in the trace log it
+                            actually fires AFTER FirstFrame because
+                            bootstrap() runs in ContentView.task)
+
+So the 430 ms is essentially the wall-clock from process exec ->
+ContentView.onAppear, which is everything BEFORE bootstrap():
+  * dyld + Swift runtime + ObjC class realization
+  * ImageGlassApp.init() body (synchronous, blocks first window)
+  * SwiftUI App / WindowGroup materialization + first paint
+  * NSApplicationDelegateAdaptor instantiation
+  * ContentView body resolution (Toolbar, modifiers, environment)
+
+What runs on the hot path TODAY in ImageGlassApp.init():
+  1. CLI help detection         (cheap, must stay)
+  2. InitialConfigSeeder.seedIfMissing()
+       - synchronous file-existence checks + (first-launch only)
+         settings.yaml + panels.yaml YAML encode/write
+       - on a warm machine the existsAt fast-path is < 1 ms, but
+         the call still does AppPaths.macAppSupportDir resolution
+         and a Performance.trace start/finish
+  3. AppState()                  (cheap @Observable init)
+  4. ImageGlassLaunchArguments.parse + applyLaunchArguments (cheap)
+
+What runs BEFORE bootstrap() in ContentView body / onAppear:
+  * Whole .toolbar { } block is built (cheap, declarative)
+  * .onAppear: themeStore.updateSystemColorScheme + applyAppAppearance
+    -- applyAppAppearance touches NSApp.appearance, also cheap
+
+Fixes (ordered by expected impact):
+
+A) Move InitialConfigSeeder OFF the @main init() hot path.
+   It is "seed-if-missing" — on every launch after the first it
+   only does fileExists checks. But on first launch it does YAML
+   encode + atomic write of two files synchronously before the
+   first window can paint. We can defer this safely:
+     * SettingsStore and PanelStateYAMLStore both already own their
+       own writes at first user mutation; the seeder is only needed
+       so the files exist on disk for users who poke around the
+       Application Support directory.
+   New behavior: dispatch seedIfMissing onto Task.detached(.utility)
+   from a willFinishLaunching-equivalent hook (we use a Task started
+   from ImageGlassApp.init() that is intentionally not awaited).
+   Net win: drops up to ~30 ms on first launch, ~1-2 ms on warm
+   launches (and avoids the synchronous PerformanceLog trace pair).
+
+B) Run independent bootstrap() steps in parallel.
+   bootstrap() today is strictly sequential. The independent pieces:
+     * loadConfig()                — disk read of igconfig.json
+     * loadSettings()              — disk read of settings.json
+     * themeStore.bootstrap()      — scans themes/ directory
+     * panelLayout.reloadFromDisk()— reads panels.json
+     * AppPaths.ensure* directory creation (must happen first)
+     * WindowRegistryBootstrap.runIfNeeded() (must happen first)
+   We can run loadConfig / loadSettings / themeStore.bootstrap /
+   panelLayout.reloadFromDisk concurrently via async let after the
+   AppPaths + WindowRegistry steps. Net win: 5–15 ms inside the
+   AppLaunch.LoadDirectories window (which is itself before
+   FirstFrame for runs where bootstrap finishes fast).
+
+C) Defer non-critical post-bootstrap work.
+   These do not need to complete before first frame:
+     * startSelectionWatcher / startViewModeWatcher /
+       startSlideshowWatcher / startDirectoriesFileWatcher
+       (all just open kqueue file descriptors — small but real)
+     * startWatching (scopes dir kqueue)
+     * writeHeartbeat + startHeartbeatTimer
+     * for-loop scheduling walks for every storedRoot — these are
+       already async (scheduleWalk just enqueues) but the audit
+       logger call + correlation-id allocation per root is on the
+       hot path
+   Move all of these to a Task.detached after activate() finishes
+   so the viewer can paint as soon as the scope's resolvedFiles
+   are ready. Keep on critical path: AppPaths.ensure*, registry
+   bootstrap, config+settings+theme+panel loads, ensureExists for
+   directories.yaml (so the count is right), activate(scope), and
+   restoreLastSelectedFileIfAvailable.
+
+D) MCP server start (if any) — not visible in main.swift today,
+   but defer the same way if it shows up.
+
+New init sequence:
+  init():
+    handle --help
+    AppState() + applyLaunchArguments
+    fire-and-forget Task.detached { InitialConfigSeeder.seedIfMissing() }
+  bootstrap():
+    ensureDirectories (sequential, fast)
+    WindowRegistryBootstrap.runIfNeeded()
+    bind frontmost window
+    async let cfg = loadConfig(); async let stg = loadSettings();
+      async let thm = themeStore.bootstrap();
+      async let pnl = panelLayout.reloadFromDisk()
+    await all four
+    reconcilePanelsWithSettings + panelLayout.startWatching
+    LoadDirectories trace (storage.bootstrap + directories load)
+    activate(scopeNamed:) + restoreLastSelectedFileIfAvailable
+    Task.detached { all watchers + heartbeat + walk scheduling }
+
+Must remain on critical path: AppPaths, WindowRegistry, config,
+settings, panel layout, theme, scope activation + restore. Anything
+that the first viewer paint reads must be done before
+ContentView's first body resolution.

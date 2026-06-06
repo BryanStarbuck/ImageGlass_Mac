@@ -1,0 +1,60 @@
+FileWatcher.EventBatch perf optimization plan
+=============================================
+
+Observed: instance_count=68 avg=269ms min=250ms max=424ms total=18,325ms.
+
+Diagnosis
+---------
+The 250 ms floor matches the spec'd debounce window in FileWatcher.swift:
+    self.queue.asyncAfter(deadline: .now() + 0.25, execute: work)
+
+The trace currently starts on the FIRST kqueue event in a debounce window:
+    if self.pendingTrace == nil {
+        self.pendingTrace = PerformanceLog.shared.start("FileWatcher.EventBatch", ...)
+    }
+...and finishes inside the work item that fires after the 250 ms delay,
+AFTER onChange() runs. So the recorded duration is:
+    debounce_wait_remaining + onChange() work
+which is at minimum the full 250 ms window (because the first event resets
+the trace start, and the work item then waits ~250 ms before finishing).
+That 250 ms wait is intentional coalescing latency, not work, and it is
+NOT user-visible — onChange() is what the user perceives.
+
+Root cause: the perf trace wraps "wait + work" instead of "work only".
+
+Change
+------
+1. Stop starting the trace inside setEventHandler. Instead, start it
+   inside the DispatchWorkItem, immediately before calling onChange(),
+   and finish it immediately after. The trace then measures only the
+   coalesced batch processing time (the user-visible work).
+2. Keep the 250 ms debounce as-is. Spec §6.6 explicitly requires that
+   window to collapse bulk filesystem ops (cp -R, git checkout, etc.)
+   into a single re-evaluation. Lowering it risks N separate re-walks
+   during a directory copy. 250 ms is a reasonable FSEvents-style
+   coalesce window and is well under the human "instant" threshold.
+3. Preserve the coalesced event count semantic: increment
+   pendingEventCount on every kqueue event in the window, snapshot it
+   inside the work item, and emit it as the trace's count= payload.
+4. The work item already runs on self.queue (background, label
+   "ImageGlass.FileWatcher"), not main — no thread change needed.
+   onChange() is the caller's responsibility to hop to main if it
+   touches UI; that is unchanged by this fix.
+
+Sanity check — we do not lose events
+------------------------------------
+* pendingWorkItem?.cancel() + reschedule on every new event is unchanged,
+  so coalescing behavior is identical.
+* pendingEventCount is still incremented on every raw event and reset
+  only inside the (last) work item that actually fires.
+* The trace is no longer "kept alive across the window" — but its
+  count= payload still reflects the full coalesced batch because we
+  snapshot pendingEventCount inside the work item before calling
+  onChange().
+
+Expected post-fix numbers
+-------------------------
+min should drop from 250 ms to whatever onChange() actually costs
+(likely single-digit ms for an empty-scope re-eval, tens of ms for a
+small directory). avg should drop proportionally. max stays bounded by
+real work, not the debounce floor.

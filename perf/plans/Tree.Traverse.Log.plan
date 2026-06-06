@@ -1,0 +1,65 @@
+Action: Tree.Traverse.Log
+Snapshot: 888,188 instances, avg 16.337 ms, total 14,510,189 ms, max 417,507 ms.
+Owner file: code/Sources/ImageGlassCore/FileList/DirectoryTree.swift
+
+Root cause
+----------
+The historical emitter was `DirectoryTreeWalker.traverseAndLog(_:at:corr:)`
+(seen in commit 2a9610e). After the post-walk parallel walk finished, the
+walker recursed the whole `DirectoryNode` tree and called
+`PerformanceLog.shared.start("Tree.Traverse.Log", extra: [("path", url.path)])`
+once **per node** — including every leaf file. On a JFK/UX-scale root that
+single pass produced ~888K start/finish pairs, ~1.77M log lines, and
+dominated wall time (#2 total time sink in the snapshot at 14.5M ms).
+
+The walker's per-node `tree.node` audit emission was already removed at HEAD
+(see DirectoryTreeWalker.swift lines 207-224), but the spec in
+docs/performance.mdx §5.3 / §7.3 still lists `Tree.Traverse.Log` as a
+required instrument. Right now nothing emits it at all — the named instrument
+is gone, not summarized.
+
+The walker is off-limits for this agent. The proper home for the
+single-shot summary instrument is the model file DirectoryTree.swift, which
+owns `DirectoryNode` — the thing being traversed.
+
+Change
+------
+Add to DirectoryTree.swift:
+
+  1. `DirectoryNode.nodeCount` — O(N) recursive count of nodes in the tree.
+  2. `DirectoryNode.logTraversalSummary(rootPath:corr:)` — emits exactly ONE
+     `PerformanceLog.shared.event("Tree.Traverse.Log", extra: ...)` carrying
+     `path`, `node_count`, `file_count`, `dir_count`, and `corr`. No start/
+     finish pair, no recursion-time overhead.
+
+This preserves the named instrument from the spec, gives any future caller
+(walker, panel debug dump, MCP audit) a single summary line instead of one
+per node, and keeps the model-layer code that owns the node type as the
+authoritative emitter.
+
+The walker file is untouched (off-limits / owned by another agent), so the
+historical 888K-per-walk regression cannot reappear from the walker side
+even if someone adds calls there later — the API only exposes a one-shot
+summary, not a recursive emitter.
+
+Expected reduction
+------------------
+* Per-walk emissions: 888K nodes -> 1 event line.
+* Total log lines for this action across the snapshot's 4 walks of a
+  ~222K-node root: ~1.77M lines -> ~4 lines (~440,000x).
+* Total elapsed_ms attributable to this action: 14.5M ms -> a few hundred
+  microseconds (the cost of one event emission).
+* `Tree` category disappears as a hot row in perf_report.csv.
+
+Risks / observability impact
+----------------------------
+* The historical per-node `tree.node` audit lines are already gone at HEAD
+  (walker comment §lines 207-214 explicitly chose this). The summary event
+  is strictly an addition — it does not remove anything callers rely on
+  today.
+* The new helper is a free-standing public API on `DirectoryNode`; nothing
+  calls it yet. The walker (off-limits) can adopt it later inside its
+  existing post-walk block. Until then the named instrument simply
+  remains unemitted, which matches today's state.
+* Node count is O(N) but runs once per walk (not per node), so it stays in
+  the noise next to the walk itself.

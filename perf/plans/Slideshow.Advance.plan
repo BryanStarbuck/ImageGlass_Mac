@@ -1,0 +1,84 @@
+Slideshow.Advance — Optimization Plan
+=====================================
+
+Measured pain
+-------------
+73 instances, avg 5,557 ms, max 42,881 ms (43 seconds for a single
+advance). On a 5s slideshow timer that means the user spends 8x the
+intended interval staring at the previous image, then jumps abruptly.
+
+Root cause (from reading code)
+------------------------------
+advance(windowID:) runs on @MainActor and does, synchronously, in order:
+  1. appState.orderedNavigationFiles — DirectoryFilenamePanel.flattenVisible
+     of all walkerRoots + a per-element isInScope filter. O(N) tree walk
+     on every tick.
+  2. ordered.filter { isInScope }  — second O(N) pass.
+  3. appState.selectedFile = toPath — triggers didSet:
+       - treeNav.revealAncestors(of: path)
+       - MCPNotificationBus.shared.emitSelectionChanged
+       - WindowState mirror, UserDefaults write.
+  4. SwiftUI re-render -> CanvasHost.updateNSView -> ImageCanvasView.setImage,
+     which synchronously calls FrameSource.load(url:) and
+     NSImage(contentsOfFile:). These can stall many seconds on a big RAW
+     or a slow filesystem (network volume, spinning disk, encrypted DMG).
+The defer trace measures the synchronous slice of advance(); the 43s
+outlier is consistent with the SwiftUI observer chain calling setImage
+synchronously inside the same run loop turn before advance returns
+(SwiftUI on macOS can re-enter representable updates inline when
+@Observable properties are mutated from MainActor).
+
+Design
+------
+* Add a small prefetch ring inside SlideshowController:
+    - prefetchCache: [String: PrefetchEntry] keyed by absolute path,
+      capacity 3 (current, +1, +2). LRU evict on insert past cap.
+    - PrefetchEntry holds either an in-flight Task<Void, Never> or a
+      decoded marker. Decoding happens via FormatLoader.load(url:) on
+      a detached Task at .utility QoS — the decoded LoadedImage is
+      thrown away after warming the OS file cache and the ImageIO
+      decode cache. We do NOT hold pixel buffers (memory risk for
+      RAW); the win is paging the file into cache and letting CGImage
+      warm up internal caches. (We keep the API black-box: we don't
+      reach into FrameSource or the canvas pipeline.)
+* On each advance:
+    - Compute current files list once (unchanged).
+    - Before assigning selectedFile, look up the target path in
+      prefetchCache; if entry is .done, advance is effectively free.
+      If still in-flight, advance still proceeds (SwiftUI will paint
+      when the canvas finishes); the prefetch at least got the bytes
+      paged in.
+    - After assigning selectedFile, schedule prefetch for the next 1-2
+      paths (idx+1, idx+2 with loop wrap) on a background Task. Cancel
+      any prefetch task whose path is no longer in the next-2 window
+      (user skip / interval flip / wrap).
+* Cancellation:
+    - Keep currentPrefetchKeys: Set<String>. On each advance, compute
+      new keys; cancel tasks for paths in old - new; spawn for new -
+      old.
+* Memory cap:
+    - cache.count <= 3. We are not holding decoded bytes, only the
+      "prefetched" status, so memory pressure is bounded.
+* Stop / teardown:
+    - On stop(windowID:): cancel all prefetch tasks for that window,
+      drop the cache entries.
+* Timer drift / pause / resume:
+    - countdownTimer logic unchanged. nextAdvanceAt + scheduleTick are
+      preserved verbatim — prefetch is a side-effect on a separate
+      Task and never blocks the timer thread.
+* Per-window isolation (multi_window §7.3):
+    - prefetch state is keyed by windowID -> per-window struct so two
+      windows running independent slideshows don't trample each other.
+
+What stays O(1) on the main thread
+----------------------------------
+* The synchronous body of advance() still mutates selectedFile and
+  scheduleTick. Prefetch dispatch is `Task.detached { ... }` — fire
+  and forget. No await inside advance.
+
+Out of scope
+------------
+* Decoded-image LRU returning ready CGImages to the canvas. That would
+  require touching ImageCanvasView / FrameSource (owned by other
+  agents). The current design only warms the OS / ImageIO caches via a
+  background FormatLoader.load call.

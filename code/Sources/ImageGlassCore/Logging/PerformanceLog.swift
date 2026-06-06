@@ -59,17 +59,34 @@ public final class PerformanceLog: @unchecked Sendable {
     /// trace is its count at the moment of `start`.
     private var instanceCounters: [String: Int] = [:]
 
+    /// Per-action sampling rate. Value N means "emit one in every N
+    /// start/finish pairs to disk; drop the rest." A missing entry or
+    /// a value of 1 means "emit every pair" (the default and the
+    /// pre-existing behaviour). See `setSampling(action:oneInN:)`.
+    private var samplingOneInN: [String: Int] = [:]
+
+    /// Per-action counter of pairs dropped under sampling since the
+    /// last summary line was emitted. Flushed by an internal threshold
+    /// or by `flush()`.
+    private var droppedSinceSummary: [String: Int] = [:]
+
+    /// Drop threshold at which we emit one `phase=sampled_summary` line
+    /// per action so the analyzer can see the true call rate even when
+    /// most pairs are sampled out.
+    private let droppedSummaryThreshold: Int = 1024
+
+    /// Cached fixed-width `YYYY-MM-DDTHH:MM:SS` prefix for the wall-clock
+    /// second `cachedPrefixSecond` (reference-date integer seconds, UTC).
+    /// Reset when a new second rolls over. Guarded by `lock`.
+    private var cachedPrefixSecond: Int64 = .min
+    private var cachedPrefixBytes: [UInt8] = []
+
     private let lock = NSLock()
-    private let dateFormatter: ISO8601DateFormatter
     private let signposter: OSSignposter
     private let sink: LogSink
 
     public init(overrideLogFile: URL? = nil) {
         self.overrideLogFile = overrideLogFile
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        f.timeZone = TimeZone.current
-        self.dateFormatter = f
         self.signposter = OSSignposter(
             subsystem: "org.imageglass.mac",
             category: "performance"
@@ -95,7 +112,40 @@ public final class PerformanceLog: @unchecked Sendable {
     /// this at shutdown so an in-flight `phase=finish` line lands
     /// before the process exits.
     public func flush() {
+        flushSampledSummaries()
         sink.flush()
+    }
+
+    // MARK: - Sampling API
+
+    /// Throttle the named action so only one in every `oneInN` start/finish
+    /// pairs lands on disk. The remaining pairs are dropped entirely
+    /// (no format, no I/O). A periodic `phase=sampled_summary` line is
+    /// emitted so the analyzer still sees the true call rate.
+    ///
+    /// `oneInN <= 1` clears any sampling for that action.
+    /// Defaults to no sampling for every action — behaviour is identical
+    /// to the pre-sampling logger until callers opt in.
+    public func setSampling(action: String, oneInN: Int) {
+        lock.lock()
+        if oneInN <= 1 {
+            samplingOneInN.removeValue(forKey: action)
+        } else {
+            samplingOneInN[action] = oneInN
+        }
+        lock.unlock()
+    }
+
+    public func clearSampling(action: String) {
+        lock.lock()
+        samplingOneInN.removeValue(forKey: action)
+        lock.unlock()
+    }
+
+    public func clearAllSampling() {
+        lock.lock()
+        samplingOneInN.removeAll(keepingCapacity: true)
+        lock.unlock()
     }
 
     // MARK: - Public API
@@ -121,15 +171,31 @@ public final class PerformanceLog: @unchecked Sendable {
         guard enabled else {
             return PerformanceTrace.disabled(action: action, owner: self)
         }
-        // Reserve the instance number for this action and the start
-        // timestamp under the same lock so two threads racing on the
-        // same action get distinct, monotonically ordered instances.
+        // Reserve the instance number for this action under the lock so
+        // two threads racing on the same action get distinct, monotonic
+        // instances. The sampling decision is made inside the same
+        // critical section so the start/finish pair stays atomic.
         lock.lock()
         let count = (instanceCounters[action] ?? 0) + 1
         instanceCounters[action] = count
+        let sampled = decideSampledLocked(action: action, instance: count)
         lock.unlock()
 
         let started = DispatchTime.now()
+
+        if !sampled {
+            // Dropped pair: no I/O, no formatting, no signposter. The
+            // trace handle still returns so the caller's `finish()` is a
+            // no-op of the same shape — keeps call sites simple.
+            recordDroppedStart(action: action)
+            return PerformanceTrace.skipped(
+                action: action,
+                instance: count,
+                owner: self,
+                startedAt: started
+            )
+        }
+
         let corr = Self.newCorrelationId()
         let startedWall = Date()
 
@@ -146,15 +212,16 @@ public final class PerformanceLog: @unchecked Sendable {
             signpostState = nil
         }
 
-        // Write the `phase=start` line.
-        var pairs: [(String, String)] = [
-            ("phase", "start"),
-            ("action", action),
-            ("instance", String(count)),
-            ("corr", corr),
-        ]
-        pairs.append(contentsOf: extra)
-        append(line: render(pairs: pairs, at: startedWall))
+        // Write the `phase=start` line. Built-in pairs never need
+        // quoting; only the user's `extra` runs through the escape path.
+        let line = renderStart(
+            action: action,
+            instance: count,
+            corr: corr,
+            extra: extra,
+            at: startedWall
+        )
+        sink.write(Data(line.utf8))
 
         return PerformanceTrace(
             owner: self,
@@ -179,17 +246,23 @@ public final class PerformanceLog: @unchecked Sendable {
         lock.lock()
         let count = (instanceCounters[action] ?? 0) + 1
         instanceCounters[action] = count
+        let sampled = decideSampledLocked(action: action, instance: count)
         lock.unlock()
+        if !sampled {
+            recordDroppedStart(action: action)
+            return
+        }
 
         let corr = Self.newCorrelationId()
-        var pairs: [(String, String)] = [
-            ("phase", "event"),
-            ("action", action),
-            ("instance", String(count)),
-            ("corr", corr),
-        ]
-        pairs.append(contentsOf: extra)
-        append(line: render(pairs: pairs, at: Date()))
+        let line = renderSingle(
+            phase: "event",
+            action: action,
+            instance: count,
+            corr: corr,
+            extra: extra,
+            at: Date()
+        )
+        sink.write(Data(line.utf8))
 
         if mirrorToSignposter {
             let name = Self.staticName(for: action)
@@ -215,16 +288,16 @@ public final class PerformanceLog: @unchecked Sendable {
         let elapsedNanos = endedAt.uptimeNanoseconds &- startedAt.uptimeNanoseconds
         let elapsedMs = Int(elapsedNanos / 1_000_000)
 
-        var pairs: [(String, String)] = [
-            ("phase", "finish"),
-            ("action", action),
-            ("instance", String(instance)),
-            ("corr", corr),
-            ("elapsed_ms", String(elapsedMs)),
-        ]
-        if let reason { pairs.append(("reason", reason)) }
-        pairs.append(contentsOf: extra)
-        append(line: render(pairs: pairs, at: Date()))
+        let line = renderFinish(
+            action: action,
+            instance: instance,
+            corr: corr,
+            elapsedMs: elapsedMs,
+            reason: reason,
+            extra: extra,
+            at: Date()
+        )
+        sink.write(Data(line.utf8))
 
         if mirrorToSignposter, let signpostState {
             let name = Self.staticName(for: action)
@@ -233,45 +306,302 @@ public final class PerformanceLog: @unchecked Sendable {
         _ = signpostID // silence unused when signposter mirror is off
     }
 
-    // MARK: - File I/O
+    // MARK: - Sampling internals
 
-    private func append(line: String) {
-        guard let data = line.data(using: .utf8) else {
-            ErrorLog.log("failed to encode performance line", class: "PerformanceLog")
-            return
-        }
-        sink.write(data)
+    /// Decide whether this `(action, instance)` pair lands on disk. The
+    /// caller holds `lock`. We use modulo on the instance counter so
+    /// the decision is deterministic and the start/finish phases agree
+    /// (the instance number is the same on both sides).
+    private func decideSampledLocked(action: String, instance: Int) -> Bool {
+        guard let n = samplingOneInN[action], n > 1 else { return true }
+        // instance 1, 1+n, 1+2n, ... land on disk. instance 1 always
+        // lands so the first occurrence of every action is captured.
+        return ((instance - 1) % n) == 0
     }
 
-    // MARK: - Formatting
-
-    private func render(pairs: [(String, String)], at when: Date) -> String {
-        var line = "ts=\(dateFormatter.string(from: when))"
-        for (k, v) in pairs {
-            line += " "
-            line += k
-            line += "="
-            line += format(value: v)
+    /// Record a dropped start under sampling. May trigger one summary
+    /// line if we've crossed the threshold for this action.
+    private func recordDroppedStart(action: String) {
+        lock.lock()
+        let dropped = (droppedSinceSummary[action] ?? 0) + 1
+        droppedSinceSummary[action] = dropped
+        let shouldEmit = dropped >= droppedSummaryThreshold
+        if shouldEmit { droppedSinceSummary[action] = 0 }
+        lock.unlock()
+        if shouldEmit {
+            emitSampledSummary(action: action, dropped: dropped)
         }
+    }
+
+    /// Emit any pending sampled-summary lines so the analyzer has the
+    /// final tally before the process exits. Called from `flush()`.
+    private func flushSampledSummaries() {
+        lock.lock()
+        let snapshot = droppedSinceSummary.filter { $0.value > 0 }
+        droppedSinceSummary.removeAll(keepingCapacity: true)
+        lock.unlock()
+        for (action, dropped) in snapshot {
+            emitSampledSummary(action: action, dropped: dropped)
+        }
+    }
+
+    private func emitSampledSummary(action: String, dropped: Int) {
+        guard enabled else { return }
+        let now = Date()
+        var line = String()
+        line.reserveCapacity(96)
+        appendTimestamp(into: &line, at: now)
+        line += " phase=sampled_summary action="
+        appendEscapedIfNeeded(value: action, into: &line)
+        line += " dropped="
+        line += String(dropped)
+        line += "\n"
+        sink.write(Data(line.utf8))
+    }
+
+    // MARK: - Formatting (hot path)
+
+    /// Build a `phase=start` line. The four built-in pairs (phase,
+    /// action, instance, corr) never need quoting. Only the user's
+    /// `extra` runs through the escape branch.
+    private func renderStart(
+        action: String,
+        instance: Int,
+        corr: String,
+        extra: [(String, String)],
+        at when: Date
+    ) -> String {
+        var line = String()
+        line.reserveCapacity(160)
+        appendTimestamp(into: &line, at: when)
+        line += " phase=start action="
+        appendEscapedIfNeeded(value: action, into: &line)
+        line += " instance="
+        line += String(instance)
+        line += " corr="
+        line += corr
+        appendExtras(extra, into: &line)
         line += "\n"
         return line
     }
 
-    private func format(value: String) -> String {
-        if value.contains(" ") || value.contains("=") || value.contains("\t")
-            || value.contains("\n") {
-            let escaped = value.replacingOccurrences(of: "\"", with: "\\\"")
-            return "\"\(escaped)\""
+    private func renderFinish(
+        action: String,
+        instance: Int,
+        corr: String,
+        elapsedMs: Int,
+        reason: String?,
+        extra: [(String, String)],
+        at when: Date
+    ) -> String {
+        var line = String()
+        line.reserveCapacity(176)
+        appendTimestamp(into: &line, at: when)
+        line += " phase=finish action="
+        appendEscapedIfNeeded(value: action, into: &line)
+        line += " instance="
+        line += String(instance)
+        line += " corr="
+        line += corr
+        line += " elapsed_ms="
+        line += String(elapsedMs)
+        if let reason {
+            line += " reason="
+            appendEscapedIfNeeded(value: reason, into: &line)
         }
-        return value
+        appendExtras(extra, into: &line)
+        line += "\n"
+        return line
     }
 
-    public static func newCorrelationId() -> String {
-        var bytes = [UInt8](repeating: 0, count: 4)
-        for i in 0..<bytes.count {
-            bytes[i] = UInt8.random(in: 0...255)
+    private func renderSingle(
+        phase: String,
+        action: String,
+        instance: Int,
+        corr: String,
+        extra: [(String, String)],
+        at when: Date
+    ) -> String {
+        var line = String()
+        line.reserveCapacity(160)
+        appendTimestamp(into: &line, at: when)
+        line += " phase="
+        line += phase
+        line += " action="
+        appendEscapedIfNeeded(value: action, into: &line)
+        line += " instance="
+        line += String(instance)
+        line += " corr="
+        line += corr
+        appendExtras(extra, into: &line)
+        line += "\n"
+        return line
+    }
+
+    private func appendExtras(
+        _ pairs: [(String, String)],
+        into line: inout String
+    ) {
+        for (k, v) in pairs {
+            line += " "
+            line += k
+            line += "="
+            appendEscapedIfNeeded(value: v, into: &line)
         }
-        return bytes.map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Append `value` to `line`, wrapping in quotes only if it contains
+    /// whitespace, `=`, or a quote/newline. Common identifier values
+    /// (dotted action names, hex correlation ids, integers) take the
+    /// fast path with zero scanning beyond a single pass over the
+    /// characters of `value`.
+    private func appendEscapedIfNeeded(value: String, into line: inout String) {
+        var needsQuoting = false
+        for u in value.utf8 {
+            if u == 0x20 /* space */ || u == 0x3D /* = */
+                || u == 0x09 /* tab */ || u == 0x0A /* \n */
+                || u == 0x22 /* " */ {
+                needsQuoting = true
+                break
+            }
+        }
+        if !needsQuoting {
+            line += value
+            return
+        }
+        line += "\""
+        // Slow branch: escape embedded quotes.
+        if value.contains("\"") {
+            line += value.replacingOccurrences(of: "\"", with: "\\\"")
+        } else {
+            line += value
+        }
+        line += "\""
+    }
+
+    /// Append `YYYY-MM-DDTHH:MM:SS.mmmZ ` to `line`. The seconds
+    /// component is cached per integer-second of reference time; only
+    /// the milliseconds suffix is rebuilt per call. ~30 ns per emission
+    /// in the cache-hit case vs ~1-2 us for `ISO8601DateFormatter`.
+    private func appendTimestamp(into line: inout String, at when: Date) {
+        let interval = when.timeIntervalSinceReferenceDate
+        let wholeSeconds = Int64(interval.rounded(.down))
+        let fractional = interval - Double(wholeSeconds)
+        var millis = Int(fractional * 1000.0)
+        if millis < 0 { millis = 0 }
+        if millis > 999 { millis = 999 }
+
+        lock.lock()
+        if wholeSeconds != cachedPrefixSecond {
+            cachedPrefixBytes = Self.formatSecondPrefixUTC(
+                refSeconds: wholeSeconds
+            )
+            cachedPrefixSecond = wholeSeconds
+        }
+        // Append the cached "ts=YYYY-MM-DDTHH:MM:SS" bytes verbatim.
+        let prefix = cachedPrefixBytes
+        lock.unlock()
+
+        // Manually convert the cached ASCII bytes back to String. The
+        // bytes are guaranteed ASCII so this is a cheap UTF-8 decode.
+        line += String(decoding: prefix, as: UTF8.self)
+        line += "."
+        // Pad to 3 digits.
+        if millis < 10 {
+            line += "00"
+        } else if millis < 100 {
+            line += "0"
+        }
+        line += String(millis)
+        line += "Z"
+    }
+
+    /// Build the ASCII bytes for `ts=YYYY-MM-DDTHH:MM:SS` (no millis,
+    /// no `Z`) for the given seconds-since-reference-date in UTC. Uses
+    /// the proleptic Gregorian calendar via the same `civil_from_days`
+    /// arithmetic Howard Hinnant published — branch-free and faster
+    /// than touching `Calendar` or `DateFormatter`.
+    private static func formatSecondPrefixUTC(refSeconds: Int64) -> [UInt8] {
+        // 978307200 = seconds from Unix epoch (1970) to reference date
+        // (2001-01-01 00:00:00 UTC).
+        let unixSeconds = refSeconds + 978_307_200
+        let secondsPerDay: Int64 = 86_400
+        var days = unixSeconds / secondsPerDay
+        var sod = unixSeconds - days * secondsPerDay
+        if sod < 0 { sod += secondsPerDay; days -= 1 }
+
+        let hour = Int(sod / 3600)
+        let minute = Int((sod % 3600) / 60)
+        let second = Int(sod % 60)
+
+        // Hinnant civil_from_days (Unix-epoch day count → Y/M/D).
+        let z = days + 719_468
+        let era = (z >= 0 ? z : z - 146_096) / 146_097
+        let doe = Int(z - era * 146_097) // [0, 146096]
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365 // [0, 399]
+        let yInt = Int(yoe) + Int(era) * 400
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100) // [0, 365]
+        let mp = (5 * doy + 2) / 153 // [0, 11]
+        let day = doy - (153 * mp + 2) / 5 + 1 // [1, 31]
+        let month = mp < 10 ? mp + 3 : mp - 9 // [1, 12]
+        let year = yInt + (month <= 2 ? 1 : 0)
+
+        var out = [UInt8]()
+        out.reserveCapacity(22)
+        // "ts=" + year(4) + "-" + month(2) + "-" + day(2) + "T"
+        // + hour(2) + ":" + min(2) + ":" + sec(2) = 22 bytes.
+        out.append(0x74) // 't'
+        out.append(0x73) // 's'
+        out.append(0x3D) // '='
+        appendASCII4(&out, year)
+        out.append(0x2D) // '-'
+        appendASCII2(&out, month)
+        out.append(0x2D) // '-'
+        appendASCII2(&out, day)
+        out.append(0x54) // 'T'
+        appendASCII2(&out, hour)
+        out.append(0x3A) // ':'
+        appendASCII2(&out, minute)
+        out.append(0x3A) // ':'
+        appendASCII2(&out, second)
+        return out
+    }
+
+    @inline(__always)
+    private static func appendASCII4(_ out: inout [UInt8], _ value: Int) {
+        let v = value < 0 ? 0 : value
+        out.append(UInt8(0x30 + (v / 1000) % 10))
+        out.append(UInt8(0x30 + (v / 100) % 10))
+        out.append(UInt8(0x30 + (v / 10) % 10))
+        out.append(UInt8(0x30 + v % 10))
+    }
+
+    @inline(__always)
+    private static func appendASCII2(_ out: inout [UInt8], _ value: Int) {
+        let v = value < 0 ? 0 : value
+        out.append(UInt8(0x30 + (v / 10) % 10))
+        out.append(UInt8(0x30 + v % 10))
+    }
+
+    /// 8 lowercase hex chars from 32 random bits. Cheaper than the
+    /// previous `[UInt8]` + `String(format:)` + `joined()` pipeline:
+    /// one `SystemRandomNumberGenerator.next()` call, one tight loop.
+    public static func newCorrelationId() -> String {
+        var rng = SystemRandomNumberGenerator()
+        var v = rng.next() as UInt32
+        // Build right-to-left into a fixed 8-byte buffer.
+        let hex: [UInt8] = [
+            0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37,
+            0x38, 0x39, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66,
+        ]
+        var buf = [UInt8](repeating: 0, count: 8)
+        var i = 7
+        while i >= 0 {
+            buf[i] = hex[Int(v & 0x0F)]
+            v >>= 4
+            i -= 1
+        }
+        return String(decoding: buf, as: UTF8.self)
     }
 
     /// `OSSignposter` requires a `StaticString` for the action name.
@@ -322,6 +652,9 @@ public final class PerformanceTrace: @unchecked Sendable {
     private let lock = NSLock()
     private var closed: Bool = false
     private let isDisabled: Bool
+    /// True for traces that were dropped by the sampling rate. `finish`
+    /// on a skipped trace is a no-op so call sites stay uniform.
+    private let isSkipped: Bool
 
     fileprivate init(
         owner: PerformanceLog,
@@ -342,6 +675,7 @@ public final class PerformanceTrace: @unchecked Sendable {
         self.signpostID = signpostID
         self.signpostState = signpostState
         self.isDisabled = false
+        self.isSkipped = false
     }
 
     private init(disabledAction action: String, owner: PerformanceLog) {
@@ -354,11 +688,46 @@ public final class PerformanceTrace: @unchecked Sendable {
         self.signpostID = .invalid
         self.signpostState = nil
         self.isDisabled = true
+        self.isSkipped = false
+        self.closed = true
+    }
+
+    private init(
+        skippedAction action: String,
+        instance: Int,
+        owner: PerformanceLog,
+        startedAt: DispatchTime
+    ) {
+        self.owner = owner
+        self.action = action
+        self.instance = instance
+        self.corr = "00000000"
+        self.startedAt = startedAt
+        self.startedWall = Date()
+        self.signpostID = .invalid
+        self.signpostState = nil
+        self.isDisabled = false
+        self.isSkipped = true
+        // `closed = true` so `finish` / deinit are pure no-ops.
         self.closed = true
     }
 
     fileprivate static func disabled(action: String, owner: PerformanceLog) -> PerformanceTrace {
         PerformanceTrace(disabledAction: action, owner: owner)
+    }
+
+    fileprivate static func skipped(
+        action: String,
+        instance: Int,
+        owner: PerformanceLog,
+        startedAt: DispatchTime
+    ) -> PerformanceTrace {
+        PerformanceTrace(
+            skippedAction: action,
+            instance: instance,
+            owner: owner,
+            startedAt: startedAt
+        )
     }
 
     /// Write the matching `phase=finish` line. Subsequent calls are
@@ -391,7 +760,7 @@ public final class PerformanceTrace: @unchecked Sendable {
         }
         closed = true
         lock.unlock()
-        guard !isDisabled, let owner else { return }
+        guard !isDisabled, !isSkipped, let owner else { return }
         owner.finish(
             action: action,
             instance: instance,
@@ -407,7 +776,7 @@ public final class PerformanceTrace: @unchecked Sendable {
     deinit {
         // Caller dropped the trace without calling `finish`. Auto-close
         // so we still see the duration.
-        if !closed, !isDisabled {
+        if !closed, !isDisabled, !isSkipped {
             complete(reason: "auto_finish", extra: [])
         }
     }

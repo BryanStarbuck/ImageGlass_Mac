@@ -1,0 +1,78 @@
+FileTree.Collapse / Expand — performance plan
+=============================================
+
+Owner: code/Sources/ImageGlass/FileList/FileListTreeView.swift
+Scope: FileTree.Collapse, FileTree.Expand, FileTree.SelectionChange (Tree-mode view)
+Out of scope: SelectableTreeRenderer SwiftUI/AppKit/Catalyst variants (separate
+  agent owns those if needed), DirectoryTree.swift, PerformanceLog.
+
+
+Measured baseline (perf/perf_report.csv)
+----------------------------------------
+* FileTree.Collapse        : 10 events, avg 223.9 ms, total 2,239 ms, max 895 ms
+* FileTree.Expand          : 2  events, avg 130   ms, total   260 ms, max 135 ms
+* FileTree.SelectionChange : 13 events, avg  15   ms, total   196 ms, max  26 ms
+
+Target: collapse / expand p95 < 16 ms (one display frame at 60 Hz).
+
+
+Root cause
+----------
+1. `FileListTreeView.body` walks the entire `FileListTreeNode` tree on every
+   redraw with a recursive `nodeView(...) -> AnyView` helper. `AnyView` erases
+   structural identity, so SwiftUI cannot skip unchanged subtrees — every
+   `@State expanded` mutation re-evaluates EVERY node, including descendants
+   of folders that are still collapsed.
+2. Inside the leaf branch, `entry(forPath:)` does
+   `model.visibleEntries.first(where: { $0.path == path })` — an O(N) linear
+   scan per file row. With M visible rows and N total visible entries, every
+   collapse/expand redraw costs O(M*N). On a moderate tree (e.g. 1k files in
+   a few hundred folders) this hits 10^5..10^6 string compares.
+3. The outer container is a plain `ScrollView { VStack { ForEach ... } }`
+   rather than `LazyVStack`, so all off-screen rows are also materialized,
+   multiplying the AnyView penalty.
+4. `buildTree()` itself is cached on the view model — that is not the
+   bottleneck. The bottleneck is the view-tree rebuild + the per-row scan.
+
+
+Fix
+---
+A. Maintain a flat list of "visible rows" (`Row` = node id, depth, kind) keyed
+   by (tree identity, expanded-set). Build it once eagerly via DFS, then mutate
+   incrementally on collapse/expand:
+   * Collapse(id): find the row, splice out the contiguous range of rows whose
+     depth > collapsed row's depth, stopping at the next sibling. O(visible
+     descendants), not O(total tree).
+   * Expand(id): DFS the node's subtree honoring the expanded set, splice the
+     resulting rows in after the expanded row.
+   The visible-row list is invalidated wholesale only when `buildTree()`
+   returns a new tree (identity tracked via `ObjectIdentifier`-equivalent —
+   we compare the root-id list and entry count, sufficient since rebuilds
+   funnel through `rebuildVisible`).
+B. Precompute `pathToEntry: [String: FileEntry]` once per tree build. Replaces
+   the per-row O(N) scan with O(1).
+C. Render via `LazyVStack` over the flat row list with `ForEach(rows, id: \.id)`.
+   Stable string IDs let SwiftUI diff cheaply. Drop the recursive `AnyView`
+   helper entirely.
+D. Thread model: all work stays on the main actor — the flat-list mutation is
+   trivial (microseconds for typical trees) and SwiftUI requires main-thread
+   state mutation. No `Task.detached` is justified at this size.
+
+
+What stays cached
+-----------------
+* `cachedTree` in the view model — unchanged.
+* `flatRows` keyed by tree-snapshot fingerprint — new, owned by the view.
+* `pathToEntry` dictionary — new, rebuilt only when the tree fingerprint
+  changes.
+* `expanded: Set<String>` — unchanged semantically, but now drives incremental
+  mutation rather than full re-walk.
+
+
+Expected impact
+---------------
+* Collapse / Expand: O(visible-descendants-of-toggled-node) row mutation +
+  one LazyVStack diff. Sub-millisecond row math; SwiftUI diff bounded by the
+  delta. Target met (< 16 ms p95).
+* SelectionChange: also benefits from the path→entry dict — drops from O(N)
+  to O(1) per row that needs to read its entry.

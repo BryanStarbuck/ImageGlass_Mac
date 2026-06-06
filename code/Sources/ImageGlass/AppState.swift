@@ -322,8 +322,36 @@ public final class AppState {
             {
                 bindToFrontmostWindow(firstWindow)
             }
-            await loadConfig()
-            await loadSettings()
+            // perf/plans/AppLaunch.Total.plan §B — the config disk reads
+            // (ConfigLoader is not actor-isolated, so we can run it on a
+            // detached background task) and the settings store
+            // (SettingsStore is an actor; loadOrDefault runs off the main
+            // actor anyway) are independent of each other. Run them in
+            // parallel and only `await` at the join point. On a warm
+            // cache the savings are small; on a cold cache (first launch,
+            // slow disk) this hides ~5–15 ms of duplicated JSON decode
+            // latency from the launch hot path.
+            let cliArgs = Array(CommandLine.arguments.dropFirst())
+            let configHandle = Task.detached(priority: .userInitiated) {
+                () -> (ConfigPaths, Config) in
+                let paths = ConfigPaths.resolve()
+                let cli = CLIOverrides.parse(cliArgs)
+                let loader = ConfigLoader(paths: paths)
+                do {
+                    let resolution = try loader.resolveAndPersist(cli: cli)
+                    return (paths, resolution.config)
+                } catch {
+                    ErrorLog.log("config load failed; using built-in defaults",
+                                 error: error, class: String(describing: AppState.self))
+                    NSLog("ImageGlass config load failed: \(error) — using built-in defaults")
+                    return (paths, .builtIn)
+                }
+            }
+            async let settingsTask: Settings = settingsStore.loadOrDefault()
+            let (loadedPaths, loadedConfig) = await configHandle.value
+            self.configPaths = loadedPaths
+            self.config = loadedConfig
+            self.settings = await settingsTask
             themeStore.bootstrap()
             PanelRegistry.shared.registerBuiltInPanels()
             panelLayout.reloadFromDisk()
@@ -364,24 +392,35 @@ public final class AppState {
             MCPAuditLogger.shared.logStartup(layout: "Browser", directoryCount: directoryCount)
             await refreshScopeList()
             await activate(scopeNamed: bootstrapped)
-            startWatching()
-            startSelectionWatcher()
-            startViewModeWatcher()
-            startSlideshowWatcher()
-            startDirectoryTreeWalkerObserver()
-            startDirectoriesFileWatcher()
-            writeHeartbeat()
-            startHeartbeatTimer()
-            // mcp_file.mdx §3A.5: the walker is "running even when the
-            // component is turned off" — so every root in
-            // directories.yaml is scheduled at boot. A relaunch with
-            // pre-existing roots repopulates the in-memory tree without
-            // the user re-adding anything.
-            for root in storedRoots {
-                let corr = MCPAuditLogger.newCorrelationId()
-                DirectoryTreeWalker.shared.scheduleWalk(
-                    root: root.path, filter: root.filter, corr: corr
-                )
+            // perf/plans/AppLaunch.Total.plan §C — none of the watchers,
+            // the heartbeat timer, the directory-tree walker observer, or
+            // the boot-time scheduleWalk loop need to complete before the
+            // first viewer paint. They all open kqueue file descriptors,
+            // post audit lines, and allocate correlation ids — costs
+            // that add up on the launch hot path. Defer to a main-actor
+            // Task so they land after FirstFrame.
+            let deferredRoots = storedRoots
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.startWatching()
+                self.startSelectionWatcher()
+                self.startViewModeWatcher()
+                self.startSlideshowWatcher()
+                self.startDirectoryTreeWalkerObserver()
+                self.startDirectoriesFileWatcher()
+                self.writeHeartbeat()
+                self.startHeartbeatTimer()
+                // mcp_file.mdx §3A.5: the walker is "running even when the
+                // component is turned off" — so every root in
+                // directories.yaml is scheduled at boot. A relaunch with
+                // pre-existing roots repopulates the in-memory tree without
+                // the user re-adding anything.
+                for root in deferredRoots {
+                    let corr = MCPAuditLogger.newCorrelationId()
+                    DirectoryTreeWalker.shared.scheduleWalk(
+                        root: root.path, filter: root.filter, corr: corr
+                    )
+                }
             }
             _loadDirsTrace.finish(extra: [
                 ("roots", String(storedRoots.count)),

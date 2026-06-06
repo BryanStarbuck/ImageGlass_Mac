@@ -35,11 +35,18 @@ struct ImageGlassApp: App {
             print(CLIArguments.helpText())
             exit(0)
         }
-        // First-launch seed: drop settings.yaml / panels.yaml into
-        // ~/Library/Application Support/ImageGlass_Mac/ before AppState
-        // wakes up, so a fresh machine has a complete starting state on
-        // disk instead of relying on in-memory defaults.
-        InitialConfigSeeder.seedIfMissing()
+        // perf/plans/AppLaunch.Total.plan §A — InitialConfigSeeder used
+        // to run synchronously here, which on a first launch did a YAML
+        // encode + atomic write of settings.yaml and panels.yaml before
+        // the first window could paint. The runtime stores (SettingsStore
+        // for JSON, PanelStateYAMLStore for layout) own their own writes
+        // at first user mutation, so the seeder is only there to make the
+        // files visible on disk for users poking around the Application
+        // Support directory. Detached at .utility so it runs off the
+        // launch path without blocking first frame.
+        Task.detached(priority: .utility) {
+            InitialConfigSeeder.seedIfMissing()
+        }
         let s = AppState()
         let parsed = ImageGlassLaunchArguments.parse(CommandLine.arguments)
         s.applyLaunchArguments(parsed)

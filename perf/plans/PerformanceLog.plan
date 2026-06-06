@@ -1,0 +1,139 @@
+PerformanceLog — performance plan
+=================================
+
+Owner: PerformanceLog.swift + LogSink.swift
+Scope: cut per-emission overhead and add a sampling lever.
+Out of scope: call-site reductions (other agents own DirectoryWalk,
+Tree.Traverse.Log, LocalStorage caching).
+
+
+Baseline observations from perf/perf_report.csv + source read
+-------------------------------------------------------------
+Hot paths emit 5.7M+ lines per session. Per emission today we pay:
+  1. NSLock acquire/release for instance-counter dict bump.
+  2. ISO8601DateFormatter.string(from:) — well-known slow, allocates
+     a CFDateFormatter result + Swift String every call.
+  3. [(String,String)] array build (copy-on-write, heap), then a
+     for-loop with `line += " "; line += k; line += "="; line +=
+     format(value:v)` — small Strings re-CoW the buffer each "+=".
+  4. format(value:) does up to 4 .contains scans + a replacingOccurrences
+     allocation, even though the actions log fixed identifiers that
+     never contain spaces or quotes.
+  5. line.data(using: .utf8) allocates a Data per emission.
+  6. corr id: 4 random bytes + 4 String(format:"%02x") allocations +
+     .joined() — String(format:) is heavy.
+  7. sink.write dispatches async — that part is fine. Verified
+     calling thread does not block on disk I/O for the production
+     path (synchronous == false). Tests use synchronous == true and
+     queue.sync — preserved as-is.
+
+
+Micro-optimisations
+-------------------
+M1. Fast wall-clock formatter.
+    Replace ISO8601DateFormatter with a hand-rolled fixed-width UTC
+    formatter. Cache the YYYY-MM-DDTHH:MM:SS prefix per integer second
+    of timeIntervalSinceReferenceDate; only the .mmmZ ms suffix is
+    rebuilt per call. Output stays ISO8601-with-millis (the docs
+    contract). Use UTC (suffix 'Z') — the old code used current TZ
+    but appended no offset, which was actually a bug; the canonical
+    log is now unambiguous UTC. Cache is guarded by the same NSLock
+    we already take for the instance counter — zero new locks.
+
+M2. Per-action atomic counters via os_unfair_lock-style fast path.
+    Keep the existing [String: Int] dict (action names are dynamic
+    strings, registering a static enum would force callers to change).
+    But shrink the critical section to a single dict bump and rip
+    String formatting out of the lock. Already mostly true today —
+    confirm and keep tight.
+
+M3. Build the line directly into a single String with reserveCapacity.
+    Skip the [(String,String)] intermediate. Inline writers append
+    "key=value " segments straight to a reusable per-call String with
+    a pre-reserved 160-byte capacity (covers the common case in one
+    allocation). Values that need quoting take a slow branch; the
+    99%-case "fixed identifier" branch does no scans (we know phase,
+    action, instance, corr, elapsed_ms never need quoting).
+
+M4. format(value:) only on extra pairs.
+    The four/five built-in pairs never contain whitespace/=/quotes.
+    Skip the scan for them; only run format(value:) on user-supplied
+    extras.
+
+M5. Drop the per-line .data(using:.utf8) allocation.
+    Use String.utf8 view via Data(line.utf8) which is a single
+    contiguous copy instead of going through the optional-returning
+    path. Marginal but free.
+
+M6. Cheaper correlation id.
+    Generate one UInt32 with arc4random_buf or SystemRandomNumberGenerator
+    .next() and emit 8 lowercase hex chars via a 16-byte LUT loop —
+    no String(format:), no array map+joined.
+
+
+New sampling API (additive — default off, behaviour preserved)
+--------------------------------------------------------------
+S1. Public surface:
+    PerformanceLog.shared.setSampling(action: String, oneInN: Int)
+    PerformanceLog.shared.clearSampling(action: String)
+    PerformanceLog.shared.clearAllSampling()
+
+S2. Semantics:
+    * One-in-N gates the start/finish PAIR atomically: if we drop
+      the start we MUST drop the finish, otherwise unpaired finish
+      lines confuse the analyzer.
+    * Decision lives in the trace handle (sampled: Bool). A "skipped"
+      trace runs no I/O, no format, no signposter calls. Instance
+      counter is still bumped — we want monotonic ordering even
+      across drops, and it's a single int increment.
+    * Drop accounting: per-action dropped-pair count. Every 1024
+      drops (or on flush()) emit one summary line:
+        phase=sampled_summary action=X dropped=N window_ms=M
+    * Default oneInN=1 (i.e. all emissions written) for every action.
+      Sampling map is empty → behaviour is byte-identical to today.
+
+S3. Thread-safety:
+    Sampling map is read on the hot path. Use a struct snapshot via
+    NSLock — held only for a dict read of one Int. Same lock as
+    instance counters (reduces cache lines).
+
+
+Thread-safety analysis
+----------------------
+* All shared state (instance counters, sampling map, second-cache for
+  the formatter) lives under PerformanceLog.lock. Lock is held only
+  for O(1) work — no allocs, no I/O. This is strictly less work than
+  today (today the lock wraps the counter, today's formatter sits
+  outside the lock — same pattern preserved).
+* PerformanceTrace stays @unchecked Sendable. Its `sampled` flag is
+  set at start and never mutated.
+* LogSink dispatch model is unchanged. We do not introduce a new queue.
+
+
+Tests to preserve
+-----------------
+Currently no PerformanceLog-named test exists, but the contract used
+by other tests is:
+  * overrideLogFile: URL forces synchronous mode → reads-after-write
+    must see the start/finish lines on disk.
+  * shared.enabled = false fully suppresses I/O.
+  * The line grammar with phase=/action=/instance=/corr= is parsed by
+    perf/parse_perf.js — keep grammar identical.
+  * `flush()` blocks until queued writes land.
+All preserved. swift build must pass. swift test must pass for any
+file that touches PerformanceLog (currently none direct).
+
+
+Estimated speedup per emission
+------------------------------
+Rough back-of-envelope, Apple Silicon:
+  * Old: ~3-6 microseconds per emission (ISO8601 ~1-2 us, dict+lock
+    ~150 ns, array+string formatting ~1 us, data alloc ~200 ns,
+    dispatch enqueue ~200 ns).
+  * New: ~700 ns - 1.2 us steady-state (cached prefix → ~30 ns
+    formatter; no [(String,String)] array; reserveCapacity single
+    alloc; cheaper corr id). 3-5x faster per call.
+  * With sampling on a hot action at oneInN=100: 100x fewer disk I/O,
+    100x less queue contention. End-to-end SingleDir log volume on
+    the worst path goes from millions of lines to tens of thousands
+    + one summary line per ~1024 drops.

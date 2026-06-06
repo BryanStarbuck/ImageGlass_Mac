@@ -94,6 +94,57 @@ public extension LoadDiagnosis {
 }
 
 public enum LoadDiagnostics {
+
+    // MARK: - Diagnosis result cache
+    //
+    // The same URL is diagnosed repeatedly within a session: FrameSource
+    // preflight, ThumbnailCache thumbnailer, SVGPlaybackController, and
+    // VideoPlaybackController all funnel through `diagnose(url:)`. The
+    // verdict is a pure function of (path, mtime, size), so we memoize.
+    // Cloud-placeholder verdicts are deliberately NOT cached because they
+    // can flip during the session as background downloads complete.
+
+    private struct CacheKey: Hashable {
+        let path: String
+        let mtime: Int64
+        let size: Int64
+    }
+
+    private static let cacheLock = NSLock()
+    private static var cache: [CacheKey: LoadDiagnosis] = [:]
+    private static var cacheOrder: [CacheKey] = []
+    private static let cacheLimit = 1024
+
+    private static func cacheGet(_ key: CacheKey) -> LoadDiagnosis? {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        return cache[key]
+    }
+
+    private static func cachePut(_ key: CacheKey, _ verdict: LoadDiagnosis) {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        if cache[key] == nil {
+            cacheOrder.append(key)
+            if cacheOrder.count > cacheLimit {
+                let drop = cacheOrder.removeFirst()
+                cache.removeValue(forKey: drop)
+            }
+        }
+        cache[key] = verdict
+    }
+
+    /// Invalidate any cached diagnosis for `url`. Call when the file was
+    /// replaced in a way that mtime parity may not catch.
+    public static func invalidateCache(for url: URL) {
+        let path = url.standardizedFileURL.path
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        let keys = cache.keys.filter { $0.path == path }
+        for k in keys { cache.removeValue(forKey: k) }
+        cacheOrder.removeAll { $0.path == path }
+    }
+
     /// Inspect the file at `url` and return the most-specific diagnosis.
     /// Order matters: cheaper / more specific checks come first so a Git
     /// LFS pointer in an iCloud folder reports "git-lfs", not "cloud".
@@ -106,10 +157,29 @@ public enum LoadDiagnostics {
         let fm = FileManager.default
         let path = url.path
 
+        // Single batched stat: pull isSymbolicLink + isDirectory + isRegular
+        // + fileSize + isReadable + mtime in one resourceValues call.
+        // On macOS this collapses what used to be 3-4 separate stat(2)
+        // syscalls into one getattrlist(2).
+        let rvKeys: Set<URLResourceKey> = [
+            .isSymbolicLinkKey,
+            .isDirectoryKey,
+            .isRegularFileKey,
+            .fileSizeKey,
+            .isReadableKey,
+            .contentModificationDateKey,
+        ]
+        let rv = try? url.resourceValues(forKeys: rvKeys)
+        let isSymlink = rv?.isSymbolicLink ?? false
+        let isDir = rv?.isDirectory ?? false
+        let fileSize = Int64(rv?.fileSize ?? 0)
+        let isReadable = rv?.isReadable ?? true
+        let mtime: Int64 = rv?.contentModificationDate
+            .map { Int64($0.timeIntervalSince1970) } ?? 0
+
         // 1. Symlink? Check the link itself before the target, so we can
         // distinguish a broken link from a plain missing file.
-        if let linkAttrs = try? fm.attributesOfItem(atPath: path),
-           (linkAttrs[.type] as? FileAttributeType) == .typeSymbolicLink {
+        if isSymlink {
             let target = try? fm.destinationOfSymbolicLink(atPath: path)
             // Resolve relative targets against the symlink's directory.
             let resolved: String? = target.map { t in
@@ -122,15 +192,27 @@ public enum LoadDiagnostics {
             }
         }
 
-        // 2. File presence. `fileExists` follows symlinks; if we got here
-        // after the symlink check, a "missing" verdict refers to the
-        // resolved target.
-        var isDir: ObjCBool = false
-        guard fm.fileExists(atPath: path, isDirectory: &isDir) else {
-            return .missing
-        }
-        if isDir.boolValue {
+        // 2. File presence + kind. resourceValues returning nil means the
+        // URL does not resolve. Confirm with fileExists for the missing /
+        // directory disambiguation.
+        if rv == nil {
+            var dirFlag: ObjCBool = false
+            guard fm.fileExists(atPath: path, isDirectory: &dirFlag) else {
+                return .missing
+            }
+            if dirFlag.boolValue {
+                return .generic("This path is a directory, not an image.")
+            }
+        } else if isDir {
             return .generic("This path is a directory, not an image.")
+        }
+
+        // Cache lookup keyed on (path, mtime, size). Checked AFTER the
+        // structural checks (missing / directory / broken symlink) since
+        // those have no business being cached.
+        let cacheKey = CacheKey(path: path, mtime: mtime, size: fileSize)
+        if let cached = cacheGet(cacheKey) {
+            return cached
         }
 
         // 3. Cloud-storage placeholder — iCloud Drive uses the ubiquitous
@@ -145,30 +227,40 @@ public enum LoadDiagnostics {
             // `.current` and `.downloaded` both mean "bytes are here";
             // `.notDownloaded` means a placeholder.
             if ubiquity != .current && ubiquity != .downloaded {
+                // Deliberately NOT cached — placeholder state is expected
+                // to flip mid-session as background downloads complete.
                 return .cloudPlaceholder(providerHint: providerHint(for: url))
             }
         }
 
-        // 4. Empty file.
-        let size = (try? fm.attributesOfItem(atPath: path)[.size] as? Int) ?? nil
-        if let size, size == 0 {
+        // 4. Empty file. Already known from fileSizeKey above.
+        if fileSize == 0 {
+            cachePut(cacheKey, .emptyFile)
             return .emptyFile
         }
 
-        // 5. Permission. `isReadableFile` is cheap and reflects the
-        // sandbox + POSIX permissions seen by *this process*, which is the
-        // permission that actually matters.
-        guard fm.isReadableFile(atPath: path) else {
+        // 5. Permission. The isReadableKey reflects the sandbox + POSIX
+        // permissions seen by *this process*, which is the permission that
+        // actually matters.
+        if !isReadable {
+            cachePut(cacheKey, .permissionDenied)
             return .permissionDenied
         }
 
-        // 6. Git LFS pointer. Check after the cheap file-presence checks
-        // because it requires opening the file.
-        if GitLFSPointer.isPointer(at: url) {
-            let repo = GitLFSPointer.repoRoot(for: url).map { AppPaths.contractTilde($0.path) }
-            return .gitLFSPointer(repoRoot: repo)
+        // 6. Git LFS pointer. Short-circuit by size — LFS pointers are
+        // <200 bytes by spec, so anything over 1 KB cannot be one.
+        // Skipping the FileHandle open here is where the LFSDetect cost
+        // goes from "every file" to "every <=1KB file".
+        if fileSize <= 1024 {
+            if GitLFSPointer.isPointer(at: url) {
+                let repo = GitLFSPointer.repoRoot(for: url).map { AppPaths.contractTilde($0.path) }
+                let verdict: LoadDiagnosis = .gitLFSPointer(repoRoot: repo)
+                cachePut(cacheKey, verdict)
+                return verdict
+            }
         }
 
+        cachePut(cacheKey, .ok)
         return .ok
     }
 

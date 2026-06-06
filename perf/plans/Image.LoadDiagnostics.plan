@@ -1,0 +1,88 @@
+Image.LoadDiagnostics + Image.LoadFrames + Image.Render perf plan
+=================================================================
+
+Observed (perf_report.csv, June 5 2026 capture):
+  Image.LoadDiagnostics  instance=194 avg=6.505 ms total=1,262 ms max=18 ms
+  Image.LoadFrames       instance=170 avg=10.006 ms total=1,701 ms max=22 ms
+  Image.Render           instance=270 avg=3.867 ms total=1,044 ms max=14 ms
+  Image.LFSDetect        instance=194 avg=1.237 ms total=240   ms max=4  ms
+
+Diagnosis
+---------
+1. LoadDiagnostics re-stat the file 3-4 times: symlink check (attributesOfItem),
+   fileExists, attributesOfItem again for size, isReadableFile. Each is a
+   syscall. None of them are cached. The same URL is diagnosed once by
+   FrameSource.load and again later by ThumbnailCache / SVG / Video for the
+   same file. That redundancy is the largest chunk of the 6.5 ms.
+
+2. LFS detection (LFSDetect, avg 1.2 ms) always opens the file with
+   FileHandle, even for files we just statted and that are megabytes in size
+   (a 5 MB JPEG cannot be a 130-byte LFS pointer — its size alone disqualifies
+   it). We can short-circuit by size.
+
+3. LoadFrames re-opens the CGImageSource a second time even though
+   FormatLoader has just opened the same file. Worse, it fully decodes EVERY
+   frame on first load (CGImageSourceCreateImageAtIndex in a for-loop). For a
+   100-frame GIF this is ~10x the work of decoding frame 0 alone — and we
+   only paint frame 0 immediately. The other frames are needed at delay
+   intervals, often hundreds of ms later.
+
+4. Render's 14 ms max is the colorChannel path: rebuildFilteredImage runs
+   CIFilter + ciContext.createCGImage on every channel change, but it is
+   also called on every applyFrame() (animation tick). For colorChannel ==
+   .all (the dominant case) it short-circuits — good. The remaining outlier
+   is the cost of ctx.draw with interpolationQuality = .high on a huge
+   CGImage. We cannot touch ImageCanvasView.swift to fix that; what we CAN
+   do is hand the canvas frames that are already "ready" (cached
+   CGImageSourceShouldCacheImmediately) so the implicit decode on first
+   draw is paid up front, not at paint time.
+
+Fixes
+-----
+* Diagnostics cache (LoadDiagnostics.swift): keyed by (path, mtime epoch,
+  size). Store the LoadDiagnosis verdict. Stored in a small OSAllocatedUn-
+  fairLock-protected dictionary with a 1024-entry FIFO cap. Hit rate will be
+  near 100% for ThumbnailCache + FrameSource + SVG/Video re-diagnosing the
+  same file; expected speedup: from avg 6.5 ms to ~0.1 ms on a hit.
+
+* Single-stat fast path (LoadDiagnostics.swift): read size + isDirectory +
+  isSymbolicLink from one URL.resourceValues(forKeys:) call instead of three
+  separate FileManager calls. ResourceValues is cached by the kernel
+  per-URL-instance for the duration of the call sequence; we still re-stat
+  on cache miss but pay once.
+
+* LFS short-circuit (LoadDiagnostics.swift): if file size > 1024, skip the
+  GitLFSPointer.isPointer probe entirely. LFS pointers are <200 bytes by
+  spec. Saves ~1.2 ms per non-LFS image (which is ~all of them).
+
+* Lazy frame decode (FrameSource.swift): change the eager
+  for i in 0..<count { CGImageSourceCreateImageAtIndex... } loop to:
+  - Read all frame PROPERTY dicts up-front (cheap — these are header reads,
+    not pixel decodes). This gives us frameCount, per-frame delay, and
+    hasDelay in O(count) header reads.
+  - Decode ONLY frame 0 eagerly so the canvas has something to paint.
+  - Keep the CGImageSource live in the FrameSource. On Frame.cgImage access
+    for index > 0, decode lazily and memoize.
+  This converts the GIF-with-100-frames case from "decode 100 frames now"
+  to "decode 1 now + 99 just-in-time as the animation timer ticks".
+
+* Shared CGImageSource across passes: FrameSource.load already opens a
+  CGImageSource. We expose an internal init that accepts a pre-opened
+  source so the FormatLoader/FrameSource sequence can share the open in the
+  future. (Cross-agent call-site changes are out of scope here per the
+  agent boundary; the API is added but FormatLoader stays untouched.)
+
+* Render outlier mitigation (data side only): when we decode frame 0, pass
+  kCGImageSourceShouldCacheImmediately so the bitmap is materialized at
+  decode time, not lazily on first draw. The 14 ms max paint is exactly
+  this lazy-decode-on-draw cost (ImageIO defers pixel materialization
+  until the CGImage is sampled). Forcing immediate cache moves the work
+  out of the Image.Render trace and into Image.LoadFrames, where it
+  belongs — and where it can be amortized into a single bigger trace
+  instead of a frame-time stutter.
+
+Out of scope
+------------
+* ImageCanvasView.swift and ImageViewer.swift edits (other agent owns).
+* FormatLoader integration of the shared CGImageSource (other agent).
+* Background-thread move (per the agent brief, do not spin threads here).

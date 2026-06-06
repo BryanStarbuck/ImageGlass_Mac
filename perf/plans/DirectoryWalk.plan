@@ -1,0 +1,134 @@
+DirectoryWalk family — performance plan
+=======================================
+
+Owner: DirectoryTreeWalker.swift
+Scope: SingleDir / Parallel / Run / Schedule / Refilter / Remove
+Out of scope: PerformanceLog mechanism, log thresholds, Tree.Traverse.Log, FileTree.Collapse
+
+
+Measured baseline (perf/perf_report.csv)
+----------------------------------------
+* DirectoryWalk.SingleDir : 2,852,492 events, total 135,829,464 ms, max 884,237 ms
+* DirectoryWalk.Parallel  :        21 calls, avg 630,501 ms, max 1,081,730 ms (~18 min)
+* DirectoryWalk.Run       :         6 calls, avg  21,291 ms,  max  92,736 ms
+* DirectoryWalk.Schedule  :        43 calls, avg     0.79 ms
+* DirectoryWalk.Refilter  :       378 calls, ~0 ms
+* DirectoryWalk.Remove    :        36 calls, ~0 ms
+
+Schedule/Refilter/Remove are already cheap. Focus = SingleDir, Parallel, Run.
+
+
+Root-cause analysis
+-------------------
+1. Re-walks of the same root.
+   The perf log shows the Dropbox "Starbuck Pictures" root being re-walked
+   instances 2, 4, 5, 6, 7, 8 within 1.5 min, each taking 18+ min. The
+   filter never changed. The current coalescing guard only fires while a
+   walk is in-flight; once a walk *finishes* a duplicate scheduleWalk
+   blindly re-walks. AppState.reloadDirectoriesFromDisk + FSEvents on
+   app-support writes drive this.
+
+2. Recursion is serial below the top level.
+   walkParallel only fans out one task per top-level subdir. Inside each
+   subtree, walkDir recurses sequentially. On JFK/UX (4910 files) and a
+   Dropbox-backed photo root, the long pole is one subtree that has
+   thousands of cloud-backed child dirs walked back-to-back. With 24
+   cores available the budget is ~19 worker tasks; the current code
+   uses up to (top-level-subdir-count) which on a flat root is 1.
+
+3. Per-child .isDirectoryKey re-read.
+   walkDir asks contentsOfDirectory(at:, includingPropertiesForKeys:
+   [.isDirectoryKey], …) then re-reads .isDirectoryKey via
+   resourceValues per child. On a cloud-backed URL the second read can
+   re-stat. Switching to a single getResourceValue call with all needed
+   keys halves the syscalls on cold dirs.
+
+4. SingleDir event volume = real symptom of #1, #2, #3.
+   Each event = one dir walk that crossed 50 ms. 2.85M of them is the
+   sum of redundant re-walks (#1) × deep serial subtrees (#2). The
+   threshold itself stays (other agent owns log volume).
+
+
+Code changes
+------------
+A. Walk-result cache (kills duplicate Runs).
+   * Cache key: (root URL, RootFilter, last-modified-of-root-dir).
+   * Cache value: WalkResult plus the timestamp the cache was filled.
+   * In runWalk, before invoking walkParallel: stat the root, look up
+     the cache; if hit AND the root mtime is unchanged AND the filter
+     equals the cached filter, reuse the cached tree, skip walkParallel
+     entirely, still emit Run start/finish so the audit line is correct.
+   * Cache lives on `queue` (same isolation as `roots`). Cleared on
+     removeRoot + on a real walk completing.
+   * scheduleWalk already coalesces in-flight duplicates. Add a second
+     short-circuit: if a fresh cache entry (≤2 s old) exists for the
+     same (root, filter), short-circuit without re-walking and just
+     re-post didChangeNotification. The FSEvents storm on app-support
+     log writes is what is generating these duplicates.
+
+B. Parallel recursion with global concurrency cap (~19).
+   * Replace serial walkDir-on-each-child with a recursive walker that
+     uses a shared `AsyncSemaphore`-style limiter sized to
+     min(19, ProcessInfo.activeProcessorCount * 4 / 5).
+   * Top-level (walkParallel) already fans out per top-level subdir.
+     Extend: any subtree whose listed-dir-child count > 1 also fans out
+     via withTaskGroup, gated by the limiter so total in-flight tasks
+     across the whole walk stay ≤ 19.
+   * Single-dir branches (only one child dir) recurse inline — no task
+     overhead.
+   * Lex order at each level is preserved by indexed slot writes
+     (same pattern as the existing top-level code).
+
+C. Single getResourceValue call per child.
+   * Replace `try? entry.resourceValues(forKeys: [.isDirectoryKey])`
+     per child with the prefetch already attached to URLs returned by
+     `contentsOfDirectory(at:includingPropertiesForKeys:)`. The URLs
+     come with cached values; read via
+     `(entry as NSURL).getResourceValue(_:forKey:)` once. Same data,
+     no extra stat on cloud roots.
+
+D. Stay-serial paths.
+   * refilter / refilterAll / removeRoot remain queue-serial.
+   * Small (<= 16 entries) directories don't fan out — task spawn cost
+     exceeds the walk.
+   * The MCP single-file refresh path (no API change here) stays serial.
+
+E. Cancellation discipline.
+   * Keep the existing Task.isCancelled check in walkDir / walkParallel.
+   * The new recursive task-group walker also checks Task.isCancelled
+     before each fan-out so a superseded walk dies quickly on a deep
+     cloud tree.
+
+
+What stays parallel vs serial (user rule)
+-----------------------------------------
+* PARALLEL (mass walk only):
+  - walkParallel and the new recursive task-group walker behind it.
+  - Top-of-stack scheduleWalk → runWalk → walkParallel.
+* SERIAL:
+  - Cache lookups (queue.async, microsecond cost).
+  - refilter / refilterAll (in-memory only).
+  - removeRoot.
+  - Small subtrees (≤ 16 entries) inside the walker.
+
+
+Validation
+----------
+1. `cd code && swift build` — must compile clean.
+2. `cd code && swift test --filter DirectoryTree` if quick.
+3. Re-trace expectation:
+   * SingleDir count: 2.85M → ≤ 500k (cache hits skip most re-walks;
+     parallel recursion drops per-dir wall time below the 50 ms
+     log threshold on local SSD trees).
+   * Total SingleDir ms: 135M → ≤ 30M (≈ 75% reduction).
+   * Parallel avg: 630s → ≤ 60s on cache hit, ≤ 250s on cold cloud
+     walk (limiter, single-stat children).
+   * Run avg: 21s → ≤ 8s.
+* Schedule/Refilter/Remove unchanged (already trivial).
+
+
+Follow-ups deferred
+-------------------
+* Per-subdirectory mtime cache (would let a refresh skip unchanged
+  subtrees, not just unchanged roots). Larger surface — a separate pass.
+* Lazy children loading on FileTree expand. Owned by another agent.

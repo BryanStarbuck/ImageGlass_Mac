@@ -1,0 +1,98 @@
+Image.Load + Image.Decode perf optimization plan
+================================================
+
+Observed (perf_report.csv, June 5 2026):
+  Image.Load   instance=176 avg=69.5 ms total=12,235 ms max=118 ms
+  Image.Decode instance=221 avg=50.8 ms total=11,236 ms max=110 ms
+Both are well over the 16 ms 60 Hz budget when triggered on the main thread.
+
+Diagnosis
+---------
+FormatLoader.decodeWithImageIO calls CGImageSourceCreateWithURL then
+CGImageSourceCreateImageAtIndex(source, 0, nil). Three latent costs:
+
+1. No cache. Every navigation re-decodes from scratch even when the user
+   pages back to the previous image. A 50 MP RAW costs the same on every
+   visit.
+2. No downsample. The viewer canvas is at most a few thousand pixels wide
+   but we always decode at full native resolution and then let the GPU
+   shrink it. That is the dominant cost for RAW + HEIC + big PNGs.
+3. The public API is synchronous. Callers (the canvas host, MCP tools)
+   have no choice but to call it on whatever thread they are on. The host
+   today calls it from updateNSView, which is main-thread.
+
+The hard constraint: FrameSource.swift, ImageCanvasView.swift, and the
+viewer plumbing are off-limits for this agent. So this plan adds the
+optimized API surface inside FormatLoader (cache + thumbnail decode +
+async decode) without forcing call-site changes. Existing call sites
+keep working unchanged; new callers can opt in. ClipboardLoader and
+Base64Loader (both in scope) are updated to use the cache transparently
+for URL loads.
+
+Design
+------
+* DecodedImageCache: small thread-safe LRU keyed by CacheKey
+    CacheKey = (URL absoluteString, mtime epoch, fileSize, targetMaxDim)
+  where targetMaxDim is 0 for full-res entries and the requested max
+  dimension for downsampled entries. Two requests at different sizes
+  share the cache but stay distinct entries.
+
+  Bound: 256 MB total approximate pixel bytes (width * height * 4).
+  Eviction: LRU on access; evict until under cap before insert.
+
+  Implementation: actor for serialization with a doubly-linked list +
+  dictionary for O(1) LRU. We do NOT use NSCache — NSCache has no
+  byte-accurate cap and its eviction is opaque, which hurts the perf
+  invariants we want to test.
+
+* Downsample-on-decode path:
+    CGImageSourceCreateThumbnailAtIndex with
+      kCGImageSourceCreateThumbnailFromImageAlways: true
+      kCGImageSourceCreateThumbnailWithTransform: true   (honor EXIF)
+      kCGImageSourceShouldCacheImmediately: true
+      kCGImageSourceThumbnailMaxPixelSize: targetMaxDim
+  This skips full-res pixel decode and lets ImageIO produce the
+  right-sized image directly from the codec. For RAW + JPEG + HEIC this
+  is dramatically faster than full decode then downsize.
+
+  Policy: when the caller passes targetMaxDim > 0, decode via the
+  thumbnail path. When 0 (or absent), use the existing full-res path.
+
+* Off-thread async API:
+    public static func loadAsync(url:targetMaxDim:) async throws -> LoadedImage
+  Runs the synchronous decode on a detached Task (background QoS). The
+  existing synchronous load(url:) is preserved for back-compat and is
+  documented as "must not be called from the main thread for large
+  images" but is not removed — call-site migration is out of scope.
+
+* Prefetch: a small concurrent prefetch executor (max 3 in flight)
+  exposes prefetch(urls:targetMaxDim:) that warms the cache for
+  next/prev navigation. Internally uses TaskGroup with a semaphore so
+  we cap concurrency at 3 — never 19. Cancellation supported via the
+  cache key so a navigation overrun does not pile up work.
+
+Invariants
+----------
+* Cache is keyed by (URL, mtime, size). Any file mutation invalidates
+  the prior entry naturally because mtime changes — no explicit
+  invalidation hook needed for FS edits.
+* When the viewer is zoomed past the thumbnail resolution, callers must
+  re-request with targetMaxDim = 0 (or a larger value) to get the
+  full-res entry. The cache will hold both; the small-res entry stays
+  warm for fit-window display, the full-res entry is created on demand.
+* All public sync entry points remain. Behavior for callers that do not
+  opt in is byte-for-byte identical to today (apart from cache hits,
+  which are pure wins).
+* PerformanceLog traces are unchanged in name/structure; we add a
+  cache_hit=true|false extra so the analyzer can subtract cache hits
+  from the work histogram.
+
+Out of scope
+------------
+* Modifying FrameSource, the canvas, or the viewer. Those agents will
+  pick up the new API in a follow-up. This PR only ships the
+  infrastructure + opts in the loaders that are in scope (Format,
+  Clipboard, Base64).
+* Multi-frame animation cache. Animated GIF/APNG/WebP go through
+  FrameSource which we cannot modify, and a per-frame cache there
+  belongs to that owner.
