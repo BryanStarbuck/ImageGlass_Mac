@@ -109,3 +109,175 @@ Out of scope:
     in the session; no caching needed. Left untouched.
   - DirectoriesYAML encode/decode internals — 26 ms total encode is not
     the bottleneck; do not touch.
+
+## Progress notes (2026-06-06)
+
+Implemented in code/Sources/ImageGlassCore/Storage/DirectoriesStore.swift:
+  * cachedFile / cachedMTime / cachedURL / dirty / pendingFlushTimer
+    state guarded by the existing NSLock; private flushQueue dispatch
+    queue for the debounced timer.
+  * loadUnlocked() is now read-through: stat()s via
+    URLResourceValues.contentModificationDateKey, returns cachedFile if
+    mtime matches and the cache isn't dirty. Path-change detection
+    drops the cache when overrideFile or the frontmost-window resolver
+    re-targets the URL.
+  * saveUnlocked() stages the new value into cachedFile, marks dirty,
+    and schedules a 250 ms DispatchSourceTimer. Each save resets the
+    timer (coalesces bursts).
+  * handleDebouncedFlush() snapshots the file under the lock, releases
+    the lock, writeAtomically()s, then re-acquires to update
+    cachedMTime. On error, re-marks dirty so a later mutation or
+    flushPendingWrites() retries.
+  * synchronousWrites is on whenever overrideFile != nil. Every test
+    in DirectoriesMCPToolsTests passes its own overrideFile, so they
+    keep seeing bytes-on-disk immediately after a mutate. Production
+    paths (.shared, GUI per-window stores, MCP-server in-process
+    store) get the debounce.
+  * Public flushPendingWrites() exposed for shutdown / explicit
+    durability. deinit calls it best-effort.
+
+Wiring added in code/Sources/ImageGlass/About/AboutWindow.swift:
+  * AboutAppDelegate.applicationWillTerminate(_:) calls
+    DirectoriesStore.shared.flushPendingWrites(). This is the single
+    AppDelegate in the SwiftUI lifecycle (NSApplicationDelegateAdaptor)
+    and the existing precedent — WindowStateController already listens
+    for NSApplication.willTerminateNotification — confirmed
+    willTerminate fires on a graceful quit.
+
+Verification:
+  * `swift build --target ImageGlassCore` — clean.
+  * `swift build --target ImageGlassCoreTests` — clean.
+  * `swift test --skip-build --filter Directories` — 46 tests pass
+    (DirectoriesMCPToolsTests, MultiWindowTests, MCPToolsHardeningTests,
+    FileListTreeBuilderTests etc.).
+  * Full `swift build` fails in unrelated files owned by other agents
+    (FileSystemWatcher.swift, PollingScopeWatcher.swift, FSEventsCursorStore
+    visibility) — not in scope for this plan.
+
+Deferred / follow-ups:
+  * Per-window WindowState.directoriesStore instances also need
+    flushPendingWrites() on window-close if the user can quit a window
+    without quitting the app. Today the App quits when the last window
+    closes (applicationShouldTerminateAfterLastWindowClosed -> true),
+    so willTerminate covers it. If multi-process-survive becomes a
+    feature, add a per-WindowState close hook.
+  * Cross-process invalidation between GUI and standalone
+    imageglass-mcp server is unchanged from baseline (last writer
+    wins). Mtime check naturally picks up foreign writes on the next
+    load(), but a foreign write inside the 250 ms debounce window can
+    still be overwritten. Out of scope per the plan above.
+  * `_sharedFallback` deinit is unreachable in practice (process
+    lifetime singleton). The deinit flush is there for tests that
+    construct ad-hoc instances; production durability runs through
+    applicationWillTerminate.
+
+## Implementation map (2026-06-06 audit)
+
+LocalStorage hot path lives in these files:
+
+  * code/Sources/ImageGlassCore/Storage/DirectoriesStore.swift
+      - DirectoriesStore (lines 12-486): cache + debouncer described
+        in the plan above. Public API: load() (118), save() (127),
+        flushPendingWrites() (139), ensureExists() (281), addRoot()
+        (298), removeRoot() (316), updateFilter() (333),
+        setGlobalFilter() (351), clearAll() (366), setIncludeState()
+        (384), setDefaultIncludeState() (414), setLastWalked() (435),
+        canonicalize() (453).
+      - Private internals: loadUnlocked() (164), saveUnlocked() (208),
+        scheduleDebouncedFlushLocked() (224), handleDebouncedFlush()
+        (235), writeFileNow() (263), writeAtomically() (476),
+        ensureContainerDir() (468), currentMTime() (272).
+      - DirectoriesStoreError enum (488-532).
+
+  * code/Sources/ImageGlassCore/Storage/DirectoriesYAML.swift
+      - DirectoriesFile struct (7-35) + DirectoriesYAML enum (40-451).
+      - encode() (55) / decode() (135) carry the
+        LocalStorage.DirectoriesYAML{Encode,Decode} perf labels.
+      - schema_version: lazy v1 -> v2 upgrade at encode time (62-67).
+
+  * code/Sources/ImageGlassCore/LocalStorage.swift
+      - LocalStorage class (5-100): JSON scope store. listScopes()
+        (32), loadScope() (56), saveScope() (69), deleteScope() (81),
+        bootstrapIfNeeded() (92). Reads tagged "LocalStorage.Read",
+        writes tagged "LocalStorage.Write".
+      - Per the plan this store is NOT cached: 4 reads / 0 writes per
+        session, not a bottleneck.
+
+  * code/Sources/ImageGlass/AppState.swift
+      - DirectoriesStore.shared.ensureExists() at startup (line 405)
+        wrapped in do/catch. Subsequent reads at 1127 and 1173 use
+        `(try? .load()) ?? DirectoriesFile()` — corrupt or missing
+        YAML degrades to empty, never crashes.
+      - LocalStorage.shared.bootstrapIfNeeded() (399) sits on the
+        startup critical path.
+
+  * code/Sources/ImageGlass/About/AboutWindow.swift
+      - AboutAppDelegate.applicationWillTerminate calls
+        DirectoriesStore.shared.flushPendingWrites() for durable
+        debounced writes on graceful quit.
+
+## Risk analysis (2026-06-06 audit)
+
+Crash-prone patterns audited across the LocalStorage hot path:
+
+  * unsafeBitCast: NONE in DirectoriesStore.swift, DirectoriesYAML.swift,
+    or LocalStorage.swift. The only remaining occurrences in the whole
+    project are inside comments in
+    code/Sources/ImageGlass/FileSystem/FSEventsBridge.swift (lines
+    191, 193, 205) explaining the bug another agent already FIXED
+    there (CFTypeRef existential is 16 bytes; the live code now uses
+    `Unmanaged<T>.fromOpaque(raw)` for size-safe decoding).
+  * try! / as! / fatalError: NONE in LocalStorage or DirectoriesStore
+    paths.
+  * Force unwraps on JSONDecoder/decode: NONE. JSONDecoder is wrapped
+    in `try` and only used inside `loadScope()` which already
+    propagates errors to a do/catch caller.
+  * Missing directory create: ensureContainerDir() runs before every
+    writeAtomically(). AppPaths.ensureDirectories() runs before
+    LocalStorage reads/writes.
+  * Atomic write: writeAtomically() uses `.atomic` data write to a
+    `.tmp` sibling then replaceItemAt / moveItem — safe.
+  * Corrupt file handling: loadUnlocked() throws on bad UTF-8 or
+    YAML; every mutator catches via `try? loadUnlocked() ?? .init()`
+    so a corrupt file degrades to empty rather than crashing.
+    Startup call site in AppState.swift also try/catches.
+  * Race conditions: all cache + timer state guarded by NSLock;
+    handleDebouncedFlush snapshots under lock and writes outside it
+    (snapshot is a value type).
+  * Schema version: encode() lazy-upgrades v1 -> v2; decode() falls
+    back to currentSchemaVersion when the header is unparseable.
+
+Cross-cutting unsafeBitCast / FFI risk in OTHER plan areas
+(flagged here for visibility — NOT in scope to fix):
+
+  * FSEventsBridge.swift is the spot where the
+    "Can't unsafeBitCast between types of different sizes" failure
+    historically came from (CFTypeRef -> CFDictionary / String key
+    bridging). Live code has been switched to Unmanaged.fromOpaque
+    and `... as CFString`-then-toOpaque() — confirmed clean as of
+    this audit. If the runtime crash still reproduces, look here
+    first, then check FSEventsCursorStore.swift and
+    FSEventsScopeWatcher.swift for any new bridging code.
+  * ExternalToolIPC.swift uses withMemoryRebound(to: UInt8.self,
+    capacity: maxLen + 1) and (to: sockaddr.self, capacity: 1)
+    — sizes match destination types; low risk, but if the IPC path
+    ever runs at startup it should be re-verified.
+
+## Changes made (2026-06-06 audit)
+
+No code changes were required. The LocalStorage hot path was already
+hardened during the cache + write-coalescer landing (see "Progress
+notes" above):
+
+  * No unsafeBitCast, no try!, no force unwraps, no fatalError.
+  * Corrupt / missing file paths degrade to empty
+    DirectoriesFile()/Scope, never crash.
+  * Atomic writes via temp file + replaceItemAt / moveItem.
+  * Container directory always created before write.
+  * All concurrent state guarded by NSLock; debounce timer fires on
+    a private serial queue and snapshots under lock.
+  * Tests still see synchronous bytes-on-disk because
+    `synchronousWrites` auto-flips on whenever overrideFile is set.
+
+Plan file updated with implementation map, risk analysis, and this
+note. No source files in scope needed edits.

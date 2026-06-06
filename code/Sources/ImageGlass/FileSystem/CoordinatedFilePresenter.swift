@@ -65,7 +65,7 @@ final class CoordinatedFilePresenter: NSObject, NSFilePresenter {
 
     // MARK: - NSFilePresenter
 
-    func relinquishPresentedItem(toWriter writer: @escaping ((() -> Void)?) -> Void) {
+    func relinquishPresentedItem(toWriter writer: @escaping @Sendable ((@Sendable () -> Void)?) -> Void) {
         // Spec §7.13: pause the focused-file watcher; wait for the
         // writer to call our reacquire closure.
         onWriterAcquired?()

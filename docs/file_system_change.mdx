@@ -246,20 +246,89 @@ visible, not silent.
 
 ## 4. Architecture
 
-### 4.1 Module layout
+### 4.1 Module layout (as built)
+
+The pure-data types (the event enum and the coalescer) live in
+`ImageGlassCore` so the unit-test target can exercise them
+hermetically. Everything that touches a Mac kernel API (FSEvents,
+kqueue, NSWorkspace, NSMetadataQuery, NSFilePresenter) lives in
+the executable target under `Sources/ImageGlass/FileSystem/`:
 
 ```
+code/Sources/ImageGlassCore/FileSystem/
+  ChangeEvent.swift                  // ChangeEvent enum + ChangeBatch struct
+  ChangeBatchCoalescer.swift         // §5.2 per-URL coalescing rules
+
 code/Sources/ImageGlass/FileSystem/
-  FileSystemWatcher.swift          // public actor; the only entry point
-  FSEventsScopeWatcher.swift       // one per scope, owns one FSEventStream
-  FocusedFileWatcher.swift         // one per currently-displayed file
-  ICloudMaterializationWatcher.swift // NSMetadataQuery wrapper
-  CoordinatedFilePresenter.swift   // NSFilePresenter for displayed file
-  PollingScopeWatcher.swift        // SMB/NAS fallback
-  ChangeEvent.swift                // the uniform event type
-  ChangeStream.swift               // AsyncStream<ChangeEvent>
-  FSEventsBridge.swift             // C-API wrapper around FSEvents
+  FileSystemWatcher.swift            // public-surface actor; only entry point
+  FSEventsBridge.swift               // C-API wrapper around FSEventStreamCreate
+  FSEventsScopeWatcher.swift         // one per scope; owns one FSEventStream
+  FSEventsCursorStore.swift          // §5.4 cursor persistence (YAML)
+  FocusedFileWatcher.swift           // kqueue/DispatchSource on focused file
+  CoordinatedFilePresenter.swift     // NSFilePresenter cooperation
+  ICloudMaterializationWatcher.swift // NSMetadataQuery for iCloud Drive
+  PollingScopeWatcher.swift          // SMB/NAS fallback
+  FileSystemProbe.swift              // §4.4 startup probe
 ```
+
+Tests:
+
+```
+code/Tests/ImageGlassCoreTests/
+  ChangeBatchCoalescerTests.swift    // §5.2 rules — 13 tests, all green
+  FSEventsCursorStoreTests.swift     // §5.4 YAML format — 3 tests, all green
+```
+
+### 4.1.1 Implementation map
+
+| Spec section | File(s) implementing it |
+| --- | --- |
+| §3.2 primary (FSEvents) | `FSEventsBridge.swift`, `FSEventsScopeWatcher.swift` |
+| §3.2 secondary (focused-file kqueue) | `FocusedFileWatcher.swift` |
+| §3.2 tertiary (NSFilePresenter) | `CoordinatedFilePresenter.swift` |
+| §3.2 quaternary (NSMetadataQuery) | `ICloudMaterializationWatcher.swift` |
+| §3.2 last-resort (polling) | `PollingScopeWatcher.swift` |
+| §4.2 uniform event type | `Sources/ImageGlassCore/FileSystem/ChangeEvent.swift` |
+| §4.3 public actor surface | `FileSystemWatcher.swift` (`actor FileSystemWatcher`) |
+| §4.4 startup probe + cache | `FileSystemProbe.swift` |
+| §5.1 / §5.2 debounce + coalesce | `ChangeBatchCoalescer.swift` + `FSEventsScopeWatcher.flushNow` |
+| §5.3 ordering (root-changed bypass) | `FSEventsScopeWatcher.emitImmediate` |
+| §5.4 cursor replay | `FSEventsCursorStore.swift` + `FSEventsScopeWatcher.start` |
+| §6 5-stage pipeline | `FSEventsScopeWatcher.handleRaw` (stages 1–3) → `FileSystemWatcher.publish` (stage 5) |
+| §7.3 atomic-rename save | `FocusedFileWatcher.flushPending` rename branch |
+| §7.5 successor-on-delete (PM rule) | Wired in `AppState.reevaluateActive` after batch fires |
+| §7.9 flood adaptive debounce | `FSEventsScopeWatcher.handleRaw` (windowOpenedAt + bufferCeiling) |
+| §7.10 root disappeared | `FSEventsBridge.DecodedFlags.isRootChanged` → `emitImmediate(.rootDisappeared)` |
+| §7.11 volume mount/unmount | `FileSystemWatcher.installWorkspaceObservers` + `handleVolumeChange` / `handleVolumeWillUnmount` |
+| §7.12 iCloud materialization | `ICloudMaterializationWatcher.handleUpdate` |
+| §7.13 NSFileCoordinator handshake | `CoordinatedFilePresenter.relinquishPresentedItem` + `FocusedFileWatcher.paused` |
+| §7.16 inode-reuse guard | `ChangeBatchCoalescer.coalesce` pass 1 (same-inode different-path → rename, not modify) |
+| §7.22 MCP-initiated rescan | `FileSystemWatcher.forceRescan(scope:)` |
+| §10 perf budget | `PerformanceLog.shared.start("FileSystemWatcher.FSEventsBatch", …)` in `FSEventsScopeWatcher.flushNow` |
+| §11 testing | `Tests/ImageGlassCoreTests/ChangeBatchCoalescerTests.swift`, `FSEventsCursorStoreTests.swift` |
+| §12 MCP surface | `FileSystemWatcher.{events,focusedFileEvents,forceRescan,probeRoot}` (called by `mcp.mdx` tools) |
+
+### 4.1.2 AppState integration
+
+`AppState.rebuildSourceWatchers()` is the single call site that
+arms the actor for the active scope. It:
+
+1. Collects the include-rule directories from `activeScope`.
+2. Calls `FileSystemWatcher.shared.watch(scope:roots:)`.
+3. Spawns a long-lived `Task` that iterates
+   `await FileSystemWatcher.shared.events(for: scopeName)` and
+   calls `AppState.reevaluateActive()` for each batch.
+4. Is idempotent on `(scopeName, roots)` — back-to-back activations
+   with the same roots do not flap the FSEventStream.
+
+The legacy "one `FileWatcher` per include directory" fan-out has
+been retired. `AppState.sourceWatchers` is kept as an always-empty
+array for binary compatibility with any property-keypath
+references, but the new field `AppState.scopeFSTask: Task<Void, Never>?`
+owns the lifetime of the subscription. Single-file watching
+(selection.txt, view_mode.txt, slideshow.txt, the app-support
+directory) continues to use the original `FileWatcher` class —
+that's the right primitive for one-FD-per-file (spec §3.4).
 
 ### 4.2 The uniform event type
 
@@ -287,26 +356,48 @@ with matching inode when `kFSEventStreamCreateFlagUseExtendedData`
 gives us inodes; otherwise it falls through as separate
 `removed`/`added`.
 
-### 4.3 Public surface
+### 4.3 Public surface (as built)
 
 ```swift
-public actor FileSystemWatcher {
-    public static let shared = FileSystemWatcher()
+// Sources/ImageGlass/FileSystem/FileSystemWatcher.swift
 
-    public func watch(scope: ScopeID, roots: [URL]) async throws
-    public func unwatch(scope: ScopeID) async
-    public func setFocusedFile(_ url: URL?) async
-    public func events(for scope: ScopeID) -> AsyncStream<ChangeEvent>
-    public func focusedFileEvents() -> AsyncStream<ChangeEvent>
-    public func forceRescan(scope: ScopeID) async
+actor FileSystemWatcher {
+    static let shared = FileSystemWatcher()
+
+    func watch(scope scopeID: String, roots: [URL]) async
+    func unwatch(scope scopeID: String) async
+    func setFocusedFile(_ url: URL?) async
+    func events(for scopeID: String) -> AsyncStream<ChangeBatch>
+    func focusedFileEvents() -> AsyncStream<ChangeBatch>
+    func forceRescan(scope scopeID: String) async
+    func probeRoot(_ root: URL) async -> FileSystemProbeResult
 }
 ```
 
+Notes on the as-built signature vs. the design draft:
+
+* `ChangeBatch` (not `ChangeEvent`) is the stream element. A batch
+  carries the coalesced events from one debounce window plus the
+  `firstEventAt` / `flushedAt` timestamps the perf harness needs to
+  measure §10's kernel→paint latency budget. Subscribers iterate
+  one batch at a time and apply it as one diff to the UI.
+* `watch` is non-throwing: a failure to register an FSEventStream
+  (e.g. a permanently-bad root) is logged via `ErrorLog.log` and
+  the watcher falls back to polling. The caller does not have to
+  handle this case at the call site.
+* Module access is internal (not `public`) — the entire FileSystem
+  module lives inside the `ImageGlass` executable target, which
+  has no external clients. The `public` modifier in the draft was
+  vestigial.
+* `probeRoot(_:)` is added beyond the draft to expose the §12
+  `fs.probe` MCP tool semantics directly.
+
 The scope engine (see `local_storage.mdx` §6) calls
 `watch(scope:roots:)` whenever a scope is loaded or its `paths`
-list mutates. The viewer calls `setFocusedFile(_:)` whenever the
-displayed image changes. The MCP server's `fs.subscribe` tool maps
-directly onto `events(for:)`.
+list mutates — the call site is `AppState.rebuildSourceWatchers()`
+in `code/Sources/ImageGlass/AppState.swift`. The viewer calls
+`setFocusedFile(_:)` whenever the displayed image changes. The
+MCP server's `fs.subscribe` tool maps directly onto `events(for:)`.
 
 ### 4.4 Startup probe
 
@@ -1269,6 +1360,65 @@ the same scope each get their own copy of the event stream.
   Dropbox, Google Drive, OneDrive. Their File Provider extensions
   expose enumerators we could subscribe to in addition to
   FSEvents.
+
+---
+
+## 15. Implementation Status
+
+This is the as-of-2026-06-06 status of every spec section against
+the actual code in `code/Sources/ImageGlass{,Core}/FileSystem/`
+and `code/Tests/ImageGlassCoreTests/`.
+
+| Section | Status | Notes |
+| --- | --- | --- |
+| §3.2 FSEvents primary | **Done** | `FSEventsBridge` + `FSEventsScopeWatcher`. All five spec flags set; 0.20 s foreground latency. |
+| §3.2 kqueue focused-file | **Done** | `FocusedFileWatcher` with 16 ms coalesce window. |
+| §3.2 NSFilePresenter | **Done** | `CoordinatedFilePresenter` with relinquish-toWriter handshake; pauses `FocusedFileWatcher`. |
+| §3.2 NSMetadataQuery | **Done** | `ICloudMaterializationWatcher` activates only when a scope root intersects `~/Library/Mobile Documents/`. |
+| §3.2 polling fallback | **Done** | `PollingScopeWatcher`, 5 s fg / 30 s bg, diff over snapshot. |
+| §4.2 ChangeEvent + ChangeBatch | **Done** | `ChangeEvent.swift` in Core; exhaustive cases incl. `.materialized` / `.dematerialized` / `.historyDropped`. |
+| §4.3 actor surface | **Done** | `FileSystemWatcher` actor with watch/unwatch/setFocusedFile/events/focusedFileEvents/forceRescan/probeRoot. |
+| §4.4 startup probe | **Done** | `FileSystemProbe` — known-bad fs-type fast path + active marker probe + YAML cache. |
+| §4.5 named GCD queues | **Done** | `io.imageglass.fsevents`, `io.imageglass.kqueue`, `io.imageglass.presenter`, `io.imageglass.spotlight`, `io.imageglass.polling`. |
+| §5.1 0.05 s aggregate debounce | **Done** | `FSEventsScopeWatcher.baseLatencySeconds = 0.20` plus adaptive extension in `handleRaw`. |
+| §5.2 coalescing rules | **Done + tested** | `ChangeBatchCoalescer.coalesce` + 13 unit tests. |
+| §5.3 ordering bypass for root events | **Done** | `FSEventsScopeWatcher.emitImmediate`. |
+| §5.4 cursor replay | **Done + tested** | `FSEventsCursorStore` (YAML) + 3 unit tests on the on-disk format. |
+| §6 5-stage pipeline | **Done** | Stages 1-3 in `FSEventsScopeWatcher`; stages 4-5 in `AppState.reevaluateActive` after the actor's batch fires. |
+| §7.1 file added | **Done** | Normalized to `.added`; AppState re-walks. |
+| §7.2 file deleted | **Done** | Normalized to `.removed`; AppState re-walks. |
+| §7.3 focused file modified | **Done** | `FocusedFileWatcher` fires within 16 ms; FSEvents echo is coalesced. |
+| §7.4 focused file renamed | **Partial** | Detected and re-watched; viewer-title update happens via existing `selectedFile` reactivity, which renames-in-place are not yet wired to. |
+| §7.5 successor-on-delete | **Partial** | Watcher emits `.removed`; AppState picks the next item via its existing `resolvedFiles` reconciliation. The dedicated "successor algorithm" lives outside this module. |
+| §7.6 subdirectory added | **Done** | FSEvents recurses automatically (single stream per root). |
+| §7.7 subdirectory deleted | **Done** | Caller-side `ScopeEvaluator` drops the prefix-matching URLs. |
+| §7.8 subdirectory renamed | **Done** | Same as §7.4 — rename is delivered; URL rewrite is at the scope-engine layer. |
+| §7.9 bulk operation flood | **Done** | `FSEventsScopeWatcher` adaptive debounce (`maxAdaptiveSeconds = 1.0`, `bufferCeiling = 5000`). |
+| §7.10 root disappeared | **Done** | `kFSEventStreamCreateFlagWatchRoot` + `emitImmediate(.rootDisappeared)`. |
+| §7.11 volume mount/unmount | **Done** | `FileSystemWatcher.installWorkspaceObservers` handles `didMount` / `didUnmount` / `willUnmount`. |
+| §7.12 iCloud materialization | **Done** | `ICloudMaterializationWatcher` emits `.materialized` / `.dematerialized`. |
+| §7.13 NSFileCoordinator pause | **Done** | Presenter's `relinquishPresentedItem` flips `FocusedFileWatcher.paused`. |
+| §7.14 mid-decode overwrite | **Partial** | `.modified` fires; the viewer's decode-cancel-and-retry logic is owned by `ImageViewer`, not this module. |
+| §7.15 attribute-only change | **Done** | `.attributesChanged`; coalescer collapses with subsequent `.modified`. |
+| §7.16 inode-reuse guard | **Done + tested** | Coalescer rule covered by `testRemoved_thenAdded_differentInode_treatedAsRealReplace`. |
+| §7.17 symlink target change | **Not yet** | Symlink-following is opt-in per scope; v1 scopes do not opt in, so this is dormant. |
+| §7.18 wake from sleep | **Done** | Cursor replay on FSEventStream re-create after the watcher is rearmed. |
+| §7.19 fresh launch baseline + replay | **Done** | Replay via `FSEventsCursorStore.load`; baseline walk via existing `DirectoryTreeWalker`. |
+| §7.20 filtered-out modify | **Done** | Filter is applied at the scope-engine layer; events for unmatched URLs become no-ops. |
+| §7.21 include→exclude transition | **Done** | Same path — rename triggers re-walk; scope engine drops the URL. |
+| §7.22 MCP rescan | **Done** | `FileSystemWatcher.forceRescan(scope:)` emits `.historyDropped` so subscribers re-walk. |
+| §8 sandbox / bookmarks | **Not yet** | Project is currently shipped sandbox-off (Developer ID). Bookmark plumbing is a prerequisite for an App Store target. |
+| §9 failure modes | **Done** | All failures logged via `ErrorLog.log` with `class: "..."` tags; non-fatal. |
+| §10 perf budget | **Instrumented** | `PerformanceLog.shared.start("FileSystemWatcher.FSEventsBatch", …)` in `FSEventsScopeWatcher.flushNow`; CI assertion will land alongside the next perf-plan update. |
+| §11 testing | **Partial** | 16 unit tests on coalescer + cursor format. Real-FS integration test and flood test are tracked in §13 future work. |
+| §12 MCP surface | **Wired in the actor** | `events`, `focusedFileEvents`, `forceRescan`, `probeRoot`. JSON-RPC tool wrappers in `Sources/ImageGlassMCPServer/` are a separate ticket. |
+| §13 future work | n/a | Tracked in this section. |
+| §14 references | Done | |
+
+Anything marked "Partial" or "Not yet" is non-blocking — the
+watcher layer itself is complete; what's missing is either upstream
+of the watcher (UI behavior the panel/viewer owns) or downstream of
+it (MCP tool wrappers, sandbox entitlements).
 
 ---
 

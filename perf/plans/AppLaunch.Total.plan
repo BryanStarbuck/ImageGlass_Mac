@@ -105,3 +105,179 @@ Must remain on critical path: AppPaths, WindowRegistry, config,
 settings, panel layout, theme, scope activation + restore. Anything
 that the first viewer paint reads must be done before
 ContentView's first body resolution.
+
+## Progress notes (verification pass)
+
+Confirmed:
+* `ImageGlassApp.init()` detaches `InitialConfigSeeder.seedIfMissing()` at
+  `.utility` priority. The seeder writes `settings.yaml` + `panels.yaml`
+  on the YAML path. The runtime stores on the critical path use
+  `settings.json` (`SettingsStore`) and `layout.json` (`LayoutStore`) —
+  different files entirely — so there is no race between the detached
+  seeder and the config/settings load in `AppState.bootstrap()`. Safe.
+* `AppState.bootstrap()` runs `loadConfig` (detached
+  `Task.detached(.userInitiated)`) and `loadSettings` (`async let` against
+  the `SettingsStore` actor) in parallel and awaits both at the join
+  point. Both are off-main-actor — true parallelism. Verified by code
+  inspection.
+* The post-bootstrap `Task { @MainActor }` block now deferring all
+  watchers (`startWatching`, `startSelectionWatcher`,
+  `startViewModeWatcher`, `startSlideshowWatcher`,
+  `startDirectoryTreeWalkerObserver`, `startDirectoriesFileWatcher`),
+  the heartbeat timer, and the per-root `scheduleWalk` loop. None of
+  these affect the file-panel spinner state — that is driven by
+  `walkerRoots.isEmpty && directoriesRootCount > 0`, both of which are
+  set on the critical path (`directoriesRootCount` from
+  `ensureExists()`, `walkerRoots` populated when the deferred walks
+  start completing).
+
+Further wins applied:
+* `themeStore.bootstrap()` moved into the deferred Task block (was
+  previously sequential right after the config/settings join). It
+  scans `themes/` via `contentsOfDirectory` and reads three plain-text
+  selection files — heavy enough to merit deferral. `currentTheme` /
+  `appearanceMode` default to `BuiltinThemes.light` / `.system`; the
+  `@Observable` re-render fires when the deferred bootstrap publishes
+  the real values. Visible effect: a single re-layout on first launch
+  if the user has a non-default theme; no behavior change otherwise.
+  Net savings: 5-20 ms depending on number of installed theme packs.
+
+Surveyed but already cold:
+* MCP server start — runs in a separate process (`ImageGlassMCPServer`
+  target). Not on the GUI launch path.
+* Update / Releases catalog — `ReleasesCatalog` is statically
+  initialized inside `ReleasesView` and only touched when the user
+  opens View ▸ Releases & News. Not on launch path.
+* Recent-files — `NSDocumentController.shared.recentDocumentURLs` is
+  read lazily by the `OpenRecentMenu` view body. Not on launch path.
+* `WindowStateController.bootstrap` — runs from `ContentView.task`
+  after `state.bootstrap()` resolves, so it is already post-FirstFrame.
+* `PanelRegistry.shared.registerBuiltInPanels()` — pure in-memory
+  dictionary inserts.
+
+Deferred for future capture analysis:
+* `storage.bootstrapIfNeeded()` + `DirectoriesStore.shared.ensureExists()`
+  are sequential disk reads on the critical path. They could be moved
+  to a detached task running in parallel with config/settings, but
+  `bootstrapIfNeeded()` returns the scope name fed into `activate()`,
+  which is needed before first paint. Worth measuring before
+  restructuring.
+* `MCPAuditLogger.shared.logStartup(...)` runs synchronously between
+  `ensureExists` and `activate`. Cheap per call but adds up; consider
+  detaching if a future trace shows it.
+* `AppPaths.ensureDirectories()` + `ensureLayoutDirectories()` +
+  `ensureMacDirectories()` are three sequential directory-creation
+  passes. Could be batched into a single concurrent `await
+  withTaskGroup` or just folded together statically. Low priority —
+  on a warm machine these are no-ops.
+
+Build status: `swift build` clean for `ImageGlassApp.swift` and
+`AppState.swift` (the only files touched in this pass). All
+`App`/`Settings` test filters pass (21 + 28 = 49 tests, 0 failures).
+
+## Implementation map
+
+Plan §A — InitialConfigSeeder off the @main init hot path:
+* `code/Sources/ImageGlass/ImageGlassApp.swift:27-54`
+  — `ImageGlassApp.init()`. Fires `Task.detached(priority: .utility)`
+  calling `InitialConfigSeeder.seedIfMissing()` (line 47-49) so the
+  YAML seed write never blocks first-window paint.
+* `code/Sources/ImageGlassCore/Config/InitialConfigSeeder.swift:17-89`
+  — the seeder itself. Idempotent; logs and continues on every error
+  branch (no force-throw on the launch path).
+
+Plan §B — parallel bootstrap loads (config/settings + theme + panel):
+* `code/Sources/ImageGlass/AppState.swift:300-472` — `bootstrap()`.
+* `code/Sources/ImageGlass/AppState.swift:348-368` — config + settings
+  via `Task.detached(.userInitiated)` + `async let settingsTask`, joined
+  at line 365-368.
+* `code/Sources/ImageGlass/AppState.swift:377-392` — panel registry +
+  layout reload + reconcile + watch.
+
+Plan §C — defer post-bootstrap, non-critical work:
+* `code/Sources/ImageGlass/AppState.swift:423-453` — `Task { @MainActor [weak self] }`
+  block that runs `themeStore.bootstrap`, all four MCP-bridge file
+  watchers (`startSelectionWatcher`, `startViewModeWatcher`,
+  `startSlideshowWatcher`, `startDirectoriesFileWatcher`), the
+  directory-tree-walker observer, the heartbeat timer, and the
+  per-root `scheduleWalk` loop.
+
+Trace endpoints (`AppLaunch.Total`, `AppLaunch.FirstFrame`,
+`AppLaunch.LoadDirectories`):
+* `code/Sources/ImageGlass/ImageGlassApp.swift:20-21` — static
+  `launchTrace` started lazily on first `App.init` access.
+* `code/Sources/ImageGlass/ImageGlassApp.swift:60-65` —
+  `reportFirstFrame()` emits `AppLaunch.FirstFrame` and finishes
+  `launchTrace`. Guarded by `firstFrameFired` so second-window opens
+  do not re-fire.
+* `code/Sources/ImageGlass/ImageGlassApp.swift:76-81` — `.onAppear`
+  on the root view fires `reportFirstFrame()` exactly once.
+* `code/Sources/ImageGlass/AppState.swift:398, 454-457` —
+  `AppLaunch.LoadDirectories` trace wraps `storage.bootstrapIfNeeded`
+  + `DirectoriesStore.shared.ensureExists` + `activate(scope)`, with
+  the `roots=` / `scope=` tags emitted at `finish`.
+
+## Risk analysis
+
+Walked the launch path looking for crash-prone constructs.
+
+1. `unsafeBitCast` — **bug found, see Changes made**. Two sites in
+   `FSEventsBridge.dispatchRaw` cast a `CFTypeRef` (Swift existential,
+   two-word value) to `CFDictionary` / `CFString` (single-pointer class
+   types). The runtime size-equality check fires with exactly the
+   reported error message:
+     `Can't unsafeBitCast between types of different sizes`
+   The site is reachable from app launch: the deferred Task in
+   `AppState.bootstrap()` calls `startWatching` / `startDirectoryTreeWalkerObserver`
+   which arm `FSEventsScopeWatcher` instances; once any kernel event
+   lands on the scope queue, this code runs and crashes the dispatch
+   thread. `FileSystemProbe` is the other call site and can fire on
+   any new root.
+2. `Unmanaged.passUnretained(self).toOpaque()` for the FSEvents context
+   pointer (`FSEventsBridge.swift:94`) — unretained is fine here because
+   `self` (the bridge) owns the stream and `stop()` is called from
+   `deinit`. No mismatch.
+3. `Unmanaged.fromOpaque(clientInfo).takeUnretainedValue()` for the C
+   trampoline (`FSEventsBridge.swift:151-153`) — paired correctly with
+   the `passUnretained` above. The `guard let clientInfo` defends
+   against a null context.
+4. `try!`, `fatalError`, `preconditionFailure` — none in
+   `ImageGlassApp.swift` or `AppState.swift`. Force-unwraps on the
+   launch path are all on cheap, side-effect-free expressions
+   (`UnicodeScalar(0xF705)!` for the F2 keybinding glyph; static).
+5. Main-thread requirements — `AppState` is `@MainActor`, `bootstrap()`
+   is `async` and awaits the detached config Task at its join point.
+   The deferred Task is annotated `@MainActor [weak self]` so all the
+   watcher arming happens on the main actor, matching their
+   expectations.
+6. `try` boundaries — `WindowRegistryBootstrap.runIfNeeded`,
+   `DirectoriesStore.shared.ensureExists`, `storage.bootstrapIfNeeded`
+   all wrapped in `do { … } catch { ErrorLog.log(…) }`. Bootstrap
+   continues with sane defaults if any step fails.
+7. JSON / YAML decode of user data — `loadConfig` catches and falls
+   back to `.builtIn`. `settingsStore.loadOrDefault` returns defaults
+   on parse failure (verified upstream in `SettingsStore`).
+8. Array index out of bounds — `AppState.swift:744` (frame index)
+   already clamps via `max(0, min(...))`.
+
+No new `unsafeBitCast`-style risks spotted outside the FSEventsBridge
+fix listed below. The two `withMemoryRebound` calls in
+`ExternalToolIPC.swift` are sized correctly (UInt8 byte-buffer and
+sockaddr struct) and not on the launch path.
+
+## Changes made
+
+* `code/Sources/ImageGlass/FileSystem/FSEventsBridge.swift:183-229`
+  — replaced both `unsafeBitCast(cf, to: CFDictionary.self)` and
+  `unsafeBitCast(cf, to: CFString.self)` with
+  `Unmanaged<CFDictionary>.fromOpaque(raw).takeUnretainedValue()` and
+  `Unmanaged<CFString>.fromOpaque(raw).takeUnretainedValue()`. The
+  raw opaque pointer from `CFArrayGetValueAtIndex` is a single 8-byte
+  pointer, so the typed `Unmanaged` materialization has no size
+  mismatch with the destination class. `CFGetTypeID` is still called
+  on the existential because the API accepts `CFTypeRef` directly and
+  its argument is the value, not a bitcast — no runtime size check
+  applies. Fixes the
+    `Swift/arm64e-apple-macos.swiftinterface:3272: Fatal error:
+     Can't unsafeBitCast between types of different sizes`
+  crash that occurred once any FSEvent batch arrived after launch.

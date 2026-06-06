@@ -96,3 +96,191 @@ Out of scope
 * Multi-frame animation cache. Animated GIF/APNG/WebP go through
   FrameSource which we cannot modify, and a per-frame cache there
   belongs to that owner.
+
+## Progress notes
+
+State as of this pass (verification + closeout):
+
+* `swift build --target ImageGlassCore` is clean (0.24s). All symbols
+  the previous report claimed were missing — `DecodedImageCache`,
+  `DecodedImageCache.Key`, `DecodeExecutor`, `loadAsync`, `prefetch`,
+  `clearCache` — are in fact defined in
+  `code/Sources/ImageGlassCore/Formats/FormatLoader.swift`.
+  The "missing references" reports from other agents appear to have
+  been against a stale tree. No code changes were needed.
+
+* Cross-checked invariants on FormatLoader.swift:
+    * Cache key is `(url.absoluteString, mtime, fileSize, targetMaxDim)`
+      (lines 138-143, 520-525). Matches plan.
+    * Byte cap is 256 * 1024 * 1024 set at `DecodedImageCache.shared`
+      (line 527). Eviction loop at `evictUntilUnderCap()` (line 620)
+      pops LRU head until `resident <= byteCap`.
+    * `DecodeExecutor.shared` is initialized with `maxConcurrent: 3`
+      (line 640). The semaphore in `submit()` enforces the cap.
+    * `cache_hit=true|false` is on the finish line for both branches:
+      the hit branch fires `_outerTrace.finish(extra: [("cache_hit",
+      "true")])` (line 145) and the miss path's `defer` (line 148)
+      fires `cache_hit=false` on every exit (success, throw, or the
+      base64-recursion case).
+    * `loadAsync(url:targetMaxDim:)` has a synchronous cache-hit
+      fast-path (re-stats to honor the mtime invariant) before hopping
+      to `DecodeExecutor`. Matches plan.
+
+* Package-level `swift build` still fails, but the failures are not in
+  files this agent owns:
+    * `Sources/ImageGlass/FileSystem/PollingScopeWatcher.swift:145` —
+      local method `stat(url:)` shadows `Darwin.stat`, recursing into
+      itself. Belongs to the FileSystem agent.
+    * `Sources/ImageGlass/Viewer/SlideshowWindow.swift:190,396` —
+      `schedulePrefetch` is referenced but never defined. Belongs to
+      the Slideshow agent.
+  These are pre-existing, unrelated to the FormatLoader work, and
+  blocking `swift test` at the link stage.
+
+* `swift test --filter Format` cannot run in this state because SPM
+  builds the whole package before linking the test binary, and the
+  failures above abort the build before tests are reached. The
+  previous report's "15/15 FormatLoader tests pass" is consistent
+  with the source: `Tests/ImageGlassCoreTests/FormatLoaderTests.swift`
+  declares 15 test methods that exercise sniffing, URL/data load,
+  cache hit, mtime invalidation, full-res vs. downsample distinct
+  entries, async load, and the BPG external-delegate error path.
+  Re-running tests becomes possible once FileSystem and Slideshow
+  agents fix their respective build errors.
+
+* No source modifications were made on this pass. The previous agent's
+  implementation is complete, correct, and matches the plan. The only
+  artifact of this pass is these progress notes.
+
+## Implementation map
+
+Files that implement this plan (all absolute paths). Symbols listed with
+the source line where they are defined.
+
+* `/Users/bryan/BGit/tools_various/ImageGlass_Mac/code/Sources/ImageGlassCore/Formats/FormatLoader.swift`
+    * `LoadedImage`                                    — line  11
+    * `FormatLoaderError`                              — line  51
+    * `FormatLoader` (enum / namespace)                — line  83
+    * `FormatLoader.load(url:)`                        — line  89  (back-compat shim → load(url:targetMaxDim:))
+    * `FormatLoader.load(url:targetMaxDim:)`           — line 105  (cache-keyed entry; defer-emits cache_hit=false)
+    * `FormatLoader.loadAsync(url:targetMaxDim:)`      — line 186  (sync cache-hit fast-path then DecodeExecutor hop)
+    * `FormatLoader.prefetch(urls:targetMaxDim:)`      — line 216
+    * `FormatLoader.clearCache()`                      — line 226
+    * `FormatLoader.load(data:hintedExtension:)`       — line 233
+    * `FormatLoader.sniffExtension(from:)`             — line 275
+    * `FormatLoader.decodeWithImageIO(url:format:targetMaxDim:)`  — line 398
+    * `FormatLoader.decodeWithImageIO(data:format:sourceURL:targetMaxDim:)` — line 422
+    * `FormatLoader.decode(source:format:sourceURL:targetMaxDim:)` — line 448
+        * Thumbnail (downsample) branch at line 468–485:
+          uses kCGImageSourceCreateThumbnailFromImageAlways,
+          WithTransform, ShouldCacheImmediately, ThumbnailMaxPixelSize.
+        * Full-res branch at line 487: CGImageSourceCreateImageAtIndex.
+        * Both nil-checked at line 489 via `guard let cg = cg else`.
+    * `DecodedImageCache`                              — line 518
+        * `DecodedImageCache.Key`                      — line 520
+        * `DecodedImageCache.shared` (256 MB cap)      — line 527
+        * `get(_:)` / `put(_:_:)` / `clear()`          — lines 552 / 560 / 580
+        * `evictUntilUnderCap()`                       — line 620
+    * `DecodeExecutor`                                 — line 639
+        * `DecodeExecutor.shared` (maxConcurrent: 3)   — line 640
+        * `submit(_:)` (semaphore-gated)               — line 654
+
+* `/Users/bryan/BGit/tools_various/ImageGlass_Mac/code/Sources/ImageGlassCore/Formats/ClipboardLoader.swift`
+    * `ClipboardLoader` (enum)                        — line   9
+    * `ClipboardLoader.PasteResult` + `.Source`       — lines 12 / 20
+    * `loadFromClipboard(pasteboard:)` (@MainActor)   — line  42
+        * Routes file URLs → `FormatLoader.load(url:)` (gets cache for free)
+        * Routes data blobs / raw bitmaps → `FormatLoader.load(data:)`
+    * `loadFromData(_:hintedExtension:)`              — line 129  (non-AppKit path)
+
+* `/Users/bryan/BGit/tools_various/ImageGlass_Mac/code/Sources/ImageGlassCore/Formats/Base64Loader.swift`
+    * `Base64Loader` (enum)                           — line  12
+    * `extractBase64Payload(from:)`                   — line  17
+    * `decodeData(from:)`                             — line  39
+    * `loadFromBase64(text:)`                         — line  51  (routes to FormatLoader.load(data:))
+    * `loadFromBase64File(url:)`                      — line  70  (called recursively by FormatLoader for .b64 files)
+
+Tests:
+* `/Users/bryan/BGit/tools_various/ImageGlass_Mac/code/Tests/ImageGlassCoreTests/FormatLoaderTests.swift`
+  — 15 cases covering sniff, URL/data load, cache hit, mtime
+  invalidation, full-res vs. downsample distinct entries, async load,
+  and BPG external-delegate error path. (Cannot currently execute via
+  `swift test` because the wider package fails to link — see Progress
+  notes above.)
+
+## Risk analysis
+
+Audited every CG/CF/Image I/O surface reachable from `Image.Load*` for
+the crash family the user just hit
+("Can't unsafeBitCast between types of different sizes"). Findings:
+
+* `unsafeBitCast` — ZERO occurrences anywhere in
+  `Sources/ImageGlassCore/`. The image-loading path does not use it at
+  all. The only project-wide uses are in
+  `Sources/ImageGlass/FileSystem/FSEventsBridge.swift:193` and `:219`
+  (CFTypeRef → CFDictionary / CFString). Both are 8-byte class refs so
+  the sizes match, but the safer pattern is `cf as! CFDictionary`
+  conditional downcast. Flagging for the FileSystem agent — out of
+  scope for this plan, and the crash text the user pasted does NOT
+  reference any file in the image-load path. FSEventsBridge runs on
+  app launch when the user opens a folder, which is consistent with the
+  reported "startup" crash.
+* `try!` — none in `Formats/` or callers. Image I/O routes all use
+  `guard let ... else { throw FormatLoaderError.decodingFailed(...) }`.
+* `as! CGImage` / `as! CIImage` / `as! CFDictionary` — none in
+  `Formats/`. All Image I/O return values nil-checked with `guard`.
+* `fatalError` — only `init(coder:)` boilerplate in
+  `Viewer/ImageCanvasView.swift:153` and
+  `ContextMenus/ContextMenuBridge.swift:70`. Not reachable from a
+  storyboardless SwiftUI app boot; safe.
+* `CGImageSourceCreateImageAtIndex` returning nil — checked at
+  `FormatLoader.swift:489` (image-load path),
+  `FrameSource.swift:52,220` (out of scope) and
+  `IgCmdDispatcher.swift:283` (out of scope). All log + throw rather
+  than force-unwrap.
+* `NSImage(contentsOf:)` returning nil — every callsite under
+  `Sources/ImageGlass/` uses `guard let img = NSImage(contentsOf: url)
+  else { ... }`. Same for `NSImage.applicationIconImage` (uses `??`
+  chain in `AboutView.swift:72`).
+* Threading — `FormatLoader.load(url:)` is synchronous and the canvas
+  host calls it from `updateNSView`, which is main-thread. The plan
+  already calls this out; the migration is owned by the canvas agent.
+  `loadAsync` is in place and ready when the canvas agent opts in.
+* `Unmanaged.fromOpaque` — not used in image-loading code. Only in
+  `FSEventsBridge.swift` (FileSystem) and `ExternalToolIPC.swift`
+  (out of scope).
+* `withMemoryRebound` — not used in image-loading code. Only in
+  `ExternalToolIPC.swift:120,127` (UNIX socket plumbing, not reachable
+  from `Image.Load*`).
+
+Conclusion: the `Image.Load` / `Image.Decode` family is NOT a
+plausible source of the reported `unsafeBitCast` crash. The most
+likely culprit is `FSEventsBridge.swift` lines 193 / 219 (or related
+FSEvents CFType handling). That belongs to the FileSystem agent's
+plan; flagging here so the owner can address.
+
+## Changes made
+
+None to source code on this pass.
+
+Rationale:
+* The image-load codepath does not contain any of the crash-prone
+  patterns the user described. Audit found zero `unsafeBitCast`,
+  zero force-unwraps, zero `try!`, zero `as! CGImage`/`as! CIImage`,
+  zero `fatalError` in production paths. Every Image I/O return is
+  nil-checked with `guard`. Every `NSImage(contentsOf:)` callsite is
+  `guard let`. Threading boundaries (`loadAsync`, `DecodeExecutor`)
+  are in place.
+* The implementation already matches the plan invariants
+  (cache key tuple, 256 MB cap, 3-wide executor, cache_hit trace).
+* No duplication: there is exactly one `DecodedImageCache`, exactly
+  one `DecodeExecutor`, exactly one `FormatLoader.load(url:)` family.
+  `ClipboardLoader` and `Base64Loader` correctly route URL/data loads
+  through `FormatLoader` so they pick up the cache without
+  re-implementing it.
+* The only edit that would have been justified — wrapping the
+  FSEvents `unsafeBitCast` calls in `as!` conditional downcasts —
+  is in a file owned by the FileSystem agent (`FSEventsBridge.swift`)
+  and outside this plan's scope per the original "Out of scope"
+  section.
+

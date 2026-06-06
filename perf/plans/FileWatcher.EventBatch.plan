@@ -111,3 +111,162 @@ Build / test:
 * `swift test --filter FileWatcher` cannot run because the package
   build fails on the off-limits files above. Re-run once those are
   fixed.
+
+## Implementation map (second pass — startup-crash hunt)
+
+FileSystem-watcher implementation, end-to-end:
+* code/Sources/ImageGlass/FileWatcher.swift
+    - final class FileWatcher (lines 6–81): single-directory
+      kqueue + DispatchSourceFileSystemObject + 250 ms debounce,
+      owner of the `FileWatcher.EventBatch` perf trace (line 51).
+      Trace is started inside the work item, finished after
+      `onChange()` — matches plan §3.
+* code/Sources/ImageGlass/FileSystem/FSEventsBridge.swift
+    - final class FSEventsBridge (line 34): thin Swift wrapper
+      around FSEventStreamCreate. Context pointer setup at
+      line 92–98 uses `Unmanaged.passUnretained(self).toOpaque()`,
+      which is the correct pattern.
+    - static C trampoline `staticCallback` (lines 148–158): uses
+      `Unmanaged<FSEventsBridge>.fromOpaque(clientInfo).takeUnretainedValue()`
+      — also correct, mirrors the passUnretained on the way in.
+    - `dispatchRaw` (lines 168–240): decodes the CF objects the
+      kernel delivers. **Was the crash site** — see Risk analysis.
+* code/Sources/ImageGlass/FileSystem/FSEventsScopeWatcher.swift
+    - final class FSEventsScopeWatcher: one per scope. Owns the
+      bridge, normalizes raw kernel callbacks, emits ChangeBatches.
+      Trace name `FileSystemWatcher.FSEventsBatch` (line 62).
+* code/Sources/ImageGlass/FileSystem/FocusedFileWatcher.swift
+    - final class FocusedFileWatcher: 16 ms-coalesce kqueue watcher
+      for the single currently-displayed file. Distinct shape from
+      FileWatcher — not a duplicate.
+* code/Sources/ImageGlass/FileSystem/CoordinatedFilePresenter.swift
+    - NSFilePresenter that pauses FocusedFileWatcher during a
+      coordinated writer handshake.
+* code/Sources/ImageGlass/FileSystem/PollingScopeWatcher.swift
+    - 5 s / 30 s polling fallback.
+* code/Sources/ImageGlass/FileSystem/FileSystemWatcher.swift
+    - public actor FileSystemWatcher (line 28): composes all the
+      above. The only entry point the rest of the app talks to.
+* code/Sources/ImageGlassCore/FileSystem/ChangeEvent.swift
+    - public enum ChangeEvent + public struct ChangeBatch.
+* code/Sources/ImageGlassCore/FileSystem/ChangeBatchCoalescer.swift
+    - public struct ChangeBatchCoalescer: pure per-URL coalescer.
+
+Duplication / migration check (git status flags ChangeBatchCoalescer.swift
+and ChangeEvent.swift as deleted under ImageGlass/FileSystem/ with new
+copies under ImageGlassCore/FileSystem/):
+* Verified: only one definition of `ChangeEvent`, `ChangeBatch`,
+  and `ChangeBatchCoalescer` survives — all in ImageGlassCore.
+  `grep` returned no shadow copies in the ImageGlass executable
+  target. Migration is complete, not double-implemented.
+* `FileSystemWatcher.swift` (new, in ImageGlass/FileSystem/) is the
+  composition root; `FileWatcher.swift` (older, top-level) is the
+  generic kqueue-on-a-directory utility used by AppState +
+  PanelLayoutModel for app-config dirs. They serve different
+  purposes — keeping both is correct.
+
+## Risk analysis (startup crash: "Can't unsafeBitCast between types of different sizes")
+
+Primary hypothesis going in: an `unsafeBitCast` in the FSEvents
+callback path. **Confirmed.** FSEventsBridge.swift previously
+contained two such casts inside `dispatchRaw`:
+
+    let cf = Unmanaged<CFTypeRef>.fromOpaque(raw).takeUnretainedValue()
+    ...
+    let dict = unsafeBitCast(cf, to: CFDictionary.self)   // crash
+    ...
+    let s    = unsafeBitCast(cf, to: CFString.self)       // crash
+
+Why this crashes on arm64e in Swift 6:
+* `CFTypeRef` is imported into Swift as `AnyObject` — but at the
+  Swift type-system level it is an existential container, not a
+  bare class reference. `unsafeBitCast` enforces a runtime
+  size-equality check between source and destination types.
+* `CFDictionary` / `CFString` are imported as single-word class
+  types (8 bytes on arm64e).
+* The size check sees existential-container ≠ class-ref and
+  aborts in `Swift/arm64e-apple-macos.swiftinterface:3272` —
+  exactly the crash signature in the bug report.
+* The previous edit pass fixed the *key-side* misuse (importing
+  the `kFSEventStreamEvent*Key` Swift `String` constants and
+  bitcasting them to `UnsafeRawPointer`) but left the
+  `CFTypeRef → CFDictionary` and `CFTypeRef → CFString`
+  bitcasts in place, so the crash persisted.
+
+Other unsafe-pointer call sites audited and found OK:
+* `Unmanaged.passUnretained(self).toOpaque()` (line 94) +
+  `Unmanaged<FSEventsBridge>.fromOpaque(clientInfo)` (lines
+  151–153): retain semantics are matched, `self` outlives the
+  stream (it owns it), and the trampoline only takes
+  unretained — no ARC mismatch.
+* `Unmanaged<CFArray>.fromOpaque(eventPaths)` (line 174):
+  `eventPaths` is documented by Apple as a CFArrayRef when
+  `UseCFTypes` is set — typed cast is correct.
+* `Unmanaged<CFString>.fromOpaque(p)` and
+  `Unmanaged<CFNumber>.fromOpaque(inodeRaw)` (lines 215, 221):
+  the dictionary values are documented as the named CF types,
+  no risk.
+* `Unmanaged.passUnretained(... as CFString).toOpaque()`
+  (lines 209–212): the `as CFString` bridges the imported
+  `String` constant to its CF representation before taking the
+  opaque key pointer; this was the correct prior fix.
+
+`try!` / force-unwrap / threading audit:
+* No `try!` or `as!` in any of the watcher files in scope.
+* `FSEventStreamSetDispatchQueue(s, callbackQueue)` (line 114)
+  is correct — callbacks fire on the caller's queue, not the
+  default runloop.
+* DispatchSource handlers in FileWatcher / FocusedFileWatcher /
+  PollingScopeWatcher all run on a private serial background
+  queue. `onChange` / `onBatch` callbacks are the caller's
+  responsibility to hop to main; documented in the comments.
+* `FSEventsScopeWatcher.stop()` hops onto `self.queue` before
+  touching mutable state — no thread races on teardown.
+
+Perf-floor sanity check on the 250 ms `FileWatcher.EventBatch`
+floor noted in the snapshot:
+* Confirmed (line 60 of FileWatcher.swift): the floor IS the
+  intentional spec §6.6 debounce window, not real work.
+* The trace already measures only `onChange()` (started on
+  line 50, after the debounce wait). So once the new perf log
+  is captured, the `FileWatcher.EventBatch` min should fall
+  from 250 ms to whatever `onChange()` actually costs
+  (single-digit ms for a typical re-eval). No code change
+  needed — this matches the first-pass fix described above
+  under "Applied".
+
+## Changes made (startup-crash root cause)
+
+File: code/Sources/ImageGlass/FileSystem/FSEventsBridge.swift
+Function: `dispatchRaw(numEvents:eventPaths:eventFlags:eventIds:)`
+
+Replaced (root cause of the startup `Fatal error: Can't
+unsafeBitCast between types of different sizes`):
+
+* Removed the intermediate `let cf = Unmanaged<CFTypeRef>...
+  .takeUnretainedValue()` materialization.
+* Replaced `unsafeBitCast(cf, to: CFDictionary.self)` with
+  `Unmanaged<CFDictionary>.fromOpaque(raw).takeUnretainedValue()`
+  — a properly typed single-word reference straight from the
+  opaque pointer, no `unsafeBitCast` involved.
+* Replaced `unsafeBitCast(cf, to: CFString.self)` with
+  `Unmanaged<CFString>.fromOpaque(raw).takeUnretainedValue()`
+  for the same reason.
+* `CFGetTypeID` is now called on a transient
+  `Unmanaged<CFTypeRef>.fromOpaque(raw).takeUnretainedValue()`
+  value — `CFGetTypeID` accepts any CFTypeRef so this is safe,
+  and it avoids the existential→class bitcast entirely.
+* Added an inline comment that names the crash signature so a
+  future agent will not re-introduce the same `unsafeBitCast`
+  pattern.
+
+Net: this is the FSEvents-callback decode path. Every FSEvents
+batch went through `dispatchRaw`, which means every scope-watcher
+startup that received at least one kernel callback would have hit
+the crash. With this fix, the bridge produces correctly-typed CF
+references without invoking `unsafeBitCast` at all.
+
+Build status: ImageGlass + FileSystem/ targets compile clean.
+ImageGlassCore still fails on `CGImage.blank1x1` in
+Viewer/FrameSource.swift — out of scope for this agent (owned by
+the viewer/image-decode agent).

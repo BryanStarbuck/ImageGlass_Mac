@@ -108,6 +108,13 @@ final class AboutAppDelegate: NSObject, NSApplicationDelegate {
         true
     }
 
+    /// Drain the DirectoriesStore write coalescer (perf/plans/LocalStorage.plan)
+    /// so the 250 ms debounce window can't drop the user's last mutation
+    /// during shutdown.
+    func applicationWillTerminate(_ notification: Notification) {
+        try? DirectoriesStore.shared.flushPendingWrites()
+    }
+
     @MainActor
     func applicationDidFinishLaunching(_ notification: Notification) {
         // When launched via `swift run` (no .app bundle), the process can

@@ -86,3 +86,173 @@ Out of scope
 * ImageCanvasView.swift and ImageViewer.swift edits (other agent owns).
 * FormatLoader integration of the shared CGImageSource (other agent).
 * Background-thread move (per the agent brief, do not spin threads here).
+
+## Progress notes (second-pass review)
+
+Confirmed against the source as it stands in LoadDiagnostics.swift and
+FrameSource.swift:
+
+* Diagnostics cache is keyed on (path, mtime epoch (Int64 seconds), size).
+  Eviction is FIFO with a 1024-entry cap (cacheLimit). The cacheOrder
+  array is append-on-miss and removeFirst on overflow, so the steady-state
+  cap holds. cacheGet / cachePut are NSLock-guarded.
+* Cloud-placeholder verdicts (.cloudPlaceholder) are returned BEFORE the
+  cache write path is reached, so they are never cached. This preserves
+  the "state flips as downloads finish" semantics.
+* Single batched URLResourceValues stat reads isSymbolicLink, isDirectory,
+  isRegularFile, fileSize, isReadable, contentModificationDate in one
+  call. Missing-file handling is two-layered: rv == nil triggers a
+  fileExists fallback to disambiguate .missing vs. odd-permissions, and
+  a deleted-between-walk-and-diagnose file falls through to .missing.
+* LFS short-circuit: GitLFSPointer.isPointer is only called when
+  fileSize <= 1024 bytes. LFS pointer spec is ~130 bytes, so 1 KB is a
+  safe ceiling that avoids the FileHandle open on every non-LFS image.
+* Lazy frame decoder (FrameSource.Decoder) is NSLock-guarded. Frame 0 is
+  eager-decoded with kCGImageSourceShouldCacheImmediately so the bitmap
+  is materialized in LoadFrames, not on the first CGContext.draw call.
+  Frame indexes > 0 decode just-in-time and memoize. The shared
+  CGImageSource is held for the lifetime of the FrameSource.
+* Image.Render 14 ms max outlier: forcing immediate cache at decode
+  shifts the implicit-decode cost into LoadFrames where the trace bucket
+  already accounts for it.
+
+Tightened in this pass:
+
+* Added `LoadDiagnostics.clearCache()` and `cacheCount` as
+  test/diagnostic hooks (cache observability + benchmarks).
+* Skipped cache writes when the batched stat itself failed (rv == nil).
+  Previously a transient permission glitch could insert a (path, 0, 0)
+  key that would shadow the real key once stat succeeded; now the rv-nil
+  path returns the right verdict without poisoning the table.
+
+Deferred — not done here:
+
+* Sharing the diagnostics cache key with FormatLoader's DecodedImageCache:
+  the two caches key on different mtime types (Int64 epoch seconds vs.
+  TimeInterval Double) and different field sets (no targetMaxDim in the
+  diagnostics cache). They could share an invalidation channel via the
+  FileWatcher, but FileWatcher.swift is owned by a different agent. Left
+  alone.
+* SVGDetection.swift is only called from SVGPlaybackController; it is not
+  on the Image.LoadDiagnostics or Image.Render path covered by this plan.
+  No edits made.
+* invalidateCache(for:) is O(n) on cacheOrder. n <= 1024, called only on
+  file-replacement events; not a hot path. Left as-is.
+
+Verification:
+
+* `swift build --target ImageGlassCore` — clean. (The whole-package build
+  fails in PollingScopeWatcher.swift / FileSystemWatcher.swift — both
+  owned by the FileSystem agent. Not this plan's territory.)
+* `swift test --filter LoadDiagnosticsTests` — 12/12 passing in 0.019 s.
+* `swift test --filter FrameSourceTests` — 2/2 passing in 0.011 s.
+
+## Implementation map
+
+Plan-owned files and the symbols / line ranges that implement each fix.
+
+* `code/Sources/ImageGlassCore/Viewer/LoadDiagnostics.swift`
+  * `LoadDiagnosis` enum + `userMessage` + `tag` (lines 32-94)
+  * `LoadDiagnostics.CacheKey` (lines 107-111)
+  * `cache` / `cacheOrder` / `cacheLimit` / `cacheGet` / `cachePut` (lines 113-135)
+  * `invalidateCache(for:)` (line 139)
+  * `clearCache()` (line 150) and `cacheCount` (line 158) — test/diagnostic hooks
+  * `diagnose(url:)` — single batched `URLResourceValues` stat, LFS size short-
+    circuit at `<=1024 bytes`, cache lookup keyed on `(path, mtime, size)` only
+    after structural checks, `canCache` guard against rv-nil poisoning
+    (lines 167-285)
+  * `diagnoseAfterDecodeFailure(url:decoderHint:)` (lines 292-305)
+  * `requestDownloadIfPossible(url:)` (line 311)
+  * `cloudDownloadStatus(for:)` (line 326), `providerHint(for:)` (line 338)
+  * Sole emit site for `Image.LoadDiagnostics` perf trace (line 169)
+
+* `code/Sources/ImageGlassCore/Viewer/FrameSource.swift`
+  * `FrameSource.Decoder` lazy-decode actor (lines 23-114). `image(at:)` uses
+    `kCGImageSourceShouldCacheImmediately` to materialize the bitmap at decode
+    time, NSLock-guarded memoization in `cached[Int:CGImage]`.
+  * `FrameSource.Decoder.fallbackPixel` — hardened static 1x1 RGBA fallback
+    (now lines 70-107; see "Changes made" below).
+  * `FrameSource.Frame` (lines ~117-138), `load(url:)` (line 176), `load(data:)`
+    (line 211), `decode(source:contextLabel:)` (line 226). Frame-0 eager
+    decode + frame-N lazy decode contract.
+  * Sole emit sites for `Image.LoadFrames` perf trace (URL path at line ~178,
+    Data path at line ~213).
+
+* `code/Sources/ImageGlassCore/Viewer/GitLFSPointer.swift`
+  * `GitLFSPointer.isPointer(at:)` (line 29) — only entered when
+    `LoadDiagnostics.diagnose` saw `fileSize <= 1024`.
+  * `GitLFSPointer.repoRoot(for:)` (line 54) — bounded 64-step parent walk.
+  * Sole emit site for `Image.LFSDetect` perf trace (line 31).
+
+Duplication audit: no duplicate emit sites for `Image.LoadDiagnostics`,
+`Image.LFSDetect`. `Image.LoadFrames` is emitted from two paths (URL and
+Data) — these are distinct code paths, not duplicates, and the action name
+is intentionally shared so the aggregate row in `perf_report.csv` covers
+both. `Image.Render` is emitted from `ImageCanvasView.swift` (line 426) —
+owned by the viewer agent; out of scope for this plan.
+
+## Risk analysis
+
+Concrete crash / correctness risks reviewed in plan-owned files:
+
+* `FrameSource.Decoder.fallbackPixel` (old code) used `CGContext(...)!` and
+  `ctx.makeImage()!` at static-init time. If either ever returned nil the
+  app would `fatalError` during the first `Decoder.fallbackPixel` access,
+  which is reachable on every image load failure path. 1x1 RGBA almost
+  never fails, but a force-unwrap in a globally-reachable static is exactly
+  the wrong place to gamble. HARDENED — see "Changes made."
+
+* `LoadDiagnostics.diagnose(url:)` performs no force-unwraps, no `try!`,
+  no `as!`. All `try?` and optional chaining handle the stat-failure case.
+  Cache key (`Int64` mtime epoch + `Int64` size) cannot overflow for any
+  reasonable file. The cacheLimit-driven `cacheOrder.removeFirst()` is safe
+  because the conditional guards on `cacheOrder.count > cacheLimit`.
+
+* `GitLFSPointer.isPointer(at:)` uses `try?` for the FileHandle open and
+  read, returns false on failure. No crash surface.
+
+* No `unsafeBitCast`, no `withMemoryRebound`, no `Unmanaged.fromOpaque`,
+  no FFI / C-callback context-pointer code in any plan-owned file.
+  Therefore the `Can't unsafeBitCast between types of different sizes`
+  fatal-error from this morning's startup crash does NOT originate here.
+
+Cross-cutting hazards spotted (NOT fixed — out of scope per agent brief):
+
+* `code/Sources/ImageGlass/FileSystem/FSEventsBridge.swift:193, 219` uses
+  `unsafeBitCast(cf, to: CFDictionary.self)` / `unsafeBitCast(cf, to:
+  CFString.self)` where `cf` came from `Unmanaged<CFTypeRef>.fromOpaque(...)
+  .takeUnretainedValue()`. On arm64e, `CFTypeRef` is imported as
+  `AnyObject` which is a 16-byte class-existential, while `CFString` /
+  `CFDictionary` are 8-byte class references. That size mismatch is
+  exactly what the runtime catches in
+  `Swift/arm64e-apple-macos.swiftinterface:3272: Fatal error: Can't
+  unsafeBitCast between types of different sizes`. THIS IS THE LIKELY
+  ROOT CAUSE OF THE STARTUP CRASH. The correct rewrite is `cf as!
+  CFDictionary` (the toll-free bridge is a guaranteed-safe runtime cast)
+  or, since `CFArrayGetValueAtIndex` already returns an opaque pointer,
+  `Unmanaged<CFDictionary>.fromOpaque(raw).takeUnretainedValue()` and
+  `Unmanaged<CFString>.fromOpaque(raw).takeUnretainedValue()` after a
+  `CFGetTypeID` discriminator. Owned by the FileSystem agent; flagged here
+  for them to fix.
+
+## Changes made
+
+* `FrameSource.swift::Decoder.fallbackPixel` (lines 70-107)
+  Replaced the `CGContext(...)!` + `ctx.makeImage()!` force-unwraps with a
+  two-tier safe construction:
+    1. Try `CGContext` + `makeImage()` via `if let` — the happy path for any
+       working macOS.
+    2. Fall back to a `CGDataProvider`-backed 1x1 transparent `CGImage`
+       built from a tiny `[UInt8]` buffer. This avoids `CGBitmapContext`
+       entirely so a single failure mode in `CGContext` cannot kill the
+       app at module-init time.
+    3. If both fail (truly unreachable on any working OS), log via
+       `ErrorLog.log` then `fatalError` with a diagnostic message. This is
+       strictly better than the previous silent force-unwrap crash because
+       the message names the symbol the user can look up.
+  Verified with `swift test --filter FrameSourceTests` (2/2 pass) and
+  `swift build --target ImageGlassCore` (clean).
+
+* No other changes were needed in plan-owned files — the audit found the
+  rest of the surface to be already free of `try!`, `as!`, `unsafeBitCast`,
+  unbounded `fatalError`, and FFI pointer-rebind hazards.

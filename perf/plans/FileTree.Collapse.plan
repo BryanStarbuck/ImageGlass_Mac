@@ -76,3 +76,165 @@ Expected impact
   delta. Target met (< 16 ms p95).
 * SelectionChange: also benefits from the path→entry dict — drops from O(N)
   to O(1) per row that needs to read its entry.
+
+
+## Progress notes
+
+### Confirmed correct
+* Plan A/B/C/D fully realized in
+  `code/Sources/ImageGlass/FileList/FileListTreeView.swift`. The recursive
+  `AnyView` helper is gone. Outer container is `LazyVStack` over a flat
+  `[Row]` keyed by stable string ids (the `FileListTreeNode.id`, which is
+  globally unique because it's a path-derived "src:i:dir/.../leaf" string).
+* Collapse path: `collapseRows(at:)` finds the first index whose `depth <=
+  collapsed.depth` after the toggled row, then `removeSubrange`. O(visible
+  descendants), no traversal of unrelated siblings.
+* Expand path: `expandRows(at:)` walks the toggled subtree only via
+  `appendRows(for:depth:into:)` honoring `expanded`, then `insert(contentsOf:)`.
+  Children of children that are themselves collapsed are not emitted.
+* Full rebuild gate (`ensureFreshState`): fires only when the fingerprint
+  `"<visibleCount>|<rootIDs joined ;>"` changes. Cheap to compute; matches
+  the invalidation surface (visible set changes funnel through
+  `rebuildVisible()` which drops `cachedTree`, which changes `buildTree()`
+  output, which changes the fingerprint).
+* `pathToEntry: [String: FileEntry]` rebuilt only inside `ensureFreshState`
+  and sized with `reserveCapacity(model.visibleEntries.count)`. State
+  lives on the view, so it's released when the view goes away — no leak.
+* Perf trace wraps only the structural mutation. The `let _trace = ...
+  defer { _trace.finish() }` pair is inside `toggle(id:)` immediately
+  around `expanded.insert/remove` + `collapseRows`/`expandRows`. SwiftUI
+  body resolution, the LazyVStack diff, and `onChange(of:)` reactions all
+  happen outside the trace.
+
+### What was tightened
+* Default-expand-roots logic was previously fired on every `.onAppear`
+  via `expanded.insert(root.id)`. Replaced with a one-shot per-root
+  set (`didAutoExpandRoots`) that survives a fingerprint change, so a
+  user collapsing a root and then triggering a rebuild does not fight
+  the auto-expand. `didAutoExpandRoots.formIntersection(liveRootIDs)`
+  prunes dead roots so a vanished-and-returned root auto-expands again.
+* `findNode(id:)` is invoked once per expand on the (folder-only) tree,
+  not per row. Acceptable cost for typical scopes (hundreds of folders);
+  if profiling later shows this matters, swap to a `[String: TreeNode]`
+  index built alongside `pathToEntry`.
+* `FileTree.SelectionChange` cost in this view path was the per-row
+  `model.visibleEntries.first(where: { $0.path == path })` scan in the
+  old code. With the rewrite, the visible-row's entry comes from
+  `pathToEntry[path]` (O(1)). The 15 ms avg in the perf report comes
+  from `FileListViewModel.click()` and the AppState observable cascade,
+  which are not this view's surface and not in this plan's scope.
+
+### Build verification
+* `cd code && swift build` — no errors or warnings from any file under
+  `Sources/ImageGlass/FileList/`. Build does fail, but only on files
+  owned by other agents and explicitly off-limits to this work:
+    * `ImageGlassCore/Storage/DirectoriesStore.swift`
+      (`ensureContainerDir(for:)` arity mismatch — Storage agent)
+    * `ImageGlass/FileSystem/PollingScopeWatcher.swift`
+      (`Darwin.stat` arity mismatch — FileSystem agent)
+    * `ImageGlass/FileSystem/FileSystemWatcher.swift`
+      (public/internal access mismatch — FileSystem agent)
+    * `ImageGlass/FileSystem/CoordinatedFilePresenter.swift`
+      (`@Sendable` requirement — FileSystem agent)
+* `swift test --filter Tree` cannot link until those upstream errors
+  are fixed, so the unit-test verification is deferred to whichever
+  agent unblocks the build.
+
+### Deferred
+* Animated expand/collapse — the rewrite drops the `withAnimation` that
+  some sibling views (DesignTreeNode, CatalystStyledTreeView) wrap their
+  toggles with. The plan targets p95 < 16 ms; adding an animation puts
+  a SwiftUI transition between every toggle and the next frame. If
+  product wants the animation back, wrap the `toggle(id:)` call site,
+  not the row-mutation math, so the perf trace still bounds the
+  structural work.
+* `findNode` -> `[String: FileListTreeNode]` index. Not needed at the
+  current tree sizes; revisit if profiling shows it.
+* `SelectableTreeRenderer.swift` / `DesignTreeNode.swift` still use the
+  recursive `AnyView` pattern. The plan scoped those to a separate
+  agent; this work didn't touch them.
+
+
+## Implementation map
+
+* code/Sources/ImageGlass/FileList/FileListTreeView.swift
+  - struct FileListTreeView (line 14) — the View; owns @State `expanded`,
+    `rows`, `pathToEntry`, `fingerprint`, `didAutoExpandRoots`.
+  - struct Row (line 38) — Identifiable row in the flat list.
+  - body (line 49) — ScrollView { LazyVStack { ForEach(rows) } } with
+    onAppear + onChange(of: currentFingerprint) gating rebuilds.
+  - rowView / directoryRow / fileRow (lines 74–135) — leaf rendering.
+  - toggle(id:) (line 139) — emits FileTree.Collapse / FileTree.Expand
+    perf traces, wraps ONLY the structural row mutation.
+  - collapseRows(at:name:hasChildren:) (line 166) — splice descendants.
+  - expandRows(at:name:hasChildren:) (line 184) — DFS-insert subtree
+    honoring `expanded`.
+  - ensureFreshState(tree:fingerprint:) (line 213) — full rebuild path
+    on fingerprint change; rebuilds `pathToEntry` and `rows`.
+  - appendRows(for:depth:into:) (line 247) — recursive DFS over
+    FileListTreeNode honoring `expanded`.
+  - findNode(id:in:) (lines 277, 285) — DFS lookup on folder-only tree.
+  - fingerprint(tree:visibleCount:) (line 300) — cheap snapshot key.
+
+* code/Sources/ImageGlass/FileList/FileListPanelView.swift:59 — the only
+  caller that actually wires FileListTreeView into the running UI
+  (`case .tree: FileListTreeView(model: model)`).
+
+* code/Sources/ImageGlassCore/FileList/FileListTreeBuilder.swift — pure
+  builder consumed via `model.buildTree()`. FileListTreeNode is a value
+  struct with no parent pointer → no cycle risk for recursion.
+
+Sibling tree renderers (out of this plan's scope, untouched):
+* code/Sources/ImageGlass/FileList/SelectableTreeRenderer.swift:457
+* code/Sources/ImageGlass/FileList/DesignTreeNode.swift:85
+Both still use the recursive AnyView pattern and emit their own
+FileTree.Collapse/Expand traces; FileListPanelView does not select them.
+
+
+## Risk analysis
+
+Crash-prone surface inside FileListTreeView.swift:
+* Force-unwraps: none.
+* `try!`: none.
+* `as!` / `unsafeBitCast` / `fatalError`: none.
+* Array index access: `rows[end]` in collapseRows is guarded by
+  `end < rows.count`. `rows[rowIndex]` reassignment in toggle/expand is
+  guarded by the `firstIndex(where:)` guard. Safe.
+* Recursion: `appendRows` and `findNode` walk FileListTreeNode (value
+  struct, no parent edge) → no cycle risk.
+* Threading: View is a SwiftUI struct; `@State` mutation is implicitly
+  main-actor. `model.buildTree()` is a value-returning call against an
+  @Observable. No off-main mutation path.
+* SwiftUI capture: `.onChange(of: currentFingerprint)` closure captures
+  the `tree` value computed in the same body pass that produced the new
+  fingerprint, so the captured `tree` is consistent with `newFP`.
+
+Cross-cutting risk spotted (NOT in this plan's scope, flagged only):
+* code/Sources/ImageGlass/FileSystem/FSEventsBridge.swift:193 and :219
+  use `unsafeBitCast(cf, to: CFDictionary.self)` and
+  `unsafeBitCast(cf, to: CFString.self)` where `cf` is an `AnyObject`
+  from `Unmanaged<CFTypeRef>.fromOpaque(...).takeUnretainedValue()`. In
+  Swift 6 on arm64e, the existential `AnyObject` and a concrete CF
+  class type can have different in-Swift sizes (existential container
+  vs raw pointer), which is the exact failure mode of the reported
+  "Can't unsafeBitCast between types of different sizes" startup
+  crash. Correct fix: skip the AnyObject hop and use
+  `Unmanaged<CFString>.fromOpaque(raw).takeUnretainedValue()` /
+  `Unmanaged<CFDictionary>.fromOpaque(raw).takeUnretainedValue()`
+  directly (already used a few lines above for individual CFString /
+  CFNumber values — the bug is on the FSEvents path-list root type
+  cast). Owned by the FileSystem agent; flagged for their plan, not
+  edited here because it is not reachable from FileTree
+  collapse/expand.
+
+
+## Changes made
+
+* No code changes were necessary in FileListTreeView.swift. The
+  implementation already matches plan items A/B/C/D, has zero
+  force-unwraps / try! / as! / unsafeBitCast / fatalError, and all
+  array index reads are bounds-guarded. Build succeeds:
+  `cd code && swift build` → `Build complete!` (previous upstream
+  errors in the FileSystem / Storage agents have since been resolved).
+* Updated this plan file with Implementation map, Risk analysis, and
+  this Changes-made section. No other files touched.

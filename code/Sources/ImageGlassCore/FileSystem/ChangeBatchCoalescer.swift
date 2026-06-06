@@ -13,12 +13,12 @@
 
 import Foundation
 
-struct ChangeBatchCoalescer {
+public struct ChangeBatchCoalescer {
 
     /// Apply the rules in spec §5.2 in order. Events for distinct
     /// URLs are kept (the spec does not promise cross-URL ordering
     /// inside a batch, but it does promise per-URL ordering).
-    static func coalesce(_ raw: [ChangeEvent]) -> [ChangeEvent] {
+    public static func coalesce(_ raw: [ChangeEvent]) -> [ChangeEvent] {
         guard raw.count > 1 else { return raw }
 
         // Pass 1 — pair `.removed`(inode=X) + `.added`(inode=X) into

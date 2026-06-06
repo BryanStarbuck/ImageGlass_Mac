@@ -372,6 +372,7 @@ private struct CanvasHost: NSViewRepresentable {
         v.smoothInterpolation = viewer.smoothInterpolation
         v.colorChannel = viewer.colorChannel
         v.showColorPicker = viewer.showColorPicker
+        v.showTransparencyChecker = viewer.showTransparencyChecker
         v.currentFrameIndex = viewer.currentFrameIndex
         v.isAnimationPaused = viewer.isAnimationPaused
 

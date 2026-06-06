@@ -636,6 +636,83 @@ Each scenario is one user utterance. The contract is:
 3. **MCP call** — the exact tool invocation.
 4. **Verify** — the on-disk + on-screen + log proof.
 
+### 5A.0 "Hide every file with `_DM_` in the name — case-sensitive." (PRIMARY)
+
+This is the primary scenario this spec is graded against (see
+§0.1). It was driven end-to-end on 2026-06-06 against the
+sidecar at
+`code/.build/arm64-apple-macosx/debug/imageglass-mcp` and
+produced the expected YAML mutation; see
+[`mcp_file.mdx` §10B.3.1](./mcp_file.mdx#10b31-live-verification-artifact-2026-06-06)
+for the exact JSON-RPC frames and the
+`corr=ed81f8bf` response.
+
+**Intent decomposition.**
+
+| Voice / typed fragment | Becomes | Why |
+| --- | --- | --- |
+| "Hide every file with…" | subtractive → `negate: true` | Verb-cookbook line "Subtractive intent" (§1.3 + `code/mcp/mcp_manual.txt` §2). |
+| "…in the name" | filename matching | Engine default (every kind matches filename, not path — `DirectoryTree.swift` line 293 → 304). |
+| "`_DM_`" | substring marker | `pattern: "*_DM_*"`, `kind: glob`. Glob is the case-sensitive option that does not require regex syntax (see §0.2 table). |
+| "case-sensitive" (explicit user qualifier) | engine-layer guarantee | `Glob.match` uses Swift `Character` equality (`code/Sources/ImageGlassCore/Glob.swift` line 97). The user does **not** set a flag for this; the choice of `kind: glob` IS the choice. |
+| (target = currently registered root) | `targets: "<absolute path>"` | The user said "have that caller application right now"; the canonicalized JFK/UX path is the sole registered root. |
+| (append vs. replace?) | **append** → `add_filter_item` | The prior filter is empty `items: []`, so the result is identical to `set_global_filter`/`update_directory_filter`, but `add_filter_item` is idempotent on the stable id (`RootFilterItem.id` — `DirectoryTree.swift` line 120) which is the correct shape for voice-driven retries. |
+
+**MCP call (the verified form).**
+
+```
+add_filter_item(
+  targets="/Users/<you>/BGit/work/into_Work/StarbuckLabs/JFK/UX",
+  item={
+    "pattern": "*_DM_*",
+    "kind":    "glob",
+    "negate":  true
+  },
+  client="claude-code"
+)
+```
+
+**Verify.** Identical contract to `mcp_file.mdx` §10B.6, with
+one additional check unique to this voice scenario:
+
+* `directories_window_1.yaml` shows the item exactly as
+  `pattern: "*_DM_*"` with `negate: true`, no `kind:` line
+  (default-omitted by `DirectoriesYAML.encode(_:)` line 90 —
+  `code/Sources/ImageGlassCore/Storage/DirectoriesYAML.swift`).
+* Tool response carries `ok=true`, `items_added=1`,
+  `app_running=true`, `corr=<8-hex>`,
+  `targets_applied=["/Users/.../JFK/UX"]`, and
+  `visible_delta` whose value depends on the
+  `include_overrides` interaction in
+  [`mcp_file.mdx` §10B.5.1](./mcp_file.mdx#10b51-interaction-with-include_overrides).
+  `visible_delta=0` is a legitimate outcome when every
+  matching file is already hidden by the override layer; the
+  filter item is still active for any future toggle of an
+  excluded ancestor back to include.
+* A follow-up `list_filter_items(targets="/Users/.../JFK/UX")`
+  returns one item with the stable id derived from
+  `"*_DM_*" + 0x1F + "glob" + 0x1F + "1" + 0x1F + "0"` →
+  first 6 hex chars of SHA1, computed by
+  `RootFilterItem.sha1Hex6` (`DirectoryTree.swift` line 131).
+
+**Removal call (for the cleanup half of the test case).**
+
+```
+remove_filter_item(
+  targets="/Users/<you>/BGit/work/into_Work/StarbuckLabs/JFK/UX",
+  match={ "pattern": "*_DM_*" },
+  client="claude-code"
+)
+```
+
+This drops the item exactly when its `pattern` field equals
+`"*_DM_*"`. The match strategy is implemented by the
+`removeFilterItem(_:)` handler in
+`code/mcp/DirectoriesMCPTools.swift` (line 318 descriptor,
+implementation below it). Per the spec §4.2 `remove_filter_item`
+schema, `match` accepts `{pattern}`, `{id}`, or `{regex}`;
+the verified form uses exact-pattern match.
+
 ### 5A. "Hide every file with `_dn_` in the name."
 
 **Intent decomposition.**

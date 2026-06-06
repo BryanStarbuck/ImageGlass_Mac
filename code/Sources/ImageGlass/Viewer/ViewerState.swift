@@ -29,6 +29,11 @@ public final class ViewerState {
     // Display options
     public var smoothInterpolation: Bool = true
     public var colorChannel: ColorChannel = .all
+    /// transparent_bk_checkers.mdx §2.5 / §8 — when true, the canvas
+    /// paints a two-tone gray checker grid behind the image so that
+    /// alpha-channel transparency and aspect-fit margins are
+    /// visually distinguishable from a flat painted backdrop.
+    public var showTransparencyChecker: Bool = true
 
     // Overlays
     public var showInfoOverlay: Bool = false

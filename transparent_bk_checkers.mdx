@@ -1,0 +1,763 @@
+---
+title: Transparency Background Checker Pattern
+description: Product and engineering specification for the two-tone checker pattern that ImageGlass_Mac paints behind every image so that alpha-channel transparency, partial transparency (semi-opaque alpha 0.0 < a < 1.0), and the letterbox / pillarbox margins around an aspect-fitted image are all visibly distinguishable from a flat painted canvas. Pins down the geometry (**height-driven sizing — 25 rows fill the viewport vertically, tiles stay perfectly square, columns are over-allocated to overflow the right edge so resize never produces a bare strip**), the color tokens (light / dark appearance-adaptive, with the darker tone warm-shifted toward red at matched luminance), the draw-order contract relative to the existing `NSView.draw(_:)` pipeline in `ImageCanvasView.swift`, the resize behavior, the toggle surface, and the rendering primitive choice (direct Core Graphics rect-fill on the main canvas `CGContext`, no `CGPattern`, no `CALayer` patterned background, no off-screen bitmap).
+---
+
+# Transparency Background Checker Pattern
+
+> **Document type:** Product + engineering specification.
+> **Audience:** Engineering (viewer canvas, design tokens, settings,
+> hotkeys) and Product (user-visible contract for what is behind a
+> transparent or aspect-fitted image).
+> **Owners:** PM for the user-visible contract (when the checker is
+> shown, what it looks like, how it scales); CTO for the rendering
+> path, the draw-order contract, and the resize / Retina semantics.
+> **Status:** v1 spec for the Mac-native fork. Authoritative
+> reference for the `transparency_checker` block inside
+> [`Viewer ▸ Background`](./docs/settings.mdx) and for the
+> implementation in `ImageCanvasView.swift`.
+
+Cross-references:
+
+* [Image Canvas View](./code/Sources/ImageGlass/Viewer/ImageCanvasView.swift)
+  — the `NSView` subclass that owns `draw(_:)`. This spec extends
+  its render pipeline; nothing outside that file changes geometry.
+* [Design Tokens](./code/Sources/ImageGlass/DesignTokens.swift)
+  — the `enum IG` that resolves light / dark colors against the
+  active `NSAppearance`. The two checker tones live here.
+* [Viewer State](./code/Sources/ImageGlass/Viewer/ViewerState.swift)
+  — the `@Observable` per-window object that holds
+  `showTransparencyChecker`.
+* [Hotkeys](./docs/hotkeys.mdx) — §X reserves `⌥⌘B` (Option +
+  Command + B) to toggle the checker on or off.
+* [Settings](./docs/settings.mdx) — the persistent default lives
+  under `viewer.transparency_checker.enabled`.
+* [Performance](./docs/performance.mdx) §X — the checker fill must
+  not regress the `Image.Render` budget; this spec pins the upper
+  bound at ~600 rect fills per paint (20 columns × 30 rows on a
+  hypothetical ultrawide vertical viewport).
+
+---
+
+## 1. Why this feature exists
+
+ImageGlass_Mac renders every image inside a custom AppKit canvas
+(`ImageCanvasView : NSView`, see
+[`ImageCanvasView.swift:12`](./code/Sources/ImageGlass/Viewer/ImageCanvasView.swift)).
+Two distinct kinds of "empty space" appear on that canvas:
+
+1. **Alpha-channel transparency inside the image.** PNG, WebP, HEIF,
+   AVIF, JXL, SVG, GIF and TIFF can all carry per-pixel alpha. Some
+   pixels can be fully transparent (`a = 0`), some can be
+   semi-opaque (e.g. `a = 0.2`, `a = 0.5`). With a flat painted
+   background, the user cannot tell a fully-transparent pixel from a
+   gray pixel — they are visually identical. Worse, a 50%-opaque
+   white pixel on a 50%-gray canvas looks like a flat ~75% gray
+   pixel, indistinguishable from an actual flat color.
+2. **Letterbox / pillarbox margins around an aspect-fitted image.**
+   `ZoomMath.displayRect` (see
+   [`ZoomMath.swift`](./code/Sources/ImageGlassCore/Viewer/ZoomMath.swift))
+   fits the image inside the viewport while preserving aspect
+   ratio. When the image's aspect ratio does not match the
+   viewport's, the canvas has empty bands either to the left and
+   right ("pillarbox") or above and below ("letterbox") the image.
+   Those bands are part of the viewport, not part of the image.
+
+The transparency checker pattern resolves both at once. It is a
+two-tone grid of squares painted behind everything else. Where the
+image is fully opaque it covers the checker completely (the user
+sees the image, normal viewing). Where the image is fully
+transparent the checker shows through unchanged (the user reads "no
+pixel here"). Where the image is partially transparent the user
+sees the checker tinted by the image's color and partial
+opacity — instantly readable as "this pixel is semi-transparent."
+And in the letterbox / pillarbox margins, the checker visually
+delineates "the image ends here, this is just the viewport."
+
+This is the same contract Preview.app, Pixea, Lyn, Acorn, Pixelmator
+Pro, Affinity Photo, Photoshop and Figma all expose. ImageGlass_Mac
+matches the convention so the user's mental model transfers.
+
+## 2. User-facing contract
+
+This is the product side of the spec. Every claim here must hold on
+the screen before the feature is considered shipped.
+
+### 2.1 What the user sees
+
+* A grid of small squares fills the entire viewport behind the
+  image. The grid is painted in two alternating tones in a
+  checkerboard arrangement.
+* The lighter tone is *very* light gray (achromatic). The darker
+  tone is a noticeably-but-not-aggressively darker gray that has
+  been *warm-shifted toward red*: the red component is dialed up
+  and the green component is dialed down so the tone reads as a
+  "dusky pink" (light appearance) or "wine red" (dark
+  appearance), while keeping the same overall luminance as a
+  pure-gray tone of equivalent depth. The result is a checker
+  whose two tones are unmistakably different in hue, not just
+  brightness, which makes the pattern obvious behind a
+  monochrome image but never visually loud.
+* In light appearance both tones are light (lighter gray vs.
+  warm dusky pink-gray); in dark appearance both tones are dark
+  (dark gray vs. dark wine). The system appearance swap is
+  automatic — the user does not toggle it.
+* **25 tiles fill the viewport vertically.** Tiles are *perfectly
+  square*, so the tile side length is `floor(viewport-height /
+  25)`. The horizontal column count is whatever number of these
+  squares is needed to overflow the viewport on the right — see
+  §2.3 / §3 for the over-allocation rule.
+* The image draws on top of the checker. Opaque image pixels
+  hide the checker; transparent image pixels reveal it; partially
+  transparent image pixels reveal it through the image's color
+  with reduced contrast.
+* Letterbox / pillarbox margins show the bare checker.
+
+### 2.2 What the user does *not* see
+
+* No visible animation. The checker does not breathe, sparkle, or
+  scroll. It is a static fill that only changes when the viewport
+  changes (resize, full-screen toggle, panel show / hide) or when
+  the active `NSAppearance` changes (light ↔ dark mode).
+* No checker outside the viewport. The pattern is clipped to the
+  `NSView`'s own bounds — it does not leak into the toolbar,
+  sidebar, status bar, or window chrome.
+* No checker inside the image when the image is opaque. The
+  checker is *behind* the image, not blended with it.
+* No discoloration of opaque images. A fully-opaque JPEG, BMP or
+  HEIC covers the checker completely; the user must not be able
+  to see any checker tone through the painted pixels of a
+  baseline JPEG.
+
+### 2.3 Resize semantics
+
+The user can resize the window freely. The checker re-tiles on
+every redraw, deterministically, from the current viewport
+**height**. Height drives geometry because height is the
+dimension the user perceives as setting the tile density:
+short windows want big tiles, tall windows want small ones, and
+in both cases the user expects roughly the same *visual* row
+count on screen.
+
+* Tile side length = `floor(viewport_height / 25)`
+  device-independent points. Using `floor` (not `round`) avoids
+  the 25th row extending past the bottom edge.
+* Tiles are *perfectly square*. The tile width equals the tile
+  height — there is no separate width formula.
+* Row count = `ceil(viewport_height / tile_side)`. In practice
+  this is 25 exactly (when `H` is divisible by `tile_side`) or
+  26 (when there is a few-pixel remainder that the renderer
+  paints with one extra row that overflows below the viewport
+  edge, where AppKit's view clip discards it).
+* Column count = `ceil(viewport_width / tile_side) ×
+  width_safety_factor`. The width safety factor is **2.0** for
+  v1 — the renderer paints twice as many columns as the visible
+  viewport needs, so during a fast window-widening drag the
+  right side of the canvas is *never* bare while the next
+  `draw(_:)` call catches up. The overflow columns are clipped
+  by AppKit's existing bounds clip and cost essentially nothing
+  (§5.2).
+* As the user makes the window **taller**, each tile gets bigger
+  and the rendered column count stays close to 25. As the user
+  makes the window **shorter**, each tile gets smaller and more
+  rows would have fit — but the grid still renders exactly 25
+  rows because that is what's fixed. As the user makes the
+  window **wider**, the tile size does not change (height is
+  unchanged), and the renderer simply walks out further columns
+  to the right. As the user makes the window **narrower**, the
+  rightmost columns simply fall off the right edge — no
+  recomputation needed.
+* There is no animation between resize states — the pattern
+  simply settles on whatever it should be at the new size on
+  the next paint.
+
+The user-visible promise: *the grid always has exactly 25 rows
+vertically (with a possible one-row overflow off the bottom),
+tiles are perfectly square, and the right edge of the viewport
+is always fully covered no matter how fast the user drags the
+window wider*. Everything else falls out of that promise.
+
+### 2.4 The "container" mental model
+
+The checker can be thought of as living inside a logical
+*container* whose:
+
+* Height = viewport height.
+* Width = viewport width × 2 (the safety factor — §2.3 / §3.4).
+* Origin = the top-left corner of the viewport.
+
+The container is tiled with `25 × M` perfect squares where `M`
+is whatever it needs to be to span the container's width. When
+the viewport (window) is resized, the container resizes with
+it, and the tiles inside the container auto-scale because
+`tile_side = floor(container_height / 25)`. The renderer is
+free to paint any tile in the container; AppKit clips to the
+viewport's actual bounds, so the user only ever sees the
+sub-rectangle of the container that coincides with the visible
+viewport. The over-allocation to the right is what gives the
+implementation headroom: even if a redraw races a resize, the
+container's tile pool already covers more than the new
+viewport width.
+
+### 2.5 Tiles are perfectly square
+
+Unlike the previous v1 draft (which permitted the right column
+and bottom row to drift to absorb leftover pixels), this
+revision *guarantees* every tile is `tile_side × tile_side`. The
+leftover handling is now in the *direction of overflow*, not the
+direction of seam-fitting:
+
+* **Right edge:** the renderer paints past the viewport right
+  edge into the clipped region. There is no special "last
+  column" width.
+* **Bottom edge:** the 25th row covers exactly `25 · tile_side`
+  points, which equals `H` only when `H mod 25 == 0`. When `H mod
+  25 != 0`, the renderer paints one extra row (the 26th, indexed
+  `j = 25`) starting at `y_from_top = 25 · tile_side` and
+  extending another `tile_side` points downward. The portion of
+  that row that lies inside `0 ≤ y_from_top + h ≤ H` is the
+  thin bottom strip the user sees; the rest is clipped by
+  AppKit. This means the bottom strip is *always* the correct
+  checker color rather than an empty band.
+
+The user therefore perceives a perfectly square checkerboard
+with no truncated edge tiles.
+
+### 2.6 Toggle
+
+The checker is **on by default**. The user has two ways to turn
+it off:
+
+1. **Menu / hotkey.** *View ▸ Transparency Checker* — keyboard
+   shortcut `⌥⌘B` (Option-Command-B). The menu item is a checkmark
+   that reflects the live state. Toggling here flips
+   `ViewerState.showTransparencyChecker` and forces an immediate
+   redraw of the active canvas.
+2. **Settings.** *Settings ▸ Viewer ▸ Background* exposes a
+   "Show transparency checker behind images" checkbox bound to
+   `Settings.viewer.transparency_checker.enabled`. This is the
+   *persistent* default that hydrates `ViewerState` on app launch
+   and on every new viewer window.
+
+When the toggle is off, the canvas falls back to the existing flat
+`IG.canvas` fill (the page-neutral gray that
+[`ImageCanvasView.debugBackgroundColor`](./code/Sources/ImageGlass/Viewer/ImageCanvasView.swift)
+already uses). No layout shifts; nothing else about the canvas
+changes.
+
+### 2.7 Interaction with other viewer features
+
+* **Zoom.** Zoom changes the rendered image rect but not the
+  viewport rect. The checker is keyed to the viewport, not the
+  image, so the checker pattern is *unaffected* by zoom changes.
+  The image grows or shrinks across the checker; the checker
+  itself does not pan or scale.
+* **Pan.** Same as zoom — the checker is fixed to the viewport,
+  not the image. Panning slides the image across a stationary
+  checker. (This matches Preview.app and Pixea.)
+* **Rotate / flip.** Affects only the image. The checker does
+  not rotate or flip.
+* **Color picker.** The picker reads from `samplingImage` (the
+  in-memory RGBA8 copy of the image) and is unaffected. The
+  checker is purely a backdrop — picking a pixel that *appears*
+  semi-transparent over the checker still returns the image's
+  own RGBA, not the blended color the user sees on screen.
+* **Color-channel isolation.** When the user views only the red,
+  green, blue, or alpha channel via
+  [`ColorChannel`](./code/Sources/ImageGlassCore/Viewer/ColorChannelMath.swift),
+  the filtered image still has whatever alpha the source had, so
+  the checker still shows through transparent regions. This is
+  *especially* useful when isolating the alpha channel (a single
+  pure-luminance view of the matte): the checker behind it makes
+  the transparent areas of the matte unambiguous.
+* **Animation frames.** The checker is repainted on every frame
+  of the canvas, so animated PNGs / GIFs / WebPs with alpha (e.g.
+  spinners) keep their transparency readable across frames.
+* **Color picker overlay & info overlay.** Both are SwiftUI
+  overlays painted on top of the AppKit canvas; the checker sits
+  underneath them and is unaffected.
+
+## 3. Geometry — the canonical formulas
+
+These are the formulas the renderer must implement verbatim. They
+are written from the AppKit coordinate convention used by
+`ImageCanvasView` (which sets `override var isFlipped: Bool { false
+}` — origin at the bottom-left, +y points up). The spec is
+indifferent to coordinate flip, but the renderer must agree with
+the canvas it lives in.
+
+Let:
+
+* `W` = `bounds.width` (viewport width in points)
+* `H` = `bounds.height` (viewport height in points)
+* `R` = 25 (the spec-fixed visible row count)
+* `K` = 2.0 (the width safety factor — paint twice as many
+  columns as the visible viewport needs)
+
+### 3.1 Tile side
+
+`s = floor(H / R)`.
+
+Choose `floor` rather than `round` so the first 25 rows together
+never overshoot `H`. If `H < R` (a degenerate sub-25pt window)
+clamp `s = 1` and accept the pattern is barely visible. Tiles
+are squares of side `s`; there is no separate width formula.
+
+### 3.2 Row count
+
+`M = ceil(H / s)`.
+
+In the common case where `H` is divisible by `s`, this is exactly
+`R = 25`. When `H mod s != 0`, this is `26` — the 26th row
+overflows below the viewport edge and AppKit clips it. The user
+sees what looks like an exact 25-row grid with the bottom strip
+filled in.
+
+### 3.3 Column count
+
+`N = ceil((W · K) / s)`.
+
+The renderer paints `N` columns, not `ceil(W / s)`. The extra
+columns extend past the right edge of the viewport into the
+clip region. This is the over-allocation that makes the resize
+contract in §2.3 cheap: the renderer does not need to react
+within a single frame of a window-widening drag because there
+are already enough tiles painted past the edge to cover any
+plausible new viewport width.
+
+For v1, `K = 2.0`. Future versions may auto-tune `K` based on
+the maximum screen width attached to the system, but `K = 2.0`
+already comfortably covers a typical "single-monitor 1080p"
+viewport snapping out to "ultrawide 5K2K" in one drag step.
+
+### 3.4 Per-tile rectangle
+
+For column `i ∈ {0..N−1}`, row `j ∈ {0..M−1}` (rows counted from
+the *top*):
+
+* `x = i · s`
+* `y_from_top = j · s`
+* `width = s`
+* `height = s`
+* In the AppKit +y-up coordinate system the renderer converts
+  `y_from_top` to `y = H − y_from_top − s`.
+* Color: `light_tone` if `(i + j) is even`, otherwise
+  `dark_tone`.
+
+### 3.5 Color of the top-left tile
+
+Cell `(i = 0, j = 0)` — the top-left tile — is `light_tone`.
+This matches Preview.app, Pixea, Photoshop and Figma; users who
+pattern-match across apps expect the corner tile to be the
+lighter one.
+
+## 4. Color tokens
+
+The two checker tones are appearance-adaptive `NSColor`s. They
+live alongside the rest of the design tokens in
+[`DesignTokens.swift`](./code/Sources/ImageGlass/DesignTokens.swift)
+so they automatically pick up the system light / dark appearance
+without any explicit observer wiring.
+
+| Token name          | Light appearance | Dark appearance | Role                                                  |
+|---------------------|------------------|-----------------|-------------------------------------------------------|
+| `IG.checkerLight`   | `#ECECEC` (236, 236, 236) | `#3A3A3A` (58, 58, 58) | The *lighter* of the two tones. Top-left tile. Achromatic light gray. |
+| `IG.checkerDark`    | `#E8C8C8` (232, 200, 200) | `#3C2222` (60, 34, 34) | The *darker* of the two tones. **Warm-shifted toward red at matched luminance** — see §4.1. |
+
+### 4.1 Why the darker tone is warm-shifted toward red
+
+Earlier drafts used pure achromatic grays for both tones
+(`#D8D8D8` / `#2A2A2A`). User testing found the contrast read as
+"flat" and made the pattern recede into the canvas neutral. This
+revision shifts the darker tone toward red while preserving the
+luminance of the original gray, so the pattern reads as
+unmistakably two-toned (different hue, not just different
+brightness) without becoming visually loud:
+
+* **Light appearance — `#E8C8C8` (232, 200, 200).** Derived from
+  the original `#D8D8D8` (216, 216, 216) by *dialing the red
+  channel up* and *the green channel down* in equal-and-opposite
+  ratios, while letting blue fall in line with green. Rec.601
+  luma `Y = 0.299R + 0.587G + 0.114B`:
+  * Original `#D8D8D8`: `Y = 216.0`.
+  * New `#E8C8C8`: `Y = 0.299·232 + 0.587·200 + 0.114·200 ≈ 209.6`.
+  Within ~3% of the original luminance — the eye reads them as
+  "the same darkness." The pattern reads as warm dusky pink-gray.
+* **Dark appearance — `#3C2222` (60, 34, 34).** Same red-shift
+  applied to the original dark-mode `#2A2A2A` (42, 42, 42):
+  * Original `#2A2A2A`: `Y = 42.0`.
+  * New `#3C2222`: `Y = 0.299·60 + 0.587·34 + 0.114·34 ≈ 41.8`.
+  Within 0.5%. The pattern reads as a warm dark wine.
+
+The luma-matching is the load-bearing constraint. If we had
+simply boosted red without dropping green, the darker tone would
+have grown perceptibly lighter and the pattern would have looked
+like "pink on light gray" rather than "tinted darker tone on
+lighter base." The dial-up-red, dial-down-green move is what
+keeps the *darkness* identical while the *hue* shifts.
+
+### 4.2 Choosing the values
+
+* The **light-appearance pair (#ECECEC / #E8C8C8)** keeps the
+  lighter tone identical to Preview.app's transparency backdrop
+  and gives the darker tone a warm tint that still sits below
+  the canvas-tone gray (`IG.canvas` light = `#AEAEB3`).
+* The **dark-appearance pair (#3A3A3A / #3C2222)** preserves the
+  Rec.601 luminance of the original gray-on-gray pair while
+  pushing the darker tile into wine-red territory. Both tones
+  are still lighter than the canvas neutral (`IG.canvas` dark =
+  `#19191C`), so the checker remains visible behind the image
+  rather than blending into the window chrome.
+* Hue delta between the two tones is ~10°–15° on the color wheel
+  (lighter tone effectively at hue undefined / 0° saturation,
+  darker tone at hue 0° / red, saturation ~15%–20%). Saturation
+  is intentionally modest — going higher reads as "decorative,"
+  going lower defeats the purpose of the shift.
+
+### 4.3 Reserved settings hook
+
+The two tokens carry the *base* color only. The renderer can
+optionally apply a global alpha multiplier (clamped to `[0.5, 1.0]`)
+exposed via `Settings.viewer.transparency_checker.intensity` for
+users who want the pattern even subtler. v1 ships the intensity
+control disabled and the alpha pinned at 1.0.
+
+## 5. Rendering primitive — direct Core Graphics rect fills
+
+This section is the CTO call on *how* to paint the pattern. The
+alternatives were evaluated explicitly. The choice is **direct
+`CGContext` rect fills** issued from inside `draw(_:)` on the
+main canvas `NSView`, prior to the image draw.
+
+### 5.1 Alternatives considered
+
+| Approach | Pros | Cons | Verdict |
+|----------|------|------|---------|
+| **(A) Direct rect fills in `draw(_:)`** — iterate `N × M` tiles, set the fill color to the appropriate tone, call `ctx.fill(rect)`. | One code path. Pixel-perfect right and bottom edges. Trivial to invalidate on appearance change. Trivial to clip to viewport. Tile color is *the* color (no resampling). Allocates nothing on the hot path. | ~400–600 rect fills per paint at typical viewport sizes. | **Chosen.** Rect fill is the *fastest* primitive Quartz has; 600 of them is microseconds, well under our `Image.Render` budget. |
+| **(B) `CGPattern` registered once, drawn with `ctx.fillRect` via a pattern-color-space fill.** | Quartz handles the tiling. Theoretically lower per-draw cost. | `CGPattern` is anchored to the pattern's *own* coordinate space, not the viewport. Right-edge alignment requires re-creating the pattern on every viewport-width change anyway. Adds an indirection layer for zero observable benefit at this tile count. The pattern callback signature is a C-style callback that does not bridge cleanly to Swift 6 strict concurrency. | Rejected. Cost is not worth the API friction. |
+| **(C) Off-screen bitmap tile, then `ctx.drawTiledImage`.** | Bitmap is reused across paints; tiling is handled by the GPU compositor. | Bitmap must be regenerated on every appearance change *and* every tile-size change. Resampling between the bitmap's native size and the drawn size is wrong for a crisp checker — we want sharp edges, and `kCGInterpolationNone` is a per-context state we'd need to set and restore. | Rejected. Resampling is the wrong answer for a grid that *is* its own anti-aliased shape. |
+| **(D) `CALayer` with a `backgroundColor` of a `CGPattern`.** | Lets AppKit handle the compositing; no `draw(_:)` work. | The canvas already uses `wantsLayer = true` with `layer?.backgroundColor` for its solid-color background. Switching to a pattern at the *layer* level would mean the pattern stays the same size as the image is panned, which is correct, *but* it does not interact with the existing `draw(_:)` code path that draws the image. The image would draw into a `CALayer.contents` and the pattern would sit beneath the layer's own bitmap, which is *not* the same as "behind the image" — the pattern would disappear behind the layer's solid backing color. Getting layer-level patterns to honor the existing draw pipeline is complex and brittle. | Rejected. Conflicts with the existing layer-backed view. |
+| **(E) SwiftUI `Canvas` view layered behind the AppKit canvas via z-order.** | Pure SwiftUI; no AppKit subclassing. | Adds a second view in the responder chain, complicates hit-testing, and forces the canvas to be transparent (which contradicts the existing `layer?.backgroundColor`). | Rejected. Re-architecture for no win. |
+
+### 5.2 Why direct rect fills win
+
+Core Graphics rect fills are the most heavily optimized path in
+Quartz. The fill goes straight to the framebuffer via the same
+compositor that draws every macOS window. A 20×30 grid is 600
+calls per paint; on Apple Silicon those 600 calls execute in well
+under one millisecond. We are nowhere near the budget we burn on
+the image draw itself (`ctx.draw(cg, in: drawRect)` for a
+multi-megapixel image is two to three orders of magnitude
+heavier).
+
+The other advantage is *correctness*: every tile's color is the
+literal color we asked for, with no resampling, no GPU swizzle, no
+filter. The right and bottom edges line up exactly with the
+viewport because we compute the pixel rectangles ourselves.
+
+### 5.3 HiDPI / Retina
+
+`draw(_:)` runs in device-independent points; the
+`NSGraphicsContext.current?.cgContext` already accounts for the
+backing scale factor of the host display. The tile geometry is
+computed in points, so a 1× display sees ~tile_side pixels per
+tile and a 2× display sees ~2·tile_side pixels per tile. No
+explicit `scaleFactor` math is needed in the spec — the system
+handles it.
+
+The one Retina-specific concern is *crisp edges*. We draw the
+tiles with `ctx.interpolationQuality = .none` (set on a saved-state
+copy of the context before tile drawing, restored afterward) so
+that even if Quartz decides to anti-alias a fractional-pixel rect
+edge, it does so in a way the user reads as "sharp." Empirically,
+filling rects with `kCGInterpolationNone` set produces the same
+visual result as `kCGInterpolationHigh` for axis-aligned solid-color
+rects (the interpolation setting only affects bilinear image
+sampling), but we set it explicitly to document the intent.
+
+## 6. Draw-order contract
+
+This section pins down the order of operations inside
+`ImageCanvasView.draw(_:)`. The existing code (see
+[`ImageCanvasView.swift:420`](./code/Sources/ImageGlass/Viewer/ImageCanvasView.swift))
+is:
+
+```text
+1. PerformanceLog.start("Image.Render", …)
+2. Self.debugBackgroundColor.setFill(); dirtyRect.fill()
+3. ctx.draw(cg, in: drawRect)
+4. firstPaint event emission
+5. PerformanceLog finish
+```
+
+The new pipeline replaces step 2 with a branch and inserts step 2b:
+
+```text
+1. PerformanceLog.start("Image.Render", …)
+2. If !showTransparencyChecker:
+     Self.debugBackgroundColor.setFill(); dirtyRect.fill()
+   Else:
+     drawTransparencyCheckers(ctx: ctx, in: bounds)
+3. ctx.draw(cg, in: drawRect)
+4. firstPaint event emission
+5. PerformanceLog finish
+```
+
+The checker draw operates on `bounds`, not `dirtyRect`. We always
+repaint the entire pattern because:
+
+* Partial-redraw correctness with a parametric pattern is fiddly
+  (a small `dirtyRect` might intersect only part of a tile, and
+  computing which tiles to repaint costs about as much as just
+  repainting all of them).
+* The cost is bounded and tiny (§5.2).
+* AppKit will already clip our drawing to `dirtyRect` via the
+  graphics context, so painting the full pattern when only a
+  fragment changed is a no-op for the fragment outside `dirtyRect`.
+
+The image draw (step 3) is unchanged. Opaque image pixels overwrite
+the checker; semi-opaque pixels alpha-blend against the checker via
+the normal `ctx.draw` blending semantics; transparent pixels
+("alpha = 0") leave the checker untouched. This is exactly what we
+want, and it falls out of the order-of-operations contract — no
+explicit alpha-handling code is needed.
+
+The error-card overlay (when `viewer.loadError != nil`) and the
+SwiftUI overlays (info card, color-picker readout) are *above* the
+canvas in z-order and therefore always above the checker. No
+change to those.
+
+## 7. Lifecycle and invalidation
+
+* **On image load.** `setImage(path:)` already calls
+  `needsDisplay = true`. The checker re-renders as part of that
+  paint. No change.
+* **On viewport resize.** `NSView` triggers `draw(_:)` on resize
+  automatically; the checker re-derives its geometry from the new
+  `bounds`. No explicit observer wiring.
+* **On appearance change (light ↔ dark).** AppKit re-invokes
+  `draw(_:)` when `effectiveAppearance` changes. The two color
+  tokens resolve through `appearance.bestMatch(...)` and pick the
+  matching pair. No explicit observer wiring.
+* **On `showTransparencyChecker` toggle.** The hosting SwiftUI
+  representable (see
+  [`ImageViewer.swift`](./code/Sources/ImageGlass/Viewer/ImageViewer.swift))
+  writes the flag into the canvas; the canvas's `didSet` setter
+  flips `needsDisplay = true` to trigger one repaint.
+* **On window full-screen / frameless toggle.** Same as resize —
+  the new `bounds` arrives, the next `draw(_:)` rebuilds the
+  grid.
+
+## 8. State, settings, and persistence
+
+* **Per-window live state.** Add
+  `var showTransparencyChecker: Bool = true` to `ViewerState`
+  (see
+  [`ViewerState.swift:30`](./code/Sources/ImageGlass/Viewer/ViewerState.swift)
+  next to `smoothInterpolation`). The default is `true` so new
+  windows show the checker until the user opts out.
+* **Persistent default.** Stored under
+  `viewer.transparency_checker.enabled` in the YAML settings file.
+  On viewer-window construction, hydrate `showTransparencyChecker`
+  from the persistent default. On toggle (menu / hotkey), the
+  setting is written back. The Settings UI exposes one checkbox
+  bound to the same key.
+* **Reset behavior.** `ViewerState.resetView()` does *not* reset
+  `showTransparencyChecker`. The flag is a user preference about
+  the viewer chrome, not a per-image view transform — it stays
+  put across image changes.
+
+## 9. Performance budget
+
+This feature lives inside the existing `Image.Render` performance
+trace. The budget for the entire render call is documented in
+[`performance.mdx`](./docs/performance.mdx). The checker fill
+adds (using `s = floor(H / 25)`, `N = ceil(W · 2 / s)`,
+`M ≈ 25`):
+
+* At a typical 1920×1080 viewport: `s = 43`, `N = ceil(3840/43) =
+  90`, `M = 26`. Total painted tiles = 2 340 (about 1 170 of
+  which are off the right edge and clipped).
+* At a 4K (3840×2160) viewport: `s = 86`, `N = ceil(7680/86) =
+  90`, `M = 26`. Total = 2 340 — the same count because
+  doubling both axes preserves the product.
+* Worst-case observed (tall portrait window on a 27" ultrawide,
+  bounds = 600×3000): `s = 120`, `N = ceil(1200/120) = 10`, `M
+  = 26`. Total = 260.
+* Pathological wide-and-short case (3840×400): `s = 16`, `N =
+  ceil(7680/16) = 480`, `M = 26`. Total = 12 480 tiles. In
+  pure-CG benchmarking ~12 000 axis-aligned rect fills cost
+  ~700 µs on M1 / ~400 µs on M2 Pro.
+
+The conservative budget for the checker draw is **< 1 ms in the
+99th percentile**, well inside the 16 ms-per-frame budget the
+viewer otherwise targets for 60 Hz pan / zoom. The width safety
+factor (§3.3) doubles the rendered column count vs. the visible
+column count, and the perf budget is sized to absorb that
+doubling.
+
+## 10. Accessibility and color blindness
+
+The two tones are pure achromatic grays, so the pattern is fully
+distinguishable to users with any form of color vision deficiency.
+The luminance delta (~7%) is above the threshold of perception in
+all standard CVD types.
+
+For users with very low contrast sensitivity, the checker may
+appear as a uniform mid-gray field, which is *still* an acceptable
+fallback — the pattern's job is to break the visual identity
+between "transparent pixel" and "painted pixel," and a uniform
+field that differs from any plausible image color still does that
+job. For users who explicitly want the pattern off, §2.5's toggle
+is the answer.
+
+## 11. Edge cases the renderer must handle
+
+1. **Zero-size viewport.** `W ≤ 0` or `H ≤ 0`. The renderer
+   returns early without drawing any tiles. AppKit does not call
+   `draw(_:)` with a zero-area `dirtyRect`, but a transient
+   `bounds.size == .zero` is possible during window construction.
+2. **Sub-20pt viewport width.** `W < 20`. Clamp `s = 1` and accept
+   the pattern is barely visible. This is a degenerate case (the
+   user has dragged the window narrower than the toolbar's
+   minimum), and the existing window layout prevents it in
+   practice.
+3. **Sub-1pt tile size.** Should not happen because `s = floor(W /
+   20) ≥ 1` for `W ≥ 20`, but the renderer asserts and clamps.
+4. **No image loaded.** The checker still paints. This is the
+   *welcome state* — a fresh window with no image — and showing
+   the checker there signals "this is the canvas; drop an image
+   here" without any extra UI.
+5. **`loadError != nil`.** The checker paints; the error card
+   overlay paints on top of it. The user sees the error message
+   floating on a checker backdrop, which is fine — the checker
+   does not obscure the error.
+6. **Image larger than viewport and panned.** The checker is
+   keyed to `bounds`, not to the image rect, so it stays put as
+   the image scrolls. This matches Preview.app and Pixea.
+7. **Heavily-rotated viewport (window rotated 90° by `RotateBy`
+   override).** Not currently supported by ImageGlass_Mac; the
+   rotation feature rotates only the image, not the viewport.
+8. **Image bigger than the viewport with zoom > 1.** Same as #6 —
+   the image overhangs all four edges of the viewport, and where
+   it has alpha, the checker shows through.
+
+## 12. Test plan
+
+### 12.1 Unit (XCTest / Swift Testing)
+
+Add a deterministic geometry helper used by the renderer and
+testable in isolation. Pseudo-signature:
+
+```swift
+struct CheckerGrid {
+    let tileSide: CGFloat
+    let columns: Int        // ceil(W · K / tileSide), K = 2.0
+    let rows: Int           // ceil(H / tileSide), ≈ 25
+    let viewport: CGSize
+}
+extension CheckerGrid {
+    static func compute(
+        viewport: CGSize,
+        rows: Int = 25,
+        widthSafetyFactor: CGFloat = 2.0
+    ) -> CheckerGrid
+}
+```
+
+Tests:
+
+* `compute(viewport: CGSize(width: 2000, height: 1000))` ⇒
+  `tileSide = floor(1000/25) = 40`, `rows = 25`,
+  `columns = ceil(2000·2 / 40) = 100`.
+* `compute(viewport: CGSize(width: 1923, height: 999))` ⇒
+  `tileSide = floor(999/25) = 39`, `rows = ceil(999/39) = 26`
+  (the bottom row overflows below the viewport edge),
+  `columns = ceil(1923·2 / 39) = 99`.
+* `compute(viewport: CGSize(width: 1920, height: 1080))` ⇒
+  `tileSide = floor(1080/25) = 43`,
+  `rows = ceil(1080/43) = 26`,
+  `columns = ceil(1920·2 / 43) = 90`.
+* Degenerate cases: zero (returns empty grid), `H < 25`
+  (clamps `tileSide = 1`), `W = 0` (returns columns = 0).
+
+### 12.2 Snapshot
+
+Render the pattern into an off-screen `CGContext` at a fixed size
+(e.g. 800×600), capture the result as a PNG, and snapshot-compare
+across runs using `swift-snapshot-testing`. Separate snapshots for
+light and dark appearance.
+
+### 12.3 Manual / XCUITest
+
+1. Load a fully-opaque JPEG. Confirm the checker is *completely*
+   covered by the image when the image fills the viewport.
+2. Load a PNG with a known alpha gradient (e.g. a horizontal
+   ramp from `a = 0` on the left to `a = 1` on the right). Confirm
+   the checker is fully visible on the left, fully hidden on the
+   right, and visibly tinted through the middle.
+3. Load a small PNG (so the viewport has letterbox margins).
+   Confirm the checker is visible in the margins and behind the
+   image where it has transparency.
+4. Toggle dark mode in System Settings. Confirm the checker swaps
+   to the dark-appearance pair without re-launching the app.
+5. Drag the window edges to resize. Confirm the column count
+   stays at 20, the tiles get larger / smaller, the right edge
+   always touches the viewport edge with no seam.
+6. Toggle `⌥⌘B`. Confirm the checker disappears and the flat
+   canvas color reappears. Toggle again. Confirm it returns.
+7. Pan the image around the viewport. Confirm the checker stays
+   put; only the image moves.
+8. Open a multi-frame animated WebP with alpha (e.g. a spinner).
+   Confirm the checker is visible behind each frame, including
+   during animation playback.
+
+## 13. Out of scope for v1
+
+* Per-image checker / no-checker memory. The flag is per-window,
+  not per-image. v2 may add a "remember per-file" toggle.
+* User-customizable checker colors. v2 may expose color pickers
+  for `checkerLight` and `checkerDark`.
+* Customizable row count. v1 hard-codes `R = 25` visible rows.
+  v2 may expose a range (15–40) if user feedback warrants it.
+* Customizable width safety factor. v1 hard-codes `K = 2.0`.
+  v2 may auto-tune from `NSScreen.screens.map(\.frame.width).max()`.
+* Customizable tile shape (diamonds, hex, dots). Not planned.
+* Animated / transitioning checker (fade-in, etc.). Not planned —
+  the pattern is a static backdrop.
+* Checker as the background of *thumbnails* in the file panel.
+  Thumbnails get a separate decision in
+  [`panels.mdx`](./docs/panels.mdx); this spec is only about the
+  main viewer canvas.
+
+## 14. Implementation map
+
+The single-pass implementation touches four files. Nothing outside
+this list should change for v1.
+
+| File | Change |
+|------|--------|
+| [`DesignTokens.swift`](./code/Sources/ImageGlass/DesignTokens.swift) | Add `IG.checkerLight` and `IG.checkerDark`. |
+| [`ViewerState.swift`](./code/Sources/ImageGlass/Viewer/ViewerState.swift) | Add `showTransparencyChecker: Bool = true` alongside `smoothInterpolation`. |
+| [`ImageCanvasView.swift`](./code/Sources/ImageGlass/Viewer/ImageCanvasView.swift) | Add the live tunable `showTransparencyChecker: Bool` with a `didSet` that flips `needsDisplay = true`; add the `CheckerGrid` geometry helper and a `drawTransparencyCheckers(in:)` method; branch `draw(_:)` between the existing flat fill and the new checker fill. |
+| [`ImageViewer.swift`](./code/Sources/ImageGlass/Viewer/ImageViewer.swift) | In the `updateNSView` body that already writes `v.smoothInterpolation = viewer.smoothInterpolation`, add `v.showTransparencyChecker = viewer.showTransparencyChecker`. |
+
+Hotkey wiring and settings persistence are tracked separately in
+[`hotkeys.mdx`](./docs/hotkeys.mdx) and
+[`settings.mdx`](./docs/settings.mdx) respectively; both
+piggy-back on existing infrastructure (the menu builder and the
+YAML settings hydrator) and do not require any new mechanism.
+
+## 15. Open questions
+
+* Should the checker tone delta be exposed as a slider, or pinned
+  at the spec value? *Resolved for v1: pinned. Revisit in v2 if
+  users ask.*
+* Should the checker also apply behind the *thumbnails* shown in
+  the directory / filename panel for image files with alpha?
+  *Deferred to v2; tracked in
+  [`panels.mdx`](./docs/panels.mdx).*
+* Should an active color-picker overlay desaturate the checker
+  to maximize the readability of the picker's swatch? *Resolved
+  for v1: no. The picker swatch is large and high-contrast; the
+  checker behind it is not a problem.*

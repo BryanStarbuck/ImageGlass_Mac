@@ -145,6 +145,22 @@ public enum LoadDiagnostics {
         cacheOrder.removeAll { $0.path == path }
     }
 
+    /// Drop the entire diagnosis cache. Test/diagnostic hook; production
+    /// code should prefer `invalidateCache(for:)` for the single-URL case.
+    public static func clearCache() {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        cache.removeAll()
+        cacheOrder.removeAll()
+    }
+
+    /// Test/diagnostic accessor: number of entries currently in the cache.
+    public static var cacheCount: Int {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        return cache.count
+    }
+
     /// Inspect the file at `url` and return the most-specific diagnosis.
     /// Order matters: cheaper / more specific checks come first so a Git
     /// LFS pointer in an iCloud folder reports "git-lfs", not "cloud".
@@ -209,9 +225,13 @@ public enum LoadDiagnostics {
 
         // Cache lookup keyed on (path, mtime, size). Checked AFTER the
         // structural checks (missing / directory / broken symlink) since
-        // those have no business being cached.
+        // those have no business being cached. When the batched stat
+        // failed (`rv == nil`) we still produce a verdict but skip the
+        // cache write below to avoid poisoning the table with a (path, 0, 0)
+        // entry that would shadow the real key once stat starts working.
+        let canCache = (rv != nil)
         let cacheKey = CacheKey(path: path, mtime: mtime, size: fileSize)
-        if let cached = cacheGet(cacheKey) {
+        if canCache, let cached = cacheGet(cacheKey) {
             return cached
         }
 
@@ -235,7 +255,7 @@ public enum LoadDiagnostics {
 
         // 4. Empty file. Already known from fileSizeKey above.
         if fileSize == 0 {
-            cachePut(cacheKey, .emptyFile)
+            if canCache { cachePut(cacheKey, .emptyFile) }
             return .emptyFile
         }
 
@@ -243,7 +263,7 @@ public enum LoadDiagnostics {
         // permissions seen by *this process*, which is the permission that
         // actually matters.
         if !isReadable {
-            cachePut(cacheKey, .permissionDenied)
+            if canCache { cachePut(cacheKey, .permissionDenied) }
             return .permissionDenied
         }
 
@@ -255,12 +275,12 @@ public enum LoadDiagnostics {
             if GitLFSPointer.isPointer(at: url) {
                 let repo = GitLFSPointer.repoRoot(for: url).map { AppPaths.contractTilde($0.path) }
                 let verdict: LoadDiagnosis = .gitLFSPointer(repoRoot: repo)
-                cachePut(cacheKey, verdict)
+                if canCache { cachePut(cacheKey, verdict) }
                 return verdict
             }
         }
 
-        cachePut(cacheKey, .ok)
+        if canCache { cachePut(cacheKey, .ok) }
         return .ok
     }
 

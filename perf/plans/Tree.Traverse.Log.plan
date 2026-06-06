@@ -122,3 +122,97 @@ Build status:
   fails to link because the `PollingScopeWatcher.swift` errors above
   block the `ImageGlass` module from compiling. Tests are not runnable
   by this agent until the FileSystem agent fixes that file.
+
+## Implementation map (session 3 — crash-audit pass)
+
+Owner: `code/Sources/ImageGlassCore/FileList/DirectoryTree.swift`
+
+* `DirectoryNode` (indirect enum) — line 308
+  * `name` — line 312
+  * `nodeCount` — line 327 (delegates to `nodeCountSplit`)
+  * `nodeCountSplit` (directories, files) — line 334; O(N) recursive on
+    `.directory` children
+  * `logTraversalSummary(rootPath:corr:)` — line 364; emits exactly one
+    `PerformanceLog.shared.event("Tree.Traverse.Log", extra: [...])` —
+    line 367
+* `PerformanceLog.event(_:extra:)` signature confirmed in
+  `code/Sources/ImageGlassCore/Logging/PerformanceLog.swift:241` —
+  matches the call site exactly.
+
+Callers of `logTraversalSummary` / `nodeCount` / `nodeCountSplit`
+across the tree: zero. The instrument is dead-on-arrival (still no
+caller has been added). The walker
+(`code/Sources/ImageGlassCore/FileList/DirectoryTreeWalker.swift`) is
+off-limits and remains the natural future call site. The historical
+per-node `traverseAndLog` emitter is gone — no `Tree.Traverse.Log`
+emission lives anywhere except inside the helper.
+
+No duplicate implementation found. `git grep` for `Tree.Traverse.Log`
+across the entire repo returns four hits and all four are inside
+`DirectoryTree.swift` (the helper body + its doc comments).
+
+## Risk analysis (session 3)
+
+Startup crash `Can't unsafeBitCast between types of different sizes`:
+NOT reachable from tree-traversal logging code. Full repo audit:
+
+* `grep -rn unsafeBitCast --include='*.swift' code/` returns three
+  hits, all in `FSEventsBridge.swift` (lines 191, 193, 205), and all
+  three are inside `//` comments documenting the historical fix.
+  There is no live `unsafeBitCast` call anywhere in the Swift sources.
+* `Unmanaged.fromOpaque` is used in `FSEventsBridge.swift` only, and
+  only on opaque pointers handed in by the FSEvents C API after a
+  `CFGetTypeID` discriminator check. Single-pointer object refs —
+  no size-mismatch path.
+* `withMemoryRebound` / `withUnsafeBytes` / `bindMemory` callsites:
+  `ExternalToolIPC.swift` (sockaddr / UInt8 — sized correctly),
+  `FileSystemProbe.swift::f_fstypename` (CChar — sized correctly).
+  None are in tree-traversal logging code.
+
+So the runtime fatal error is being raised by a DIFFERENT subsystem.
+Most likely candidates (flagged for the owning agents, NOT fixed
+here because they are out of scope for this plan):
+
+* `code/Sources/ImageGlass/FileSystem/PollingScopeWatcher.swift` —
+  session 2 already noted this file has compile errors against
+  `Darwin.stat`. A wrong-sized `stat` interop is a textbook trigger.
+* `code/Sources/ImageGlass/FileSystem/FileSystemProbe.swift:154` —
+  `withUnsafeBytes(of: &st.f_fstypename) { ... bindMemory(to: CChar.self) }`.
+  Sized correctly today, but this is the same family of API surface;
+  flagged as adjacent risk.
+
+Per-node crash audit of `DirectoryTree.swift` (the file this plan
+owns):
+
+* No `unsafeBitCast`.
+* No `try!`.
+* No `as!` casts.
+* No `fatalError`.
+* No force-unwrap (`!.` / trailing `!`).
+* No `Unmanaged` / opaque-pointer interop.
+* `nodeCountSplit` is recursive; stack-overflow risk only if depth
+  ≫ typical filesystem (~50). The walker constructs the tree by
+  recursing the same way, so any tree the walker can build, this
+  helper can also count.
+* `logTraversalSummary` is total — no precondition, no optional
+  chain, no early failure. Safe to call on any subtree.
+
+Conclusion: the helper and its supporting code are crash-clean. The
+startup fatal error is upstream of this plan's surface.
+
+## Changes made (session 3)
+
+None. The crash-audit pass found no force-unwrap, no `try!`, no
+`unsafeBitCast`, no `Unmanaged` mismatch, and no recursion-overflow
+risk on realistic filesystem trees in the code this plan owns. The
+session-2 implementation is still in place and still uncalled.
+
+Demotion / deletion note (per the runbook prompt): the named
+instrument is spec-required by `docs/performance.mdx` §5.3, and the
+helper is a one-shot emitter (not a per-node trace), so there is
+nothing to demote to debug-level. The chattiness problem
+(`Tree.Traverse.Log` at 888K instances in the snapshot) was caused
+by the deleted per-node `traverseAndLog` pattern, not by this
+helper. Keeping the API in place; ready for the
+`DirectoryTreeWalker` agent to wire in a single call inside the
+existing post-walk block.

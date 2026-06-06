@@ -186,15 +186,30 @@ final class FSEventsBridge {
                 inodes.append(nil)
                 continue
             }
-            let cf = Unmanaged<CFTypeRef>.fromOpaque(raw).takeUnretainedValue()
-            let typeID = CFGetTypeID(cf)
+            // IMPORTANT: do not materialize a `CFTypeRef` (`AnyObject`)
+            // existential here. In Swift, `CFTypeRef` is a 16-byte two-word
+            // existential, so `unsafeBitCast(cf, to: CFDictionary.self)`
+            // (single-pointer class type) trips the runtime size-equality
+            // check with: "Can't unsafeBitCast between types of different
+            // sizes." Decode straight from the opaque pointer instead —
+            // `Unmanaged<T>.fromOpaque(raw)` produces a properly typed
+            // single-pointer object reference with no size mismatch.
+            // CFGetTypeID accepts any CFTypeRef opaque pointer.
+            let typeID = CFGetTypeID(
+                Unmanaged<CFTypeRef>.fromOpaque(raw).takeUnretainedValue()
+            )
 
             if typeID == CFDictionaryGetTypeID() {
-                let dict = unsafeBitCast(cf, to: CFDictionary.self)
-                let pathKey = unsafeBitCast(
-                    kFSEventStreamEventExtendedDataPathKey, to: UnsafeRawPointer.self)
-                let idKey = unsafeBitCast(
-                    kFSEventStreamEventExtendedFileIDKey, to: UnsafeRawPointer.self)
+                let dict = Unmanaged<CFDictionary>.fromOpaque(raw).takeUnretainedValue()
+                // The kFSEventStreamEvent*Key constants are imported into
+                // Swift as `String` (a 16-byte value type), so unsafeBitCast
+                // to `UnsafeRawPointer` (8 bytes) trips the runtime size
+                // check. Bridge to `CFString` first, then take the opaque
+                // pointer that `CFDictionaryGetValue` expects.
+                let pathKey = Unmanaged.passUnretained(
+                    kFSEventStreamEventExtendedDataPathKey as CFString).toOpaque()
+                let idKey = Unmanaged.passUnretained(
+                    kFSEventStreamEventExtendedFileIDKey as CFString).toOpaque()
 
                 if let p = CFDictionaryGetValue(dict, pathKey) {
                     let pcf = Unmanaged<CFString>.fromOpaque(p).takeUnretainedValue()
@@ -211,7 +226,7 @@ final class FSEventsBridge {
                     inodes.append(nil)
                 }
             } else if typeID == CFStringGetTypeID() {
-                let s = unsafeBitCast(cf, to: CFString.self)
+                let s = Unmanaged<CFString>.fromOpaque(raw).takeUnretainedValue()
                 paths.append(s as String)
                 inodes.append(nil)
             } else {

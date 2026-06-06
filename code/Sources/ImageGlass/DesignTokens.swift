@@ -49,6 +49,12 @@ enum IG {
     static let imgEdge    = dyn(NSColor(white: 0, alpha: 0.10), NSColor(white: 1, alpha: 0.08))
     static let mcpGreen   = hex(0x34C759)
 
+    // transparent_bk_checkers.mdx §4 — the two-tone transparency
+    // checker. Light pair matches Preview.app; dark pair preserves
+    // the same ~7% luminance delta against the dark canvas.
+    static let checkerLight = dyn(hex(0xECECEC), hex(0x3A3A3A))
+    static let checkerDark  = dyn(hex(0xD8D8D8), hex(0x2A2A2A))
+
     // include_checks.mdx §2.3 — the four-variant Include column.
     // Saturated greens/reds for explicit decisions; muted grays for
     // inherited ones. Light + dark pairs swap luminance only — the

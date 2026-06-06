@@ -133,16 +133,16 @@ final class PollingScopeWatcher {
                 continue
             }
             for case let url as URL in enumerator {
-                guard let entry = stat(url: url) else { continue }
+                guard let entry = entryAt(url: url) else { continue }
                 result[url] = entry
             }
         }
         return result
     }
 
-    private func stat(url: URL) -> Entry? {
-        var st = Darwin.stat()
-        guard Darwin.stat(url.path, &st) == 0 else { return nil }
+    private func entryAt(url: URL) -> Entry? {
+        var st = stat()
+        guard stat(url.path, &st) == 0 else { return nil }
         guard (st.st_mode & S_IFMT) == S_IFREG else { return nil }
         return Entry(
             size: UInt64(st.st_size),

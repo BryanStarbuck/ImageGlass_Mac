@@ -92,6 +92,10 @@ final class ImageCanvasView: NSView {
     var flipVertical: Bool = false    { didSet { needsDisplay = true } }
     var smoothInterpolation: Bool = true { didSet { needsDisplay = true } }
     var colorChannel: ColorChannel = .all { didSet { rebuildFilteredImage(); needsDisplay = true } }
+    /// transparent_bk_checkers.mdx §2.5 / §6 — when true, `draw(_:)`
+    /// paints the 20-column checker grid behind the image instead of
+    /// the flat `debugBackgroundColor` fill. Toggling forces one redraw.
+    var showTransparencyChecker: Bool = true { didSet { needsDisplay = true } }
     var showColorPicker: Bool = false { didSet { needsDisplay = true } }
     var currentFrameIndex: Int = 0 {
         didSet {
@@ -423,8 +427,17 @@ final class ImageCanvasView: NSView {
             extra: [("path", loadedPath ?? "")]
         )
         defer { _renderTrace.finish() }
-        Self.debugBackgroundColor.setFill()
-        dirtyRect.fill()
+
+        // transparent_bk_checkers.mdx §6 — checker fill when enabled,
+        // flat canvas fill otherwise. The checker is keyed to `bounds`,
+        // not `dirtyRect`, because partial-pattern recomputation costs
+        // about as much as full repaint at this tile count (§5.2).
+        if showTransparencyChecker, let cctx = NSGraphicsContext.current?.cgContext {
+            drawTransparencyCheckers(in: cctx)
+        } else {
+            Self.debugBackgroundColor.setFill()
+            dirtyRect.fill()
+        }
 
         guard let cg = filteredImage else { return }
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
@@ -578,6 +591,67 @@ final class ImageCanvasView: NSView {
             b: ptr[offset + 2],
             a: bpp >= 4 ? ptr[offset + 3] : 255
         )
+    }
+
+    /// transparent_bk_checkers.mdx §5 — paint the 20-column,
+    /// auto-rows checker grid that backs every image. Direct CG rect
+    /// fills (one save/restore pair, `kCGInterpolationNone` to document
+    /// intent). The grid is keyed to `bounds`, not `dirtyRect`, so the
+    /// full pattern is repainted on every `draw(_:)`; AppKit's existing
+    /// clip-to-`dirtyRect` means tiles outside the dirty region are no-ops.
+    /// Tile (column 0, row 0) is the *top-left* (per spec §3) and gets
+    /// the lighter tone; rows are counted from the top, then converted
+    /// to the canvas's +y-up coordinate system at draw time.
+    private func drawTransparencyCheckers(in ctx: CGContext) {
+        let viewport = bounds.size
+        guard viewport.width > 0, viewport.height > 0 else { return }
+        let grid = CheckerGrid.compute(viewport: viewport)
+        guard grid.tileSide > 0, grid.columns > 0, grid.rows > 0 else { return }
+
+        // AppKit sets the current drawing appearance before calling
+        // `draw(_:)`, so the dynamic NSColors resolve to the correct
+        // light/dark variant just by reading `.cgColor`.
+        let lightCG = IG.checkerLight.cgColor
+        let darkCG = IG.checkerDark.cgColor
+
+        ctx.saveGState()
+        ctx.interpolationQuality = .none
+        // Clip to bounds so a stale `dirtyRect` never matters and the
+        // pattern can't bleed past the canvas if the host miscomputes
+        // the view frame during a window-mode transition.
+        ctx.clip(to: bounds)
+
+        // Bucket tiles by color so we issue two color-state changes
+        // total instead of one per tile.
+        var lightRects: [CGRect] = []
+        var darkRects: [CGRect] = []
+        lightRects.reserveCapacity(grid.columns * grid.rows / 2 + 1)
+        darkRects.reserveCapacity(grid.columns * grid.rows / 2 + 1)
+
+        let viewportHeight = viewport.height
+        for j in 0..<grid.rows {
+            // `j` is row-from-top; convert to y-from-bottom for AppKit.
+            let h = grid.rowHeight(j)
+            let yFromTop = CGFloat(j) * grid.tileSide
+            let y = viewportHeight - yFromTop - h
+            for i in 0..<grid.columns {
+                let w = grid.columnWidth(i)
+                let x = CGFloat(i) * grid.tileSide
+                let rect = CGRect(x: x, y: y, width: w, height: h)
+                if CheckerGrid.isLightTile(column: i, row: j) {
+                    lightRects.append(rect)
+                } else {
+                    darkRects.append(rect)
+                }
+            }
+        }
+
+        ctx.setFillColor(lightCG)
+        ctx.fill(lightRects)
+        ctx.setFillColor(darkCG)
+        ctx.fill(darkRects)
+
+        ctx.restoreGState()
     }
 
     /// Re-render the source image into a deterministic RGBA8 buffer so we can

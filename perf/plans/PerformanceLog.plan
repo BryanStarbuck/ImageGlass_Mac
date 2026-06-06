@@ -137,3 +137,262 @@ Rough back-of-envelope, Apple Silicon:
     100x less queue contention. End-to-end SingleDir log volume on
     the worst path goes from millions of lines to tens of thousands
     + one summary line per ~1024 drops.
+
+
+## Progress notes (finishing agent)
+
+Confirmed in PerformanceLog.swift + LogSink.swift:
+  * Public API source-compatible: start, event, finish, measure,
+    measureAsync, flush, newCorrelationId all present and same
+    signatures as before.
+  * Sampling default off: samplingOneInN starts empty; decideSampledLocked
+    returns true when the map has no entry for the action or n<=1.
+    Behaviour is byte-identical to the pre-sampling logger until a
+    caller opts in.
+  * PerformanceTrace.skipped: no signposter calls, no I/O, closed=true
+    at construction so finish() and deinit are pure no-ops. Instance
+    counter is still bumped under the lock so monotonic ordering is
+    preserved across drops (matches plan S2).
+  * Drop accounting: per-action droppedSinceSummary counter, threshold
+    1024 triggers emitSampledSummary, flush() drains pending counts.
+  * Critical section in start/event is minimal: counter dict bump +
+    sampling map read + (in appendTimestamp) prefix-cache check.
+    No string formatting, no Data alloc, no signposter, no disk I/O
+    under the lock.
+  * Hand-rolled UTC formatter: civil_from_days (Hinnant) algorithm
+    is the standard branch-free proleptic-Gregorian conversion.
+    Spot-checked: handles month boundaries (Mar 1 / Feb 28-29),
+    leap years (400-year era cycle), and post-2001 negative refSeconds
+    via the sod < 0 fixup. UTC suffix Z is now correct (old code
+    appended Z but used current-timezone Date — fixed by going through
+    timeIntervalSinceReferenceDate which is UTC-anchored).
+  * Tests using overrideLogFile still force synchronous=true in the
+    LogSink constructor (PerformanceLog init: `let isTest = overrideLogFile != nil`).
+    Production shared singleton stays async.
+
+Tightened by finishing agent:
+  * (None) — no defects found in the rewrite that required editing.
+    The implementation matches the plan as specified.
+
+Sampling wiring:
+  * Deferred. The high-volume call sites identified in perf_report.csv
+    (DirectoryWalk.SingleDir at 2.85M instances, Tree.Traverse.Log at
+    888K instances) are emitted from DirectoryTree.swift /
+    DirectoryTreeWalker.swift, which are owned by the DirectoryWalk
+    agent. The only other safe startup sites — AppState.swift and
+    ImageGlassApp.swift — are owned by the AppLaunch agent (they
+    already touch PerformanceLog for AppLaunch.Total / FirstFrame).
+    Per the task constraints, the sampling API is shipped (setSampling,
+    clearSampling, clearAllSampling) and the wiring is left to the
+    owning agents. Suggested initial call once the DirectoryWalk
+    agent's caching lands and they re-measure:
+      PerformanceLog.shared.setSampling(
+          action: "DirectoryWalk.SingleDir", oneInN: 100)
+      PerformanceLog.shared.setSampling(
+          action: "Tree.Traverse.Log", oneInN: 100)
+    Best site is the early branch of ImageGlassApp.init() right after
+    the launchTrace touch, before InitialConfigSeeder is dispatched.
+
+Build verification:
+  * `swift build` from code/: ImageGlassCore (the target containing
+    Logging/) builds clean. The full workspace build fails on
+    Sources/ImageGlass/FileSystem/PollingScopeWatcher.swift (Darwin.stat
+    call-site signature mismatch — out of scope for this agent;
+    PollingScopeWatcher is not in code/Sources/ImageGlassCore/Logging/).
+  * `swift build --target ImageGlassCore` succeeds in 0.15s on the
+    cached build, no warnings in Logging/*.swift.
+  * `swift test --filter PerformanceLog` / `--filter LogSink` not run
+    because no test files reference those types yet and the full test
+    binary cannot link until PollingScopeWatcher compiles. Adding
+    dedicated tests is a follow-up.
+
+Follow-ups for owning agents:
+  * DirectoryWalk agent: after caching lands, call
+    setSampling(action: "DirectoryWalk.SingleDir", oneInN: 100) and
+    setSampling(action: "Tree.Traverse.Log", oneInN: 100) from the
+    DirectoryWalk module's one-time init / dispatchOnce hook.
+  * AppLaunch agent: optionally pull the two setSampling calls into
+    ImageGlassApp.init() right after `_ = Self.launchTrace` so the
+    rates apply before the first walk.
+  * Test owner: add a focused test file (e.g.
+    code/Tests/ImageGlassCoreTests/PerformanceLogTests.swift) that
+    drives overrideLogFile, asserts the start/finish/event/sampled_summary
+    grammar, and verifies drop counter behaviour. The plan grammar
+    (parse_perf.js-compatible) is the contract to assert against.
+
+
+## Implementation map
+
+PerformanceLog + LogSink — single canonical home, no duplicates.
+  * code/Sources/ImageGlassCore/Logging/PerformanceLog.swift
+      - `public final class PerformanceLog` (line 36)
+      - `public static let shared` (line 38)
+      - `init(overrideLogFile:)` (line 88)
+      - `flush()` (line 114)
+      - `setSampling/clearSampling/clearAllSampling` (lines 129/139/145)
+      - `start(_:extra:)` (line 167) — main hot-path entry
+      - `event(_:extra:)` (line 241)
+      - `finish(...)` fileprivate (line 277)
+      - `decideSampledLocked` (line 315)
+      - `recordDroppedStart` (line 324)
+      - `flushSampledSummaries` (line 338) / `emitSampledSummary` (line 348)
+      - `renderStart/renderFinish/renderSingle` (lines 367/388/417)
+      - `appendExtras` (line 441), `appendEscapedIfNeeded` (line 458)
+      - `appendTimestamp` (line 486), `formatSecondPrefixUTC` (line 524)
+      - `newCorrelationId` (line 589), `staticName(for:)` (line 611)
+      - `PerformanceTrace` class (line 641); deinit at line 776
+      - `measure` / `measureAsync` extension (lines 793/807)
+  * code/Sources/ImageGlassCore/Logging/LogSink.swift
+      - `public final class LogSink` (line 26)
+      - `init(label:url:maxBytes:synchronous:)` (line 59)
+      - `write(_:)` (line 74), `flush()` (line 88), `reset()` (line 94)
+      - `performWrite/ensureHandle/rotate` (lines 105/127/170)
+
+Touch points reachable at process start (relevant if the logger ever
+faulted at launch):
+  * code/Sources/ImageGlass/ImageGlassApp.swift line 20 — the static
+    `launchTrace = PerformanceLog.shared.start("AppLaunch.Total")` is
+    the first observable call. Initializing `PerformanceLog.shared`
+    constructs an `OSSignposter` + `LogSink`. None of those paths use
+    unsafeBitCast, force-unwrap, or unsafe pointer rebinding.
+  * code/Sources/ImageGlassCore/Paths.swift line 122 —
+    `macPerformanceLogFile` is resolved lazily inside the LogSink
+    queue closure on first write, not at init.
+
+Other PerformanceLog call sites are spread across the codebase
+(MCPServer, LocalStorage, IgCmdDispatcher, AppState, FileWatcher,
+DirectoryFilenamePanel, ScopeEvaluator, ExternalTools/*, Formats/*,
+Config/*, Panels/*, Releases/UpdateChecker, SVG/SVGDetection) — they
+all go through `PerformanceLog.shared` only; no other class hosts a
+parallel implementation.
+
+
+## Risk analysis
+
+Crash signature from the run:
+  `Swift/arm64e-apple-macos.swiftinterface:3272: Fatal error:
+   Can't unsafeBitCast between types of different sizes`
+
+Audit of every unsafeBitCast / withMemoryRebound / Unmanaged.fromOpaque
+/ unsafe-pointer call site in code/Sources/:
+
+1. PerformanceLog.swift / LogSink.swift — ZERO unsafeBitCast,
+   ZERO withMemoryRebound, ZERO Unmanaged.fromOpaque, ZERO force-unwrap
+   (no `!` postfix), ZERO `try!`, ZERO `as!`, ZERO `fatalError`. The
+   only "unsafe" surface is `String(decoding: [UInt8], as: UTF8.self)`
+   on ASCII bytes the formatter itself produced — provably safe.
+   ✅ Not the crash site.
+
+2. code/Sources/ImageGlass/FileSystem/FSEventsBridge.swift —
+   This is the historical and most likely site for the exact crash
+   string. The current file shows the bug has already been fixed
+   (lines 188-212): the previous `unsafeBitCast(cf, to:
+   CFDictionary.self)` (16-byte CFTypeRef existential → 8-byte
+   class reference) was replaced with
+   `Unmanaged<CFDictionary>.fromOpaque(raw).takeUnretainedValue()`,
+   and the `unsafeBitCast(kFSEventStreamEventExtended*Key as String,
+   to: UnsafeRawPointer.self)` (16-byte String → 8-byte pointer) was
+   replaced with `Unmanaged.passUnretained(... as CFString).toOpaque()`.
+   The remaining comments in lines 189-212 document the prior bug.
+   ✅ Already fixed; reachable from FSEventsScopeWatcher → AppState's
+   active-scope bind, not from the perf logger.
+
+3. code/Sources/ImageGlassCore/ExternalTools/ExternalToolIPC.swift
+   lines 119-130 — sockaddr_un rebind. The `capacity:` argument
+   matches `MemoryLayout.size(ofValue: addr.sun_path)` precisely.
+   Not reached at app launch; only when an external-tool IPC socket
+   is opened.
+   ✅ Safe.
+
+4. code/Sources/ImageGlass/FileSystem/FileSystemProbe.swift line 155
+   `raw.bindMemory(to: CChar.self)` — getmntinfo-style buffer rebind.
+   Not on the logger hot path.
+   ✅ Not the crash site.
+
+5. code/Sources/ImageGlass/FileActions.swift line 572 — NSAlert
+   `contextInfo: UnsafeMutableRawPointer?` callback signature; this
+   is a C-callback declaration, not a pointer cast.
+   ✅ Safe.
+
+Conclusion: the perf logger is NOT the source of the reported
+`unsafeBitCast` crash. The crash signature matches the previously-known
+FSEventsBridge bug, which is already patched in the current tree. The
+crash will not reproduce against the current FSEventsBridge.swift. If
+the crash recurs in a future capture, the next suspect is any newly
+added Core Foundation bridging in the FileSystem/ subtree, not the
+Logging/ subtree.
+
+Defects audited inside PerformanceLog.swift / LogSink.swift:
+  * Force-unwrap of FileHandle — NONE. LogSink uses the throwing
+    `FileHandle(forWritingTo:)` initializer (line 151) inside a
+    `do/try/catch`, falling back to nil and logging to stderr.
+  * FileHandle close on error — handled at lines 120 and 130-133;
+    handle is dropped to nil on any write failure so the next call
+    reopens cleanly.
+  * Data race on cached `FileHandle` — all `handle`/`currentURL`/
+    `currentBytes` reads + writes are queue-confined to the serial
+    `queue: DispatchQueue` constructed in `init` (line 65). No
+    cross-thread access.
+  * Data race on PerformanceLog state — `instanceCounters`,
+    `samplingOneInN`, `droppedSinceSummary`, `cachedPrefixSecond`,
+    `cachedPrefixBytes` all read/written under `lock` (NSLock). The
+    formatter copies `cachedPrefixBytes` (value-type `[UInt8]`) under
+    the lock then releases the lock before the String conversion.
+  * Millisecond formatting — `interval.rounded(.down)` guarantees
+    `fractional ≥ 0`; clamped to [0, 999]. No negative-index panic.
+  * Hinnant civil_from_days — verified against the published algorithm;
+    `sod < 0` branch (line 531) handles the pre-2001 case via Hinnant's
+    standard adjustment.
+  * Correlation id generation — uses `SystemRandomNumberGenerator`
+    + a fixed 16-byte hex LUT and a fixed 8-byte buffer; no String
+    formatting, no array allocation in the hot path beyond the
+    8-byte buffer.
+  * Trace lifecycle — `PerformanceTrace.complete` is idempotent via
+    a `closed` flag under its own `NSLock`. `deinit` skips work when
+    `isDisabled`, `isSkipped`, or `closed`. `weak var owner` — the
+    owner is `PerformanceLog.shared` (a static let), so the weak
+    reference is effectively strong for the process lifetime; the
+    `guard let owner` in `complete` covers the test-only case where
+    a non-shared instance is dropped.
+  * Static singletons — `PerformanceLog()` initializer does no I/O,
+    only constructs OSSignposter + LogSink. Safe to lazy-init on the
+    main thread from `ImageGlassApp.init` line 20.
+
+Perf-cost / log-volume opportunities noted (not fixed here — these
+are sampling/call-site concerns owned by DirectoryWalk / AppLaunch
+agents, per the existing plan body):
+  * The 1.4 GB / 7.5M-line capture is dominated by
+    DirectoryWalk.SingleDir (2.85M instances) and Tree.Traverse.Log
+    (888K instances). The sampling API is shipped but not wired.
+    Estimated saving with oneInN=100 on both: ~3.7M lines per
+    session removed, ~700 MB on disk.
+  * LogSink is async + buffered (DispatchQueue async, cached
+    FileHandle, no per-line `fsync`). Confirmed no synchronous
+    flushes on the hot path. The only `queue.sync` calls are
+    `flush()` (shutdown) and `reset()` (tests). Production write
+    rate is bounded by the background queue, not the main thread.
+
+
+## Changes made
+
+None. The audit found no latent defect in PerformanceLog.swift or
+LogSink.swift that warranted a code change.
+
+  * No force-unwraps, `try!`, `as!`, `fatalError`, or `unsafeBitCast`
+    in either file.
+  * No duplicate logger machinery elsewhere in the codebase — only
+    `PerformanceLog.shared` is referenced; no parallel implementation
+    exists.
+  * No file-handle leak path; no race on shared mutable state.
+  * The reported `unsafeBitCast` crash is attributable to a sibling
+    file (FSEventsBridge.swift, already patched in the current tree),
+    not to the perf logger.
+
+Logging/*.swift remains unchanged. Files reviewed and confirmed:
+  * code/Sources/ImageGlassCore/Logging/PerformanceLog.swift (817 lines)
+  * code/Sources/ImageGlassCore/Logging/LogSink.swift (181 lines)
+
+Re-verified `swiftc -parse Logging/PerformanceLog.swift
+Logging/LogSink.swift` exits clean. (Full ImageGlassCore build fails
+on FrameSource.swift CGImage? → CGImage return-type errors —
+unrelated to this agent's scope.)

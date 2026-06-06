@@ -132,3 +132,172 @@ Follow-ups deferred
 * Per-subdirectory mtime cache (would let a refresh skip unchanged
   subtrees, not just unchanged roots). Larger surface — a separate pass.
 * Lazy children loading on FileTree expand. Owned by another agent.
+
+
+Completion log
+--------------
+State on arrival: code/Sources/ImageGlassCore/FileList/DirectoryTreeWalker.swift
+had already been implemented to spec in commit 810da07 ("Bryan 20") —
+the +228 lines for this file in that commit cover items A through E:
+
+  * WalkCacheEntry struct + walkCache dictionary (item A).
+  * scheduleWalk cache-hit short-circuit at ≤ 2 s with matching root
+    mtime + filter (item A).
+  * runWalk cache lookup before walkParallel + cache write after
+    a real walk completes (item A).
+  * walkCache + inflightFilter cleared in removeRoot (item A).
+  * Recursive walkSubtreeParallel with TaskGroup fan-out (item B).
+  * WalkLimiter actor with non-blocking tryAcquire/release so a
+    parent task holding a slot never deadlocks waiting on a child
+    that cannot get one — falls back to serial walkDir for the
+    losing subtree (item B).
+  * maxParallelWalkers = max(1, min(19, cores * 4 / 5)) (item B).
+  * minChildrenToFanOut = 2 — single-subdir levels recurse inline
+    rather than spawn a TaskGroup whose overhead would dominate
+    (item D, narrower than the plan's "<= 16 entries" but matches
+    item B's "listed-dir-child count > 1 also fans out"; the tighter
+    rule wins because subdir-spawn cost is what we are amortizing
+    over, not file-classification cost which is already inline).
+  * .isDirectoryKey read once per child via the
+    contentsOfDirectory(at:includingPropertiesForKeys:) prefetch
+    (item C).
+  * refilter / refilterAll / removeRoot stay queue.sync (item D).
+  * Task.isCancelled checked at every fan-out point (item E).
+
+Symbols that earlier reports flagged as unresolved (walkSubtreeParallel,
+walkSubtreeFromListing, WalkLimiter, WalkCacheEntry):
+
+  * walkSubtreeParallel  — defined at line ~512, used at line ~413.
+  * WalkLimiter          — actor defined at line ~488, instantiated
+                           at line ~504 as static let walkLimiter.
+  * WalkCacheEntry       — struct defined at line ~68, used in
+                           walkCache, scheduleWalk, runWalk, removeRoot.
+  * walkSubtreeFromListing — never referenced anywhere in the tree.
+                             Earlier report was stale; no missing symbol.
+
+Build state at hand-off:
+
+  * `swift build --target ImageGlassCore` — clean.
+  * `swift build` (whole package) — 2 errors, both in
+    code/Sources/ImageGlass/FileSystem/PollingScopeWatcher.swift
+    around `Darwin.stat(url.path, &st) == 0`. PollingScopeWatcher
+    lives under code/Sources/ImageGlass/ and is owned by the
+    FileWatcher.EventBatch plan, not this one. Left untouched per
+    the off-limits rule.
+  * `swift test --filter Directory` / `--filter Walker` — could not
+    run end-to-end because the test target links the ImageGlass
+    executable target, which transitively fails on the
+    PollingScopeWatcher errors above. The only existing test that
+    touches DirectoryTreeWalker is
+    Tests/ImageGlassCoreTests/DirectoriesMCPToolsTests.swift; it
+    references only the existing public surface (walkSync, the
+    initializer) and does not depend on the new internal symbols,
+    so it will run as soon as the PollingScopeWatcher errors are
+    fixed by their owning agent.
+
+No changes were needed in this session — the implementation was
+already complete and matches the plan. Only this completion-log
+section was appended.
+
+
+## Implementation map
+
+Canonical implementation — single source of truth, no duplication:
+
+* code/Sources/ImageGlassCore/FileList/DirectoryTreeWalker.swift:13
+  - `final class DirectoryTreeWalker` (singleton, `.shared` at line 15)
+* DirectoryTreeWalker.swift:68 — `struct WalkCacheEntry` (filter, rootMTime, result, storedAt)
+* DirectoryTreeWalker.swift:74 — `walkCache: [URL: WalkCacheEntry]`
+* DirectoryTreeWalker.swift:89 — `scheduleWalk(root:filter:corr:)` (DirectoryWalk.Schedule)
+  - line 101: in-flight + same-filter coalescing short-circuit
+  - line 108: ≤ 2 s cache-fresh short-circuit, re-posts didChange
+* DirectoryTreeWalker.swift:127 — `removeRoot(path:)` (DirectoryWalk.Remove); clears walkCache
+* DirectoryTreeWalker.swift:147 — `refilter(root:filter:)` (DirectoryWalk.Refilter)
+* DirectoryTreeWalker.swift:169 — `refilterAll(filter:)` (DirectoryWalk.RefilterAll)
+* DirectoryTreeWalker.swift:205 — `runWalk(...)` async (DirectoryWalk.Run)
+  - line 224: stat root mtime, queue.sync cache lookup
+  - line 235: cold path → walkParallel
+  - line 241: commit roots + walkCache + clear inflight
+* DirectoryTreeWalker.swift:309 — `walkSync` (test-only public surface)
+* DirectoryTreeWalker.swift:327 — `walkParallel` (DirectoryWalk.Parallel) — fans top-level subdirs
+* DirectoryTreeWalker.swift:471 — `maxParallelWalkers = max(1, min(19, cores * 4 / 5))`
+* DirectoryTreeWalker.swift:488 — `actor WalkLimiter` (tryAcquire / release, non-blocking)
+* DirectoryTreeWalker.swift:504 — `static let walkLimiter` (process-wide)
+* DirectoryTreeWalker.swift:512 — `walkSubtreeParallel(at:filter:)` (recursive fan-out)
+* DirectoryTreeWalker.swift:599 / 676 — DirectoryWalk.SingleDir emission (50 ms threshold)
+* DirectoryTreeWalker.swift:621 — `walkDir(...)` synchronous fallback / serial path
+
+Callers (read-only reference — outside walker scope):
+* code/Sources/ImageGlass/AppState.swift:449, :1145, :1148, :1155 (boot, reconcile)
+* code/Sources/ImageGlass/ImageGlassApp.swift:397, :414, :452, :492, :524
+* code/Sources/ImageGlass/DirectoryFilenamePanel.swift:514, :545
+* code/Sources/ImageGlass/Window/FloatingFileTreeWindow.swift:303
+* code/Sources/ImageGlass/ContextMenus/ContextMenuActions.swift:338, :364, :378, :395, :479, :507
+
+Duplication check: GREP of `DirectoryTreeWalker|walkSync|walkParallel|walkDir|scheduleWalk`
+across the whole Swift tree shows ONE implementation file and many call
+sites. No competing implementation. The historical `traverseAndLog`
+pattern that this replaced is documented in DirectoryTree.swift:354 as a
+comment only — the code is gone.
+
+
+## Risk analysis (crash / exception surface)
+
+DirectoryTreeWalker.swift itself:
+* Zero `try!`, `as!`, `fatalError`, `unsafeBitCast`, force-unwraps,
+  or `Unmanaged.fromOpaque` calls. Confirmed by grep.
+* All `try` calls are `try?` (line 376, 462, 541, 654) — they degrade
+  cleanly to "treat as non-directory" / "treat as miss".
+* All `try` against the disk-backed `store` is `try?` (line 257).
+* `queue.sync` inside `async` `runWalk` (lines 225, 241) is safe — the
+  call is from a `Task.detached`, never from inside `queue` itself, so
+  no re-entrancy deadlock.
+* `WalkLimiter.tryAcquire` is non-blocking by design — eliminates the
+  classic limiter-deadlock where a parent task holding a slot awaits a
+  child that can never acquire one. Losers fall back to serial
+  `walkDir`, so progress is guaranteed.
+* `Task.isCancelled` checked at every fan-out point (lines 338, 516,
+  632) — a superseded walk dies before doing more cloud I/O.
+* No retain cycles: `scheduleWalk` and `removeRoot` use `[weak self]`
+  on their `queue.async` blocks; the detached walk Task also uses
+  `[weak self]` (line 117).
+* `firstImageInOrder` is recursion bounded by tree depth, not by
+  user-controlled values. No stack-overflow surface on realistic
+  filesystems.
+* `walkParallel` / `walkSubtreeParallel` / `walkDir` all guard
+  `fileExists(...isDirectory:)` before listing, so a vanished root
+  yields an empty tree rather than throwing.
+
+Cross-cutting `unsafeBitCast`-style risk spotted OUTSIDE my scope
+(noted, not fixed in this plan):
+* code/Sources/ImageGlass/FileSystem/FSEventsBridge.swift:189-200 —
+  An earlier capture had `unsafeBitCast(cf, to: CFDictionary.self)`
+  / `unsafeBitCast(cf, to: CFString.self)` against a value typed
+  `CFTypeRef` (which is the 2-word `AnyObject` existential in Swift,
+  16 bytes, not 8). That is the exact crash pattern in
+  `Swift/arm64e-apple-macos.swiftinterface:3272 Fatal error: Can't
+  unsafeBitCast between types of different sizes`.
+  The file currently in tree at the time of this audit no longer uses
+  unsafeBitCast — it decodes straight from the raw opaque pointer via
+  `Unmanaged<CFDictionary>.fromOpaque(raw)` (single-word) and
+  `Unmanaged<CFString>.fromOpaque(raw)`. That is the correct fix.
+  Owner: FSEvents / file-watcher plan, not this one. Confirmed
+  resolved by build success (`swift build` clean).
+* code/Sources/ImageGlassCore/ExternalTools/ExternalToolIPC.swift:120,
+  :127 use `withMemoryRebound` with explicit `capacity:` values that
+  match the source allocation. Not a size-mismatch risk.
+
+
+## Changes made
+
+None to DirectoryTreeWalker.swift — the implementation was already on
+spec, already hardened, and exception-clean.
+
+Build verification this session:
+* `cd code && swift build --target ImageGlassCore` — clean.
+* `cd code && swift build` (full package, includes ImageGlass which
+  depends on FSEventsBridge) — clean. The previously reported
+  PollingScopeWatcher compile errors are no longer present, and the
+  FSEventsBridge unsafeBitCast crash pattern is no longer present —
+  both owned by sister plans, but logged here because they affected
+  end-to-end testability of this plan.

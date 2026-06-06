@@ -67,13 +67,43 @@ public final class FrameSource: @unchecked Sendable {
             lock.unlock()
         }
 
+        /// 1x1 transparent fallback used when a lazy frame decode fails and
+        /// we have no seed frame to hand back. Tries CGContext first, then
+        /// falls back to a CGDataProvider-built image so a single failure
+        /// mode in CGBitmapContext can't crash the app at module-init time.
+        /// `fallbackPixel` is reachable from any image load path, so any
+        /// startup-time crash here would surface as "the app dies before
+        /// the first image paints."
         static let fallbackPixel: CGImage = {
             let cs = CGColorSpaceCreateDeviceRGB()
-            let ctx = CGContext(data: nil, width: 1, height: 1,
-                                bitsPerComponent: 8, bytesPerRow: 4,
-                                space: cs,
-                                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
-            return ctx.makeImage()!
+            let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue
+            if let ctx = CGContext(data: nil, width: 1, height: 1,
+                                   bitsPerComponent: 8, bytesPerRow: 4,
+                                   space: cs,
+                                   bitmapInfo: bitmapInfo),
+               let img = ctx.makeImage() {
+                return img
+            }
+            // Last-ditch: build the same 1x1 transparent pixel directly from
+            // a CGDataProvider. Avoids CGContext entirely.
+            let bytes: [UInt8] = [0, 0, 0, 0]
+            if let data = CFDataCreate(nil, bytes, bytes.count),
+               let provider = CGDataProvider(data: data),
+               let img = CGImage(width: 1, height: 1,
+                                  bitsPerComponent: 8, bitsPerPixel: 32,
+                                  bytesPerRow: 4, space: cs,
+                                  bitmapInfo: CGBitmapInfo(rawValue: bitmapInfo),
+                                  provider: provider, decode: nil,
+                                  shouldInterpolate: false,
+                                  intent: .defaultIntent) {
+                return img
+            }
+            // Truly unreachable on any working macOS — both CGBitmapContext
+            // and CGDataProvider would have to fail. Log loudly and fall
+            // back to fatalError so the failure is at least diagnosable.
+            ErrorLog.log("FrameSource.fallbackPixel: failed to build 1x1 CGImage",
+                         class: "FrameSource")
+            fatalError("FrameSource.fallbackPixel: CGImage construction failed at module init")
         }()
     }
 

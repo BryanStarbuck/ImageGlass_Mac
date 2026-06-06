@@ -218,10 +218,24 @@ public final class AppState {
 
     private let storage = LocalStorage.shared
     private var fileWatcher: FileWatcher?
-    /// Watchers for the source directories of the active scope. Spec §
-    /// "Animation & Multi-Frame Support" → "real-time file change monitoring":
-    /// re-evaluate the scope when an external tool drops a new file into a
-    /// watched directory.
+    /// Long-lived subscription to `FileSystemWatcher.shared.events(for:)`.
+    /// Replaces the legacy fan-out of one `FileWatcher` per include-rule
+    /// directory: spec docs/file_system_change.mdx §3.1 / §3.3 says a
+    /// single FSEventStream per scope is correct and cheap, while N
+    /// kqueue file descriptors over a tree is the wrong primitive
+    /// (Apple "do not use kqueue for large hierarchies"). Cancelled and
+    /// re-armed by `rebuildSourceWatchers()` on every scope change.
+    private var scopeFSTask: Task<Void, Never>?
+    /// Name of the scope the active subscription belongs to. Tracked so
+    /// `rebuildSourceWatchers` can decide whether to keep the existing
+    /// subscription (same scope, same roots) or replace it.
+    private var scopeFSScopeName: String?
+    /// Roots the active subscription covers. Same purpose as
+    /// `scopeFSScopeName` — short-circuits a no-op rebuild.
+    private var scopeFSRoots: [URL] = []
+    /// Legacy field — retained for binary compatibility with any
+    /// callers that read this property; the new FileSystemWatcher
+    /// subscription replaces its function. Always empty in v2+.
     private var sourceWatchers: [FileWatcher] = []
     /// Watches `~/Library/Application Support/ImageGlass_Mac/selection.txt`
     /// so MCP `select_file` calls move the GUI selection without us having
@@ -352,7 +366,14 @@ public final class AppState {
             self.configPaths = loadedPaths
             self.config = loadedConfig
             self.settings = await settingsTask
-            themeStore.bootstrap()
+            // perf/plans/AppLaunch.Total.plan §B / §C — `themeStore.bootstrap()`
+            // does a `contentsOfDirectory` scan of the themes folder plus
+            // three plain-text reads. The `currentTheme` / `appearanceMode`
+            // bindings ContentView reads are @Observable, so painting the
+            // first frame with built-in defaults and re-rendering after the
+            // store loads costs at most a single re-layout — far cheaper
+            // than blocking first paint on the scan. Deferred to the
+            // post-bootstrap Task below.
             PanelRegistry.shared.registerBuiltInPanels()
             panelLayout.reloadFromDisk()
             // docs/panels.mdx §6.5 — bootstrap reconciliation. The
@@ -402,6 +423,14 @@ public final class AppState {
             let deferredRoots = storedRoots
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                // perf/plans/AppLaunch.Total.plan §C — themeStore.bootstrap
+                // scans `themes/` and reads three plain-text selection
+                // files. ContentView's `.tint` / `.preferredColorScheme`
+                // bindings re-render automatically when the store
+                // republishes, so painting first frame with the
+                // BuiltinThemes defaults and updating afterwards is
+                // visually fine.
+                self.themeStore.bootstrap()
                 self.startWatching()
                 self.startSelectionWatcher()
                 self.startViewModeWatcher()
@@ -690,28 +719,74 @@ public final class AppState {
         await walkTask?.value
     }
 
-    /// (Re)attach FileWatchers to each include-rule directory in the active
-    /// scope so external changes (new screenshots, deleted files, renames)
-    /// trigger a re-evaluation. Called after every scope activation.
+    /// Bind `FileSystemWatcher.shared` to the active scope so external
+    /// changes (new screenshots, deletes, renames, atomic-rename saves,
+    /// volume unmounts) trigger a re-evaluation. Replaces the legacy
+    /// per-directory kqueue fan-out — spec docs/file_system_change.mdx
+    /// §3.1 explains why one FSEventStream per scope beats N
+    /// kqueue file descriptors for a tree. Called after every scope
+    /// activation.
     private func rebuildSourceWatchers() {
-        sourceWatchers.forEach { $0.cancel() }
-        sourceWatchers.removeAll()
-        guard let scope = activeScope else { return }
+        guard let scope = activeScope else {
+            // Scope cleared — release any active subscription.
+            let task = scopeFSTask
+            let prevScope = scopeFSScopeName
+            scopeFSTask = nil
+            scopeFSScopeName = nil
+            scopeFSRoots = []
+            task?.cancel()
+            if let prev = prevScope {
+                Task { await FileSystemWatcher.shared.unwatch(scope: prev) }
+            }
+            return
+        }
+
+        // Resolve include-rule directories to URLs the watcher can
+        // bind to. Skip non-existent paths — `ScopeEvaluator` already
+        // tolerates missing roots, and FSEventsScopeWatcher itself
+        // emits `.rootDisappeared` if a previously-present root goes
+        // away later.
         var seen = Set<String>()
+        var roots: [URL] = []
         for dir in scope.include.directories {
             let expanded = AppPaths.expandTilde(dir)
             guard seen.insert(expanded).inserted else { continue }
             var isDir: ObjCBool = false
             guard FileManager.default.fileExists(atPath: expanded, isDirectory: &isDir),
                   isDir.boolValue else { continue }
-            let url = URL(fileURLWithPath: expanded)
-            let w = FileWatcher(url: url) { [weak self] in
-                Task { @MainActor in
-                    await self?.reevaluateActive()
-                }
+            roots.append(URL(fileURLWithPath: expanded))
+        }
+
+        // Idempotent: identical scope + roots → keep the existing
+        // subscription, do not flap the FSEventStream.
+        if scopeFSScopeName == scope.name && scopeFSRoots == roots {
+            return
+        }
+
+        // Tear down the previous subscription before spawning a new one
+        // so its `for await` loop exits cleanly (the AsyncStream is
+        // finished by `unwatch(scope:)`).
+        let previousScope = scopeFSScopeName
+        scopeFSTask?.cancel()
+
+        scopeFSScopeName = scope.name
+        scopeFSRoots = roots
+
+        let scopeName = scope.name
+        scopeFSTask = Task { [weak self] in
+            guard let self else { return }
+            if let prev = previousScope, prev != scopeName {
+                await FileSystemWatcher.shared.unwatch(scope: prev)
             }
-            w.start()
-            sourceWatchers.append(w)
+            await FileSystemWatcher.shared.watch(scope: scopeName, roots: roots)
+            let stream = await FileSystemWatcher.shared.events(for: scopeName)
+            for await _ in stream {
+                if Task.isCancelled { break }
+                // Spec §6 stage 4 — every batch triggers a single
+                // scope re-evaluation. `reevaluateActive()` already
+                // serializes overlapping walks via `walkTask`.
+                await self.reevaluateActive()
+            }
         }
     }
 

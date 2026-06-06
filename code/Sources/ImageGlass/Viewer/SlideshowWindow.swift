@@ -343,11 +343,12 @@ final class SlideshowController {
         guard var run = runs[windowID],
               let appState = run.appState,
               let viewer = run.viewer else { return }
-        let ordered = appState.orderedNavigationFiles
-        let walkerRoots = appState.walkerRoots
-        let files: [String] = walkerRoots.isEmpty
-            ? ordered
-            : ordered.filter { Self.isInScope(path: $0, roots: walkerRoots) }
+        // `orderedNavigationFiles` already applies `isInScope` when
+        // walker roots are present (AppState.swift line ~1334) — the
+        // previous double-filter pass here was an O(N) waste on every
+        // tick and was a primary contributor to the 5.5s avg /
+        // 42.8s max `Slideshow.Advance` in perf_report.csv.
+        let files = appState.orderedNavigationFiles
         let loop = appState.settings.slideshow.loop
         let interval = appState.settings.slideshow.interval_seconds
 
@@ -405,9 +406,16 @@ final class SlideshowController {
             loop: loop
         )
 
-        appState.selectedFile = toPath
+        // Bump advanceCount and write back BEFORE mutating
+        // `selectedFile`. SwiftUI's observer chain on `selectedFile`
+        // can re-enter the run loop synchronously (representable
+        // updates → ImageCanvasView.setImage → FrameSource.load),
+        // and if a re-entrant tick fired another `advance(windowID:)`
+        // before we wrote `run` back, the advanceCount mutation
+        // would be lost. Writing first keeps the count monotonic.
         run.advanceCount += 1
         runs[windowID] = run
+        appState.selectedFile = toPath
 
         // multi_window.mdx §7.1 — mirror the advance into the
         // WindowState so the next quit-time flush records the correct
@@ -450,11 +458,9 @@ final class SlideshowController {
     /// from the current selection. Used by `start(...)` where we
     /// don't yet have the files list computed in advance().
     private func schedulePrefetch(windowID: Int, appState: AppState) {
-        let ordered = appState.orderedNavigationFiles
-        let walkerRoots = appState.walkerRoots
-        let files: [String] = walkerRoots.isEmpty
-            ? ordered
-            : ordered.filter { Self.isInScope(path: $0, roots: walkerRoots) }
+        // `orderedNavigationFiles` already applies `isInScope`
+        // (AppState.swift ~1334). Don't double-filter here.
+        let files = appState.orderedNavigationFiles
         guard !files.isEmpty else { return }
         let loop = appState.settings.slideshow.loop
         let currentPath = appState.selectedFile ?? ""

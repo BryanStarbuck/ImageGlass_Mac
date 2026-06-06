@@ -144,3 +144,134 @@ Build status
 * `swift test --filter Slideshow` cannot run until that downstream
   error is fixed by the owning agent; SlideshowController test
   targets compile against the same product.
+
+## Implementation map
+
+* `code/Sources/ImageGlass/Viewer/SlideshowWindow.swift`
+  - `SlideshowController` (line 22) — @MainActor singleton, all
+    slideshow state.
+  - `Run` struct (line 29) — per-window state including
+    `prefetchKeys: Set<String>`.
+  - `toggle(appState:source:windowID:)` (line 96).
+  - `start(appState:seconds:source:windowID:)` (line 120).
+  - `stop(windowID:reason:source:)` (line 232).
+  - `scheduleTick(windowID:every:)` (line 290) — 10 Hz countdown
+    timer; uses `[weak self]` + `Task { @MainActor }` re-entry.
+  - `tickCountdown(windowID:)` (line 305).
+  - `advance(windowID:)` (line 337) — THE hotspot in
+    `perf_report.csv` (avg 5,557 ms / max 42,881 ms).
+  - `schedulePrefetch(windowID:appState:)` (line 449) — start-time
+    seed.
+  - `schedulePrefetch(windowID:appState:files:anchorIdx:loop:)`
+    (line 475) — per-advance dispatch to `FormatLoader.prefetch`.
+  - `isInScope(path:roots:)` (line 525) — already invoked inside
+    `AppState.orderedNavigationFiles`.
+* `code/Sources/ImageGlass/AppState.swift`
+  - `orderedNavigationFiles` (line 1331) — ALREADY filters via
+    `SlideshowController.isInScope`. This is the canonical
+    in-scope navigation list. Slideshow's own re-filter was dead
+    weight; removed (see Changes made).
+  - `selectNext(wrap:)` (line 1355) / `selectPrevious(wrap:)`
+    (line 1340) — sibling manual-step path used by `N`/`P` keys.
+* `code/Sources/ImageGlass/ContextMenus/ContextMenuActions.swift`
+  - `canvasNextImage(state:viewer:)` (line 553) /
+    `canvasPreviousImage(state:viewer:)` (line 558) /
+    `advanceSelection(state:delta:)` (line 566) — separate
+    arrow-key/context-menu step path. Uses `flattenVisible` +
+    `resolvedFiles` directly, NOT `orderedNavigationFiles`, so
+    it does not honor `isInScope` filtering. Diverges from
+    slideshow's contract on purpose (right-arrow walks the
+    visible panel including excluded rows). Not unified.
+* `code/Sources/ImageGlassCore/Formats/FormatLoader.swift`
+  - `prefetch(urls:targetMaxDim:)` (line 216) — bounded-concurrency
+    decode (cap 3 via `DecodeExecutor.shared`), errors swallowed.
+    Signature matches the call site in slideshow prefetch.
+
+## Risk analysis
+
+Crash-prone patterns audited in `SlideshowWindow.swift`:
+* No `unsafeBitCast`, `try!`, `as!`, `fatalError`, or force-unwrap
+  on `Optional` in this file. (Only `?? 0` / `?? ""` defaults.)
+* Force-unwrap-free guards on `runs[windowID]`, `run.viewer`,
+  `run.appState` — every entry point bails cleanly when the
+  window or weak references are gone.
+* `Timer.scheduledTimer` callback uses `[weak self]` + a
+  `Task { @MainActor in ... }` hop — no retain cycle, no
+  context-pointer FFI, so NOT susceptible to the launch-time
+  `unsafeBitCast` size-mismatch crash.
+* `firstIndex(of:)` returns `Int?` — guarded; no OOB. Wrap math
+  (`raw % files.count`) is gated by `loop`, so the off-by-one /
+  modulo-by-zero hazard is absent (caller already gates
+  `!files.isEmpty`).
+
+Cross-cutting `unsafeBitCast`-style risks spotted elsewhere
+(flagged per instructions, NOT modified — not reachable from
+slideshow):
+* `code/Sources/ImageGlass/FileSystem/FSEventsBridge.swift` line
+  ~180-230 — the FSEventsCallback C bridge. Comments at lines
+  189-208 explicitly document the EXACT crash from the launch
+  log ("Can't unsafeBitCast between types of different sizes")
+  and have already migrated to `Unmanaged<T>.fromOpaque` to
+  avoid it. The code currently looks correct. If the launch
+  crash signature points here, the regression is elsewhere on
+  the FSEvents init path (callback context pointer registration
+  at line ~94, where `Unmanaged.passUnretained(self).toOpaque()`
+  is used — verify the matching `Unmanaged<X>.fromOpaque(info)`
+  in the C trampoline uses the SAME concrete type X, not a
+  protocol/existential).
+* `code/Sources/ImageGlassCore/ExternalTools/ExternalToolIPC.swift`
+  lines 120, 127 — `withMemoryRebound(to: UInt8.self, capacity:
+  maxLen + 1)` and `withMemoryRebound(to: sockaddr.self,
+  capacity: 1)`. These are size-sensitive; if `maxLen` ever
+  miscounts the null terminator the rebind capacity is wrong.
+  Not reachable from slideshow.
+
+Perf-correctness bugs found in slideshow code (now fixed below):
+1. Double `isInScope` filter on every tick — `orderedNavigationFiles`
+   already filters; the local re-filter inside `advance()` and
+   `schedulePrefetch(windowID:appState:)` was an O(N) duplicate
+   walk. With N walker rows in the millions for some scopes,
+   this is a direct cause of the 5.5s average.
+2. Re-entrancy hazard around `selectedFile` mutation —
+   `appState.selectedFile = toPath` triggers the SwiftUI observer
+   chain SYNCHRONOUSLY in the same run loop turn (per the
+   root-cause analysis above). If a re-entrant `tickCountdown`
+   fires before the controller writes its own `run` back to
+   `runs[windowID]`, `advanceCount` increments are lost. Fixed
+   by writing `run` BEFORE mutating `selectedFile`.
+
+Duplication note:
+* `advance(windowID:)` (slideshow auto-advance) and
+  `advanceSelection(state:delta:)` (right-arrow / context menu)
+  compute "next file" with DIFFERENT semantics: slideshow uses
+  `orderedNavigationFiles` (in-scope filtered, loop-aware),
+  manual step uses `flattenVisible` (includes excluded rows,
+  clamped at ends). Tempting to unify but the difference is
+  intentional per `slideshow.mdx` §10A vs the panel's right-arrow
+  contract. Not factored out. Recorded here so a later refactor
+  pass can re-evaluate.
+
+## Changes made
+
+In `code/Sources/ImageGlass/Viewer/SlideshowWindow.swift`:
+
+1. `advance(windowID:)` — replaced the
+   `walkerRoots.isEmpty ? ordered : ordered.filter { isInScope ... }`
+   block with a direct `let files = appState.orderedNavigationFiles`,
+   because `orderedNavigationFiles` already runs the same
+   `isInScope` filter at AppState.swift line 1334. Eliminates one
+   full O(N) walk per tick. Added a comment pointing at the
+   source-of-truth filter so a future agent doesn't reintroduce
+   the duplicate.
+2. `schedulePrefetch(windowID:appState:)` — same dead-filter
+   removal applied to the start-time prefetch seeder.
+3. `advance(windowID:)` — moved `run.advanceCount += 1; runs[windowID]
+    = run` BEFORE `appState.selectedFile = toPath` so re-entrant
+   ticks from the SwiftUI observer chain cannot lose the
+   advance-count update. Added inline comment explaining the
+   re-entrancy hazard.
+
+No changes outside `SlideshowWindow.swift`. No new files. No
+public API changes. No test removals. Plan-file's `Run` struct,
+prefetch ring, timer cadence, and audit-log surface are
+unchanged.
