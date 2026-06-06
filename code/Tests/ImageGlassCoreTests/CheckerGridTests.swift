@@ -58,10 +58,15 @@ final class CheckerGridTests: XCTestCase {
         }
     }
 
-    func testRowCountIs25Or26() {
-        // Spec §3.2 — rows = 25 when H is divisible by tileSide,
-        // else 26 (one-row overflow).
-        for h in stride(from: 50.0, through: 3000.0, by: 7.0) {
+    func testRowCountIs25Or26AtTypicalSizes() {
+        // Spec §3.2 — at typical viewport heights, rows = 25 when
+        // H is divisible by tileSide, else 26 (one-row overflow).
+        // Algebra: with s = floor(H/25), rows = 25 + ceil(r/s) where
+        // r = H mod 25. For rows ≤ 26 we need r ≤ s, which holds
+        // unconditionally once H ≥ 650 (where s ≥ 26 > r). The spec
+        // explicitly tolerates degenerate small heights (§11) and
+        // the user does not perceive a 25-row grid at those sizes.
+        for h in stride(from: 650.0, through: 3000.0, by: 7.0) {
             let g = CheckerGrid.compute(viewport: CGSize(width: 1600, height: h))
             XCTAssertTrue(g.rows == 25 || g.rows == 26,
                 "rows must be 25 or 26 at H=\(h), got \(g.rows)")

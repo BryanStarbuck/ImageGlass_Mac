@@ -92,9 +92,10 @@ final class ImageCanvasView: NSView {
     var flipVertical: Bool = false    { didSet { needsDisplay = true } }
     var smoothInterpolation: Bool = true { didSet { needsDisplay = true } }
     var colorChannel: ColorChannel = .all { didSet { rebuildFilteredImage(); needsDisplay = true } }
-    /// transparent_bk_checkers.mdx §2.5 / §6 — when true, `draw(_:)`
-    /// paints the 20-column checker grid behind the image instead of
-    /// the flat `debugBackgroundColor` fill. Toggling forces one redraw.
+    /// transparent_bk_checkers.mdx §2.6 / §6 — when true, `draw(_:)`
+    /// paints the 25-row, height-driven checker grid behind the
+    /// image instead of the flat `debugBackgroundColor` fill.
+    /// Toggling forces one redraw.
     var showTransparencyChecker: Bool = true { didSet { needsDisplay = true } }
     var showColorPicker: Bool = false { didSet { needsDisplay = true } }
     var currentFrameIndex: Int = 0 {

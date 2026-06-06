@@ -262,6 +262,21 @@ Implementation contract:
   outside the visible viewport. The auto-scroll target is **center**,
   not **top**, so the user can see what is coming next and what just
   played.
+* The same `ScrollViewReader` contract applies in **List mode** — when
+  `state.selectedFile` changes the flat list also scrolls the selected
+  row into view at `.center`. The Directory Panel must never become a
+  stale navigation surface in either mode, including during fast
+  slideshows that cross folder boundaries (the slideshow timer just
+  steps through `AppState.orderedNavigationFiles`; the panel reacts to
+  the same `selectedFile` change either way).
+* Implementation surface: each file row in tree mode is tagged with
+  `.id(fullPath)` so `ScrollViewReader.scrollTo` can find it; in list
+  mode the `ForEach(... id: \.self)` already keys rows by their path
+  string. The auto-scroll is dispatched on the next runloop tick so
+  the auto-reveal expansion of the containing folder (`DesignTreeNode`
+  `onChange(of: selected)`) has time to materialize the row before
+  `scrollTo` looks for its id. The animation matches the framework's
+  200 ms `easeInOut` so the row glides rather than snaps.
 * When the cursored file lives inside a currently-collapsed subtree
   (e.g., the slideshow crossed a folder boundary), the path from the
   active root down to the file is auto-expanded so the row can be

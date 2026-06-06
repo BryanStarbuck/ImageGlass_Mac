@@ -298,26 +298,56 @@ struct DirectoryFilenamePanel: View {
             groups[dir, default: []].append(f)
         }
         let activeFolder = state.selectedFile.map { ($0 as NSString).deletingLastPathComponent }
-        return ScrollView {
-            LazyVStack(alignment: .leading, spacing: 2, pinnedViews: [.sectionHeaders]) {
-                ForEach(order, id: \.self) { folder in
-                    Section(header: folderHeader(folder,
-                                                 count: groups[folder]?.count ?? 0,
-                                                 active: folder == activeFolder)) {
-                        ForEach(groups[folder] ?? [], id: \.self) { path in
-                            designRow(name: displayName(for: path),
-                                      icon: iconForPath(path),
-                                      isDir: false,
-                                      depth: 1,
-                                      selected: state.selectedFile == path)
-                                .contentShape(Rectangle())
-                                .onTapGesture { state.selectedFile = path }
+        // dir_ui.mdx §5.4 — keep the selected file row visible regardless of
+        // how the cursor moved. Same contract as treeView; both modes have
+        // to react to slideshow advance.
+        return ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 2, pinnedViews: [.sectionHeaders]) {
+                    ForEach(order, id: \.self) { folder in
+                        Section(header: folderHeader(folder,
+                                                     count: groups[folder]?.count ?? 0,
+                                                     active: folder == activeFolder)) {
+                            ForEach(groups[folder] ?? [], id: \.self) { path in
+                                designRow(name: displayName(for: path),
+                                          icon: iconForPath(path),
+                                          isDir: false,
+                                          depth: 1,
+                                          selected: state.selectedFile == path)
+                                    .contentShape(Rectangle())
+                                    .onTapGesture { state.selectedFile = path }
+                                    .id(path)
+                            }
                         }
                     }
                 }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 8)
             }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 8)
+            .onChange(of: state.selectedFile) { _, newValue in
+                scrollSelectionIntoView(proxy: proxy, path: newValue)
+            }
+            .onAppear {
+                scrollSelectionIntoView(proxy: proxy, path: state.selectedFile)
+            }
+        }
+    }
+
+    /// dir_ui.mdx §5.4 — center the currently selected file's row in
+    /// the panel's scroll view. The auto-scroll runs on every
+    /// `selectedFile` change, including the slideshow timer's
+    /// timer-driven advance. The dispatch onto the next runloop tick
+    /// lets the SwiftUI render pass apply the auto-reveal expansion
+    /// (`DesignTreeNode.onChange(of: selected)`) so the row exists by
+    /// the time `proxy.scrollTo` looks for its `.id`. `withAnimation`
+    /// matches the framework's 200 ms ease-in-out so the user sees a
+    /// smooth follow rather than a snap.
+    private func scrollSelectionIntoView(proxy: ScrollViewProxy, path: String?) {
+        guard let path else { return }
+        DispatchQueue.main.async {
+            withAnimation(.easeInOut(duration: 0.2)) {
+                proxy.scrollTo(path, anchor: .center)
+            }
         }
     }
 
@@ -429,19 +459,33 @@ struct DirectoryFilenamePanel: View {
             return Self.buildView(node: tree, parentPath: root.path)
         }
         let walkerRootsSnapshot = state.walkerRoots
-        return ScrollView {
-            LazyVStack(spacing: 2) {
-                ForEach(roots) { root in
-                    DesignTreeNode(node: root, depth: 0,
-                                   nav: state.treeNav,
-                                   selected: $state.selectedFile,
-                                   matches: matchesSearch,
-                                   walkerRoots: walkerRootsSnapshot,
-                                   appState: state)
+        // dir_ui.mdx §5.4 — every change to `state.selectedFile` (user
+        // click, ↑/↓, slideshow advance, MCP select_file, watcher
+        // remove-and-resync) must scroll the row into view so the
+        // tree never lags behind the viewer. The auto-scroll target
+        // is .center per spec, so the user can see what came before
+        // and what is coming next during a fast slideshow.
+        return ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(spacing: 2) {
+                    ForEach(roots) { root in
+                        DesignTreeNode(node: root, depth: 0,
+                                       nav: state.treeNav,
+                                       selected: $state.selectedFile,
+                                       matches: matchesSearch,
+                                       walkerRoots: walkerRootsSnapshot,
+                                       appState: state)
+                    }
                 }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 8)
             }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 8)
+            .onChange(of: state.selectedFile) { _, newValue in
+                scrollSelectionIntoView(proxy: proxy, path: newValue)
+            }
+            .onAppear {
+                scrollSelectionIntoView(proxy: proxy, path: state.selectedFile)
+            }
         }
     }
 

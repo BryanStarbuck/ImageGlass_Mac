@@ -121,6 +121,12 @@ struct DesignTreeNode: View {
                 }
             }
             .overlay(fileRowContextMenuBridge(filePath: filePath))
+            // dir_ui.mdx §5.4 — `ScrollViewReader` in `DirectoryFilenamePanel`
+            // needs each file row tagged with its full path so it can
+            // `proxy.scrollTo(path, anchor: .center)` whenever
+            // `state.selectedFile` changes (slideshow advance, ↑/↓,
+            // MCP select_file, watcher re-sync).
+            .id(filePath)
     }
 
     // MARK: - Context menu bridges (docs/right_click.mdx §7.1 / §7.2 / §7.3)
