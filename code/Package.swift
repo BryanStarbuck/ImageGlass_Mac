@@ -33,7 +33,17 @@ let package = Package(
         .target(
             name: "ImageGlassCore",
             path: ".",
-            exclude: ["mcp/mcp_manual.txt"],
+            exclude: [
+                "mcp/mcp_manual.txt",
+                // Directories owned by other targets — exclude so SwiftPM
+                // does not treat their files as unhandled inputs to this
+                // target (path is ".", the package root).
+                "Sources/ImageGlass",
+                "Sources/ImageGlassMCPServer",
+                "Sources/igcmd",
+                "Tests",
+                "README.md",
+            ],
             sources: ["Sources/ImageGlassCore", "mcp"],
             resources: [
                 // docs/use_cases/mcp_and_filters_on_dirs.mdx §7.4 — the
