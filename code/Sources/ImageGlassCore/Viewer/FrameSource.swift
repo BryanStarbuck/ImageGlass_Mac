@@ -185,11 +185,61 @@ public final class FrameSource: @unchecked Sendable {
             return nil
         }
         let opts: [CFString: Any] = [kCGImageSourceShouldCache: false]
-        guard let src = CGImageSourceCreateWithURL(url as CFURL, opts as CFDictionary) else {
-            ErrorLog.log("CGImageSourceCreateWithURL returned nil for \(url.path)",
+        if let src = CGImageSourceCreateWithURL(url as CFURL, opts as CFDictionary),
+           CGImageSourceGetCount(src) > 0 {
+            return decode(source: src, contextLabel: url.lastPathComponent)
+        }
+        // URL-based source is lazy and quietly returns count==0 for a number
+        // of macOS file-system corner cases that aren't covered by the
+        // preflight diagnose() pass: provenance-tagged downloads, files
+        // with restrictive POSIX ACLs that still report isReadable=true,
+        // sparse-file backing on certain network providers, etc. Fall back
+        // to reading the bytes via Foundation and handing ImageIO a Data
+        // source. This bypasses the URL-side opening logic entirely while
+        // still using the same decoders, so a progressive JPEG that won't
+        // open from URL will open from its own bytes if `Data(contentsOf:)`
+        // can read them.
+        return loadByReadingBytes(url: url)
+    }
+
+    /// Second-chance load: read the file's bytes through Foundation and
+    /// hand them to `CGImageSourceCreateWithData`. Used as a fallback when
+    /// `CGImageSourceCreateWithURL` produces a source that reports
+    /// `count == 0` despite the file being on disk and passing the
+    /// `LoadDiagnostics.diagnose` preflight. Each failure mode in this
+    /// path emits its own log line so we can tell from
+    /// `error.err` alone whether the bytes were unreadable, the data
+    /// source refused them, or the decoder gave up.
+    private static func loadByReadingBytes(url: URL) -> FrameSource? {
+        let data: Data
+        do {
+            data = try Data(contentsOf: url, options: [.mappedIfSafe])
+        } catch {
+            ErrorLog.log("URL load returned 0 frames and Data(contentsOf:) failed for \(url.path): \(error.localizedDescription)",
                          class: "FrameSource")
             return nil
         }
+        if data.isEmpty {
+            ErrorLog.log("URL load returned 0 frames and Data(contentsOf:) returned 0 bytes for \(url.path)",
+                         class: "FrameSource")
+            return nil
+        }
+        let opts: [CFString: Any] = [kCGImageSourceShouldCache: false]
+        guard let src = CGImageSourceCreateWithData(data as CFData, opts as CFDictionary) else {
+            ErrorLog.log("CGImageSourceCreateWithData fallback returned nil for \(url.path) (data size=\(data.count))",
+                         class: "FrameSource")
+            return nil
+        }
+        let count = CGImageSourceGetCount(src)
+        if count == 0 {
+            let kind = (CGImageSourceGetType(src) as String?) ?? "unknown"
+            let status = CGImageSourceGetStatus(src).rawValue
+            ErrorLog.log("CGImageSourceCreateWithData fallback also returned count=0 for \(url.path) (data size=\(data.count), type=\(kind), status=\(status))",
+                         class: "FrameSource")
+            return nil
+        }
+        ErrorLog.log("recovered \(url.lastPathComponent) via Data fallback (URL source had count=0; data size=\(data.count))",
+                     class: "FrameSource")
         return decode(source: src, contextLabel: url.lastPathComponent)
     }
 
@@ -219,7 +269,13 @@ public final class FrameSource: @unchecked Sendable {
     private static func decode(source: CGImageSource, contextLabel: String = "<unknown>") -> FrameSource? {
         let count = CGImageSourceGetCount(source)
         guard count > 0 else {
-            ErrorLog.log("CGImageSourceGetCount returned 0 for \(contextLabel)",
+            // Include type + status so the next failure is diagnosable
+            // without rebuilding the app: `status=-1` (unknownType) means
+            // ImageIO never saw any recognizable header bytes, which is the
+            // signature of the URL-load path failing to open the file.
+            let kind = (CGImageSourceGetType(source) as String?) ?? "unknown"
+            let status = CGImageSourceGetStatus(source).rawValue
+            ErrorLog.log("CGImageSourceGetCount returned 0 for \(contextLabel) (type=\(kind), status=\(status))",
                          class: "FrameSource")
             return nil
         }

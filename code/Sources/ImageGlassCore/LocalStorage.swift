@@ -4,6 +4,15 @@ import Foundation
 /// Format: pretty-printed JSON in ~/Library/Application Support/ImageGlass/scopes/<name>.json
 public final class LocalStorage {
 
+    /// Distinguishable failure modes for `loadScope`. Callers (especially
+    /// `AppState.activate(scopeNamed:)`) need to tell "file missing" apart
+    /// from a real decode failure so the missing case can fall back to a
+    /// sensible default at INFO level while a schema mismatch keeps its
+    /// ERROR log + the original underlying decoder error.
+    public enum Error: Swift.Error {
+        case notFound(name: String)
+    }
+
     public static let shared = LocalStorage()
 
     private let encoder: JSONEncoder
@@ -60,6 +69,14 @@ public final class LocalStorage {
         )
         defer { _trace.finish() }
         let url = scopeURL(for: name)
+        // Distinguish "file missing" from "file present but malformed" so
+        // callers can react differently. A missing file is a normal
+        // condition (scope was deleted, never written, or last-active
+        // name is stale across an upgrade); a malformed file is a real
+        // decode error that deserves the existing ERROR log.
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            throw Error.notFound(name: name)
+        }
         let data = try Data(contentsOf: url)
         var scope = try decoder.decode(Scope.self, from: data)
         scope.name = name // file name is authoritative

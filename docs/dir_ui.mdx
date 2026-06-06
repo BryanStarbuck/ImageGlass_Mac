@@ -77,6 +77,20 @@ for the title-bar button contract and [panels.mdx §6.5](./panels.mdx#65-bootstr
 for the bootstrap reconciliation pass that keeps a stale layout from
 swallowing the panel.
 
+**Resizable width.** The Directory Panel column carries an 8 pt
+grippable divider on the side that faces the viewer (right edge
+when docked left, left edge when docked right). Dragging it widens
+or narrows the panel relative to the viewer; the new width
+persists to `layout.json` via `PanelLayoutModel.setSize("file_panel",
+…)` exactly the same way the framework's docked dividers do —
+there is no parallel "inline width" store. Dragging the column
+below 160 pt snaps it closed and runs the same code path as `⌘L`
+(the title-bar toggle and MCP `hide_panel("file_panel")` route
+here too), so the persisted state and the audit log are coherent
+across all three controls. See
+[panels.mdx §5.3.1](./panels.mdx#531-inline-file-panel-draggable-splitter)
+for the full contract.
+
 ---
 
 ## 3. View Mode: Hierarchical Tree

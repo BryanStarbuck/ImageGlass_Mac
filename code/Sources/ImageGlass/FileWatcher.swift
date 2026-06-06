@@ -95,22 +95,25 @@ final class FileWatcher {
     }
 
     func cancel() {
-        queue.sync {
-            cancelled = true
-            source?.cancel()
-            source = nil
-            parentSource?.cancel()
-            parentSource = nil
-        }
+        cancelled = true
+        source?.cancel()
+        source = nil
+        parentSource?.cancel()
+        parentSource = nil
     }
 
     /// Attach a kqueue watcher to the parent directory and, on the next
     /// write/extend/rename event there, retry `open(O_EVTONLY)` on the
     /// real path. Once the file appears the parent watcher is cancelled
     /// and the normal `start()` path is invoked to wire up the
-    /// per-file watcher + event handler. The retry is silent — at most
-    /// one debug-level signal is produced if the parent directory
-    /// itself is missing (which is itself a real error).
+    /// per-file watcher + event handler. The retry is silent — only a
+    /// missing parent directory is itself reported at error severity.
+    ///
+    /// Concurrency: this method matches `start()` — it runs on the
+    /// caller's thread (typically @MainActor) and produces a
+    /// DispatchSource whose handlers run on `self.queue`. It does not
+    /// add locking beyond what the original `start()` had; owners are
+    /// expected not to race `start()` and `cancel()`.
     private func armParentDirectoryRetry() {
         let parentPath = url.deletingLastPathComponent().path
         let pfd = open(parentPath, O_EVTONLY)
@@ -121,43 +124,37 @@ final class FileWatcher {
                          class: "FileWatcher")
             return
         }
-        queue.sync {
-            if cancelled {
-                close(pfd)
-                return
-            }
-            parentFileDescriptor = pfd
-            let src = DispatchSource.makeFileSystemObjectSource(
-                fileDescriptor: pfd,
-                eventMask: [.write, .extend, .rename, .delete],
-                queue: queue
-            )
-            src.setEventHandler { [weak self] in
-                guard let self else { return }
-                // File may now exist. Try to attach the real watcher.
-                // Re-test cancellation: cancel() may have been called
-                // between event delivery and handler entry.
-                if self.cancelled { return }
-                // Probe without holding state: a separate open() inside
-                // start() will succeed once the file exists.
-                if access(self.pathString, F_OK) == 0 {
-                    self.parentSource?.cancel()
-                    self.parentSource = nil
-                    // Re-enter start() outside the parent-source handler
-                    // so the new source is owned by `self.source`.
-                    self.start()
-                }
-            }
-            src.setCancelHandler { [weak self] in
-                guard let self else { return }
-                if self.parentFileDescriptor >= 0 {
-                    close(self.parentFileDescriptor)
-                    self.parentFileDescriptor = -1
-                }
-            }
-            src.resume()
-            self.parentSource = src
+        if cancelled {
+            close(pfd)
+            return
         }
+        parentFileDescriptor = pfd
+        let src = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: pfd,
+            eventMask: [.write, .extend, .rename, .delete],
+            queue: queue
+        )
+        src.setEventHandler { [weak self] in
+            guard let self else { return }
+            if self.cancelled { return }
+            // Probe cheaply: access() avoids opening an extra fd. If the
+            // file exists, tear down the parent watcher and run the
+            // normal start() path so the per-file watcher takes over.
+            if access(self.pathString, F_OK) == 0 {
+                self.parentSource?.cancel()
+                self.parentSource = nil
+                self.start()
+            }
+        }
+        src.setCancelHandler { [weak self] in
+            guard let self else { return }
+            if self.parentFileDescriptor >= 0 {
+                close(self.parentFileDescriptor)
+                self.parentFileDescriptor = -1
+            }
+        }
+        src.resume()
+        self.parentSource = src
     }
 
     deinit {

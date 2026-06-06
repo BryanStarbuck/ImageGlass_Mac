@@ -308,6 +308,78 @@ hides it; it remains in `hidden`). A subsequent double-click on the
 same divider restores it. Hidden panels also appear in the View menu
 with their normal Show/Hide checkbox.
 
+#### 5.3.1 Inline file-panel draggable splitter
+
+The **file panel** (`file_panel`) is rendered as **inline window
+chrome** in `ContentView` rather than docked via `PanelHostView` —
+this is the fork's primary navigation column and lives in the
+window's main `HStack` next to the image viewer. Because the panel
+is inline, the framework's generic `ResizableDivider` from
+§8.1 / `PanelHostView` does not get a chance to run for it. The
+inline column therefore ships **its own resize handle** that follows
+the same contract the docked dividers follow.
+
+Behavior — pinned so the handle and the docked layout never diverge:
+
+* **Single source of truth.** The handle reads the file panel's
+  width from the `file_panel`'s tab-group `size` in `layout.json`,
+  with a fallback of 300 pt the first time it is rendered (matches
+  the panel's `preferredSize.width`). On every drag end, the new
+  width is written back via `PanelLayoutModel.setSize("file_panel",
+  newSize)`. Persistence, MCP visibility (`set_panel_size`), and the
+  YAML mirror at `panels.yaml` all go through the same path the
+  docked panels use — there is no parallel "inline width" key.
+* **Where the handle lives.** The handle is always on the side of
+  the file panel that **faces the viewer**:
+    * When `layout.position(of: "file_panel") == .left` (default)
+      the handle is on the panel's **right** edge.
+    * When the user moves the panel to `.right` (e.g. via `move_panel`
+      or "Move to → Right" from the panel header context menu) the
+      file panel re-renders on the right of the viewer and the
+      handle moves to the panel's **left** edge.
+    * When the panel is `.floating`, `.top`, `.bottom`,
+      `.centerOverlay`, or hidden, the inline chrome is not
+      rendered and the inline handle does not exist — the user
+      gets the framework's docked dividers (or the `NSPanel`
+      resize chrome) instead.
+* **Hit area.** The visible gripper bar is 1 pt by default and 3 pt
+  on hover; the **clickable hit area is 8 pt wide** (≥ 6 pt minimum
+  required by the project brief) so the user does not need to aim
+  pixel-perfect. The hit area uses `Color.clear` with `contentShape`
+  so it captures the gesture without occluding the panel's content.
+* **Cursor + hover affordance.** On hover the gripper tints with the
+  system accent color at 60 % opacity and the cursor becomes
+  `NSCursor.resizeLeftRight`. The cursor is pushed `onHover` enter
+  and popped on exit so the rest of the window keeps its default
+  cursor.
+* **Drag math.** The handle uses a `DragGesture(minimumDistance: 0)`
+  and tracks the *incremental* translation delta per update. When
+  the panel is docked left, a positive delta widens the panel; when
+  docked right, a positive delta narrows it (the handle is on the
+  opposite edge). The math is mirrored at the call site so the
+  drag direction always feels natural.
+* **Min size + snap-to-hide.** Below the panel's `minSize.width`
+  (clamped to `dragSnapMin = 160 pt`) the handle snaps and calls
+  `state.hideByUser(panelID: "file_panel")` — the same code path
+  the title-bar `sidebar.left` button (§5.6.1) and `⌘L` go through,
+  so the `settings.layout.show_*` mirror, the audit log, and the
+  reconciliation pass on next launch all see the user-driven hide.
+* **Max size.** The handle clamps to `dragMaxFraction = 0.6` of the
+  window's content width, matching the docked-divider clamp in
+  `PanelHostView`. The viewer can never be squeezed below 40 % of
+  the window.
+* **Doesn't fight the viewer.** The AppKit `MTKView` canvas is a
+  greedy `NSViewRepresentable` sibling — `layoutPriority(1)` is set
+  on the file-panel column and `layoutPriority(0)` on the viewer
+  column so the explicit width wins and the divider stays where the
+  user dragged it. This is the same contract that protected the
+  fixed 300 pt column before the splitter existed.
+
+The inline handle is the *only* control that mutates `file_panel`'s
+width in v1. The MCP `set_panel_size("file_panel", …)` tool writes
+to the same `size` field; the next render picks the new width up
+through SwiftUI observation and animates over 200 ms.
+
 ### 5.4 Float / tear off
 
 Dragging a panel header out of the main window's bounds turns it into

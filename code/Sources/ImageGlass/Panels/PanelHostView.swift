@@ -113,71 +113,6 @@ struct PanelHostView<Center: View>: View {
         }
     }
 
-    // MARK: - Resizable splitter
-
-    /// A draggable divider that exposes a visible 6-point gripper
-    /// strip with a slim center bar. Reports drag delta to the caller
-    /// so the caller can update the layout's `size` for the adjacent
-    /// panel and persist it. Per CLAUDE.md: "Make sure there's a
-    /// resizer bar on the right when there's the FileTree and that
-    /// window and that panel. Make sure it's grippable on the right
-    /// edge, with a little gripper gap…"
-    struct ResizableDivider: View {
-        enum Orientation { case vertical, horizontal }
-        let orientation: Orientation
-        /// Called with the *incremental* drag distance in points since
-        /// the last update. Positive vertical delta = drag right /
-        /// down; negative = left / up.
-        let onDrag: (CGFloat) -> Void
-
-        @State private var lastTranslation: CGSize = .zero
-        @State private var hovered: Bool = false
-
-        var body: some View {
-            ZStack {
-                // Wide invisible hit area so the user can grab the
-                // divider without aiming pixel-perfect.
-                Color.clear
-                    .frame(
-                        width: orientation == .vertical ? 8 : nil,
-                        height: orientation == .horizontal ? 8 : nil
-                    )
-                    .contentShape(Rectangle())
-                // Visible 1pt center bar.
-                Rectangle()
-                    .fill(hovered ? Color.accentColor.opacity(0.6)
-                                  : Color(NSColor.separatorColor))
-                    .frame(
-                        width: orientation == .vertical ? (hovered ? 3 : 1) : nil,
-                        height: orientation == .horizontal ? (hovered ? 3 : 1) : nil
-                    )
-            }
-            .onHover { isOver in
-                hovered = isOver
-                if isOver {
-                    let cursor: NSCursor = orientation == .vertical
-                        ? .resizeLeftRight : .resizeUpDown
-                    cursor.push()
-                } else {
-                    NSCursor.pop()
-                }
-            }
-            .gesture(
-                DragGesture(minimumDistance: 0)
-                    .onChanged { g in
-                        let delta = orientation == .vertical
-                            ? g.translation.width  - lastTranslation.width
-                            : g.translation.height - lastTranslation.height
-                        lastTranslation = g.translation
-                        onDrag(delta)
-                    }
-                    .onEnded { _ in
-                        lastTranslation = .zero
-                    }
-            )
-        }
-    }
-
     // MARK: - Group lookup
 
     private func group(at position: DockPosition) -> TabGroup? {
@@ -222,6 +157,72 @@ struct PanelHostView<Center: View>: View {
         }
         .frame(minWidth: PanelRegistry.shared.panel(for: activeID)?.descriptor.minSize.width ?? 64,
                minHeight: PanelRegistry.shared.panel(for: activeID)?.descriptor.minSize.height ?? 32)
+    }
+}
+
+/// A draggable divider that exposes a visible 1-point (3-point on hover)
+/// gripper bar inside an 8-point invisible hit area. Reports the
+/// *incremental* drag distance in points to the caller so the caller can
+/// update the layout's `size` for the adjacent panel and persist it.
+///
+/// Used both by `PanelHostView` for docked panels (spec §5.3) and by
+/// `ContentView` for the inline file-panel column (spec §5.3.1). The
+/// hit area is ≥ 6 pt per the project brief; the visible bar is slim
+/// so it does not steal pixels from the panel content.
+@MainActor
+struct ResizableDivider: View {
+    enum Orientation { case vertical, horizontal }
+    let orientation: Orientation
+    /// Called with the *incremental* drag distance in points since
+    /// the last update. Positive vertical delta = drag right;
+    /// positive horizontal delta = drag down.
+    let onDrag: (CGFloat) -> Void
+
+    @State private var lastTranslation: CGSize = .zero
+    @State private var hovered: Bool = false
+
+    var body: some View {
+        ZStack {
+            // Wide invisible hit area so the user can grab the
+            // divider without aiming pixel-perfect. ≥ 6 pt — spec
+            // §5.3.1.
+            Color.clear
+                .frame(
+                    width: orientation == .vertical ? 8 : nil,
+                    height: orientation == .horizontal ? 8 : nil
+                )
+                .contentShape(Rectangle())
+            Rectangle()
+                .fill(hovered ? Color.accentColor.opacity(0.6)
+                              : Color(NSColor.separatorColor))
+                .frame(
+                    width: orientation == .vertical ? (hovered ? 3 : 1) : nil,
+                    height: orientation == .horizontal ? (hovered ? 3 : 1) : nil
+                )
+        }
+        .onHover { isOver in
+            hovered = isOver
+            if isOver {
+                let cursor: NSCursor = orientation == .vertical
+                    ? .resizeLeftRight : .resizeUpDown
+                cursor.push()
+            } else {
+                NSCursor.pop()
+            }
+        }
+        .gesture(
+            DragGesture(minimumDistance: 0)
+                .onChanged { g in
+                    let delta = orientation == .vertical
+                        ? g.translation.width  - lastTranslation.width
+                        : g.translation.height - lastTranslation.height
+                    lastTranslation = g.translation
+                    onDrag(delta)
+                }
+                .onEnded { _ in
+                    lastTranslation = .zero
+                }
+        )
     }
 }
 

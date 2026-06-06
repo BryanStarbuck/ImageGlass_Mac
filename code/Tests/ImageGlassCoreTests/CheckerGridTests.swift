@@ -3,45 +3,68 @@ import CoreGraphics
 @testable import ImageGlassCore
 
 /// transparent_bk_checkers.mdx §12.1 — deterministic geometry tests
-/// for the transparency-checker grid.
+/// for the height-driven transparency-checker grid.
 final class CheckerGridTests: XCTestCase {
 
-    func testEvenViewport_TileSideIsFloorOfWidthOver20() {
+    func testEvenViewport_TileSideIsFloorOfHeightOver25() {
         let g = CheckerGrid.compute(viewport: CGSize(width: 2000, height: 1000))
-        XCTAssertEqual(g.tileSide, 100)
-        XCTAssertEqual(g.columns, 20)
-        XCTAssertEqual(g.rows, 10)
-        XCTAssertEqual(g.rightColumnWidth, 100)
-        XCTAssertEqual(g.bottomRowHeight, 100)
+        XCTAssertEqual(g.tileSide, 40)
+        XCTAssertEqual(g.rows, 25)
+        // columns = ceil(2000 · 2 / 40) = 100
+        XCTAssertEqual(g.columns, 100)
     }
 
-    func testFractionalViewport_RightColumnAbsorbsLeftover() {
-        // W = 1923 ⇒ s = floor(1923/20) = 96, r = 1923 − 19·96 = 99.
-        // H = 999 ⇒ rows = ceil(999/96) = 11, bottom = 999 − 10·96 = 39.
+    func testFractionalViewport_BottomRowOverflows() {
+        // H = 999 ⇒ s = floor(999/25) = 39
+        // rows = ceil(999/39) = 26 (the 26th row overflows below)
+        // columns = ceil(1923 · 2 / 39) = ceil(98.6) = 99
         let g = CheckerGrid.compute(viewport: CGSize(width: 1923, height: 999))
-        XCTAssertEqual(g.tileSide, 96)
-        XCTAssertEqual(g.columns, 20)
-        XCTAssertEqual(g.rightColumnWidth, 99)
-        XCTAssertEqual(g.rows, 11)
-        XCTAssertEqual(g.bottomRowHeight, 39)
+        XCTAssertEqual(g.tileSide, 39)
+        XCTAssertEqual(g.rows, 26)
+        XCTAssertEqual(g.columns, 99)
     }
 
-    func testRightColumnAlwaysReachesViewportRightEdge() {
-        // The promise: the 20 columns together cover the entire width.
+    func testTypical1080pViewport() {
+        // H = 1080 ⇒ s = floor(1080/25) = 43
+        // rows = ceil(1080/43) = 26
+        // columns = ceil(1920 · 2 / 43) = ceil(89.3) = 90
+        let g = CheckerGrid.compute(viewport: CGSize(width: 1920, height: 1080))
+        XCTAssertEqual(g.tileSide, 43)
+        XCTAssertEqual(g.rows, 26)
+        XCTAssertEqual(g.columns, 90)
+    }
+
+    func testColumnsAlwaysOverflowTheViewport() {
+        // The promise: the painted column count always covers more
+        // than the visible width — at least 2× by spec §3.3.
         for w in stride(from: 200.0, through: 4000.0, by: 17.0) {
-            let g = CheckerGrid.compute(viewport: CGSize(width: w, height: 800))
-            let totalWidth = CGFloat(g.columns - 1) * g.tileSide + g.rightColumnWidth
-            XCTAssertEqual(totalWidth, CGFloat(w), accuracy: 0.0001,
-                "20 columns must sum to viewport width at W=\(w)")
+            let g = CheckerGrid.compute(viewport: CGSize(width: w, height: 1000))
+            let paintedWidth = CGFloat(g.columns) * g.tileSide
+            XCTAssertGreaterThanOrEqual(
+                paintedWidth, CGFloat(w) * 2,
+                "painted column run must cover ≥ 2 viewport widths at W=\(w)"
+            )
         }
     }
 
-    func testBottomRowAlwaysReachesViewportBottomEdge() {
+    func testRowsAlwaysCoverTheViewportHeight() {
         for h in stride(from: 100.0, through: 3000.0, by: 13.0) {
             let g = CheckerGrid.compute(viewport: CGSize(width: 1600, height: h))
-            let totalHeight = CGFloat(g.rows - 1) * g.tileSide + g.bottomRowHeight
-            XCTAssertEqual(totalHeight, CGFloat(h), accuracy: 0.0001,
-                "rows must sum to viewport height at H=\(h)")
+            let paintedHeight = CGFloat(g.rows) * g.tileSide
+            XCTAssertGreaterThanOrEqual(
+                paintedHeight, CGFloat(h),
+                "painted rows must cover the full viewport height at H=\(h)"
+            )
+        }
+    }
+
+    func testRowCountIs25Or26() {
+        // Spec §3.2 — rows = 25 when H is divisible by tileSide,
+        // else 26 (one-row overflow).
+        for h in stride(from: 50.0, through: 3000.0, by: 7.0) {
+            let g = CheckerGrid.compute(viewport: CGSize(width: 1600, height: h))
+            XCTAssertTrue(g.rows == 25 || g.rows == 26,
+                "rows must be 25 or 26 at H=\(h), got \(g.rows)")
         }
     }
 
@@ -56,32 +79,35 @@ final class CheckerGridTests: XCTestCase {
         let g = CheckerGrid.compute(viewport: .zero)
         XCTAssertEqual(g.tileSide, 0)
         XCTAssertEqual(g.rows, 0)
+        XCTAssertEqual(g.columns, 0)
     }
 
-    func testSubColumnCountWidth_ClampsTileSideToOne() {
-        // W < 20 ⇒ floor(W/20) = 0; the renderer clamps to 1.
-        let g = CheckerGrid.compute(viewport: CGSize(width: 10, height: 50))
+    func testSubRowCountHeight_ClampsTileSideToOne() {
+        // H < 25 ⇒ floor(H/25) = 0; the renderer clamps to 1.
+        let g = CheckerGrid.compute(viewport: CGSize(width: 100, height: 10))
         XCTAssertEqual(g.tileSide, 1)
-        XCTAssertEqual(g.columns, 20)
-        // Right column carries the leftover: 10 − 19·1 = −9.
-        // Negative is allowed by the formula; the renderer simply
-        // produces an off-screen rect that AppKit's clip discards.
-        // The important promise — 20 columns sum to W — still holds.
-        let totalWidth = CGFloat(g.columns - 1) * g.tileSide + g.rightColumnWidth
-        XCTAssertEqual(totalWidth, 10, accuracy: 0.0001)
+        XCTAssertEqual(g.rows, 10)  // ceil(10/1)
+        // columns = ceil(100 · 2 / 1) = 200
+        XCTAssertEqual(g.columns, 200)
     }
 
-    func testColumnWidthAccessor() {
-        let g = CheckerGrid.compute(viewport: CGSize(width: 1923, height: 999))
-        XCTAssertEqual(g.columnWidth(0), 96)
-        XCTAssertEqual(g.columnWidth(18), 96)
-        XCTAssertEqual(g.columnWidth(19), 99)
+    func testCustomSafetyFactor() {
+        // K = 3.0 — paint triple-width.
+        let g = CheckerGrid.compute(
+            viewport: CGSize(width: 2000, height: 1000),
+            widthSafetyFactor: 3.0
+        )
+        XCTAssertEqual(g.tileSide, 40)
+        XCTAssertEqual(g.columns, 150)  // ceil(2000·3/40)
     }
 
-    func testRowHeightAccessor() {
-        let g = CheckerGrid.compute(viewport: CGSize(width: 1923, height: 999))
-        XCTAssertEqual(g.rowHeight(0), 96)
-        XCTAssertEqual(g.rowHeight(9), 96)
-        XCTAssertEqual(g.rowHeight(10), 39)  // last row, clipped
+    func testCustomRowCount() {
+        // R = 10 — fewer, bigger rows.
+        let g = CheckerGrid.compute(
+            viewport: CGSize(width: 2000, height: 1000),
+            rows: 10
+        )
+        XCTAssertEqual(g.tileSide, 100)
+        XCTAssertEqual(g.rows, 10)
     }
 }

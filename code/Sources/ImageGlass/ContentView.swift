@@ -14,27 +14,16 @@ struct ContentView: View {
 
     var body: some View {
         PanelHostView(state: state, model: state.panelLayout) {
-            // Left: design file panel inline. It MUST win width against the
-            // viewer: the AppKit NSViewRepresentable canvas is greedy and
-            // otherwise squeezes a fixed-width sibling to zero. `fixedSize` +
-            // `layoutPriority` lock the 300pt column.
+            // The file panel is inline window chrome — it lives in the main
+            // window's HStack next to the viewer rather than docked via
+            // PanelHostView (FloatingPanelController.inlineSuppressedIDs
+            // keeps the dock from materializing a duplicate). The 8 pt
+            // grippable divider, the persisted width, and the docking
+            // side are all driven by `state.panelLayout` so the inline
+            // column and the panel framework cannot diverge — see
+            // docs/panels.mdx §5.3.1 + docs/dir_ui.mdx §2.
             HStack(spacing: 0) {
-                DirectoryFilenamePanel(state: state)
-                    .frame(width: 300)
-                    .layoutPriority(1)
-                Divider().overlay(IG.sidebarLineC)
-                VStack(spacing: 0) {
-                    ImageViewer(state: state, viewer: state.viewer)
-                    statusBar
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .layoutPriority(0)
-                .clipped()   // AppKit canvas must not overdraw the panel column.
-                if state.crop.isActive {
-                    Divider()
-                    CropPanelView(controller: state.crop)
-                        .background(.regularMaterial)
-                }
+                inlineLayoutContent
             }
         }
         .navigationTitle(windowTitle)
@@ -103,6 +92,129 @@ struct ContentView: View {
                         .symbolVariant(isShown ? .none : .fill)
                 }
                 .help(isShown ? "Hide file panel" : "Show file panel")
+            }
+        }
+    }
+
+    // MARK: - Inline column layout (file panel + viewer + crop)
+
+    /// Minimum draggable width for the inline file panel column.
+    /// Below this, the splitter snaps and hides the panel via the
+    /// same `hideByUser` path as `⌘L` / the title-bar button.
+    /// Matches the snap-min the docked `PanelHostView` uses so the two
+    /// resize surfaces feel identical (spec §5.3 / §5.3.1).
+    private static let filePanelMinWidth: CGFloat = 160
+    /// Default width on first show — matches `BuiltInPanelCatalog.filePanel`'s
+    /// `preferredSize.width`. The fork's previous hardcoded 300pt column.
+    private static let filePanelDefaultWidth: CGFloat = 300
+
+    /// Builds the inline `HStack` content. Reorders the file panel and
+    /// the viewer so the panel sits on whichever side the layout dock
+    /// position calls for (.left, default — panel on the left; .right
+    /// — panel on the right). The splitter is always on the side
+    /// facing the viewer (spec §5.3.1).
+    @ViewBuilder
+    private var inlineLayoutContent: some View {
+        let pos = inlineFilePanelPosition
+        if pos == .left {
+            filePanelColumn
+            splitter(forLeftDock: true)
+            viewerColumn
+            cropTrailing
+        } else if pos == .right {
+            viewerColumn
+            cropTrailing
+            splitter(forLeftDock: false)
+            filePanelColumn
+        } else {
+            // Panel hidden / floating / docked top|bottom|overlay —
+            // the framework owns it elsewhere; show viewer + crop only.
+            viewerColumn
+            cropTrailing
+        }
+    }
+
+    /// Returns `.left` / `.right` when the file panel is one of the two
+    /// supported inline positions; `nil` for any other state (hidden,
+    /// floating, top, bottom, centerOverlay). Only `.left` / `.right`
+    /// render inline; everything else falls back to the dock so the
+    /// inline chrome never duplicates the dock copy.
+    private var inlineFilePanelPosition: DockPosition? {
+        switch state.panelLayout.layout.position(of: BuiltInPanelCatalog.filePanel.id) {
+        case .left:  return .left
+        case .right: return .right
+        default:     return nil
+        }
+    }
+
+    /// Current persisted width of the inline file-panel column, with a
+    /// 300 pt fallback the first time it is rendered. Reads the same
+    /// `size` field from `layout.json` that the docked panels use, so
+    /// the inline column and the framework cannot drift apart.
+    private var inlineFilePanelWidth: CGFloat {
+        let id = BuiltInPanelCatalog.filePanel.id
+        if let g = state.panelLayout.layout.groups.first(where: { $0.panelIDs.contains(id) }),
+           let size = g.size {
+            return size
+        }
+        return Self.filePanelDefaultWidth
+    }
+
+    /// The file panel column. `layoutPriority(1)` is required because
+    /// the AppKit `NSViewRepresentable` viewer canvas is a greedy
+    /// sibling — without an explicit priority the canvas would
+    /// squeeze the fixed-width column to zero. See spec §5.3.1.
+    private var filePanelColumn: some View {
+        DirectoryFilenamePanel(state: state)
+            .frame(width: inlineFilePanelWidth)
+            .layoutPriority(1)
+    }
+
+    /// Viewer column (canvas + bottom status strip). `.clipped()` is
+    /// required so the canvas does not overdraw the file panel column
+    /// during a divider drag.
+    private var viewerColumn: some View {
+        VStack(spacing: 0) {
+            ImageViewer(state: state, viewer: state.viewer)
+            statusBar
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .layoutPriority(0)
+        .clipped()
+    }
+
+    /// Crop panel — kept inline at the trailing edge of the viewer
+    /// column when the crop tool is active. Same behavior as before
+    /// the splitter refactor.
+    @ViewBuilder
+    private var cropTrailing: some View {
+        if state.crop.isActive {
+            Divider()
+            CropPanelView(controller: state.crop)
+                .background(.regularMaterial)
+        }
+    }
+
+    /// The 8 pt grippable splitter. Mirrors the drag direction based
+    /// on which side the file panel is docked: when on the left, drag
+    /// right widens it; when on the right, drag right narrows it
+    /// (because the handle is on the *left* edge of the panel).
+    /// Snap-to-hide at `filePanelMinWidth` runs `hideByUser` so the
+    /// `settings.layout.show_*` mirror and the audit log stay coherent
+    /// with the `⌘L` / title-bar / MCP `hide_panel` code paths.
+    @ViewBuilder
+    private func splitter(forLeftDock isLeftDock: Bool) -> some View {
+        let id = BuiltInPanelCatalog.filePanel.id
+        ResizableDivider(orientation: .vertical) { delta in
+            let current = inlineFilePanelWidth
+            // When the panel is docked left, the handle is on its
+            // right edge: positive delta widens it. When docked right,
+            // the handle is on its left edge: positive delta narrows it.
+            let proposed = isLeftDock ? current + delta : current - delta
+            if proposed < Self.filePanelMinWidth {
+                state.hideByUser(panelID: id)
+            } else {
+                state.panelLayout.setSize(panelID: id, size: proposed)
             }
         }
     }

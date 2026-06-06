@@ -257,7 +257,14 @@ final class ImageCanvasView: NSView {
         // (Git LFS pointer, ImageIO refusal, zero frames, ...). NSImage uses
         // the same decoders so re-logging its failure here would duplicate
         // that line without adding new information.
+        //
+        // NSImage(contentsOfFile:) shares the URL-based path with the
+        // primary FrameSource pipeline and has been observed to fail on the
+        // same files (provenance-tagged downloads, certain progressive
+        // JPEGs) even when reading the bytes directly works. Mirror the
+        // FrameSource Data fallback so the two pipelines stay in sync.
         sourceImage = NSImage(contentsOfFile: path)
+            ?? (try? Data(contentsOf: url)).flatMap { NSImage(data: $0) }
         if fs != nil && sourceImage == nil {
             ErrorLog.log("FrameSource decoded \(url.lastPathComponent) but NSImage(contentsOfFile:) did not — possible decoder divergence",
                          class: String(describing: Self.self))
@@ -593,14 +600,17 @@ final class ImageCanvasView: NSView {
         )
     }
 
-    /// transparent_bk_checkers.mdx §5 — paint the 20-column,
-    /// auto-rows checker grid that backs every image. Direct CG rect
-    /// fills (one save/restore pair, `kCGInterpolationNone` to document
-    /// intent). The grid is keyed to `bounds`, not `dirtyRect`, so the
-    /// full pattern is repainted on every `draw(_:)`; AppKit's existing
-    /// clip-to-`dirtyRect` means tiles outside the dirty region are no-ops.
-    /// Tile (column 0, row 0) is the *top-left* (per spec §3) and gets
-    /// the lighter tone; rows are counted from the top, then converted
+    /// transparent_bk_checkers.mdx §5 — paint the 25-row,
+    /// height-driven checker grid that backs every image. Tiles are
+    /// perfectly square (`s = floor(H / 25)`). Columns are
+    /// over-allocated to overflow the right edge of the viewport
+    /// (§3.3), so a fast window-widening drag never bares the right
+    /// strip while the next `draw(_:)` catches up; AppKit's bounds
+    /// clip drops the off-screen tiles essentially for free.
+    /// Direct CG rect fills, bucketed by tone — two `setFillColor` +
+    /// `fill(rects:)` calls total, regardless of tile count. Tile
+    /// (column 0, row 0) is the *top-left* (§3.5) and gets the
+    /// lighter tone; rows are counted from the top, then converted
     /// to the canvas's +y-up coordinate system at draw time.
     private func drawTransparencyCheckers(in ctx: CGContext) {
         let viewport = bounds.size
@@ -616,28 +626,27 @@ final class ImageCanvasView: NSView {
 
         ctx.saveGState()
         ctx.interpolationQuality = .none
-        // Clip to bounds so a stale `dirtyRect` never matters and the
-        // pattern can't bleed past the canvas if the host miscomputes
-        // the view frame during a window-mode transition.
+        // Clip to bounds so the over-allocated right-edge columns and
+        // any bottom-row overflow (§2.5, §3.3) are discarded cheaply.
         ctx.clip(to: bounds)
 
         // Bucket tiles by color so we issue two color-state changes
         // total instead of one per tile.
         var lightRects: [CGRect] = []
         var darkRects: [CGRect] = []
-        lightRects.reserveCapacity(grid.columns * grid.rows / 2 + 1)
-        darkRects.reserveCapacity(grid.columns * grid.rows / 2 + 1)
+        let halfCapacity = grid.columns * grid.rows / 2 + 1
+        lightRects.reserveCapacity(halfCapacity)
+        darkRects.reserveCapacity(halfCapacity)
 
         let viewportHeight = viewport.height
+        let side = grid.tileSide
         for j in 0..<grid.rows {
             // `j` is row-from-top; convert to y-from-bottom for AppKit.
-            let h = grid.rowHeight(j)
-            let yFromTop = CGFloat(j) * grid.tileSide
-            let y = viewportHeight - yFromTop - h
+            let yFromTop = CGFloat(j) * side
+            let y = viewportHeight - yFromTop - side
             for i in 0..<grid.columns {
-                let w = grid.columnWidth(i)
-                let x = CGFloat(i) * grid.tileSide
-                let rect = CGRect(x: x, y: y, width: w, height: h)
+                let x = CGFloat(i) * side
+                let rect = CGRect(x: x, y: y, width: side, height: side)
                 if CheckerGrid.isLightTile(column: i, row: j) {
                     lightRects.append(rect)
                 } else {

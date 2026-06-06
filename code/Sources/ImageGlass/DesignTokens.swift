@@ -50,10 +50,19 @@ enum IG {
     static let mcpGreen   = hex(0x34C759)
 
     // transparent_bk_checkers.mdx §4 — the two-tone transparency
-    // checker. Light pair matches Preview.app; dark pair preserves
-    // the same ~7% luminance delta against the dark canvas.
+    // checker. Lighter tone is achromatic light/dark gray; darker
+    // tone is **warm-shifted toward red at matched Rec.601
+    // luminance** (red dialed up, green dialed down, blue follows
+    // green — §4.1). The result reads as warm dusky pink-gray in
+    // light mode and dark wine in dark mode, distinct in hue from
+    // the lighter tone without being decorative.
+    //
+    //   light light:  #ECECEC (236, 236, 236)  → Y ≈ 236
+    //   light dark :  #E8C8C8 (232, 200, 200)  → Y ≈ 209.6   (warm-shifted from #D8D8D8 / Y 216)
+    //   dark  light:  #3A3A3A ( 58,  58,  58)  → Y ≈  58
+    //   dark  dark :  #3C2222 ( 60,  34,  34)  → Y ≈  41.8   (warm-shifted from #2A2A2A / Y 42)
     static let checkerLight = dyn(hex(0xECECEC), hex(0x3A3A3A))
-    static let checkerDark  = dyn(hex(0xD8D8D8), hex(0x2A2A2A))
+    static let checkerDark  = dyn(hex(0xE8C8C8), hex(0x3C2222))
 
     // include_checks.mdx §2.3 — the four-variant Include column.
     // Saturated greens/reds for explicit decisions; muted grays for

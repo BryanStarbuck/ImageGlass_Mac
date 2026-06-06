@@ -617,6 +617,30 @@ public final class AppState {
         let scope: Scope
         do {
             scope = try storage.loadScope(name)
+        } catch LocalStorage.Error.notFound {
+            // "Not found" is normal (scope deleted, never written, or a
+            // stale last-active name from a prior schema). Log at INFO
+            // via NSLog (not ErrorLog) and fall back to the bootstrap
+            // scope so the app stays usable. The schema-mismatch ERROR
+            // path below stays intact.
+            NSLog("ImageGlass scope '\(name)' not found; falling back to bootstrap scope")
+            let fallbackName: String
+            do {
+                fallbackName = try storage.bootstrapIfNeeded()
+            } catch {
+                ErrorLog.log("storage.bootstrapIfNeeded failed during fallback for missing scope '\(name)'",
+                             error: error, class: String(describing: Self.self))
+                return
+            }
+            if fallbackName == name {
+                // bootstrapIfNeeded handed back the same broken name —
+                // refuse to recurse forever.
+                ErrorLog.log("scope '\(name)' missing and bootstrap returned same name; giving up",
+                             class: String(describing: Self.self))
+                return
+            }
+            await activate(scopeNamed: fallbackName)
+            return
         } catch {
             ErrorLog.log("storage.loadScope failed for '\(name)'",
                          error: error, class: String(describing: Self.self))
@@ -1285,6 +1309,13 @@ public final class AppState {
                     let reloaded: Scope?
                     do {
                         reloaded = try self.storage.loadScope(self.activeScopeName)
+                    } catch LocalStorage.Error.notFound {
+                        // Scope file vanished between FSEvent and reload
+                        // (deletion / rename in flight). Don't log as an
+                        // error — just skip this reload tick; the
+                        // refreshScopeList above already updated the
+                        // visible scope list.
+                        reloaded = nil
                     } catch {
                         ErrorLog.log("storage.loadScope failed during watcher reload for '\(self.activeScopeName)'",
                                      error: error, class: String(describing: Self.self))
