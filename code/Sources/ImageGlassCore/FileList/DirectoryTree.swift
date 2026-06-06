@@ -315,6 +315,66 @@ public indirect enum DirectoryNode: Sendable, Equatable {
         case .file(let n, _, _): return n
         }
     }
+
+    /// Total count of nodes (directories + files) reachable from this
+    /// node, including the node itself. O(N) single pass.
+    ///
+    /// Used by `logTraversalSummary(rootPath:corr:)` to populate the
+    /// `node_count` field of the single per-walk
+    /// `Tree.Traverse.Log` event. Callers that want the split between
+    /// directory and file counts should call `nodeCountSplit` instead
+    /// (one pass, both numbers).
+    public var nodeCount: Int {
+        let s = nodeCountSplit
+        return s.directories + s.files
+    }
+
+    /// Directory and file counts in one pass. `directories` includes
+    /// `self` when `self` is `.directory`.
+    public var nodeCountSplit: (directories: Int, files: Int) {
+        switch self {
+        case .file:
+            return (0, 1)
+        case .directory(_, let children):
+            var d = 1
+            var f = 0
+            for c in children {
+                let s = c.nodeCountSplit
+                d += s.directories
+                f += s.files
+            }
+            return (d, f)
+        }
+    }
+
+    /// Emit exactly ONE `Tree.Traverse.Log` event summarizing a
+    /// just-completed traversal of this subtree. Carries `path`,
+    /// `node_count`, `dir_count`, `file_count`, and `corr`.
+    ///
+    /// This replaces the historical `DirectoryTreeWalker.traverseAndLog`
+    /// pattern that emitted one start/finish pair per node (~888K
+    /// emissions per JFK/UX-scale walk in the June 2026 capture). The
+    /// summary form runs the counter once and emits a single event
+    /// line — see `perf/plans/Tree.Traverse.Log.plan`.
+    ///
+    /// Callers: any traversal entry point that finishes a full walk of
+    /// a `DirectoryNode` subtree (walker post-walk hook, panel debug
+    /// dump, MCP audit). Call ONCE per traversal, not per recursion
+    /// frame.
+    public func logTraversalSummary(rootPath: String, corr: String) {
+        let split = nodeCountSplit
+        let total = split.directories + split.files
+        PerformanceLog.shared.event(
+            "Tree.Traverse.Log",
+            extra: [
+                ("path", rootPath),
+                ("node_count", String(total)),
+                ("dir_count", String(split.directories)),
+                ("file_count", String(split.files)),
+                ("corr", corr),
+            ]
+        )
+    }
 }
 
 /// docs/use_cases/include_checks.mdx §1 / §4.3 — three-state per-row

@@ -58,3 +58,56 @@ min should drop from 250 ms to whatever onChange() actually costs
 (likely single-digit ms for an empty-scope re-eval, tens of ms for a
 small directory). avg should drop proportionally. max stays bounded by
 real work, not the debounce floor.
+
+## Progress notes
+
+Status: Plan applied. The previous agent's report of a clean build did
+not actually include the trace-relocation change — the file checked in
+still had `pendingTrace` started inside `setEventHandler`. Reverified
+from source before editing.
+
+Applied:
+* Removed `pendingTrace: PerformanceTrace?` state. The trace is now
+  created locally inside the `DispatchWorkItem` immediately before
+  `onChange()` and finished immediately after. The 250 ms debounce
+  wait is no longer counted as work.
+* Preserved `pendingEventCount` across the debounce window: it is
+  incremented on every kqueue event in `setEventHandler` and snapshot
+  + reset inside the work item that actually fires. `count=` payload
+  still reflects every coalesced raw event.
+* Updated the doc comment on `pendingEventCount` to explain the new
+  invariant (trace measures work only; count survives debounce).
+
+Tightened (beyond the plan):
+* Cached `url.path` into `let pathString: String` at init. Avoids a
+  fresh `URL.path` computation + `String` materialization per batch on
+  the trace's `extra` payload. Reused in the `open()` call and the
+  errno log path. Minor, but the trace `extra:` array is allocated on
+  every fired batch and `pathString` is now a direct stored property
+  load instead of `URL.path` going through `_NSURL` bridging.
+
+Not changed (deliberate):
+* Debounce window stays at 250 ms per spec §6.6 (bulk-ops coalesce).
+* No "leading edge" / fire-first-event-immediately mode added. That
+  would change semantics (first kqueue event in a `cp -R` would fire
+  before the copy finishes), which the plan and spec both reject.
+* `DispatchWorkItem` is still allocated per kqueue event because the
+  cancel/reschedule pattern requires a fresh sealed work item. The
+  trace + `extra` array allocations are now once per fired batch
+  instead of once per raw event, so the dominant per-event cost is
+  just the work-item alloc + an Int increment.
+
+Thread check:
+* `queue = DispatchQueue(label: "ImageGlass.FileWatcher")` is a private
+  serial background queue. Both `setEventHandler` and the work item run
+  on it. `onChange()` is the caller's responsibility to hop to main if
+  it touches UI — unchanged.
+
+Build / test:
+* `swift build` from `code/` fails on PollingScopeWatcher.swift and
+  SlideshowWindow.swift — both off-limits to this agent (other agents
+  own them). FileWatcher.swift itself compiles cleanly: no errors or
+  warnings reference it in the build output.
+* `swift test --filter FileWatcher` cannot run because the package
+  build fails on the off-limits files above. Re-run once those are
+  fixed.

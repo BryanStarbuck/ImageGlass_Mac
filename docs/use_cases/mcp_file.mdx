@@ -1500,6 +1500,49 @@ directory-name matching ("carve out every file under any
   `ok=false err=path_separator_in_pattern` — v1 only supports
   filename matching (§10B.8). `directories.yaml` is unchanged.
 
+### 10B.10 Code map for §10B
+
+Every behavior §10B asserts has exactly one implementation site
+in the codebase. Reviewers should be able to walk from a spec
+clause to the code that delivers it without `grep`-ing. The
+table is grouped by which gate of the panel pipeline the spec
+clause exercises.
+
+| Spec clause | Concern | Implementing file | Class / function / line |
+| --- | --- | --- | --- |
+| §10B.0 — case-sensitive glob | Character-by-character compare | `code/Sources/ImageGlassCore/Glob.swift` | `Glob.match(_:_:)` line 13 → `matchSlice(_:_:_:_:pathMode:)` line 39 (literal compare at line 97) |
+| §10B.0 — substring is case-INsensitive (so glob is the right choice here) | Case-insensitive substring fallback | `code/Sources/ImageGlassCore/FileList/DirectoryTree.swift` | `RootFilter.itemMatches(_:filename:)` line 293; substring branch line 298 uses `options: .caseInsensitive` |
+| §10B.0 — regex default | NSRegularExpression default options | same file | `itemMatches` regex branch line 300 — `NSRegularExpression(pattern:)` no opts ⇒ case-sensitive |
+| §10B.3 — `add_filter_item` tool descriptor | MCP tool registration + JSON Schema | `code/mcp/DirectoriesMCPTools.swift` | descriptor block starting line 257 (`addFilterItem` descriptor); routed by `MCPTools.call(name:arguments:)` in `code/Sources/ImageGlassCore/MCPTools.swift` |
+| §10B.3 — `addFilterItem` handler | Path canonicalization, validation, append, write | `code/mcp/DirectoriesMCPTools.swift` | `addFilterItem(_:)` starting line 999 |
+| §10B.3 — stable item id | SHA1-derived 6-hex id | `code/Sources/ImageGlassCore/FileList/DirectoryTree.swift` | `RootFilterItem.id` line 120 (computed); `sha1Hex6` line 131; `sha1(_:)` line 142 |
+| §10B.3 — `priority` clamp | `-1000…1000` enforcement | same file | `RootFilterItem.init(pattern:kind:negate:priority:)` line 99 |
+| §10B.3 — atomic YAML write | Temp-file + `rename(2)` | `code/Sources/ImageGlassCore/Storage/DirectoriesStore.swift` | `DirectoriesStore.shared.save(_:)` (multi-window-aware resolver) |
+| §10B.4 — YAML encode (default omission) | `kind`, `match`, `priority` defaults skipped | `code/Sources/ImageGlassCore/Storage/DirectoriesYAML.swift` | `encode(_:)` line 55; default checks at lines 81, 90, 99 |
+| §10B.4 — YAML decode | Indent state machine | same file | `decode(_:)` line 135; per-item field application `applyItem` line 358 |
+| §10B.4 — lazy v1→v2 schema bump | Auto-upgrade on first non-zero priority | same file + `DirectoryTree.swift` | encoder upgrade at `DirectoriesYAML.swift` line 62; `DirectoriesFile.anyItemHasNonDefaultPriority` at `DirectoryTree.swift` line 27 |
+| §10B.5 — `passesFilter` flip | In-memory re-eval per file | `code/Sources/ImageGlassCore/FileList/DirectoryTree.swift` | `RootFilter.evaluate(filename:)` line 248 (priority-grouped tier walk) |
+| §10B.5.1 — include-override layer | Walks ancestors up to root | same file | `RootDirectory.effectiveState(for:)` line 410; `decision(for:)` line 434; `explicitState(for:)` line 443 |
+| §10B.5 — file-kind gate (precedes filter) | Drops non-media UTIs | same file | `FileKind.classify(uti:)` line 21; `FileKind.classify(path:)` line 37; non-media extension hard-deny set line 57 |
+| §10B.5 — walker (provides the in-memory tree being refiltered) | `FileManager.enumerator` + tree build | `code/Sources/ImageGlassCore/FileList/DirectoryTreeWalker.swift` | `DirectoryTreeWalker.shared` |
+| §10B.5 — FSEventStream watcher (catches user-side filesystem edits between MCP calls) | kqueue / FSEvents wrapper | `code/Sources/ImageGlass/FileWatcher.swift` | `FileWatcher` class |
+| §10B.6 — MCP audit line | Single-line key/value record | `code/Sources/ImageGlassCore/Logging/MCPAuditLogger.swift` | `logMCPCall(toolName:scope:client:corr:ok:err:extra:)` line 91 |
+| §10B.6 — refilter app line | `app=directory.refilter ... visible_delta=K` | same file + panel refilter pipeline | `log(_:)` line 79 |
+| §10B.6 — correlation id | 8-char hex per call | same file | `newCorrelationId()` line 68 |
+| §10B.6 — log file path | `~/Library/Application Support/ImageGlass_Mac/log.log` | `code/Sources/ImageGlassCore/Paths.swift` | `AppPaths.macLogFile` |
+| §10B.3.1 — sidecar entry point | Bootstrap + `MCPServer().run()` | `code/Sources/ImageGlassMCPServer/main.swift` | top-of-file |
+| §10B.3.1 — JSON-RPC transport | Line-delimited stdio | `code/Sources/ImageGlassCore/MCPServer.swift` | `MCPServer.run()` line 46; read loop line 75 |
+| §10B.3.1 — initialize handler | Returns `protocolVersion`, `instructions`, capabilities | same file | `handleInitialize(_:)` (referenced line 151) |
+| §10B.3.1 — manual content served at initialize + via resource | Backing file | `code/mcp/mcp_manual.txt` + `code/mcp/MCPManual.swift` | loaded at startup via `Bundle.module` |
+| §10B.3 — distributed notification posted on write | Wake the desktop app | `code/mcp/MCPNotificationBus.swift` | `MCPNotificationBus.directoriesChangedNotificationName` |
+
+This table is the contract between this scenario and the
+code. Any PR that moves or renames any row above MUST update
+this table in the same PR; CI checks for §10B.10 row → file
+existence the same way `MCPManualTests` checks the manual
+against the tool name list (`mcp_and_filters_on_dirs.mdx`
+§7.6).
+
 ---
 
 ## 11. End-to-End Acceptance
@@ -1547,22 +1590,36 @@ A run of this tour passes when **all of**:
   (`path_not_found`, no media, `permission_denied`) surface
   cleanly without mutating `directories.yaml` and prompt the user
   for authorization when applicable.
-* §10B — continuing from §10A, a single `update_directory_filter`
-  call with one `negate: true` regex item carves `*_DM_*.jpg`
-  files out of the JFK/UX subtree. The user-shorthand
-  `.../*_DM_*.jpg` is normalized at the MCP boundary: the `.../`
-  prefix is dropped (implicit recursion), the `_DM_` substring
-  becomes the pattern body, and `.jpg` is anchored in the regex
-  tail. `directories.yaml` stores the canonical regex form
-  (`.*_DM_.*\.jpg$`) with `kind: regex` and `negate: true`.
+* §10B — **the primary acceptance test for this product**.
+  Continuing from §10A, a single `add_filter_item` call with
+  one `negate: true` glob item — `{ pattern: "*_DM_*", kind:
+  "glob", negate: true }` — appends to the JFK/UX root's
+  `filter.items[]`. The choice of `kind: "glob"` IS the
+  case-sensitivity choice (per the §10B.0 table: glob and
+  regex are case-sensitive; substring is not). The MCP server
+  canonicalizes `targets`, validates the item, computes the
+  stable id via `RootFilterItem.id` (SHA1 of
+  `pattern + kind + negate + priority`), atomically writes
+  `directories_window_<N>.yaml`, posts the distributed
+  notification, and returns within ~5 ms with `ok=true`,
+  `corr=<8-hex>`, `app_running=true`,
+  `targets_applied=[<JFK/UX>]`, and `items_added=1`. The
+  in-memory refilter (`RootFilter.evaluate` in
+  `DirectoryTree.swift`) flips `passesFilter` to `false` on
+  every `*_DM_*` file whose `include_overrides` ancestor
+  resolves to `.include`; files whose ancestor already
+  resolves to `.exclude` are unchanged and contribute zero to
+  `visible_delta` (legitimate per §10B.5.1, not a failure).
   `last_walked` is unchanged (in-memory re-eval only). The
-  `directory.refilter` log line records `negate_items=1` and a
-  `visible_delta` equal to the count of carved-out files. The
-  cookbook in §7.0.1 is the contract for which user intents map
-  to which `filter.items[]` shapes; the four failure modes
-  (`invalid_regex`, `path_not_found`, `storage_write_failed`,
-  `path_separator_in_pattern`) surface cleanly without
-  divergence between memory and disk.
+  `directory.refilter` log line records `visible_delta=<K>`;
+  the `tool=mcp.add_filter_item` line records
+  `items_added=1`. The §10B.10 code map binds every clause of
+  this scenario to its implementing file; the four failure
+  modes (`invalid_filter`, `unknown_root`,
+  `storage_write_failed`, `path_separator_in_pattern`)
+  surface cleanly without divergence between memory and disk.
+  The 2026-06-06 live run (corr `ed81f8bf`, §10B.3.1) is the
+  acceptance artifact.
 
 If any step fails, the failing line in `log.log` (with its `corr=`
 correlation id) is the first place to look — `grep corr=<id>

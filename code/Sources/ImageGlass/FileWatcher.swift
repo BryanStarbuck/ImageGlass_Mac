@@ -5,6 +5,7 @@ import ImageGlassCore
 /// invokes the callback on a debounce. Uses kqueue via DispatchSource.
 final class FileWatcher {
     private let url: URL
+    private let pathString: String
     private let onChange: @Sendable () -> Void
     private var source: DispatchSourceFileSystemObject?
     private var fileDescriptor: Int32 = -1
@@ -20,13 +21,14 @@ final class FileWatcher {
 
     init(url: URL, onChange: @escaping @Sendable () -> Void) {
         self.url = url
+        self.pathString = url.path
         self.onChange = onChange
     }
 
     func start() {
-        let fd = open(url.path, O_EVTONLY)
+        let fd = open(pathString, O_EVTONLY)
         guard fd >= 0 else {
-            ErrorLog.log("open(O_EVTONLY) failed for \(url.path) errno=\(errno)",
+            ErrorLog.log("open(O_EVTONLY) failed for \(pathString) errno=\(errno)",
                          class: "FileWatcher")
             return
         }
@@ -40,26 +42,17 @@ final class FileWatcher {
         src.setEventHandler { [weak self] in
             guard let self else { return }
             self.pendingWorkItem?.cancel()
-            // docs/performance.mdx §5.3 — `FileWatcher.EventBatch` covers
-            // one debounce window. We start the trace on the first event
-            // in the window and reuse it for subsequent events so the
-            // `count=` payload reflects how many raw events the
-            // user-visible batch coalesced.
-            if self.pendingTrace == nil {
-                self.pendingTrace = PerformanceLog.shared.start(
-                    "FileWatcher.EventBatch",
-                    extra: [("path", self.url.path)]
-                )
-            }
             self.pendingEventCount += 1
             let work = DispatchWorkItem { [weak self] in
                 guard let self else { return }
-                let trace = self.pendingTrace
                 let count = self.pendingEventCount
-                self.pendingTrace = nil
                 self.pendingEventCount = 0
+                let trace = PerformanceLog.shared.start(
+                    "FileWatcher.EventBatch",
+                    extra: [("path", self.pathString)]
+                )
                 self.onChange()
-                trace?.finish(extra: [("count", String(count))])
+                trace.finish(extra: [("count", String(count))])
             }
             self.pendingWorkItem = work
             // Spec §6.6: debounce 250 ms so bulk filesystem ops (e.g. cp -R)

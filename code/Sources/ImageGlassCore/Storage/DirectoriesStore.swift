@@ -82,6 +82,34 @@ public final class DirectoriesStore: @unchecked Sendable {
 
     private let lock = NSLock()
 
+    // MARK: - Cache + write coalescer state (perf/plans/LocalStorage.plan)
+    // All access guarded by `lock`. The debounce timer fires on
+    // `flushQueue`; its handler re-acquires `lock`, snapshots the
+    // pending file into a local value, and writes outside the lock.
+
+    private var cachedFile: DirectoriesFile?
+    private var cachedMTime: Date?
+    private var cachedURL: URL?
+    private var dirty: Bool = false
+    private var pendingFlushTimer: DispatchSourceTimer?
+    private let flushQueue = DispatchQueue(label: "ImageGlassCore.DirectoriesStore.flush")
+    private static let debounceInterval: DispatchTimeInterval = .milliseconds(250)
+
+    /// When true, `saveUnlocked` writes synchronously instead of
+    /// scheduling a debounced flush. Auto-enabled when `overrideFile`
+    /// is set (test path) so existing tests that `String(contentsOf:)`
+    /// the YAML right after a mutate continue to observe the new bytes.
+    private var synchronousWrites: Bool {
+        return overrideFile != nil
+    }
+
+    deinit {
+        // Best-effort: surface any in-memory mutations to disk on
+        // teardown. The C runtime tears down without an event loop,
+        // so we can't rely on the debounce timer firing.
+        flushPendingWritesNoThrow()
+    }
+
     // MARK: - High-level API
 
     /// Load the current state from disk. If the file doesn't exist yet,
@@ -104,28 +132,146 @@ public final class DirectoriesStore: @unchecked Sendable {
         try saveUnlocked(file)
     }
 
+    /// Synchronously persist any in-memory mutations that have been
+    /// staged by the write coalescer but not yet flushed. Call from
+    /// `applicationWillTerminate` (GUI) and any other shutdown path
+    /// that wants durability guarantees.
+    public func flushPendingWrites() throws {
+        lock.lock()
+        let snapshot: DirectoriesFile? = dirty ? cachedFile : nil
+        let url = cachedURL ?? fileURL
+        if snapshot != nil {
+            dirty = false
+            pendingFlushTimer?.cancel()
+            pendingFlushTimer = nil
+        }
+        lock.unlock()
+        guard let file = snapshot else { return }
+        try writeFileNow(file, to: url)
+        lock.lock()
+        cachedURL = url
+        cachedMTime = currentMTime(of: url)
+        lock.unlock()
+    }
+
+    private func flushPendingWritesNoThrow() {
+        do { try flushPendingWrites() } catch { /* best effort */ }
+    }
+
     // MARK: - Private unlocked I/O helpers
     // Call only while `lock` is held by the caller.
 
     private func loadUnlocked() throws -> DirectoriesFile {
         let url = fileURL
+        if cachedURL != url {
+            // Path changed (overrideFile flipped, frontmost window
+            // resolver pointed elsewhere). Drop the cache and any
+            // in-flight debounce — the old buffer belongs to the
+            // previous URL.
+            cachedFile = nil
+            cachedMTime = nil
+            cachedURL = nil
+            dirty = false
+            pendingFlushTimer?.cancel()
+            pendingFlushTimer = nil
+        }
         if !FileManager.default.fileExists(atPath: url.path) {
-            return DirectoriesFile()
+            if dirty, let file = cachedFile { return file }
+            let empty = DirectoriesFile()
+            cachedFile = empty
+            cachedMTime = nil
+            cachedURL = url
+            return empty
+        }
+        let diskMTime = currentMTime(of: url)
+        if let cached = cachedFile,
+           let cachedM = cachedMTime,
+           let diskM = diskMTime,
+           cachedM == diskM,
+           !dirty {
+            return cached
+        }
+        if dirty, let cached = cachedFile {
+            return cached
         }
         let data = try Data(contentsOf: url)
         guard let s = String(data: data, encoding: .utf8) else {
             throw CocoaError(.fileReadCorruptFile)
         }
-        return try DirectoriesYAML.decode(s)
+        let decoded = try DirectoriesYAML.decode(s)
+        cachedFile = decoded
+        cachedMTime = diskMTime
+        cachedURL = url
+        return decoded
     }
 
     private func saveUnlocked(_ file: DirectoriesFile) throws {
-        try ensureContainerDir()
+        let url = fileURL
+        cachedFile = file
+        cachedURL = url
+        dirty = true
+        if synchronousWrites {
+            pendingFlushTimer?.cancel()
+            pendingFlushTimer = nil
+            try writeFileNow(file, to: url)
+            cachedMTime = currentMTime(of: url)
+            dirty = false
+            return
+        }
+        scheduleDebouncedFlushLocked()
+    }
+
+    private func scheduleDebouncedFlushLocked() {
+        pendingFlushTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: flushQueue)
+        timer.schedule(deadline: .now() + Self.debounceInterval)
+        timer.setEventHandler { [weak self] in
+            self?.handleDebouncedFlush()
+        }
+        pendingFlushTimer = timer
+        timer.resume()
+    }
+
+    private func handleDebouncedFlush() {
+        lock.lock()
+        guard dirty, let file = cachedFile else {
+            pendingFlushTimer = nil
+            lock.unlock()
+            return
+        }
+        let url = cachedURL ?? fileURL
+        dirty = false
+        pendingFlushTimer = nil
+        lock.unlock()
+        do {
+            try writeFileNow(file, to: url)
+            lock.lock()
+            cachedURL = url
+            cachedMTime = currentMTime(of: url)
+            lock.unlock()
+        } catch {
+            // Re-mark dirty so the next mutation (or shutdown flush)
+            // retries. Logging to PerformanceLog would recurse; the
+            // GUI's user-visible error path runs through explicit
+            // calls to `save(_:)`, not the debounce queue.
+            lock.lock()
+            dirty = true
+            lock.unlock()
+        }
+    }
+
+    private func writeFileNow(_ file: DirectoriesFile, to url: URL) throws {
+        try ensureContainerDir(for: url)
         let yaml = DirectoriesYAML.encode(file)
         guard let data = yaml.data(using: .utf8) else {
             throw CocoaError(.fileWriteUnknown)
         }
-        try writeAtomically(data: data, to: fileURL)
+        try writeAtomically(data: data, to: url)
+    }
+
+    private func currentMTime(of url: URL) -> Date? {
+        let values = try? url.resourceValues(forKeys: [.contentModificationDateKey])
+        return values?.contentModificationDate
     }
 
     /// Make sure the file exists on disk, materialising an empty one if
@@ -316,7 +462,11 @@ public final class DirectoriesStore: @unchecked Sendable {
     }
 
     private func ensureContainerDir() throws {
-        let dir = fileURL.deletingLastPathComponent()
+        try ensureContainerDir(for: fileURL)
+    }
+
+    private func ensureContainerDir(for url: URL) throws {
+        let dir = url.deletingLastPathComponent()
         let fm = FileManager.default
         if !fm.fileExists(atPath: dir.path) {
             try fm.createDirectory(at: dir, withIntermediateDirectories: true)

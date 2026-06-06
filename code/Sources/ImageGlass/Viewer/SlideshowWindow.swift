@@ -38,7 +38,16 @@ final class SlideshowController {
         var runCorr: String = ""
         var runStart: Date = .distantPast
         var advanceCount: Int = 0
+        /// Paths currently in flight (or already warmed) for prefetch.
+        /// Keyed by absolute path; bounded by PREFETCH_AHEAD entries.
+        /// Per-window isolation (multi_window.mdx §7.3): each window
+        /// has its own ring, so two slideshows don't trample.
+        var prefetchKeys: Set<String> = []
     }
+
+    /// How many upcoming files to prefetch on each advance / start.
+    /// Plan: idx+1, idx+2 with loop wrap.
+    private static let prefetchAhead: Int = 2
 
     /// Keyed by `window_id`. Absent key ⇒ no slideshow running in
     /// that window.
@@ -174,6 +183,12 @@ final class SlideshowController {
             corr: corr, ok: true
         )
 
+        // Warm the cache for the first couple of upcoming files so
+        // the first advance lands on bytes that are already paged in.
+        // Computed against the same ordered+in-scope list advance()
+        // will walk on the first tick.
+        schedulePrefetch(windowID: target, appState: appState)
+
         scheduleTick(windowID: target, every: seconds)
     }
 
@@ -228,6 +243,10 @@ final class SlideshowController {
         run.countdownTimer?.invalidate()
         run.countdownTimer = nil
         run.nextAdvanceAt = nil
+        // Drop the per-window prefetch ring. In-flight FormatLoader
+        // tasks finish on their own (errors swallowed) but no new
+        // ones are scheduled for this window after stop.
+        run.prefetchKeys.removeAll()
 
         let corr = run.runCorr
         let elapsed = Date().timeIntervalSince(run.runStart)
@@ -369,6 +388,23 @@ final class SlideshowController {
         }
 
         let toPath = files[targetIdx]
+
+        // Prefetch the *next* couple of files (idx+1, idx+2 from the
+        // target) BEFORE we mutate selectedFile. The SwiftUI observer
+        // chain on selectedFile can re-enter representable updates
+        // synchronously and stall the main thread on FrameSource.load;
+        // scheduling here gives the background decoder a head start
+        // while the foreground decode is still pending. The current
+        // path (toPath) is also seeded so its bytes are warm if we
+        // somehow arrived at advance() without a prior prefetch tick.
+        schedulePrefetch(
+            windowID: windowID,
+            appState: appState,
+            files: files,
+            anchorIdx: targetIdx,
+            loop: loop
+        )
+
         appState.selectedFile = toPath
         run.advanceCount += 1
         runs[windowID] = run
@@ -407,6 +443,80 @@ final class SlideshowController {
     /// `height`, `fit`, `fill`).
     private func zoomModeLabel(_ mode: ZoomMode) -> String {
         mode.rawValue
+    }
+
+    /// Compute the current ordered + in-scope file list for `appState`
+    /// and dispatch a prefetch for the first PREFETCH_AHEAD entries
+    /// from the current selection. Used by `start(...)` where we
+    /// don't yet have the files list computed in advance().
+    private func schedulePrefetch(windowID: Int, appState: AppState) {
+        let ordered = appState.orderedNavigationFiles
+        let walkerRoots = appState.walkerRoots
+        let files: [String] = walkerRoots.isEmpty
+            ? ordered
+            : ordered.filter { Self.isInScope(path: $0, roots: walkerRoots) }
+        guard !files.isEmpty else { return }
+        let loop = appState.settings.slideshow.loop
+        let currentPath = appState.selectedFile ?? ""
+        let anchor = files.firstIndex(of: currentPath) ?? 0
+        schedulePrefetch(
+            windowID: windowID,
+            appState: appState,
+            files: files,
+            anchorIdx: anchor,
+            loop: loop
+        )
+    }
+
+    /// Per-window prefetch dispatcher. Builds the set of upcoming
+    /// paths (anchorIdx+1 ... anchorIdx+PREFETCH_AHEAD, wrap-aware),
+    /// dedups against this run's in-flight set, and hands the new
+    /// URLs to `FormatLoader.prefetch(urls:)` which submits them to
+    /// the bounded decode executor. No await — fire and forget so
+    /// the advance() main-thread slice stays O(1).
+    private func schedulePrefetch(
+        windowID: Int,
+        appState: AppState,
+        files: [String],
+        anchorIdx: Int,
+        loop: Bool
+    ) {
+        guard var run = runs[windowID] else { return }
+        guard !files.isEmpty else { return }
+
+        // Build the target window of upcoming paths.
+        var newKeys: [String] = []
+        newKeys.reserveCapacity(Self.prefetchAhead)
+        for step in 1...Self.prefetchAhead {
+            let raw = anchorIdx + step
+            let idx: Int
+            if raw < files.count {
+                idx = raw
+            } else if loop {
+                idx = raw % files.count
+            } else {
+                break
+            }
+            newKeys.append(files[idx])
+        }
+        let newSet = Set(newKeys)
+
+        // Dedup: only dispatch paths that aren't already in flight
+        // for this window. Paths that drop out of the window stay
+        // in flight until the executor completes them; we don't
+        // try to cancel mid-decode.
+        let toDispatch = newKeys.filter { !run.prefetchKeys.contains($0) }
+        // Keep the in-flight set bounded to the active window —
+        // entries that fell off are forgotten so a later wrap-around
+        // can re-prefetch them.
+        run.prefetchKeys = newSet
+        runs[windowID] = run
+
+        guard !toDispatch.isEmpty else { return }
+        let urls = toDispatch.map { URL(fileURLWithPath: $0) }
+        Task.detached(priority: .utility) {
+            FormatLoader.prefetch(urls: urls)
+        }
     }
 
     /// include_checks.mdx §9.1 — a file is in scope iff it both

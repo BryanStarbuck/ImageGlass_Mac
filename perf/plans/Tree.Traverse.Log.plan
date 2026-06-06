@@ -63,3 +63,62 @@ Risks / observability impact
   remains unemitted, which matches today's state.
 * Node count is O(N) but runs once per walk (not per node), so it stays in
   the noise next to the walk itself.
+
+## Progress notes (session 2)
+
+State at session start:
+* The previous session's report claimed `logTraversalSummary(...)`,
+  `nodeCount`, and `nodeCountSplit` were already on `DirectoryNode`. They
+  were not — `git grep` for those symbols and for `Tree.Traverse.Log`
+  returned zero hits across the entire tree (code/, tests/, docs/ included).
+  The earlier work was not committed or was reverted.
+* `DirectoryTreeWalker.swift` lines 259-266 still document the deliberate
+  removal of the per-node `tree.node` emitter, so the 888K-per-walk
+  regression is already fixed at HEAD even without the summary line.
+* `docs/performance.mdx` line 322 still lists `Tree.Traverse.Log` as a
+  named instrument in §5.3 of the spec — so the named instrument is
+  spec-required and is currently unemitted.
+
+This session:
+* Added `DirectoryNode.nodeCountSplit` — `(directories: Int, files: Int)`
+  computed in one O(N) recursive pass over the subtree.
+* Added `DirectoryNode.nodeCount` — sum of the two, kept for callers that
+  only want the total.
+* Added `DirectoryNode.logTraversalSummary(rootPath:corr:)` — emits
+  exactly one `PerformanceLog.shared.event("Tree.Traverse.Log", …)`
+  carrying `path`, `node_count`, `dir_count`, `file_count`, `corr`.
+  No start/finish pair, no recursion-time overhead. Single line per
+  traversal entry point.
+
+Wire-in survey of callers performing full `DirectoryNode` traversals:
+* `DirectoryTreeWalker.swift` — the natural and only batch-walk caller.
+  Off-limits for this agent (DirectoryWalk agent owns it). The new API
+  is left available for that agent to adopt inside the existing post-walk
+  block (line ~257-294 of the walker, right after `logDirectoryWalk`).
+* `DirectoryFilenamePanel.swift::flattenVisible` / `buildView` — render-
+  path traversals. Run on every panel render; emitting per render would
+  be chattier than per walk and there is no clean per-traversal boundary
+  the user thinks of as "one traversal". Not wired.
+* `ContextMenus/ContextMenuActions.swift::expandAllUnder` — user-driven
+  context-menu action over typically small subtrees. Not a perf-relevant
+  emission point. Not wired.
+* `code/Sources/ImageGlass/FileList/TreeNavigator.swift` — owned by
+  another agent (FileTree.Collapse). Not touched.
+
+Decision: kept the API (option b from the runbook) rather than deleting
+it. Rationale: the spec still names `Tree.Traverse.Log` as a required
+instrument, the walker — the natural caller — is owned by another agent
+and will likely adopt this on its next edit, and the helper is dead-cheap
+(only the prose comment costs anything until called). No caller wired in
+this session.
+
+Build status:
+* `swift build --target ImageGlassCore` — clean.
+* `swift build` (whole tree) — fails only in off-limits files
+  (`SlideshowWindow.swift::schedulePrefetch` and
+  `FileSystem/PollingScopeWatcher.swift::Darwin.stat`). No errors in
+  DirectoryTree.swift or any file this agent touched.
+* `swift test --filter DirectoryTree` — cannot run; the test binary
+  fails to link because the `PollingScopeWatcher.swift` errors above
+  block the `ImageGlass` module from compiling. Tests are not runnable
+  by this agent until the FileSystem agent fixes that file.

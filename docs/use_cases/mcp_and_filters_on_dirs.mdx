@@ -63,6 +63,98 @@ them. They are a strict superset of
   on-screen state, or read the named line of `log.log`. Each verify
   step is a check a human or an XCUITest run can perform.
 
+### 0.1 Primary use case and primary test case
+
+The **primary use case and primary acceptance test** for this
+entire spec is the case-sensitive `_DM_` exclude scenario in
+[`mcp_file.mdx` §10B](./mcp_file.mdx#10b-real-world-rehearsal--carving-out-_dm_-files-via-a-negative-filter-item).
+Every other scenario in this document (`_dn_`, `_WIP_`, the
+priority examples in §3.5, the voice-decomposition tables in
+§5A–§5E) is a generalization of that single canonical shape:
+*"hide everything whose filename contains a literal marker —
+case-sensitive."* The 2026-06-06 verification run with `corr =
+ed81f8bf` (see `mcp_file.mdx` §10B.3.1) is the artifact a
+reviewer should re-create end-to-end to qualify a release
+candidate of this spec.
+
+Concretely, the canonical call form this spec is graded against
+is:
+
+```
+add_filter_item(
+  targets="/Users/<you>/BGit/work/into_Work/StarbuckLabs/JFK/UX",
+  item={
+    "pattern": "*_DM_*",
+    "kind":    "glob",     # case-sensitive — by construction
+    "negate":  true
+  },
+  client="claude-code"
+)
+```
+
+driven over line-delimited JSON-RPC 2.0 against the sidecar at
+`code/.build/arm64-apple-macosx/debug/imageglass-mcp` (or its
+release counterpart). The case-sensitivity guarantee is **not**
+expressed as a per-item flag; it is delivered by the `kind`
+choice — see §0.2 below for the why, with code citations.
+
+### 0.2 Where case-sensitivity is implemented
+
+The three `kind` values dispatch through
+`RootFilter.itemMatches(_:filename:)` in
+`code/Sources/ImageGlassCore/FileList/DirectoryTree.swift`
+(lines 293–304). Each branch has a different case-sensitivity
+posture, fixed at the engine layer:
+
+| `kind` | Case-sensitive? | Implementing line in `DirectoryTree.swift` | Why |
+| --- | --- | --- | --- |
+| `glob` | **Yes** | line 296 — `return Glob.match(item.pattern, filename)` | `Glob.match(_:_:)` in `code/Sources/ImageGlassCore/Glob.swift` line 13 dispatches to `matchSlice(_:_:_:_:pathMode:)` line 39, whose literal-character compare (line 97 — `n[ni] != pc`) uses Swift `Character` equality, which is case-sensitive. |
+| `substring` | **No** | line 298 — `return filename.range(of: item.pattern, options: .caseInsensitive) != nil` | The `.caseInsensitive` option is hard-coded. This is the right choice for free-form voice ("show me anything with hero in the name") but **wrong** for marker-strings like `_DM_` where lower-case occurrences are not the same concept. |
+| `regex` | **Yes** (by default) | line 300 — `NSRegularExpression(pattern: item.pattern)` | Default `NSRegularExpression` options are case-sensitive. Users can opt in to case-insensitive by embedding `(?i)` in the pattern body; the engine does not flip the flag for them. |
+
+This is the contract: a future PR that changes the
+case-sensitivity of any branch above changes the meaning of
+every filter item the user has on disk and must be reviewed
+as a breaking change. The §11 acceptance suite includes a
+regression test that pins these three lines.
+
+### 0.3 Top-level code map
+
+Every behavior anywhere in this spec resolves to one of the
+files below. This table is the contract between this spec
+and the implementation; per-section code maps in §3, §4, §6,
+§7, §8, and §10 narrow further.
+
+| Subsystem | File | Primary symbol(s) |
+| --- | --- | --- |
+| Filter item model + id | `code/Sources/ImageGlassCore/FileList/DirectoryTree.swift` | `RootFilterItem` (line 85), `RootFilterItem.id` (line 120), `sha1Hex6` (line 131) |
+| Per-root filter + priority resolution | same file | `RootFilter` (line 202), `RootFilter.evaluate(filename:)` (line 248), `itemMatches(_:filename:)` (line 293) |
+| File-kind gate | same file | `FileKind.classify(uti:)` (line 21), `FileKind.classify(path:)` (line 37), `nonMediaExtensions` (line 57) |
+| Include-override layer (independent of `filter.items[]`) | same file | `IncludeState` (line 329), `IncludeOverrideEntry` (line 363), `RootDirectory.effectiveState(for:)` (line 410) |
+| Glob match (case-sensitive) | `code/Sources/ImageGlassCore/Glob.swift` | `Glob.match(_:_:)` (line 13), `Glob.matchPath(_:_:)` (line 23), `matchSlice(_:_:_:_:pathMode:)` (line 39) |
+| YAML codec | `code/Sources/ImageGlassCore/Storage/DirectoriesYAML.swift` | `DirectoriesYAML.encode(_:)` (line 55), `DirectoriesYAML.decode(_:)` (line 135), `applyItem(key:value:into:line:)` (line 358) |
+| Store + atomic writes + multi-window resolver | `code/Sources/ImageGlassCore/Storage/DirectoriesStore.swift` | `DirectoriesStore.shared`, `ensureExists()`, `save(_:)` |
+| MCP top-level dispatcher | `code/Sources/ImageGlassCore/MCPTools.swift` | `MCPTools`, `MCPTools.call(name:arguments:)` |
+| MCP protocol envelopes | `code/Sources/ImageGlassCore/MCPProtocol.swift` | `MCP.Request`, `MCP.Response`, `MCP.ToolDescriptor`, `MCP.ListToolsResult` |
+| MCP JSON-RPC stdio server | `code/Sources/ImageGlassCore/MCPServer.swift` | `MCPServer.run()` (line 46), `handleLine(_:encoder:decoder:)` (line 107), `handleInitialize(_:)`, `handleToolCall(_:)` |
+| MCP sidecar entry point | `code/Sources/ImageGlassMCPServer/main.swift` | top-of-file: bootstrap + `MCPServer().run()` |
+| Directory tools (the §4 surface) | `code/mcp/DirectoriesMCPTools.swift` | `DirectoriesMCPTools.toolNames` (line 32), `descriptors()` (line 65), `call(name:arguments:)` (line 390), `addFilterItem(_:)` (line 999) |
+| File-panel bridge tools | `code/mcp/FilePanelBridgeMCPTools.swift` | (panel selection, view-mode mutations) |
+| Path canonicalization at MCP boundary | `code/mcp/MCPPath.swift` | `MCPPath.canonicalize(_:)` |
+| MCP-side scope name resolver | `code/mcp/MCPScopeName.swift` | scope-name normalization |
+| Distributed notification bus | `code/mcp/MCPNotificationBus.swift` | `MCPNotificationBus.directoriesChangedNotificationName` |
+| Self-describing manual (§7) | `code/mcp/MCPManual.swift` + `code/mcp/mcp_manual.txt` | manual loader + plain-text source-of-truth |
+| Audit log | `code/Sources/ImageGlassCore/Logging/MCPAuditLogger.swift` | `MCPAuditLogger.shared` (line 26), `logMCPCall(toolName:scope:client:corr:ok:err:extra:)` (line 91), `newCorrelationId()` (line 68) |
+| Audit log path | `code/Sources/ImageGlassCore/Paths.swift` | `AppPaths.macLogFile` |
+| Walker (provides the in-memory tree the §8 contract guards) | `code/Sources/ImageGlassCore/FileList/DirectoryTreeWalker.swift` | `DirectoryTreeWalker.shared` |
+| FSEvent watcher (kqueue fallback) | `code/Sources/ImageGlass/FileWatcher.swift` | `FileWatcher` |
+| Panel UI (the surface §6 toggles) | `code/Sources/ImageGlass/DirectoryFilenamePanel.swift`, `code/Sources/ImageGlass/FileList/FileListTreeView.swift`, `code/Sources/ImageGlass/FileList/FileListPanelView.swift` | (tree / details / strip / grid views) |
+
+A PR that moves any symbol above MUST update this table in
+the same diff. The §11 acceptance suite enforces row → file
+existence via the same SwiftSyntax pass that runs the §9
+main-thread audit.
+
 ---
 
 ## 1. The Voice-Driven Workflow

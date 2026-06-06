@@ -82,3 +82,65 @@ Out of scope
   require touching ImageCanvasView / FrameSource (owned by other
   agents). The current design only warms the OS / ImageIO caches via a
   background FormatLoader.load call.
+
+## Progress notes
+
+Bugs fixed
+* The previous agent's draft of SlideshowWindow.swift (referencing a
+  `PrefetchState.warmed` case and a tuple destructure on a `String`)
+  was not present on disk — file was in its pre-edit baseline. Wrote
+  the prefetch ring fresh against the actual `FormatLoader.prefetch`
+  signature in `code/Sources/ImageGlassCore/Formats/FormatLoader.swift`:
+  `public static func prefetch(urls: [URL], targetMaxDim: Int = 0)`.
+  No tuple destructuring is used now (string-keyed `Set<String>`), so
+  the "tuple pattern cannot match values of non-tuple type 'String'"
+  class of bug cannot reappear.
+
+What is now wired
+* `Run` carries a per-window `prefetchKeys: Set<String>` plus the
+  static `prefetchAhead = 2`. Per-window isolation is enforced by
+  keying everything off `windowID` through `runs[windowID]`.
+* `start(...)` calls `schedulePrefetch(windowID:appState:)` after the
+  viewer is configured and the toggle audit line is written, so the
+  first advance lands on warm bytes for the next 1-2 files.
+* `advance(...)` calls the lower-level
+  `schedulePrefetch(windowID:appState:files:anchorIdx:loop:)` BEFORE
+  the `appState.selectedFile = toPath` mutation — that's the point in
+  the run loop where the SwiftUI observer chain has not yet started
+  the synchronous `setImage -> FormatLoader.load` cascade, so the
+  bounded decode executor gets a head start on idx+1 and idx+2 while
+  the foreground decode of `toPath` is still pending.
+* Dedup: `toDispatch = newKeys.filter { !run.prefetchKeys.contains($0) }`
+  — paths still in flight from the previous advance are not
+  re-submitted; new entries are added to the set; paths that fall out
+  of the window are forgotten so a later wrap can re-prefetch them.
+* `stop(...)` clears `run.prefetchKeys`. In-flight `FormatLoader.load`
+  tasks complete on their own (errors swallowed) but no new prefetch
+  is scheduled for that window.
+* Loop-aware indexing: `(anchorIdx + step)` is wrapped with `% files.count`
+  when `loop` is true, and the step is skipped (break) when loop is
+  off and the index runs past the end.
+* `FormatLoader.prefetch(urls:)` is invoked from a
+  `Task.detached(priority: .utility)` so the advance() main-thread
+  slice stays O(1) — no `await` inside advance.
+
+Deferred (out of scope, by plan)
+* No decoded-image LRU returning ready `CGImage`s to the canvas. The
+  current design only warms the ImageIO / OS page cache; the canvas
+  pipeline (FrameSource, ImageCanvasView) is owned by other agents
+  and untouched.
+* No cancellation of in-flight `FormatLoader` decodes when the user
+  skips forward — the decode executor is bounded (concurrency cap 3
+  per the FormatLoader comment) so an abandoned prefetch is cheap to
+  let finish.
+* No `targetMaxDim` is passed to `FormatLoader.prefetch`; the default
+  (0 = full size) is used. If thumbnail-tier prefetch is wanted later,
+  pass the viewer's pixel bounds.
+
+Build status
+* `swift build` now passes for SlideshowWindow.swift cleanly. Build
+  still fails downstream in `PollingScopeWatcher.swift` (Darwin.stat
+  signature mismatch) — owned by the FileSystem agent, not touched.
+* `swift test --filter Slideshow` cannot run until that downstream
+  error is fixed by the owning agent; SlideshowController test
+  targets compile against the same product.
