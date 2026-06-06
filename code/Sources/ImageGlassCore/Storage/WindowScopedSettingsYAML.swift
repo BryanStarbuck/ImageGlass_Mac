@@ -154,10 +154,8 @@ public enum WindowScopedSettingsYAML {
             lines[i] = lines[i].trimmingCharacters(in: .init(charactersIn: " \t\r"))
         }
 
-        // First pass: build a flat dictionary of top-level keys → raw block text.
+        // First pass: scan for top-level keys (indentation determines hierarchy).
         var idx = 0
-        var topKeys: [String: String] = [:]
-        var topOrder: [String] = []
         while idx < lines.count {
             let line = lines[idx]
             if line.isEmpty { idx += 1; continue }
