@@ -957,7 +957,7 @@ public final class AppState {
     private func startHeartbeatTimer() {
         heartbeatTimer?.invalidate()
         heartbeatTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
-            self?.writeHeartbeat()
+            Task { @MainActor [weak self] in self?.writeHeartbeat() }
         }
     }
 
