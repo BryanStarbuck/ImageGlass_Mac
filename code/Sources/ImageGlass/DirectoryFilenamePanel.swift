@@ -68,11 +68,49 @@ struct DirectoryFilenamePanel: View {
             .focusable()
             .focusEffectDisabled()
             .imageGlassHotkeys(state: state, viewer: state.viewer)
+            // hotkeys.mdx §4.4 — Space on a folder row toggles
+            // expand/collapse. On a file row (or no cursor), falls
+            // through to the slideshow toggle so the panel-focused
+            // upstream-ImageGlass Space binding still works.
+            .onKeyPress(.space, phases: .down) { handleSpace($0) }
             Divider().overlay(IG.sidebarLineC)
             footer
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(IG.sidebarC)
+    }
+
+    /// hotkeys.mdx §4.4 — Space, when the panel has focus.
+    ///
+    /// Routing:
+    /// * cursor on a folder row in tree mode → toggle expand/collapse
+    ///   via `treeNav.toggle(_:depth:)`. Same call path as the disclosure
+    ///   triangle, so the change persists into
+    ///   `session.directory_panel.expanded_paths` (dir_ui.mdx §3.3.1).
+    /// * any other case (file cursor, no cursor, list mode) → toggle
+    ///   the slideshow on the active scope, matching the upstream
+    ///   ImageGlass Space-starts-slideshow shortcut and the dir_ui.mdx
+    ///   §5.2 contract.
+    ///
+    /// Modifiers (⌘/⌥/⌃ Space) fall through (`.ignored`) so Spotlight
+    /// and Input Source switching keep their system bindings.
+    private func handleSpace(_ press: KeyPress) -> KeyPress.Result {
+        let blocking: EventModifiers = [.command, .option, .control]
+        if !press.modifiers.intersection(blocking).isEmpty { return .ignored }
+        if state.panelViewMode == .tree,
+           let cursor = state.treeNav.activeRow,
+           let row = state.visibleTreeRows.first(where: { $0.path == cursor }),
+           row.isDirectory {
+            let _trace = PerformanceLog.shared.start(
+                "FileTree.ToggleSpace",
+                extra: [("path", row.path)]
+            )
+            defer { _trace.finish() }
+            state.treeNav.toggle(row.path, depth: row.depth)
+            return .handled
+        }
+        SlideshowController.shared.toggle(appState: state, source: "key:Space:panel")
+        return .handled
     }
 
     /// Case-insensitive filename match against the search field.

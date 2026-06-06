@@ -144,6 +144,55 @@ mode (§6) on tall UI mockups, screenshots, and infographics.
   scroll within the current image only. The bare arrow keys are the
   way to move between files.
 
+### 4.4 Space Bar in the Directory Panel — Toggle Folder Expand/Collapse
+
+When the **Directory Panel has focus** and the cursor row
+(`treeNav.activeRow`) is a **folder**, pressing **Space** toggles the
+folder's expand/collapse state. This is the keyboard twin of clicking
+the disclosure triangle: same `treeNav.setExpanded(...)` call, same
+persistence into `session.directory_panel.expanded_paths` per
+[`dir_ui.mdx` §3.3.1](./dir_ui.mdx#331-persistence-across-launches).
+
+The binding is **context-sensitive** — Space does not always mean
+"toggle folder." Resolution is by focus and cursor row:
+
+| Focus | Cursor row (`treeNav.activeRow`) | Space behavior |
+| --- | --- | --- |
+| **Directory Panel** | **Folder** | **Toggle expand/collapse** on that folder. The cursor stays on the same row. |
+| **Directory Panel** | **File** (or no cursor) | Toggle the slideshow on the active scope (same as upstream and `dir_ui.mdx` §5.2). |
+| **Viewer** | — | Focus-context handler in `ImageViewer.handleSpace()` (`videos.mdx` §11.2 / `svg.mdx` §10.2 / `slideshow.mdx` §10.2): play/pause for video, animation toggle for animated SVG, slideshow toggle for static images. |
+| **Text field** | — | Space types a literal space character into the field. No binding fires. |
+
+Behavioral notes:
+
+* **Same call path as ← / →.** A folder-row `Space` is equivalent to
+  pressing `→` on a collapsed folder, or `←` on an expanded folder.
+  The arrow keys keep the §4.1 dual semantics (expand vs. step into,
+  collapse vs. step out); `Space` is the single-key "just toggle"
+  alternative that does not move the cursor under any circumstance.
+* **Cursor never moves.** Whether expanding or collapsing, the cursor
+  row remains on the toggled folder. `↑` / `↓` are still the way to
+  walk into or out of the folder after toggling.
+* **Viewer is not touched.** Toggling a folder does not load any new
+  image; the viewer holds its last-viewed file, matching §4.2.
+* **Tree view only.** This binding only fires when the panel is in
+  tree view (`panelViewMode == .tree`). In list view, folders are not
+  cursor-addressable, so `treeNav.activeRow` will be a file path and
+  Space falls through to the slideshow toggle.
+* **No-op when there is no row.** If the panel has focus but the user
+  has not yet placed the cursor (no `activeRow`, no `selectedFile`),
+  Space is a no-op — no folder to toggle and no scope file to begin a
+  slideshow on.
+* **Modifiers fall through.** `⌘ Space`, `⌥ Space`, `⌃ Space` are
+  **not** captured here. Spotlight and Input Source switching keep
+  their system bindings; menu chords that happen to use Space are
+  unaffected.
+
+This makes the file-tree feel like Finder's column / list view: a
+disclosure triangle, an arrow key, and `Space` are three equivalent
+ways to open or close a folder, and the user picks whichever matches
+their hand position.
+
 ---
 
 ## 5. Zoom Hotkeys (Bare Letters)
@@ -381,7 +430,7 @@ function; menu-bar twins are listed in the *Menu shortcut* column.
 | **`W`** | Zoom to Width | View ▸ Zoom to Width (⌥ ⌘ 9) |
 | **`P`** | Copy file path to clipboard | File ▸ Copy File Path (⌃ ⌘ C) |
 | **`L`** | Load image from clipboard path | File ▸ Load From Clipboard (⌥ ⌘ V) |
-| **␣** (Space) | Toggle slideshow | View ▸ Slideshow |
+| **␣** (Space) | **Directory Panel + folder cursor:** toggle folder expand/collapse (§4.4). **Otherwise:** toggle slideshow (or video play/pause / SVG animation per `videos.mdx` / `svg.mdx`). | View ▸ Slideshow |
 | **⌫** | Move selected file to Trash | Edit ▸ Delete |
 
 The full list of `⌘`-prefixed shortcuts (menu chords) is owned by
