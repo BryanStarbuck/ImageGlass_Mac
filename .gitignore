@@ -45,3 +45,34 @@ build/
 dist/
 *.dmg
 *.app/
+
+# Node / JS package ecosystems — never commit these to the server.
+# They are huge, machine-specific, and reproducible from package.json /
+# package-lock.json / yarn.lock / pnpm-lock.yaml.
+node_modules/
+.pnp.*
+.yarn/cache/
+.yarn/unplugged/
+.yarn/install-state.gz
+.npm/
+.pnpm-store/
+
+# Scratch / throwaway working files. Anything dropped under scratch/ is
+# local-only — perf logs, snapshots, experiments. The directory itself is
+# tracked (placeholder) so the path exists; contents are ignored.
+scratch/*
+!scratch/.gitkeep
+
+# Performance / profiling snapshots (can balloon to GB). Belt-and-suspenders
+# on top of scratch/ in case they land elsewhere.
+*.snapshot.log
+*.heapsnapshot
+*.cpuprofile
+*.heapprofile
+*.trace
+*.profraw
+*.profdata
+
+# Logs
+*.log
+logs/
