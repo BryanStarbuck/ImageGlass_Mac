@@ -1,4 +1,4 @@
-import AppKit
+@preconcurrency import AppKit
 import Foundation
 import ImageGlassCore
 
@@ -217,10 +217,10 @@ final class WindowRegistryFrontmostObserver {
             forName: NSWindow.didBecomeKeyNotification,
             object: nil,
             queue: .main
-        ) { [weak self] note in
+        ) { [weak self] _ in
             guard let self else { return }
             MainActor.assumeIsolated {
-                guard let window = note.object as? NSWindow,
+                guard let window = NSApp.keyWindow,
                       window.styleMask.contains(.titled),
                       window.canBecomeMain
                 else { return }

@@ -1,4 +1,4 @@
-import AppKit
+@preconcurrency import AppKit
 import Foundation
 import ImageGlassCore
 import QuickLookUI
@@ -735,8 +735,7 @@ enum ContextMenuActions {
 /// is a true `NSResponder`-based singleton and needs a data-source
 /// object that outlives the calling menu handler.
 @MainActor
-final class QuickLookCoordinator: NSObject, QLPreviewPanelDataSource,
-                                   QLPreviewPanelDelegate {
+final class QuickLookCoordinator: NSObject {
     static let shared = QuickLookCoordinator()
     private var items: [QLPreviewItem] = []
 
@@ -748,13 +747,15 @@ final class QuickLookCoordinator: NSObject, QLPreviewPanelDataSource,
         panel.reloadData()
         panel.makeKeyAndOrderFront(nil)
     }
+}
 
-    nonisolated func numberOfPreviewItems(in panel: QLPreviewPanel!) -> Int {
-        MainActor.assumeIsolated { items.count }
+extension QuickLookCoordinator: @preconcurrency QLPreviewPanelDataSource, QLPreviewPanelDelegate {
+    func numberOfPreviewItems(in panel: QLPreviewPanel!) -> Int {
+        items.count
     }
 
-    nonisolated func previewPanel(_ panel: QLPreviewPanel!,
-                                  previewItemAt index: Int) -> QLPreviewItem! {
-        MainActor.assumeIsolated { items[index] }
+    func previewPanel(_ panel: QLPreviewPanel!,
+                      previewItemAt index: Int) -> QLPreviewItem! {
+        items[index]
     }
 }

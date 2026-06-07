@@ -19,7 +19,7 @@
 import Foundation
 import ImageGlassCore
 
-final class ICloudMaterializationWatcher: NSObject {
+final class ICloudMaterializationWatcher: NSObject, @unchecked Sendable {
 
     let scopeID: String
     private let query: NSMetadataQuery

@@ -19,7 +19,7 @@
 import Foundation
 import ImageGlassCore
 
-final class CoordinatedFilePresenter: NSObject, NSFilePresenter {
+final class CoordinatedFilePresenter: NSObject, NSFilePresenter, @unchecked Sendable {
 
     /// Called when a coordinated writer takes the file. The
     /// `FocusedFileWatcher`'s `paused` flag is flipped on so we

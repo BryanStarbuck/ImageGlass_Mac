@@ -173,7 +173,7 @@ private struct AVPlayerViewRepresentable: NSViewRepresentable {
 
     func makeCoordinator() -> Coordinator { Coordinator(controller: controller) }
 
-    final class Coordinator: NSObject, AVPlayerViewDelegate {
+    final class Coordinator: NSObject, AVPlayerViewDelegate, @unchecked Sendable {
         let controller: VideoPlaybackController
         init(controller: VideoPlaybackController) {
             self.controller = controller

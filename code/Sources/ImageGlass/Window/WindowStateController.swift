@@ -1,4 +1,4 @@
-import AppKit
+@preconcurrency import AppKit
 import Foundation
 import ImageGlassCore
 
@@ -63,10 +63,10 @@ final class WindowStateController: NSObject {
                 forName: NSWindow.didBecomeKeyNotification,
                 object: nil,
                 queue: .main
-            ) { [weak self] note in
+            ) { [weak self] _ in
                 guard let self else { return }
                 MainActor.assumeIsolated {
-                    guard let win = note.object as? NSWindow,
+                    guard let win = NSApp.keyWindow,
                           win.styleMask.contains(.titled),
                           win.canBecomeMain
                     else { return }

@@ -1,6 +1,6 @@
 import Foundation
 import Observation
-import AppKit
+@preconcurrency import AppKit
 import ImageGlassCore
 
 /// Root reactive model. Holds the active scope, its resolved file list,
@@ -1085,6 +1085,8 @@ public final class AppState {
             object: nil,
             queue: .main
         ) { [weak self] note in
+            // URL is Sendable; extract it before crossing into @MainActor Task.
+            let url = note.object as? URL
             Task { @MainActor in
                 guard let self else { return }
                 guard self.selectedFile == nil else {
@@ -1093,7 +1095,7 @@ public final class AppState {
                     // fall on the floor.
                     return
                 }
-                if let url = note.object as? URL {
+                if let url {
                     let path = url.path
                     if !self.resolvedFiles.contains(path) {
                         self.resolvedFiles.insert(path, at: 0)

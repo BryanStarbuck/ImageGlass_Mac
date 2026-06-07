@@ -168,7 +168,7 @@ private struct SVGWebView: NSViewRepresentable {
         // subsequent navigation request is cancelled.
         func webView(_ webView: WKWebView,
                      decidePolicyFor navigationAction: WKNavigationAction,
-                     decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+                     decisionHandler: @escaping @MainActor @Sendable (WKNavigationActionPolicy) -> Void) {
             if navigationAction.navigationType == .other,
                navigationAction.targetFrame?.isMainFrame == true {
                 decisionHandler(.allow)

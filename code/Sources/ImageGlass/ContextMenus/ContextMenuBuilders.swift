@@ -1,4 +1,4 @@
-import AppKit
+@preconcurrency import AppKit
 import Foundation
 import ImageGlassCore
 import SwiftUI
@@ -772,8 +772,8 @@ final class OpenWithMenuDelegate: NSObject, NSMenuDelegate {
         self.surface = surface
     }
 
-    nonisolated func menuNeedsUpdate(_ menu: NSMenu) {
-        MainActor.assumeIsolated { rebuild(menu) }
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        rebuild(menu)
     }
 
     private func rebuild(_ menu: NSMenu) {

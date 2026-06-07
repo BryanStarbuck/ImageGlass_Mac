@@ -1,4 +1,4 @@
-import AppKit
+@preconcurrency import AppKit
 import SwiftUI
 import ImageGlassCore
 
@@ -90,14 +90,12 @@ final class ContextMenuOverlayView: NSView {
     /// AppKit's right-click handler. We rebuild the menu on each fire
     /// so it reflects live state.
     override func menu(for event: NSEvent) -> NSMenu? {
-        MainActor.assumeIsolated {
-            preselect?()
-            guard let menu = menuBuilder?() else { return nil }
-            ContextMenuActions.recordOpen(menu: surface,
-                                          itemCount: menu.items.count,
-                                          targetPath: targetPath)
-            return menu
-        }
+        preselect?()
+        guard let menu = menuBuilder?() else { return nil }
+        ContextMenuActions.recordOpen(menu: surface,
+                                      itemCount: menu.items.count,
+                                      targetPath: targetPath)
+        return menu
     }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { false }

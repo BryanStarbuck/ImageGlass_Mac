@@ -17,7 +17,7 @@ import ImageGlassCore
 /// (docs/videos.mdx §3.7 hardware decode).
 @MainActor
 @Observable
-public final class VideoPlaybackController {
+public final class VideoPlaybackController: @unchecked Sendable {
 
     // MARK: - Public observable state
 

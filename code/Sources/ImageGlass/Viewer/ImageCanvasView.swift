@@ -1,4 +1,4 @@
-import AppKit
+@preconcurrency import AppKit
 import CoreImage
 import CoreImage.CIFilterBuiltins
 import ImageGlassCore
@@ -159,15 +159,11 @@ final class ImageCanvasView: NSView {
     override func menu(for event: NSEvent) -> NSMenu? {
         guard let state = hostState, let viewer = hostViewer,
               state.selectedFile != nil else { return nil }
-        let menu = MainActor.assumeIsolated {
-            ContextMenuBuilders.imageCanvas(state: state, viewer: viewer)
-        }
+        let menu = ContextMenuBuilders.imageCanvas(state: state, viewer: viewer)
         if let menu {
-            MainActor.assumeIsolated {
-                ContextMenuActions.recordOpen(menu: .viewerCanvas,
-                                              itemCount: menu.items.count,
-                                              targetPath: state.selectedFile)
-            }
+            ContextMenuActions.recordOpen(menu: .viewerCanvas,
+                                          itemCount: menu.items.count,
+                                          targetPath: state.selectedFile)
         }
         return menu
     }
