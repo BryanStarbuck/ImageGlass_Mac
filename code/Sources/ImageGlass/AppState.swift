@@ -288,15 +288,26 @@ public final class AppState {
     public init() {}
 
     deinit {
-        heartbeatTimer?.invalidate()
-        if let t = directoriesChangedToken {
-            DistributedNotificationCenter.default().removeObserver(t)
-        }
-        if let t = firstImageFoundToken {
-            NotificationCenter.default.removeObserver(t)
-        }
-        if let t = directoryDidChangeToken {
-            NotificationCenter.default.removeObserver(t)
+        // Swift 6.x toolchains (observed: Swift 6.3.2 / Xcode 26 on macOS 26)
+        // make `deinit` of an @MainActor class implicitly nonisolated, so
+        // touching MainActor-isolated stored properties directly is a hard
+        // error. Older toolchains let this compile. Wrap in
+        // `MainActor.assumeIsolated` — the same pattern used throughout
+        // this codebase — so the cleanup compiles on both. Safe in
+        // practice: @Observable @MainActor instances are only released
+        // from the main thread (SwiftUI ownership, test teardown on
+        // MainActor), which is what `assumeIsolated` requires at runtime.
+        MainActor.assumeIsolated {
+            heartbeatTimer?.invalidate()
+            if let t = directoriesChangedToken {
+                DistributedNotificationCenter.default().removeObserver(t)
+            }
+            if let t = firstImageFoundToken {
+                NotificationCenter.default.removeObserver(t)
+            }
+            if let t = directoryDidChangeToken {
+                NotificationCenter.default.removeObserver(t)
+            }
         }
     }
 
