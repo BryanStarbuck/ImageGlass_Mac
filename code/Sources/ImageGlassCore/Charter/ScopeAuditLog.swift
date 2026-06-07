@@ -27,7 +27,7 @@ public struct ScopeAuditEntry: Codable, Equatable, Sendable {
 }
 
 /// Append-only JSONL audit log, one file per scope.
-public final class ScopeAuditLog {
+public final class ScopeAuditLog: @unchecked Sendable {
 
     public static let shared = ScopeAuditLog()
 

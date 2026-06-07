@@ -7,7 +7,7 @@ import Foundation
 /// stdin and writes responses to stdout. Diagnostics go to stderr only.
 /// Spec §13.1: clients must be able to complete the `initialize` and
 /// `tools/list` handshake.
-public final class MCPServer {
+public final class MCPServer: @unchecked Sendable {
 
     /// Latest MCP protocol revision we know how to speak. We will echo back
     /// the client's `protocolVersion` if it asks for the same one, otherwise

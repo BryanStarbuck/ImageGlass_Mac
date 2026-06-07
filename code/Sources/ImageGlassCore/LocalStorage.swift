@@ -2,7 +2,7 @@ import Foundation
 
 /// Plain-text on-disk store of scope files.
 /// Format: pretty-printed JSON in ~/Library/Application Support/ImageGlass/scopes/<name>.json
-public final class LocalStorage {
+public final class LocalStorage: @unchecked Sendable {
 
     /// Distinguishable failure modes for `loadScope`. Callers (especially
     /// `AppState.activate(scopeNamed:)`) need to tell "file missing" apart

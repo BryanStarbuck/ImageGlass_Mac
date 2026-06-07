@@ -78,7 +78,7 @@ public enum ErrorLog {
         url: { AppPaths.macLogFile }
     )
 
-    private static let timestampFormatter: ISO8601DateFormatter = {
+    nonisolated(unsafe) private static let timestampFormatter: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return f

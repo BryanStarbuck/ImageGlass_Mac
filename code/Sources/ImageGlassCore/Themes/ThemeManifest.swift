@@ -195,7 +195,7 @@ public struct ThemeManifest: Codable, Equatable, Sendable {
         /// fields from future spec versions.
         public var extra: [String: ThemeColor]
 
-        private static let knownKeys: [String: WritableKeyPath<Colors, ThemeColor?>] = [
+        nonisolated(unsafe) private static let knownKeys: [String: WritableKeyPath<Colors, ThemeColor?>] = [
             "BackColor": \Colors.backColor,
             "TitleBarColor": \Colors.titleBarColor,
             "ToolbarBackground": \Colors.toolbarBackground,
@@ -347,7 +347,7 @@ public struct ThemeManifest: Codable, Equatable, Sendable {
         // Extras we don't have a typed slot for yet.
         public var extra: [String: String]
 
-        private static let knownKeys: [String: WritableKeyPath<ToolbarIcons, String?>] = [
+        nonisolated(unsafe) private static let knownKeys: [String: WritableKeyPath<ToolbarIcons, String?>] = [
             "ZoomIn": \ToolbarIcons.zoomIn,
             "ZoomOut": \ToolbarIcons.zoomOut,
             "ResetZoom": \ToolbarIcons.resetZoom,

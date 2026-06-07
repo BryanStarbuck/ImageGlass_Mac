@@ -898,19 +898,22 @@ public struct MCPTools {
         // Synchronously dispatch the async check from a non-async tool call.
         // Tools may be invoked from a synchronous JSON-RPC dispatch loop, so
         // we hop onto a dedicated semaphore-gated Task to wait for the result.
-        var captured: Result<UpdateCheckResult, Error>!
+        // Box the result so the Task closure (which is @Sendable in Swift 6)
+        // can mutate it without capturing a mutable local variable.
+        final class _Box: @unchecked Sendable { var value: Result<UpdateCheckResult, Error>? }
+        let box = _Box()
         let sem = DispatchSemaphore(value: 0)
         Task {
             do {
                 let r = try await checker.check(force: force)
-                captured = .success(r)
+                box.value = .success(r)
             } catch {
-                captured = .failure(error)
+                box.value = .failure(error)
             }
             sem.signal()
         }
         sem.wait()
-        switch captured! {
+        switch box.value! {
         case .success(let r):
             let payload: [String: Any] = [
                 "current_version": r.currentVersion,

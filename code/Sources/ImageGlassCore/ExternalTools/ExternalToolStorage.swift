@@ -8,7 +8,7 @@ import Foundation
 /// Charter: plain text. JSON is the lingua franca already used by `LocalStorage`
 /// for scopes, so reusing it here keeps the on-disk story uniform and lets
 /// users hand-edit tool descriptors with any text editor.
-public final class ExternalToolStorage {
+public final class ExternalToolStorage: @unchecked Sendable {
 
     public static let shared = ExternalToolStorage()
 

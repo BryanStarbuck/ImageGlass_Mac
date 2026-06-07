@@ -29,7 +29,7 @@ public struct RuleSet: Codable, Equatable, Sendable {
 }
 
 /// Plain-text on-disk store for `RuleSet` values.
-public final class RuleSetStorage {
+public final class RuleSetStorage: @unchecked Sendable {
 
     public static let shared = RuleSetStorage()
 

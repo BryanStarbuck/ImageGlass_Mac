@@ -1,4 +1,4 @@
-// swift-tools-version: 6.0
+// swift-tools-version: 6.3
 //
 // SwiftPM manifest for ImageGlass_Mac (Starbuck fork).
 //
@@ -74,9 +74,5 @@ let package = Package(
             path: "Tests/ImageGlassCoreTests"
         ),
     ],
-    // Pin to Swift 5 language mode for now. Swift 6 strict concurrency
-    // would require Sendable annotations on a handful of static lookup
-    // tables in Sources/ImageGlassCore/Themes (and similar) before it can
-    // be enabled. Bump to `.v6` once those product-code annotations land.
-    swiftLanguageModes: [.v5]
+    swiftLanguageModes: [.v6]
 )

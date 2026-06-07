@@ -111,8 +111,8 @@ public enum LoadDiagnostics {
     }
 
     private static let cacheLock = NSLock()
-    private static var cache: [CacheKey: LoadDiagnosis] = [:]
-    private static var cacheOrder: [CacheKey] = []
+    nonisolated(unsafe) private static var cache: [CacheKey: LoadDiagnosis] = [:]
+    nonisolated(unsafe) private static var cacheOrder: [CacheKey] = []
     private static let cacheLimit = 1024
 
     private static func cacheGet(_ key: CacheKey) -> LoadDiagnosis? {
