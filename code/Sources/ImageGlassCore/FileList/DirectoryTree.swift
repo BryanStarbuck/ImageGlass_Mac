@@ -520,6 +520,106 @@ public struct RootDirectory: Sendable, Equatable {
         }
         return s
     }
+
+    /// moves_and_reconciliation.mdx §4.4 / §5.3 / include_checks.mdx §12A.1
+    /// — carry the include state forward across an **in-tree move**.
+    /// When an item at root-relative path `oldRel` (and everything under
+    /// it) moves to `newRel`, every `include_overrides[]` entry whose
+    /// key is `oldRel` or a descendant of it is **reprefixed** to sit
+    /// under `newRel`; the `state` is untouched, so a green check stays
+    /// a green check at the new location. Entries outside the moved
+    /// subtree are left alone.
+    ///
+    /// A pure root relocation (§4.5 / §12A.2) passes `oldRel == newRel`,
+    /// which is a no-op here — the payoff of storing overrides relative
+    /// to the root. Returns the number of override entries rewritten.
+    @discardableResult
+    public mutating func rewriteOverridePaths(
+        fromRelative oldRel: String,
+        toRelative newRel: String
+    ) -> Int {
+        let from = Self.normalize(oldRel)
+        let to = Self.normalize(newRel)
+        if from == to { return 0 }
+        let fromPrefix = from + "/"
+        var rewritten = 0
+        for i in includeOverrides.indices {
+            let key = Self.normalize(includeOverrides[i].path)
+            if key == from {
+                includeOverrides[i].path = to
+                rewritten += 1
+            } else if key.hasPrefix(fromPrefix) {
+                let suffix = key.dropFirst(fromPrefix.count)
+                includeOverrides[i].path = to.isEmpty
+                    ? String(suffix)
+                    : to + "/" + suffix
+                rewritten += 1
+            }
+        }
+        return rewritten
+    }
+
+    /// moves_and_reconciliation.mdx §5.4 / include_checks.mdx §12A.3 —
+    /// an item that moved **out of scope** loses its explicit check.
+    /// Deletes the override for `relativePath` and every descendant so
+    /// nothing survives as a floating orphan. Returns the count deleted.
+    @discardableResult
+    public mutating func dropOverrides(under relativePath: String) -> Int {
+        let base = Self.normalize(relativePath)
+        let prefix = base + "/"
+        let before = includeOverrides.count
+        includeOverrides.removeAll { entry in
+            let key = Self.normalize(entry.path)
+            return key == base || key.hasPrefix(prefix)
+        }
+        return before - includeOverrides.count
+    }
+}
+
+/// moves_and_reconciliation.mdx §5.6 / local_storage.mdx §5.6 — a
+/// volume-scoped, move-stable identity for a file or directory. The
+/// `inode` is the durable primary key on a single volume (stable
+/// across a move/rename, **not** across volumes); `documentID` is the
+/// corroborating key that survives an APFS safe-save and distinguishes
+/// a moved document from a copy (nil when the volume does not supply
+/// it). Persisted alongside each cached path so a move that happened
+/// while the app was closed can be reconciled at next launch.
+///
+/// `fileResourceIdentifier` is intentionally **not** modeled here: it
+/// is not durable across restarts and is used only for in-session
+/// equality, so it never reaches disk.
+public struct FileIdentity: Sendable, Equatable, Hashable, Codable {
+    public var volumeID: String
+    public var inode: UInt64
+    public var documentID: UInt64?
+
+    public init(volumeID: String, inode: UInt64, documentID: UInt64? = nil) {
+        self.volumeID = volumeID
+        self.inode = inode
+        self.documentID = documentID
+    }
+
+    /// Read the move-stable identity for a URL, or nil if the file
+    /// system does not supply the required keys (some network volumes).
+    /// The inode comes from `FileManager` attributes (`.systemFileNumber`
+    /// is a `FileAttributeKey`, not a URL resource key); the volume and
+    /// document identifiers come from URL resource values.
+    public static func read(for url: URL) -> FileIdentity? {
+        let fm = FileManager.default
+        guard let attrs = try? fm.attributesOfItem(atPath: url.path),
+              let inodeNum = attrs[.systemFileNumber] as? Int
+        else { return nil }
+        let vals = try? url.resourceValues(
+            forKeys: [.volumeIdentifierKey, .documentIdentifierKey]
+        )
+        // `volumeIdentifier` is an opaque NSCopying; its description is
+        // stable within a boot and adequate as a persisted discriminator
+        // (the FSEvents volume-UUID cursor is the authoritative cross-boot
+        // check — local_storage.mdx §5.8).
+        let volString = (vals?.volumeIdentifier).map { String(describing: $0) } ?? ""
+        let doc = (vals?.documentIdentifier).map { UInt64(bitPattern: Int64($0)) }
+        return FileIdentity(volumeID: volString, inode: UInt64(inodeNum), documentID: doc)
+    }
 }
 
 /// include_checks.mdx §6.2 — render-time view-model bundling the

@@ -1,0 +1,202 @@
+---
+title: Use Case — Moving Files and Directories (No More "Can't Display This Image")
+description: A user-scenario tour of what happens when someone reorganizes their photos while ImageGlass_Mac is tracking them — moving a whole directory of images into a subdirectory, moving loose files between folders, and doing it while the app is closed. Each step lists the exact on-screen outcome and on-disk YAML so the behavior is verifiable. This is the human-facing companion to the moves_and_reconciliation.mdx engineering spec.
+---
+
+# Use Case — Moving Files and Directories
+
+> **Document type:** Use-case tour (verifiable scenarios).
+> **Audience:** PM, QA, and anyone validating that a reorganization on
+> disk does the right thing on screen.
+> **Owns the mechanism:** [moves_and_reconciliation.mdx](../moves_and_reconciliation.mdx).
+> This file is the walkthrough; that file is the contract.
+
+## 0. The Bug We Are Killing
+
+The user loads a folder of photos into the left panel, checks a few of
+them green, and browses. Then they do the most ordinary thing in the
+world — **organize their pictures**: they drag a folder into another
+folder, or move a handful of images somewhere tidier. The old,
+path-based design responded by showing:
+
+> **Can't display this image.**
+
+…on every row that had moved, because the panel still pointed at the
+old paths. The bytes were fine; only the location had changed. This
+tour demonstrates the fixed behavior: the panel **follows** the files,
+**keeps** the green checks, **keeps** the current picture on screen, and
+**never** shows that placeholder for a file that still exists.
+
+## 0.1 Common Preconditions
+
+* One scope root added: `~/Pictures/shoot/`
+  ([mcp_file.mdx §4](./mcp_file.mdx#4-mcp-adds-a-directory)).
+* The panel is in tree mode
+  ([mcp_file.mdx §3](./mcp_file.mdx#3-toggle-into-file-tree-view)).
+* Under `shoot/` there is a subfolder `edited/` with 120 images.
+* The user has clicked the green swatch on 40 of those images
+  (`edited/keeper_001.jpg` … `edited/keeper_040.jpg`), so
+  `directories.yaml` has 40 `include_overrides[]` entries with
+  `state: include`. The other 80 rows are inherited (no entry).
+* One image, `edited/keeper_012.jpg`, is currently selected and showing
+  in the viewer.
+
+## 1. Move a Directory Into a Subdirectory — App Running
+
+### 1.1 Action
+
+In Finder, drag `~/Pictures/shoot/edited/` into
+`~/Pictures/shoot/final/`, producing `~/Pictures/shoot/final/edited/`.
+
+### 1.2 What happens on screen (verify)
+
+* Within ~250 ms the `edited` node **slides** from directly under
+  `shoot` to under `final` — it is a *move* of the existing node, not a
+  disappear-and-reappear. Its expansion state is unchanged.
+* All 40 green swatches are **still green**, now on rows whose paths
+  read `final/edited/keeper_00N.jpg`.
+* The 80 inherited rows are **still inherited**.
+* `keeper_012.jpg` is **still selected** and **still on screen in the
+  viewer** — no re-decode, no flash, and critically **no "Can't
+  display this image."**
+* The viewer title bar updates to the new path.
+
+### 1.3 What happens on disk (verify)
+
+`directories.yaml` shows one logical change — the override keys gained
+the `final/` prefix, the states are untouched:
+
+```yaml
+root_directories:
+  - path: ~/Pictures/shoot
+    filter: { items: [] }
+    include_overrides:
+      - path: final/edited/keeper_001.jpg   # was: edited/keeper_001.jpg
+        state: include
+      # …39 more, all reprefixed, all still `state: include`…
+```
+
+The audit log records the move:
+
+```
+event=move.detected from=~/Pictures/shoot/edited to=~/Pictures/shoot/final/edited children=120 source=live
+```
+
+### 1.4 Why it works
+
+FSEvents delivered two `ItemRenamed` events (old + new) with the same
+inode; the correlator paired them into one `.movedDir`; the scope
+engine reprefixed every resolved path, tree node, and override key
+because `include_overrides[].path` is stored **relative to the root**
+(`moves_and_reconciliation.mdx` §4.4, §5.3). Identity is the inode, so
+nothing was rebuilt.
+
+## 2. Move Loose Files Between Folders — App Running
+
+### 2.1 Action
+
+Drag `final/edited/keeper_012.jpg` (the selected one) and three inherited
+images up into `~/Pictures/shoot/` directly.
+
+### 2.2 Verify
+
+* The four rows move to sit directly under `shoot`.
+* `keeper_012.jpg` keeps its green check (now `path: keeper_012.jpg`)
+  and stays selected and on screen.
+* The three inherited files stay inherited under their new parent.
+* No placeholder, no thumbnail regeneration (inodes unchanged).
+
+## 3. Move Something OUT of Scope — App Running
+
+### 3.1 Action
+
+Drag `final/edited/keeper_040.jpg` to `~/Desktop/` (outside every
+watched root).
+
+### 3.2 Verify
+
+* The row leaves the panel; selection advances to the next in-scope
+  image.
+* Its `include_overrides[]` entry is **deleted** — the check does not
+  survive as a floating orphan.
+* If the user later drags that same file back under `shoot/`, it
+  returns as an **inherited** row (no green check) until they re-check
+  it. This is the product rule: *out of scope ⇒ inherit mode.*
+
+## 4. Reorganize While the App Is CLOSED
+
+### 4.1 Action
+
+Quit ImageGlass_Mac. In Finder, move `~/Pictures/shoot/final/edited/`
+back out to `~/Pictures/shoot/edited/`, and move ten loose images
+around. Relaunch ImageGlass_Mac.
+
+### 4.2 Verify — instant paint, then convergence
+
+* The panel appears **immediately**, painted from the cached
+  `last_known_files` list, so the workspace is visible with no spinner-
+  gated blank screen.
+* A thin strip reads **"Updating file list… (checked N of M folders)."**
+  The panel is fully usable while it runs.
+* Within a second or two, the `edited` node is back under `shoot`, the
+  40 checks are green again at the restored paths, and the ten loose
+  moves are reflected. The strip disappears.
+
+### 4.3 Why it works
+
+At launch the watcher validated each root's stored
+`(lastEventId, volumeUUID)` and **replayed the FSEvents journal**,
+which persists per-volume across quits and reboots — the offline moves
+came back as the same `ItemRenamed` pairs and were correlated by inode.
+Where the journal was insufficient (coalesced, dropped, or the cursor
+invalid), the **async reconciliation scan** enumerated the subtree and
+diffed it against `last_known_files` by identity
+(`moves_and_reconciliation.mdx` §7). `directories.yaml` was repaired in
+a single settled write.
+
+## 5. Move the Whole Root While Closed
+
+### 5.1 Action
+
+Quit. In Finder, move `~/Pictures/shoot/` itself to
+`~/Pictures/2026/shoot/`. Relaunch.
+
+### 5.2 Verify
+
+* The scope comes up pointing at the **new** location automatically —
+  no "Find it…" prompt — because the root's **security-scoped
+  bookmark** tracks the inode and resolved to the new path
+  (`moves_and_reconciliation.mdx` §4.5, §7.5).
+* Because every item kept its position *under* the root, **no override
+  keys changed** — only the root `path:` was rewritten. All 40 checks
+  are still green.
+* The audit log shows `event=root.relocated old=~/Pictures/shoot new=~/Pictures/2026/shoot via=bookmark`.
+
+### 5.3 The unhappy fallback
+
+If the bytes truly cannot be found (moved to a disconnected volume,
+deleted), the root shows a non-destructive banner — *"Source folder is
+no longer available. Showing the last known contents."* — with a
+**"Find it…"** button. The last-known list stays visible, dimmed;
+nothing is lost. Pointing the picker at the new location re-mints the
+bookmark and rewrites the path.
+
+## 6. Acceptance
+
+This tour passes when **all of**:
+
+1. §1 — a directory moved into a subdirectory reparents in place, keeps
+   all 40 green checks at new paths, keeps the selected image on screen,
+   and produces the reprefixed `include_overrides[]` and the
+   `move.detected` audit line — with **no "Can't display this image."**
+2. §2 — loose file moves re-target rows and preserve check + selection.
+3. §3 — a move out of scope deletes the override and returns the item as
+   inherited if it comes back.
+4. §4 — an offline reorganization paints instantly from cache, then
+   converges via journal replay / reconciliation scan, with checks and
+   layout restored.
+5. §5 — a root moved while closed is recovered via its bookmark with
+   zero override churn; an unrecoverable root shows the non-destructive
+   "Find it…" banner.
+6. No step regenerates thumbnails or re-decodes an image whose inode is
+   unchanged.

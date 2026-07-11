@@ -507,6 +507,78 @@ public final class DirectoriesStore: @unchecked Sendable {
         return file.roots.count
     }
 
+    /// moves_and_reconciliation.mdx §4.4 / §5.2 / include_checks.mdx §12A.1
+    /// — apply an **in-tree move** to the include state: an item (and its
+    /// subtree) at root-relative path `fromRelative` moved to
+    /// `toRelative` under the same root. Reprefixes the matching
+    /// `include_overrides[]` keys so every explicit green check / exclude
+    /// is carried forward to the new location; states are untouched. One
+    /// atomic write. Returns the number of override entries rewritten
+    /// (0 when `fromRelative == toRelative`, e.g. a pure root relocation).
+    @discardableResult
+    public func applyInTreeMove(
+        rootPath: URL,
+        fromRelative: String,
+        toRelative: String
+    ) throws -> Int {
+        let _trace = PerformanceLog.shared.start("LocalStorage.MutateDirectories")
+        defer { _trace.finish() }
+        lock.lock()
+        defer { lock.unlock() }
+        var file = (try? loadUnlocked()) ?? DirectoriesFile()
+        guard let idx = file.roots.firstIndex(where: { $0.path == rootPath }) else {
+            throw DirectoriesStoreError.pathNotFound(rootPath.path)
+        }
+        let n = file.roots[idx].rewriteOverridePaths(
+            fromRelative: fromRelative, toRelative: toRelative
+        )
+        if n > 0 { try saveUnlocked(file) }
+        return n
+    }
+
+    /// moves_and_reconciliation.mdx §5.4 / include_checks.mdx §12A.3 —
+    /// an item that moved **out of scope** loses its explicit check.
+    /// Deletes the override for `relativePath` and every descendant.
+    /// One atomic write. Returns the count deleted.
+    @discardableResult
+    public func dropOverridesOutOfScope(
+        rootPath: URL,
+        relativePath: String
+    ) throws -> Int {
+        let _trace = PerformanceLog.shared.start("LocalStorage.MutateDirectories")
+        defer { _trace.finish() }
+        lock.lock()
+        defer { lock.unlock() }
+        var file = (try? loadUnlocked()) ?? DirectoriesFile()
+        guard let idx = file.roots.firstIndex(where: { $0.path == rootPath }) else {
+            throw DirectoriesStoreError.pathNotFound(rootPath.path)
+        }
+        let n = file.roots[idx].dropOverrides(under: relativePath)
+        if n > 0 { try saveUnlocked(file) }
+        return n
+    }
+
+    /// moves_and_reconciliation.mdx §4.5 / §7.5 / include_checks.mdx §12A.2
+    /// — a watched **root** was relocated (moved/renamed) while every
+    /// item kept its position under the root. Rewrites the root's `path:`
+    /// to `newPath`; because items are unmoved relative to the root, the
+    /// `include_overrides[]` keys are untouched (zero override churn).
+    /// One atomic write. Returns false if `oldPath` is not a known root.
+    @discardableResult
+    public func relocateRoot(oldPath: URL, newPath: URL) throws -> Bool {
+        let _trace = PerformanceLog.shared.start("LocalStorage.MutateDirectories")
+        defer { _trace.finish() }
+        lock.lock()
+        defer { lock.unlock() }
+        var file = (try? loadUnlocked()) ?? DirectoriesFile()
+        guard let idx = file.roots.firstIndex(where: { $0.path == oldPath }) else {
+            return false
+        }
+        file.roots[idx].path = newPath
+        try saveUnlocked(file)
+        return true
+    }
+
     /// Update the cached `last_walked` timestamp for one root after the
     /// walker completes a pass.
     public func setLastWalked(path: URL, at date: Date) throws {

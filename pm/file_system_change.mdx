@@ -342,6 +342,7 @@ public enum ChangeEvent: Sendable, Equatable {
     case removed(URL, inode: UInt64?)
     case modified(URL, inode: UInt64?)
     case renamed(from: URL, to: URL, inode: UInt64?)
+    case movedDir(from: URL, to: URL, inode: UInt64?)  // dir whose subtree moves with it (§7.23, moves_and_reconciliation.mdx §4.1)
     case attributesChanged(URL)
     case rootDisappeared(URL)        // watched root deleted / unmounted
     case rootReappeared(URL)         // watched root re-mounted
@@ -1217,6 +1218,107 @@ before; emits the consolidated event set.
 
 **Stage 5.** Panel applies the diff. MCP returns the diff
 summary to the caller.
+
+### 7.23 A directory of images is moved into a subdirectory (the headline move)
+
+**Trigger.** Scope root is `~/Pictures/shoot/`. The user drags
+`~/Pictures/shoot/edited/` (120 images, 40 green-checked) into
+`~/Pictures/shoot/final/`, producing `~/Pictures/shoot/final/edited/`.
+
+**Stage 1.** With the stream created using
+`kFSEventStreamCreateFlagFileEvents | …UseExtendedData`, FSEvents fires
+`ItemRenamed | ItemIsDir` for **both** `…/edited` (old, now gone) and
+`…/final/edited` (new), each dictionary carrying the **same extended
+file ID** (inode). The two halves may be non-adjacent and out of order
+within the batch.
+
+**Stage 2.** Each becomes a tentative `ItemRenamed` with its inode.
+
+**Stage 2.5 (new — correlate).** `MoveCorrelator.pair(_:)` groups the
+window's `ItemRenamed` events by inode, confirms the old path no
+longer `stat`s and the new one does, and synthesizes one
+`.movedDir(from: …/edited, to: …/final/edited, identity:)`. Per-child
+rename events (if the filesystem emits any — APFS usually emits only
+the directory event) are dropped because their new paths are
+prefix-covered by the moved directory.
+
+**Stage 3.** Standard window; the single `.movedDir` passes through.
+
+**Stage 4.** ScopeEngine runs the **subtree path-rewrite**
+(`moves_and_reconciliation.mdx` §4.4): every resolved-list URL, tree
+node, and `include_overrides[]` entry prefixed by the old directory
+path is rewritten to the new prefix. The 40 checks keep their
+`state: include`; only their `path:` key changes from `edited/…` to
+`final/edited/…`. Inodes are unchanged → **thumbnails are not
+regenerated**.
+
+**Stage 5.** Panel reparents the `edited` node under `final` in one
+diff; expansion, selection, and the green-check column ride along
+because row/node identity is the inode, not the path
+(`dir_ui.mdx` §4.2). If the focused image was inside `edited/`, it
+stays selected and on screen with **no re-decode**. MCP publishes
+`fs.changed { movedDir: { from, to } }`.
+
+**What the user sees.** The folder appears in its new place, still
+checked exactly as before, the current picture still on screen. **No
+`Can't display this image`.** This scenario is the specific failure
+this whole design eliminates — see `moves_and_reconciliation.mdx` §1.
+
+**Corner cases.** Move + rename in one gesture (§8.1 there); move into
+an excluded destination → treated as move-out-of-scope; cross-volume
+move → §7.25.
+
+### 7.24 Files or folders moved while the app was CLOSED (reconciliation)
+
+**Trigger.** The app is quit. The user reorganizes photos in Finder —
+moving a whole folder into a subdirectory, moving loose images between
+folders. Later they launch ImageGlass_Mac.
+
+**Stage 1 (journal replay).** At launch the watcher validates each
+root's persisted `(lastEventId, volumeUUID)` (§5.4 — UUID must match
+and the ID must not be ahead of the volume). When valid, the stream is
+created with `sinceWhen: lastEventId`; the kernel **replays the
+`ItemRenamed` pairs that occurred while we were dead**, terminated by
+`HistoryDone`. These flow through §7.23's correlator and re-target the
+moved items exactly as a live move would.
+
+**Stage 1′ (scan fallback).** If replay is impossible or insufficient —
+UUID mismatch, `MustScanSubDirs`, `UserDropped`/`KernelDropped`,
+`EventIdsWrapped`, or a `last_known_files` entry that fails to `stat` at
+its recorded path — that root is queued for the **async reconciliation
+scan** (`moves_and_reconciliation.mdx` §7.4), which enumerates the
+current subtree, diffs it against `last_known_files` by identity, and
+re-targets moved rows / rewrites override keys just like a live event.
+
+**Stage 5.** The panel paints instantly from `last_known_files` at
+launch, shows a non-blocking "Updating file list…" strip while the scan
+runs (`dir_ui.mdx` §4.2), and converges row-by-row. A root that cannot
+be located at all falls back to §7.10's stale banner, now with a
+"Find it…" button.
+
+The full offline design — the coordinator, the identity diff, locating
+a vanished file by bookmark/Spotlight, and the single settled write —
+lives in `moves_and_reconciliation.mdx` §7.
+
+### 7.25 A cross-volume move (inode not preserved)
+
+**Trigger.** A watched file/folder is moved from the internal disk to
+an in-scope external SSD (or vice-versa). macOS implements this as
+**copy-then-delete**, so the destination gets a **new inode** — the
+inode link between old and new is broken.
+
+**Stage 2.5.** Inode correlation finds no pair. `MoveCorrelator`
+falls back to the **heuristic correlator** (`moves_and_reconciliation.mdx`
+§4.6): match the vanished path to the appeared path by content
+fingerprint (size + head/tail hash), then `(size, mtime, basename)`.
+
+**Stage 4/5.** A high-confidence content match is applied as a move
+that **carries the green check** forward; a low-confidence (basename-
+only) match re-targets the row and selection but **drops the explicit
+check to inherit** (`moves_and_reconciliation.mdx` §5.5) — we never
+assert a user's checkmark onto bytes we are not sure are the same. If
+nothing correlates, it degrades cleanly to remove-at-old + add-at-new
+(the file still appears, as a fresh inherited row).
 
 ---
 

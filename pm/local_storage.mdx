@@ -433,6 +433,81 @@ the truth about what is currently on disk:
 This means `resolved_files` can be safely deleted at any time without
 losing user intent — the next evaluation will rebuild it.
 
+### 5.6 File Identity — the Move-Stable Key
+
+Paths locate a file; they do not identify it. To survive moves
+(`moves_and_reconciliation.mdx` §2) the store persists, next to each
+cached path, a **volume-scoped identity** that is stable across a
+move/rename on the same volume:
+
+```yaml
+id: { vol: "5B1C…UUID", inode: 84213, doc: 90112 }
+```
+
+* `vol` — `URLResourceKey.volumeIdentifierKey`, stringified. Required
+  because inode numbers are only unique within one volume.
+* `inode` — `URLResourceKey.fileSystemFileNumberKey` (`st_ino`). The
+  durable primary key on a single volume; **stable across a move**,
+  **not** stable across volumes (a cross-volume move is copy+delete).
+* `doc` — `URLResourceKey.documentIdentifierKey` (optional). Survives
+  an APFS safe-save (`replaceItemAt`, which swaps the inode but keeps
+  the path) and is not copied to duplicates; used to see through
+  safe-saves and to tell a moved document from a copy.
+
+`fileResourceIdentifierKey` is **not** persisted — Apple documents it
+as non-durable across restarts; it is used only for in-session
+equality.
+
+### 5.7 Reconciliation Write Discipline
+
+The boot-time reconciler (`moves_and_reconciliation.mdx` §7) may
+re-target hundreds of rows after an offline reorganization. It must
+**not** thrash the file:
+
+* All repairs accumulate in the in-memory model
+  (`AppState.walkerRoots`); the reconciler writes `directories.yaml`
+  **once** when the scan of all roots completes (or on a 5 s coalescing
+  timer for very long scans), through the normal atomic path (§6).
+* The write is byte-stable: `last_known_files[]` is emitted in the
+  walker's canonical sort order so a reconcile that changed nothing
+  produces a zero-byte diff.
+* Reconciliation is idempotent (`moves_and_reconciliation.mdx` §7.8):
+  after one pass every `last_known_files` entry `stat`s to its recorded
+  path, so a second pass writes nothing.
+
+### 5.8 `last_known_files[]` Schema
+
+`directories.yaml` gains one optional per-root cache block, distinct
+from the scope-engine `resolved_files` (§5.5) in that it stores
+**identities**, which the reconciler needs to correlate moves:
+
+```yaml
+root_directories:
+  - path: ~/Pictures/shoot
+    filter: { items: [] }
+    last_walked: 2026-07-11T09:00:00Z
+    include_overrides:
+      - path: edited/keeper.jpg
+        state: include
+    last_known_files:                 # § 5.8 — cache, not truth
+      - rel: edited/keeper.jpg
+        id: { vol: "5B1C…", inode: 84213, doc: 90112 }
+      - rel: edited/snap.jpg
+        id: { vol: "5B1C…", inode: 84214 }
+```
+
+* `rel` — path **relative to the root**, forward slashes, matching the
+  `include_overrides[]` convention so a subtree move rewrites both with
+  the same prefix operation.
+* `id` — the §5.6 identity. `doc` omitted when the volume does not
+  supply a document identifier.
+
+The block is optional and is a pure cache: if it is missing, stale, or
+corrupt the reconciler falls back to a full walk
+(`moves_and_reconciliation.mdx` §7.6) and rebuilds it. It is written on
+clean quit and after every settled live change. A v1 reader ignores it;
+a v2 reader treats its absence as "no cache, must scan."
+
 ---
 
 ## 6. Atomicity and Concurrency

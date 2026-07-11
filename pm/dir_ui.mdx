@@ -189,6 +189,64 @@ events for the directories named in the active scope. On a change:
 4. The current selection is preserved if the file still exists; if it
    was removed, selection moves to the nearest surviving sibling.
 
+### 4.2 Auto-Update on Moves (Files and Directories)
+
+The panel must follow files and folders when they move, in place,
+without a manual refresh and without losing state. This is the UI half
+of `moves_and_reconciliation.mdx`; the detection/data half lives there.
+
+**Identity, not path, is the row/node key.** The `List`/`Table` row
+identity and the `OutlineGroup` node identity are the item's
+`FileIdentity` (inode+volume), **not** its path string. The direct
+consequence: "the same folder, now under a different parent" renders as
+a **move** of an existing node, so its expansion state, its subtree's
+rendered rows, the selection on it, the include-swatch column, and any
+in-flight thumbnail all **ride along** to the new location. It is never
+a delete-then-insert, which would blink the node out and drop that
+state.
+
+**What auto-updates, and how:**
+
+* **A directory moved into a subdirectory** (the headline case,
+  `file_system_change.mdx` §7.23): the node reparents in one structured
+  diff. Green checks on it and its descendants stay green at their new
+  paths (the `include_overrides[]` keys are rewritten by prefix,
+  `include_checks.mdx` §12). Inherited rows stay inherited and now
+  resolve from their new ancestor chain.
+* **A loose file moved between folders:** the row moves; if it was the
+  viewer's focused image it stays selected and on screen with no
+  re-decode (§5, `file_system_change.mdx` §7.4).
+* **A directory created / deleted / renamed:** node inserted / removed /
+  relabeled in the same incremental diff (never a full collapse).
+* **A file moved out of scope:** its row leaves; selection advances to
+  the successor; its explicit check is dropped (returns as `inherit` if
+  it ever comes back — `include_checks.mdx` §12).
+
+**The reconciliation status strip (offline moves).** When the app
+launches after files were reorganized while it was closed, the panel:
+
+1. Paints **immediately** from `last_known_files` (`local_storage.mdx`
+   §5.8) so the workspace is visible instantly — even if some paths are
+   momentarily stale.
+2. Shows a thin, non-blocking strip at the bottom of the directory
+   panel: **"Updating file list… (checked *N* of *M* folders)."** The
+   panel stays fully interactive; rows re-target live as the background
+   reconciler resolves each one.
+3. For a root that cannot be located at all, shows the
+   `file_system_change.mdx` §7.10 stale banner **plus a "Find it…"
+   button** that opens an `NSOpenPanel`; picking the new location
+   re-mints the security-scoped bookmark and rewrites the root path.
+
+**Hide-empty interaction.** A move that empties a shown directory
+removes that node in the same diff when "Hide Empty Directories" is on,
+or leaves it as an empty folder when off; a move that fills a
+previously-empty hidden directory makes it appear
+(`moves_and_reconciliation.mdx` §6.5).
+
+**The hard guarantee.** No move — of any size, running or offline —
+may drop the user onto *Can't display this image*. That placeholder is
+reserved for genuinely unreadable bytes, never a stale path.
+
 ---
 
 ## 5. Selection and Image Preview

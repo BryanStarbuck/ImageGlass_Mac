@@ -1248,6 +1248,72 @@ against the `~/Pictures/tour/` fixture from §0.
 
 ---
 
+## 12A. Include State Across Moves
+
+When a file or directory **moves** — in Finder, from another app, or
+while ImageGlass_Mac is closed — its include state must follow it. This
+is the normative rule; the detection and reconciliation machinery lives
+in [moves_and_reconciliation.mdx](../moves_and_reconciliation.mdx) §5.
+
+The rule, stated in the product owner's words: *"If it has an active
+check to track it, the green fill, then we carry that forward. If it's
+just an inherit state, we leave that as inherit. If files move out of
+it and into a different directory, it'll always be in inherit mode."*
+
+### 12A.1 In-tree move — explicit state carried forward
+
+Because `include_overrides[].path` is stored **relative to the root**
+(§5.3, chosen for exactly this portability), a move that changes an
+item's position under its root rewrites the override **key** and keeps
+the **state**:
+
+```
+oldRel = OLD.relativeTo(root)     # "edited"
+newRel = NEW.relativeTo(root)     # "final/edited"
+for entry where entry.path == oldRel or entry.path.hasPrefix(oldRel + "/"):
+    entry.path = newRel + entry.path.dropPrefix(oldRel)   # state unchanged
+```
+
+A row with `state: include` (green check) keeps `state: include`; only
+its `path` moves from `edited/keeper.jpg` to `final/edited/keeper.jpg`.
+A row with **no** entry (inherit) still has no entry — it now inherits
+from its new ancestor chain, which is the correct meaning of "follow my
+parent."
+
+### 12A.2 Pure root relocation — zero override churn
+
+If a **root's** parent moves but items keep their position *under* the
+root, `oldRel == newRel` for every override, so **no override keys
+change at all** — only the root's `path:` is rewritten
+(`moves_and_reconciliation.mdx` §4.5). This is the payoff of storing
+overrides relative to the root promised in §5.3.
+
+### 12A.3 Move out of scope — drop to inherit
+
+An item moved to a destination **not under any watched root** has its
+`include_overrides[]` entry **deleted**. An override is meaningful only
+relative to a root; once the item is rootless the entry has no anchor
+and is not kept as a floating orphan. If that directory later returns
+to scope, its rows start as `inherit` unless the user re-checks them —
+exactly the product owner's "always in inherit mode" requirement.
+
+### 12A.4 Low-confidence / cross-volume move — bias to inherit
+
+A cross-volume move (copy+delete → new inode) or any move matched only
+by a weak heuristic (basename alone) re-targets the row and preserves
+**selection**, but **drops the explicit check to inherit** and deletes
+the override entry (`moves_and_reconciliation.mdx` §5.5). We carry a
+green check forward only when we are confident (inode match, or a
+high-confidence content match) that the very same bytes moved — we
+never assert a user's checkmark onto a file we are not sure is theirs.
+
+### 12A.5 `default_include_state` does not travel with subtrees
+
+`default_include_state` is a root-level field. A relocated
+*subdirectory* keeps its own explicit override (if any) and its
+descendants keep theirs; the root default is untouched. Only a whole-
+*root* move carries `default_include_state` with the root record.
+
 ## 13. End-to-End Acceptance
 
 A run of this tour passes when **all of**:
@@ -1299,6 +1365,11 @@ A run of this tour passes when **all of**:
 * §12 — the real-world rehearsal against
   `~/Pictures/tour/beach/notes_old.png` produces the predicted
   YAML, log lines, and on-screen variants at each step.
+* §12A — a move preserves an explicit green check at the item's
+  new path (override key rewritten by prefix, state unchanged);
+  keeps an inherited row inherited; and drops the explicit check
+  to `inherit` when the item moves out of scope or is only matched
+  by a low-confidence heuristic.
 
 If any step fails, the failing line in `log.log` (with its
 `corr=` correlation id) is the first place to look — `grep

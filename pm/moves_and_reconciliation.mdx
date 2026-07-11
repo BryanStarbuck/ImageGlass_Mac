@@ -1,0 +1,933 @@
+---
+title: File & Directory Moves and Reconciliation
+description: Product and engineering specification for how ImageGlass_Mac detects, tracks, and recovers from file and directory MOVES — including a whole directory of images relocated into a subdirectory, moves across the scope boundary, and moves that happen while the app is not running. Covers move detection (inode/fileID correlation, FSEvents rename pairing, security-scoped bookmark recovery), the boot-time reconciliation scan, how the include/inherit state and the resolved file list are carried forward, how the left panel auto-updates, how the on-disk YAML is repaired, and the "Can't display this image" failure that this whole design exists to eliminate.
+---
+
+# File & Directory Moves and Reconciliation
+
+> **Document type:** Product + engineering specification.
+> **Audience:** Engineering (file-watcher, scope engine, reconciliation
+> scanner, Local Storage, panel) and Product (behavior contract for
+> what the user sees when files and folders move, both while the app is
+> running and while it is closed).
+> **Owners:** PM owns the user-visible outcome — "the left bar just
+> follows my files, my green checks stay put, and I never see *Can't
+> display this image* because a folder moved." CTO owns the detection
+> strategy, the correlation keys, the reconciliation algorithm, and the
+> failure semantics.
+> **Status:** v1 spec for the Mac-native fork. This document is the
+> authoritative cross-cutting reference for MOVE handling. It sits on
+> top of and coordinates the four specs that own the individual pieces.
+
+Cross-references:
+
+* [File System Change Notifications](./file_system_change.mdx) — the
+  live event engine. This spec adds the move-specific event
+  (`.movedDir`), the correlation logic (§4), and the boot replay
+  (§7) that `file_system_change.mdx` §7.23–§7.25 point back to.
+* [Directory Panel UI](./dir_ui.mdx) — the left bar that must
+  auto-update in place when files and folders move (§6, and
+  `dir_ui.mdx` §4.2).
+* [Local Storage](./local_storage.mdx) — `directories.yaml`, the
+  `last_known_files` cache, and the reconciliation journal that this
+  spec reads and repairs (§5, §7, and `local_storage.mdx` §5.6–§5.8).
+* [Per-Row Include / Inherit / Don't-Include](./use_cases/include_checks.mdx)
+  — the green check / inherit state whose carry-forward rule across a
+  move is specified in §5 here and in `include_checks.mdx` §12.
+* [Error Handling](./error_handling.mdx) — the audit and error events
+  emitted by the reconciler (§9, and `error_handling.mdx` §6 event set).
+* [MCP Server](./mcp.mdx) — the `reconcile_now` / `get_reconcile_status`
+  tools (§10).
+
+The Mac stack used throughout: **Swift 6 + Swift Concurrency**
+(`actor`, `Task`, `TaskGroup`, `AsyncStream`), **CoreServices
+FSEvents** with extended data (`kFSEventStreamCreateFlagUseExtendedData`
+→ per-event file IDs) as the primary move detector, **`URLResourceKey`
+identity keys** (`.fileResourceIdentifierKey`,
+`.fileSystemFileNumberKey`, `.volumeIdentifierKey`) as the correlation
+keys, **security-scoped bookmarks** (`URL.bookmarkData` /
+`URL(resolvingBookmarkData:)`) as the moved-root recovery mechanism,
+and **`NSMetadataQuery` (Spotlight)** as the last-resort locator when
+inode correlation fails.
+
+---
+
+## 1. The Problem This Spec Exists To Fix
+
+### 1.1 The observed failure
+
+A user has a directory of images loaded into the panel. In Finder — or
+from another app, or the command line — they **move that whole
+directory into a subdirectory** (for example, `~/Pictures/shoot/`
+becomes `~/Pictures/2026/shoot/`), or they drag a handful of images
+from one folder into another. Later, the viewer shows:
+
+> **Can't display this image.**
+
+The panel is still pointing at the *old* paths. The bytes are fine —
+they just live somewhere else now. Every one of those rows is a
+dangling reference to a path that no longer resolves. Selecting the row
+hands the viewer a URL that `CGImageSourceCreateWithURL` cannot open,
+so it renders the failure placeholder. This is the single worst
+first-impression bug a file-centric viewer can have, because the user
+did a completely ordinary thing (organizing their photos) and the app
+broke.
+
+### 1.2 Why the naïve design breaks
+
+The panel and `directories.yaml` remember files and folders **by
+path**. A path is not an identity — it is a *location*. The moment
+something moves, the path is stale, and every structure keyed on that
+path (the resolved file list, the tree nodes, the `include_overrides[]`
+entries, the currently-selected row, the viewer's focused URL) is now
+wrong. Three distinct things have to happen and, before this spec, none
+of them did well:
+
+1. **Detect** that a move happened (not a delete + unrelated create).
+2. **Re-target** every structure from the old path to the new path,
+   *carrying the state* (selection, green check, expansion) forward.
+3. **Do all of this even if the move happened while the app was
+   closed**, discovered lazily at next launch.
+
+### 1.3 The design goal, stated as a contract
+
+> When a file or directory that ImageGlass_Mac is tracking moves —
+> whether the app is running or not, whether it moves within a watched
+> tree, into a subdirectory, across watched roots, or out of scope
+> entirely — the panel converges to the truth on disk with the user's
+> intent preserved: an explicitly-checked (green-fill) item stays
+> checked at its new location; an inherited item stays inherited; the
+> selected image stays selected; and the viewer never shows *Can't
+> display this image* for a file that still exists somewhere reachable.
+
+Everything below is in service of that one sentence.
+
+### 1.4 Scope of "move" in this document
+
+| Term | Meaning here |
+| --- | --- |
+| **Rename** | Same parent directory, new last path component. (`file_system_change.mdx` §7.4 / §7.8 own the in-place case; this spec generalizes it.) |
+| **Move** | New parent directory, same or different name. Same volume ⇒ inode preserved. |
+| **Relocation into a subdirectory** | The headline case in §1.1: a tracked directory becomes a child of one of its former siblings or of a new folder. |
+| **Cross-root move** | A file/dir moves from inside watched root A to inside watched root B. |
+| **Move out of scope** | Destination is not inside any watched root. Becomes a scope removal (§5.4). |
+| **Move in from out of scope** | Source was untracked; destination is inside a watched root. Becomes a plain add (`file_system_change.mdx` §7.1). |
+| **Cross-volume move** | Destination on a different volume. The OS implements this as copy-then-delete, so the inode is **not** preserved — correlation degrades to content/name (§4.6). |
+
+---
+
+## 2. Identity, Not Path — The Core Principle
+
+The whole design rests on one decision: **track a stable identity
+alongside the path, and treat the path as a cache of where that
+identity currently lives.**
+
+### 2.1 The identity we use
+
+On APFS and HFS+, every file and directory has a **file ID** (the inode
+number, `st_ino`) that is **stable across a move or rename within the
+same volume**. macOS surfaces it three compatible ways; we use them in
+this order of preference:
+
+1. **`URLResourceKey.fileResourceIdentifierKey`** →
+   `fileResourceIdentifier` — an opaque `NSCopying` object that is
+   equal for two URLs iff they name the same file, and is stable
+   across moves on the same volume. This is our canonical *in-memory*
+   key, but Apple explicitly documents that it is **not persistent
+   across system restarts**, so it is never written to disk.
+2. **`URLResourceKey.fileSystemFileNumberKey`** → the raw inode
+   (`UInt64`), paired with **`URLResourceKey.volumeIdentifierKey`** to
+   disambiguate identical inode numbers on different volumes. This
+   `(volumeID, inode)` tuple is what we **persist** to disk, because
+   `fileResourceIdentifier` is not serializable across launches.
+3. **`URLResourceKey.documentIdentifierKey`** (macOS 10.10+) → a
+   per-document ID that APFS/Foundation **preserves across a move
+   *and* across an atomic safe-save (`replaceItemAt`)**, and that is
+   **not** copied to a duplicate. It is our *corroborating* durable
+   key, used to (a) distinguish "the same document moved" from "a copy
+   appeared," and (b) **see through an APFS safe-save**, which keeps
+   the path but swaps the inode (§8.15) — the exact inverse of a move
+   and the one case where inode identity lies. We persist it alongside
+   the inode when available.
+4. **FSEvents extended file ID** — when the watcher is created with
+   `kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagUseExtendedData`,
+   each event is a dictionary carrying `kFSEventStreamEventExtendedFileIDKey`
+   (the inode) alongside `kFSEventStreamEventExtendedDataPathKey`. This
+   is what lets the live watcher pair the two halves of a move (§4.2).
+   `FileEvents` (per-item granularity) is macOS 10.7+; `UseExtendedData`
+   / the extended-file-ID key are macOS 10.13+. Both are far below our
+   macOS 14 floor.
+
+We define the persisted identity type:
+
+```swift
+/// A volume-scoped, move-stable identity for a file or directory.
+/// Persisted in directories.yaml so a move that happened while the
+/// app was closed can be reconciled at next launch (§7). `inode` is
+/// the durable primary key on a single volume; `documentID` is the
+/// corroborating key that survives APFS safe-saves and distinguishes
+/// moves from copies (nil when the volume does not supply it).
+public struct FileIdentity: Sendable, Equatable, Hashable, Codable {
+    public var volumeID: String    // volumeIdentifierKey, stringified
+    public var inode: UInt64       // fileSystemFileNumberKey (st_ino)
+    public var documentID: UInt64? // documentIdentifierKey, if present
+}
+```
+
+### 2.2 What is truth and what is cache
+
+| Structure | Role | Survives a move? |
+| --- | --- | --- |
+| `FileIdentity` `(volumeID, inode)` | **Truth** — the durable identity | Yes (same volume) |
+| Absolute path (`RootDirectory.path`) | Cache of current location | Rewritten on move |
+| Root-relative override path (`include_overrides[].path`) | Cache of a node's position under its root | Rewritten on in-tree move (§5.3) |
+| `last_known_files[]` | Cache of the resolved list for offline diffing (§7.3) | Rebuilt / repaired on reconcile |
+| Tree node URLs, selection, expansion | Derived UI state | Re-targeted by identity |
+
+The rule that falls out of this table: **whenever a path changes, we do
+not discard the row — we look up its identity and rewrite the path in
+place.** Discarding is what produced *Can't display this image*.
+
+### 2.3 Why not just re-scan everything every time?
+
+A full re-walk on every change is correct but not acceptable: it loses
+UI state (selection, scroll, expansion, the *distinction* between an
+explicit green check and an inherited one), it churns thumbnails, and
+on a 40,000-file scope it is slow enough to be visible. Identity-based
+re-targeting is O(changed items); a full rescan is the fallback we use
+only when identity correlation is impossible (§7.6, history dropped).
+
+---
+
+## 3. The Two Regimes: App Running vs. App Closed
+
+There are exactly two worlds, and the design handles each with a
+different mechanism that converges on the same data model.
+
+```
+┌──────────────────────────────┬───────────────────────────────────────┐
+│ APP IS RUNNING                │ APP IS CLOSED                         │
+│ (live regime — §4)            │ (offline regime — §7)                 │
+├──────────────────────────────┼───────────────────────────────────────┤
+│ FSEvents delivers the move    │ Nothing is delivered; we were dead.   │
+│ as it happens. We pair the    │ At next launch we (a) replay the      │
+│ two rename halves by inode    │ FSEvents historical journal via the   │
+│ and re-target in place,       │ persisted last-event-ID, and, when    │
+│ typically < 250 ms.           │ that is insufficient, (b) run the     │
+│                               │ async reconciliation scan that diffs  │
+│                               │ last_known_files against the disk and │
+│                               │ correlates survivors by identity.     │
+└──────────────────────────────┴───────────────────────────────────────┘
+```
+
+Both regimes end at the same three write points: the in-memory
+`AppState.walkerRoots`, the on-disk `directories.yaml`, and the MCP
+change stream. The user cannot tell which regime handled a given move —
+that is the point.
+
+---
+
+## 4. Live Move Detection (App Running)
+
+This section extends `file_system_change.mdx`. It assumes that spec's
+layered watcher, debounce window, and response chain, and specifies the
+move-specific additions.
+
+### 4.1 The new event type
+
+`file_system_change.mdx` §4.2's `ChangeEvent` gains one case and its
+existing `.renamed` case is now understood to cover both same-parent
+rename and cross-parent move:
+
+```swift
+public enum ChangeEvent: Sendable, Equatable {
+    // …existing cases…
+    case renamed(from: URL, to: URL, identity: FileIdentity?)   // file OR dir, any parent
+    case movedDir(from: URL, to: URL, identity: FileIdentity?)  // directory whose subtree moves with it
+    // …
+}
+```
+
+`.renamed` and `.movedDir` differ only in the downstream handling: a
+`.movedDir` triggers the **subtree path-rewrite** (§4.4), a `.renamed`
+of a plain file rewrites a single row. The watcher classifies by
+`isDirectory` on the destination.
+
+### 4.2 Pairing the two halves of a move
+
+FSEvents does **not** hand us a `(from, to)` pair. A move within a
+watched tree is delivered as **two** events: the old path flagged
+`kFSEventStreamEventFlagItemRenamed` and the new path also flagged
+`ItemRenamed`. Two hard facts from the API shape the algorithm: the
+two halves are **not guaranteed to be adjacent or in order** within a
+batch (FSEvents may reorder and coalesce — e.g. `mv a b; mv b c`
+collapses to fewer events), and the from→to pairing is **never
+supplied**. We must pair them ourselves, keyed on the inode from
+extended data. The algorithm, run inside the debounce window (Stage 3
+of the response chain), over the *whole* window's event set (not
+pairwise-adjacent):
+
+1. Collect all `ItemRenamed` events in the window into a working set,
+   each carrying its extended file ID (inode).
+2. Partition by inode. An inode that appears with a path that **no
+   longer exists on disk** (old side) and a path that **does exist**
+   (new side) is a confirmed move → synthesize `.renamed` / `.movedDir`
+   `(from: oldPath, to: newPath, identity: (volumeID, inode))`.
+3. An `ItemRenamed` inode that resolves to **only a vanished path** is a
+   move *out* of the watched tree → `.removed` (§5.4).
+4. An `ItemRenamed` inode that resolves to **only a new path** is a move
+   *in* from outside → `.added` (a plain insertion).
+5. If extended data is unavailable (pre-10.13, or a filesystem that
+   does not supply file IDs), fall back to the heuristic correlator
+   (§4.6): match a vanished path against a new path by
+   `(size, mtime, basename)` within the same batch.
+
+This pairing is implemented in
+`code/Sources/ImageGlass/FileSystem/MoveCorrelator.swift`, class
+`MoveCorrelator`, method `pair(_ events:) -> [ChangeEvent]`, called by
+`FileSystemWatcher` between Stage 2 (normalize) and Stage 3 (coalesce).
+
+### 4.3 The headline case, step by step — a directory relocated into a subdirectory
+
+**Trigger.** Scope `Shoot` has root `~/Pictures/shoot/`. The user drags
+`~/Pictures/shoot/edited/` into `~/Pictures/shoot/final/`, producing
+`~/Pictures/shoot/final/edited/`. `edited/` held 120 images, 40 of them
+explicitly green-checked, the rest inherited.
+
+* **Stage 1 (kernel).** FSEvents fires `ItemRenamed | ItemIsDir` for
+  both `…/edited` (old) and `…/final/edited` (new) in one callback,
+  each with the same extended file ID. Because we registered the parent
+  recursively, no new stream is needed.
+* **Stage 2 (normalize).** Each raw event becomes a tentative
+  `ItemRenamed` with its inode.
+* **Stage 2.5 (correlate).** `MoveCorrelator` pairs them by inode,
+  confirms the old path is gone and the new path exists, and emits one
+  `.movedDir(from: …/edited, to: …/final/edited, identity: …)`.
+* **Stage 3 (coalesce).** The individual per-file rename events for the
+  120 children (if the filesystem even emits them — on APFS a directory
+  move typically emits only the directory event) are dropped in favor
+  of the single `.movedDir`, because their new paths are prefix-covered
+  by the moved directory. No child is processed twice.
+* **Stage 4 (scope resolve).** The scope engine performs the **subtree
+  path rewrite** (§4.4): every resolved-list URL, every tree node, and
+  every `include_overrides[]` entry whose path is prefixed by the old
+  directory path is rewritten to the new prefix. The 40 green checks
+  keep their `state: include` entries — only the `path:` key changes
+  from `edited/…` to `final/edited/…`. Inodes are unchanged, so
+  thumbnails are **not** regenerated.
+* **Stage 5 (UI + MCP).** The panel moves the `edited` node under
+  `final` in one structured diff. Expansion state and the 40 green
+  swatches move with it. If the selected/focused image was inside
+  `edited/`, selection stays on the same file at its new path and the
+  viewer does **not** re-decode (§6.4). MCP publishes
+  `fs.changed { movedDir: { from, to } }`.
+
+**Net user experience:** the folder simply appears in its new place in
+the tree, still checked exactly as before, the current picture still on
+screen. No error, no flicker, no lost checkmarks.
+
+### 4.4 The subtree path-rewrite
+
+Given a confirmed `.movedDir(from: OLD, to: NEW)` where both are
+absolute URLs:
+
+```
+for each resolved-list URL U where U.path == OLD.path or U.path hasPrefix OLD.path + "/":
+    U.path := NEW.path + U.path.dropPrefix(OLD.path)
+for each tree node under OLD: reparent to NEW (identity unchanged)
+if OLD is itself a root (RootDirectory.path == OLD):
+    rewrite RootDirectory.path := NEW               // §4.5 root move
+    refresh the security-scoped bookmark from NEW     // §4.5
+else:
+    // OLD is a descendant of some root R
+    for each include_overrides[] entry E under R whose relPath is
+      OLD.relPathUnderR or a descendant of it:
+        E.path := NEW.relPathUnderR + E.path.dropPrefix(OLD.relPathUnderR)
+```
+
+The include-override rewrite is the mechanism that carries the green
+checks forward. It is specified precisely, with its cross-root and
+out-of-scope edge cases, in §5. It is one atomic YAML write.
+
+### 4.5 When the moved thing is a watched root
+
+If the item that moved is itself a `RootDirectory` (the user moved the
+top of a scope), two extra things happen beyond §4.4:
+
+1. **`directories.yaml` `path:` is rewritten** to the new location.
+2. **The security-scoped bookmark is refreshed.** This is important and
+   is a macOS gift we exploit: a bookmark is an alias-class object that
+   embeds the file's inode + volume, so `URL(resolvingBookmarkData:)`
+   **resolves to the file's *new* location after a move or rename**,
+   setting `bookmarkDataIsStale == true`. On any move of a root — and
+   especially during offline reconciliation (§7) — we resolve the
+   stored bookmark first; it frequently *is* the new path, which is how
+   we recover a moved root even when FSEvents told us nothing (root
+   moved while closed). We then re-mint the bookmark from the resolved
+   URL and rewrite `path:`.
+
+There is a second, independent recovery mechanism for the *running*
+case, used when `kFSEventStreamCreateFlagWatchRoot` fires
+`kFSEventStreamEventFlagRootChanged` (which carries event ID 0 and the
+now-stale original path, telling us nothing about the destination): we
+hold a long-lived **open file descriptor on the root** and call
+`fcntl(fd, F_GETPATH, buf)`. Because the FD tracks the vnode/inode, it
+follows the move, and `F_GETPATH` returns the root's current path
+directly. Bookmark resolution and `F_GETPATH` are belt-and-suspenders;
+we try the FD path first when the app was running (it needs no disk
+read), the bookmark first when reconciling at launch (no FD was held).
+
+`file_system_change.mdx` §7.10 (root moved/renamed/deleted) is now a
+special case of this section: RootChanged that resolves via the
+bookmark to a live new path is a **root move**, not a
+`.rootDisappeared`.
+
+### 4.6 When inode correlation is impossible
+
+Three cases force the fallback correlator:
+
+* **Extended data unavailable** (old OS, unusual filesystem).
+* **Cross-volume move** — the OS did copy-then-delete, so the
+  destination has a *new* inode. There is no inode link between old and
+  new.
+* **Network volumes** (SMB/NFS) where FSEvents and inodes are
+  unreliable (`file_system_change.mdx` §4.4 known-bad list).
+
+The heuristic correlator (`MoveCorrelator.heuristicPair`) matches a
+vanished path against an appeared path within the same window by, in
+descending confidence:
+
+1. Exact **content hash** of the first and last 64 KiB + total size
+   (computed lazily, only for candidates that already match on size).
+2. `(size, mtime, basename)` triple.
+3. `basename` alone (lowest confidence — only used to preserve
+   *selection*, never to silently move a green check; a basename-only
+   match downgrades the moved item's explicit state to `inherit`, §5.5,
+   because we are not confident enough to assert the user's checkmark
+   followed the bytes).
+
+A correlation below a confidence threshold is treated as an independent
+`removed` + `added` pair, which is safe: the file still shows up at its
+new path (as a fresh inherited row); we simply do not claim to have
+preserved its prior explicit check.
+
+---
+
+## 5. Carrying the Include / Inherit State Across a Move
+
+This is the user's explicit requirement, quoted from the product brief:
+
+> "If it has an active check to track it, the green fill, then we carry
+> that forward. If it's just an inherit state, then we'll leave that as
+> kind of inherit. If files move out of it and into a different
+> directory, it'll just always be in an inherit mode."
+
+This section is the normative rule. It is mirrored in
+`include_checks.mdx` §12.
+
+### 5.1 The three states, restated for moves
+
+Per `include_checks.mdx` §1, every row is one of:
+
+* **`include`** — an *explicit* green check the user set on this row.
+  Stored as an `include_overrides[]` entry `state: include`.
+* **`exclude`** — an *explicit* don't-include. Stored as
+  `state: exclude`.
+* **`inherit`** — no stored entry; the row resolves from its nearest
+  explicit ancestor or the root default.
+
+Only `include` and `exclude` are *explicit*; `inherit` is the *absence*
+of a decision.
+
+### 5.2 The carry-forward rule (in-tree move)
+
+When an item moves and **both source and destination are under the same
+root** (including the headline subdirectory relocation):
+
+* Its **explicit** state (`include` / `exclude`) is **carried
+  forward**: the `include_overrides[]` entry survives; only its `path`
+  key is rewritten from the old root-relative path to the new one
+  (§4.4).
+* Its **inherit** state is carried forward as inherit: there was no
+  entry, so nothing is written — but note the *resolved* value may
+  change because the row now inherits from a **different ancestor
+  chain**. That is correct and intended: an inherited row means "follow
+  my parent," and its parent is now different.
+
+Worked example: `edited/keeper.jpg` had `state: include` (path
+`edited/keeper.jpg`). After the move it is
+`final/edited/keeper.jpg` with `state: include` (path
+`final/edited/keeper.jpg`). Still green. `edited/snap.jpg` had no entry
+(inherit); after the move it still has no entry and now inherits from
+`final/edited` → whatever that resolves to.
+
+### 5.3 Rewriting the override key, precisely
+
+Because `include_overrides[].path` is stored **relative to the root**
+(`include_checks.mdx` §5.3 — chosen exactly for portability), a move
+that changes an item's position under its root requires rewriting the
+key:
+
+```
+let oldRel = OLD.path.relativeTo(root.path)   // e.g. "edited"
+let newRel = NEW.path.relativeTo(root.path)   // e.g. "final/edited"
+for entry in root.include_overrides where
+      entry.path == oldRel || entry.path.hasPrefix(oldRel + "/"):
+    entry.path = newRel + entry.path.dropPrefix(oldRel)
+```
+
+If the root's *parent* moves but the item's position *under the root*
+is unchanged (a pure root relocation, §4.5), `oldRel == newRel` and no
+override keys change at all — this is the portability property
+`include_checks.mdx` §5.3 promised, now made explicit.
+
+### 5.4 Move OUT of scope → drop to inherit
+
+When an item moves to a destination **not under any watched root**:
+
+* It leaves the resolved list (`.removed`, `file_system_change.mdx`
+  §7.5 successor logic applies to selection).
+* Its `include_overrides[]` entry is **deleted**. The explicit check is
+  *not* preserved as a floating orphan. This implements the brief's
+  "if files move out of it and into a different directory, it'll just
+  always be in an inherit mode": if that same directory later comes
+  back into scope (re-added as/under a root, or moved back), its rows
+  start as `inherit` unless the user re-checks them.
+
+Rationale: an override is meaningful only *relative to a root*. Once the
+item is rootless, the override has no anchor, and keeping a dangling
+entry would silently re-assert a stale check if the path were ever
+reused.
+
+### 5.5 Low-confidence correlation → drop to inherit
+
+Per §4.6, if a move is only matched by a low-confidence heuristic
+(basename-only), we re-target the **path and selection** but downgrade
+the item's explicit state to `inherit` and delete its override entry.
+We only carry a *green check* forward when we are confident (inode
+match, or high-confidence content match) that the very same file moved.
+This is a deliberate bias toward never *falsely* asserting a user's
+checkmark on the wrong bytes.
+
+### 5.6 Cross-root move
+
+An item that moves from root A into root B is, for include state, a
+**move out of A (§5.4) + a move into B**. The override under A is
+deleted; the item arrives under B as `inherit` (no override), because
+its A-relative override path is meaningless under B and we do not
+speculatively re-check it. If the user had explicitly checked it under
+A and wants it checked under B, that is one click. (A future revision
+may offer "keep checks across roots"; v1 does not, to avoid surprising
+re-assertions.)
+
+### 5.7 Directory default and the moved subtree
+
+`default_include_state` is a **root-level** field; it does not move with
+a subdirectory. When a subdirectory relocates within a root, it keeps
+its own explicit override (if any) and its descendants keep theirs; the
+root default is untouched. When a whole *root* moves (§4.5),
+`default_include_state` travels with the root record unchanged.
+
+---
+
+## 6. The Left Bar Auto-Updates
+
+This section is the UI contract; it extends `dir_ui.mdx` §4.
+
+### 6.1 The promise
+
+> When directories are created, moved into other directories, or
+> deleted, and when files are moved around, the left bar updates
+> automatically — in place — without the user pressing refresh, and
+> without losing selection, scroll position, expansion state, or the
+> green-check column.
+
+### 6.2 In-place diff, never a rebuild
+
+On any move event (live §4 or reconciled §7), the panel applies a
+**structured diff**, not a reload:
+
+* A `.movedDir` reparents an existing tree node (SwiftUI
+  `OutlineGroup` identity is the `FileIdentity`, **not** the path, so
+  the node's expansion and its subtree's rendered state ride along).
+* Row identity in the `Table` / `List` is the `FileIdentity`, so
+  selection, the include-swatch column, and any in-flight thumbnail all
+  follow the moved row to its new position.
+* Sort order is re-applied to the moved rows only; the rest of the list
+  does not re-sort.
+
+Because node and row identity is inode-based, "the same folder, now
+under a different parent" is a *move* animation in the outline, not a
+*delete + insert*. This is what makes the update feel like the folder
+slid to its new home rather than blinking out and reappearing.
+
+### 6.3 The reconciliation banner and progress (offline moves)
+
+When the app launches and the async reconciler (§7) is running, the
+panel shows a thin, non-blocking status strip at the bottom of the
+directory panel:
+
+* Text: "Updating file list… (checked *N* of *M* folders)".
+* It does **not** block interaction — the panel is fully usable against
+  the last-known list while the scan runs; rows re-target live as the
+  scanner resolves each one.
+* When a root cannot be located at all (moved out of every known place
+  and not found by bookmark or Spotlight), that root shows the existing
+  `file_system_change.mdx` §7.10 stale banner: "Source folder is no
+  longer available…", but now with a **"Find it…"** button that opens
+  an `NSOpenPanel` so the user can point us at the new location, after
+  which we re-mint the bookmark and rewrite `path:`.
+
+### 6.4 Selection and the viewer during a move
+
+* If the currently-selected / focused image moves, selection stays on
+  that file (by identity) and the viewer keeps the already-decoded
+  image on screen; the title bar path updates. No re-decode, because
+  the inode (and thus our open file handle, if any) is unchanged
+  (`file_system_change.mdx` §7.4).
+* If the focused image moves **out of scope**, the viewer keeps showing
+  the decoded bytes but the panel selection clears to the successor
+  (§5.4 + `file_system_change.mdx` §7.5).
+* The user must never be dropped onto *Can't display this image*
+  because of a move: the viewer only shows that placeholder when the
+  bytes are genuinely unreadable, never merely because a path went
+  stale.
+
+### 6.5 Empty-directory and hide-empty interaction
+
+If a move empties a directory that was being shown, and
+"Hide Empty Directories" (`dir_ui.mdx`, the
+`set_hide_empty_directories` toggle) is on, the now-empty node
+disappears in the same diff; if it is off, the node remains as an empty
+folder. A move that *fills* a previously-empty hidden directory makes
+it appear. This falls out of the standard resolve, but is called out so
+the diff is deterministic.
+
+---
+
+## 7. Offline Reconciliation (Moves That Happened While Closed)
+
+This is the hardest regime and the one the naïve design ignored
+entirely. It has two stages: **journal replay** (cheap, catches most
+cases) and the **reconciliation scan** (thorough, catches the rest).
+The scan is asynchronous and runs in the background so launch is never
+blocked.
+
+### 7.1 Launch sequence
+
+```
+App launch
+  1. Load directories.yaml → walkerRoots (paths as last persisted).
+  2. Paint the panel immediately from last_known_files (§7.3) so the
+     user sees their workspace instantly, even if some paths are stale.
+  3. Kick off, off the main actor, the ReconciliationCoordinator:
+       a. Journal replay (§7.2) per root.
+       b. If replay is clean and produced moves → apply them, done.
+       c. If any root reports history-dropped / must-scan, OR any
+          last_known_files entry fails to stat at its recorded path →
+          enqueue that root for the reconciliation scan (§7.4).
+  4. As the scan resolves each stale entry, re-target its row live
+     (§6.2) and update the banner (§6.3).
+  5. On completion, write the repaired directories.yaml once (§7.7)
+     and clear the banner.
+```
+
+Implemented in
+`code/Sources/ImageGlass/FileSystem/ReconciliationCoordinator.swift`,
+an `actor` invoked from `AppState.applicationDidFinishLaunching`.
+
+### 7.2 Stage A — FSEvents journal replay
+
+macOS persists an on-disk FSEvents journal **per volume** (under
+`/System/Volumes/Data/.fseventsd`) that **survives app termination and
+reboots** — Apple calls persistence across reboots one of the API's
+most powerful features. We persist, per root, **both** the last-seen
+`FSEventStreamEventId` **and the volume UUID** from
+`FSEventsCopyUUIDForDevice` (`file_system_change.mdx` §5.4,
+`~/T/_imageglass/fsevents_cursors.yaml`). The UUID is mandatory because
+device IDs are not stable across reboots, and a stored event ID is only
+meaningful against the volume that minted it.
+
+At launch, **before** replaying, we validate the cursor:
+
+* Re-fetch the volume UUID. If it **differs** from the stored one (the
+  volume was reformatted, swapped, or is a different disk with the same
+  name), the stored event ID is meaningless → mark the root
+  **needs-scan** (§7.4), skip replay.
+* If the UUID matches but the stored ID is **higher than the volume's
+  current** newest ID (the volume was restored from backup, or the ID
+  space wrapped), the cursor is invalid → **needs-scan**.
+* Otherwise create the stream with `sinceWhen:` set to the stored ID.
+  The kernel replays everything that happened while we were dead,
+  **including the `ItemRenamed` pairs of moves**, terminated by a
+  `kFSEventStreamEventFlagHistoryDone` sentinel, after which live
+  events begin. Replayed events flow through the exact same live
+  pipeline (§4) — `MoveCorrelator` pairs them by inode just as if they
+  had happened a moment ago.
+
+This is the happy path: an offline move of a folder produces two
+journaled `ItemRenamed` events; replay + correlate re-targets it with
+no scan needed.
+
+**When replay is not enough** — the stream reports any of:
+
+* `kFSEventStreamEventFlagHistoryDone` reached with a preceding
+  `kFSEventStreamEventFlagMustScanSubDirs` — the journal coalesced too
+  much and is telling us to rescan a subtree.
+* `kFSEventStreamEventFlagUserDropped` / `KernelDropped` — events were
+  lost under pressure.
+* `kFSEventStreamEventFlagEventIdsWrapped` or a rolled/absent journal
+  (long downtime, volume was on another machine, external drive
+  reformatted-adjacent) — the cursor is meaningless.
+
+Any of these marks the affected root **needs-scan** and we fall through
+to Stage B for that root only.
+
+### 7.3 The `last_known_files` cache
+
+To diff "what we had" against "what's on disk," we persist, per root,
+the resolved file list **with identities**, written on clean quit and
+after every settled live change. Schema addition to `directories.yaml`
+(`local_storage.mdx` §5.8):
+
+```yaml
+root_directories:
+  - path: /Users/you/Pictures/shoot
+    # …filter, include_overrides…
+    last_walked: 2026-07-11T09:00:00Z
+    last_known_files:                 # cache, not truth (§2.2)
+      - rel: edited/keeper.jpg
+        id: { vol: "…", inode: 84213 }
+      - rel: edited/snap.jpg
+        id: { vol: "…", inode: 84214 }
+```
+
+`last_known_files` is a **cache**: if it is missing, stale, or
+corrupt, the reconciler falls back to a full walk (§7.6). It exists
+purely to make offline move-detection O(changed) instead of O(tree),
+and to let the panel paint instantly at launch (§7.1 step 2).
+
+### 7.4 Stage B — the reconciliation scan (async, background)
+
+For each needs-scan root, on a `utility`-QoS `Task`:
+
+1. **Enumerate** the root's current subtree with
+   `FileManager.enumerator(at:includingPropertiesForKeys:)` requesting
+   `[.fileSystemFileNumberKey, .volumeIdentifierKey, .isDirectoryKey,
+   .fileSizeKey, .contentModificationDateKey]`. This yields the current
+   `(identity → path)` map.
+2. **Diff** against `last_known_files`:
+   * Identity present in both, **path unchanged** → nothing to do.
+   * Identity present in both, **path changed** → a **move**; re-target
+     the row and rewrite the override key (§5.3), exactly as a live
+     `.movedDir` would.
+   * Identity in `last_known_files` but **absent** from the current
+     enumeration → the file left this root. Try to **locate** it (§7.5)
+     before concluding it was deleted.
+   * Identity newly present → an **add** (a file that arrived while we
+     were closed).
+3. **Apply** each resolved change through the same Stage 4/5 code path
+   as live events, re-targeting rows on the main actor and updating the
+   banner count.
+
+The scan is chunked (default 2,000 entries per yield) so it never
+starves the main actor, and it honors the same adaptive back-pressure
+as the bulk-operation path (`file_system_change.mdx` §7.9).
+
+### 7.5 Locating a vanished identity across roots and the volume
+
+An identity that vanished from its root may have (a) moved to another
+watched root, (b) moved out of scope, or (c) been deleted. We resolve
+in order:
+
+1. **Cross-root check** — is that `(volumeID, inode)` present in
+   another watched root's fresh enumeration? If yes → cross-root move
+   (§5.6).
+2. **Bookmark resolve** — for roots (and for any node we happen to hold
+   a bookmark for), resolve the security-scoped bookmark; it tracks the
+   inode and may hand back the new path directly (§4.5).
+3. **Spotlight locate** — issue a bounded `NSMetadataQuery` for
+   `kMDItemFSName == <basename>` (optionally constrained by size) to
+   find where the bytes went, then confirm by re-stat'ing the
+   candidate's inode. Time-boxed (default 3 s); best-effort.
+4. If none locate it → treat as **deleted**: drop from the resolved
+   list and delete its override entry (a deletion, like §5.4 but
+   because the bytes are gone, not merely rootless).
+
+### 7.6 Full-rescan fallback
+
+If `last_known_files` is missing/corrupt for a root, or the journal
+said `MustScanSubDirs` for the whole root, or the diff is degenerate
+(e.g., the root's own inode changed — it was deleted and a new folder
+took its place), we abandon incremental reconciliation for that root
+and do a **full walk**, rebuilding the resolved list and
+`last_known_files` from scratch. Include overrides are matched to the
+freshly-walked tree by **relative path** (their stored key); overrides
+whose relative path no longer resolves to any file are **retired**
+(logged, §9) rather than kept as dangling entries.
+
+### 7.7 One settled write
+
+The reconciler does not thrash `directories.yaml`. It accumulates all
+repairs in memory (`walkerRoots`) and writes the file **once** when the
+scan for all roots completes (or on a 5 s coalescing timer if the scan
+is very long), via the existing atomic `DirectoriesStore` write path.
+This keeps a `git diff` of `directories.yaml` to one logical
+"reconciled after offline moves" change.
+
+### 7.8 Determinism and idempotency
+
+Running the reconciler twice in a row is a no-op the second time: after
+the first pass, every `last_known_files` entry stat's to its recorded
+path, so the diff is empty. Reconciliation is therefore safe to trigger
+redundantly (e.g., the MCP `reconcile_now` tool, §10, or a
+return-from-sleep, `file_system_change.mdx` §7.18).
+
+---
+
+## 8. Corner Cases
+
+| # | Case | Handling |
+| --- | --- | --- |
+| 8.1 | Folder moved **and** renamed at once (`edited` → `final/keepers`) | One `.movedDir`; inode pairs both halves; override keys rewritten `edited/*` → `final/keepers/*`. |
+| 8.2 | Two folders **swap** names via a temp | Two independent inode-paired moves; each re-targets by identity; no path collision because identity, not path, is the key. |
+| 8.3 | Move **into** a directory the scope **excludes** (e.g. into `.Trash`, `node_modules`) | Destination fails scope → treated as move-out-of-scope (§5.4): removed from list, override deleted. |
+| 8.4 | Move + immediate modify (drag, then an app rewrites the file) | Coalesced: `.movedDir` then `.modified` on the new path; thumbnail refreshes, path already correct. |
+| 8.5 | Inode **reuse** after delete-then-create at a recycled inode | Guarded by also comparing `(size, mtime)` at correlation time; a reused inode with a different size/mtime is *not* paired as a move (§4.6 confidence gate). |
+| 8.6 | Cross-volume move (to an external SSD in scope) | Copy+delete ⇒ new inode ⇒ heuristic correlator (§4.6); high-confidence content match carries the check, else inherit. |
+| 8.7 | Move while a **bulk** op is in flight (`mv` of 5,000 files) | Adaptive debounce (`file_system_change.mdx` §7.9) batches; correlator pairs within each flush; over the flood cap → history-dropped → scan (§7.4). |
+| 8.8 | The moved item was the **selected** image | Selection and viewer follow by identity (§6.4); no re-decode. |
+| 8.9 | App **crashes** mid-move | The FSEvents cursor was persisted before the crash; journal replay (§7.2) catches the move at next launch. |
+| 8.10 | Move on a **network volume** with no reliable inodes | Watcher is already in polling mode there (`file_system_change.mdx` §4.4); reconciler uses content/name heuristic; overrides matched by relative path. |
+| 8.11 | Symlinked file moves; symlink stays | We track resolved paths (`DirectoriesStore.canonicalize` resolves symlinks); the target's inode is stable → normal move. A moved *symlink* whose target is unchanged is a rename of the link node. |
+| 8.12 | iCloud/File Provider "move" that is really evict+materialize | Identity is preserved by the provider; if not, treated as remove+add and re-inherited (§5.5). |
+| 8.13 | Root moved **out of every known place** while closed, bookmark stale, Spotlight finds nothing | Root shows stale banner + "Find it…" (§6.3); list stays visible in dimmed last-known state; no data loss. |
+| 8.14 | Hard-linked file "moved" (one link renamed) | Inode identical across links; we key on `(path-that-we-track, inode)`; the tracked path's rename is a normal move; the other link is unaffected. `ItemRemoved` fires only on **last**-link removal, so a still-linked file that "disappears" from a path is a move, not a delete. |
+| 8.15 | APFS **safe-save** (`replaceItemAt`) by another app — path stays, inode **changes** | This is the inverse of a move and the one case inode identity lies. We detect it via `documentIdentifierKey` (preserved across safe-save) + unchanged path → treat as `.modified`, **not** remove+add; the row and its green check stay, thumbnail refreshes. (`file_system_change.mdx` §7.14.) |
+| 8.16 | Network volume (SMB/NFS) — no reliable inodes, no per-volume journal | No historical replay; watcher polls (`file_system_change.mdx` §4.4); reconciler correlates by content/name only; overrides matched by relative path; roots recovered by bookmark best-effort. |
+
+---
+
+## 9. Audit and Error Reporting
+
+The reconciler emits to the `error_handling.mdx` surfaces (new events
+added to its §6 closed set):
+
+| Event | Level | When |
+| --- | --- | --- |
+| `move.detected` | INFO | A live or replayed move is applied. Fields: `from`, `to`, `identity`, `children`, `source=live|replay|scan`. |
+| `reconcile.start` | INFO | Boot reconciliation begins. Fields: `roots`, `reason=journal_gap|missing_cache|forced`. |
+| `reconcile.summary` | INFO | Scan completes. Fields: `roots`, `moved`, `added`, `removed`, `relocated_roots`, `duration_ms`. |
+| `override.retired` | AUDIT | A dangling include override was retired (§7.6). Fields: `root`, `rel_path`, `state`. |
+| `move.lowconfidence` | AUDIT | A move was applied by heuristic and its check dropped to inherit (§5.5). Fields: `from`, `to`, `matched_by`. |
+| `root.relocated` | AUDIT | A watched root's `path:` was rewritten. Fields: `old`, `new`, `via=fsevents|bookmark|spotlight|user`. |
+| `root.lost` | WARN | A root could not be located (§8.13). Fields: `path`. |
+
+Retiring an override and dropping a check to inherit are **AUDIT**
+(not silent) because they change what the user will see checked — the
+scope-edit audit-trail requirement in `error_handling.mdx` §9 covers
+them.
+
+---
+
+## 10. MCP Surface
+
+Two tools, so Claude Code can drive and observe reconciliation:
+
+* **`reconcile_now(root?)`** — force a reconciliation scan (§7.4) of one
+  root or all. Idempotent (§7.8). Returns the `reconcile.summary`
+  payload.
+* **`get_reconcile_status()`** — returns `{ running, root, checked,
+  total, lastSummary }` for the progress strip and for headless
+  clients.
+
+Both route through `ReconciliationCoordinator` and are registered
+alongside the existing `refresh_directory` tool. A move applied by the
+reconciler publishes the same `fs.changed { movedDir | moved }`
+notification the live path uses, so a subscribed MCP client sees an
+offline move and a live move identically.
+
+---
+
+## 11. Performance Budget
+
+| Operation | Budget |
+| --- | --- |
+| Live move of a single file → row re-targeted | ≤ 250 ms kernel→paint (`file_system_change.mdx` §10) |
+| Live `.movedDir` of a 1,000-file folder → subtree reparented | ≤ 400 ms (one diff, no thumbnail regen) |
+| Boot paint from `last_known_files` (10,000 files) | ≤ 150 ms; never blocks on the scan |
+| Reconciliation scan throughput | ≥ 20,000 entries/s enumerated; chunked at 2,000/yield |
+| `directories.yaml` repair write | one atomic write per reconcile pass (§7.7) |
+| Spotlight locate timeout | 3 s per vanished identity, bounded, best-effort (§7.5) |
+
+Regenerating thumbnails on a move is a **budget violation** and a bug:
+identity is preserved, so the thumbnail cache key (keyed on
+`(identity, mtime)`) is still valid.
+
+---
+
+## 12. Testing Requirements
+
+* **Unit — correlator.** Feed synthetic `ItemRenamed` batches (with and
+  without extended file IDs); assert correct `.movedDir` synthesis,
+  out-of-scope→removed, in-from-outside→added, and the inode-reuse
+  guard (§8.5).
+* **Unit — override rewrite.** A subtree move rewrites exactly the
+  prefixed override keys and no others; a pure root move rewrites zero
+  override keys (§5.3); a move out of scope deletes the entry (§5.4).
+* **Integration — live move (XCUITest + real FS).** Move a folder into a
+  subdirectory on a temp APFS volume with the app running; assert the
+  tree reparents, the 40 green checks survive at new paths, selection
+  and the viewer are unchanged, no *Can't display* placeholder.
+* **Integration — offline move.** Load a scope, quit, move a folder,
+  relaunch; assert journal replay re-targets it; then a variant that
+  forces `MustScanSubDirs` and asserts the scan path produces the same
+  end state.
+* **Integration — moved root recovery.** Move a scope root while closed;
+  assert bookmark resolution recovers the new path and rewrites `path:`.
+* **Determinism.** Run the reconciler twice; second pass is a no-op
+  (§7.8).
+* **Snapshot.** `directories.yaml` after a reconcile pass has one
+  logical diff and byte-stable ordering.
+
+---
+
+## 13. Acceptance Criteria for v1
+
+1. Moving a tracked directory into a subdirectory — app running —
+   updates the left bar in place, preserves every green check at the
+   new location, keeps the current image on screen, and never shows
+   *Can't display this image*.
+2. The same move performed while the app is **closed** is reconciled at
+   next launch: the panel paints instantly from cache, then converges,
+   with checks and selection preserved.
+3. An item moved **out of scope** disappears from the list and its
+   explicit check is dropped (returns as inherit if it ever comes
+   back).
+4. A moved **root** is recovered via its security-scoped bookmark
+   without user intervention when the bytes are still on the same
+   volume; when it truly cannot be found, the user gets a
+   non-destructive stale banner with "Find it…".
+5. No move — of any size, in either regime — regenerates thumbnails or
+   re-decodes the focused image whose identity is unchanged.
+6. `directories.yaml` after any reconcile is a single atomic, byte-
+   stable write, and the audit trail records every check that changed.
+
+---
+
+## 14. Relationship to Other Specs (What Changed Where)
+
+This spec introduced changes that the owning specs now carry:
+
+* `file_system_change.mdx` — new `.movedDir` event and the
+  `MoveCorrelator`; new scenarios §7.23 (dir into subdirectory), §7.24
+  (moves while closed / reconciliation), §7.25 (cross-volume move); the
+  root-change scenario §7.10 reframed as a special case of §4.5.
+* `local_storage.mdx` — `directories.yaml` gains `last_known_files[]`
+  and the persisted `FileIdentity`; new §5.6 (identity), §5.7
+  (reconciliation write discipline), §5.8 (`last_known_files` schema).
+* `dir_ui.mdx` — new §4.2 (auto-update on moves), the reconciliation
+  banner, identity-based row/node identity.
+* `include_checks.mdx` — new §12 (include state across moves), pointing
+  here for the normative rule.
+* `mcp.mdx` / `error_handling.mdx` — the tools (§10) and events (§9).
