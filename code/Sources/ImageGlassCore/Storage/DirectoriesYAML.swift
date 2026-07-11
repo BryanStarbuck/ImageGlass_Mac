@@ -8,6 +8,18 @@ public struct DirectoriesFile: Sendable, Equatable {
     public var schemaVersion: Int
     public var roots: [RootDirectory]
 
+    /// menus.mdx View ▸ Left File Tree ▸ "Only Show Included Items" —
+    /// a window-level view filter over the include model
+    /// (include_checks.mdx §6). When `true`, the file-tree panel hides
+    /// every row whose resolved `effectiveState` is `.exclude`, showing
+    /// only rows that are green-checked `include` or inherit-include
+    /// with an all-include chain above them. When `false` (the factory
+    /// default for every customer) the panel shows the full hierarchy,
+    /// red-X rows included. Persisted here — in the same window-scoped
+    /// `directories_window_<N>.yaml` as the include overrides it filters
+    /// — so the choice survives a relaunch.
+    public var onlyShowIncludedItems: Bool
+
     /// `mcp_and_filters_on_dirs.mdx` §3.2 / §3.6. `1` is the legacy
     /// shape; `2` adds optional `priority` per filter item. New
     /// files stay at `1` until the engine sees a non-default
@@ -17,9 +29,14 @@ public struct DirectoriesFile: Sendable, Equatable {
     public static let prioritySchemaVersion = 2
     public static let currentSchemaVersion = legacySchemaVersion
 
-    public init(schemaVersion: Int = currentSchemaVersion, roots: [RootDirectory] = []) {
+    public init(
+        schemaVersion: Int = currentSchemaVersion,
+        roots: [RootDirectory] = [],
+        onlyShowIncludedItems: Bool = false
+    ) {
         self.schemaVersion = schemaVersion
         self.roots = roots
+        self.onlyShowIncludedItems = onlyShowIncludedItems
     }
 
     /// True if any filter item carries a non-default priority. Used
@@ -66,6 +83,12 @@ public enum DirectoriesYAML {
             return file.schemaVersion
         }()
         out += "schema_version: \(effectiveVersion)\n"
+        // View ▸ Left File Tree ▸ "Only Show Included Items". Off by
+        // default; emitted only when on so a fresh file (and every
+        // customer who never touches the toggle) stays byte-identical.
+        if file.onlyShowIncludedItems {
+            out += "only_show_included_items: true\n"
+        }
         if file.roots.isEmpty {
             out += "root_directories: []\n"
             return out
@@ -138,6 +161,9 @@ public enum DirectoriesYAML {
         let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         var schemaVersion = DirectoriesFile.currentSchemaVersion
         var roots: [RootDirectory] = []
+        // View ▸ Left File Tree ▸ "Only Show Included Items" — top-level
+        // flag; absent means off (the default for every customer).
+        var onlyShowIncludedItems = false
 
         // State machine — we step through the indented blocks under
         // `root_directories:`.
@@ -213,6 +239,8 @@ public enum DirectoriesYAML {
                 if let (k, v) = parseKeyValue(body) {
                     if k == "schema_version" {
                         schemaVersion = Int(v) ?? DirectoriesFile.currentSchemaVersion
+                    } else if k == "only_show_included_items" {
+                        onlyShowIncludedItems = (v == "true")
                     }
                 }
                 continue
@@ -335,7 +363,11 @@ public enum DirectoriesYAML {
         }
         flushCurrentRoot()
 
-        return DirectoriesFile(schemaVersion: schemaVersion, roots: roots)
+        return DirectoriesFile(
+            schemaVersion: schemaVersion,
+            roots: roots,
+            onlyShowIncludedItems: onlyShowIncludedItems
+        )
     }
 
     // MARK: - Helpers

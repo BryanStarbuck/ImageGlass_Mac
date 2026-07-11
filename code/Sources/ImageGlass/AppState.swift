@@ -110,6 +110,18 @@ public final class AppState {
     }
     public var panelViewMode: PanelViewMode = .tree
 
+    /// menus.mdx View ▸ Left File Tree ▸ "Only Show Included Items".
+    /// When on, the file-tree panel hides every row whose resolved
+    /// include state (`RootDirectory.effectiveState`) is `.exclude`,
+    /// leaving only the green-checked / inherit-include rows whose chain
+    /// above them is all-include (include_checks.mdx §6). Off by default
+    /// for every customer. Persisted per-window in
+    /// `directories_window_<N>.yaml` (`only_show_included_items`) and
+    /// mirrored here so the panel re-renders the instant it changes.
+    /// Mutate through `setOnlyShowIncludedItems(_:)`, never by assigning
+    /// this property directly, so the on-disk YAML stays in sync.
+    public var onlyShowIncludedItems: Bool = false
+
     /// Live snapshot of `DirectoryTreeWalker.shared.snapshot()`. Refreshed
     /// from `DirectoryTreeWalker.didChangeNotification` (walk completed,
     /// refilter ran, root removed) and is the source of truth the file

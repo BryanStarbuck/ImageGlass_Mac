@@ -579,6 +579,28 @@ public final class DirectoriesStore: @unchecked Sendable {
         return true
     }
 
+    /// menus.mdx View ▸ Left File Tree ▸ "Only Show Included Items" —
+    /// persist the window-level view filter (`only_show_included_items`)
+    /// into this window's `directories_window_<N>.yaml`. One atomic
+    /// load → set → save. No-op fast path when the value is unchanged so
+    /// a redundant toggle does not rewrite the file.
+    public func setOnlyShowIncludedItems(_ enabled: Bool) throws {
+        let _trace = PerformanceLog.shared.start("LocalStorage.MutateDirectories")
+        defer { _trace.finish() }
+        lock.lock()
+        defer { lock.unlock() }
+        var file = (try? loadUnlocked()) ?? DirectoriesFile()
+        guard file.onlyShowIncludedItems != enabled else { return }
+        file.onlyShowIncludedItems = enabled
+        try saveUnlocked(file)
+    }
+
+    /// Read the current `only_show_included_items` view filter for this
+    /// window (defaults to `false` when the file or field is absent).
+    public func loadOnlyShowIncludedItems() -> Bool {
+        return ((try? load()) ?? DirectoriesFile()).onlyShowIncludedItems
+    }
+
     /// Update the cached `last_walked` timestamp for one root after the
     /// walker completes a pass.
     public func setLastWalked(path: URL, at date: Date) throws {
