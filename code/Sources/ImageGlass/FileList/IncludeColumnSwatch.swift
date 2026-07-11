@@ -228,6 +228,97 @@ enum IncludeStateController {
         }
     }
 
+    /// include_checks.mdx §7.2 — recursively set a node and every
+    /// descendant to `state` (the "Include On / Off (including children)"
+    /// context-menu items, right_click.mdx §7.1 / §7.2). Routes through
+    /// the batch `DirectoriesStore.setSubtreeIncludeState`, then does one
+    /// synchronous mirror refresh + one cross-process notification, so
+    /// the whole subtree re-renders in the next frame (§5.6). Works on a
+    /// root row too — there "including children" is the entire root
+    /// subtree.
+    @discardableResult
+    static func setSubtree(
+        absolutePath: String,
+        state: IncludeState,
+        appState: AppState
+    ) -> Bool {
+        let roots = appState.walkerRoots
+        guard let root = root(for: absolutePath, in: roots) else { return false }
+        let corr = MCPAuditLogger.newCorrelationId()
+        let relative = IncludePath.relative(absolutePath: absolutePath, root: root.path)
+        do {
+            let resolved = try DirectoriesStore.shared.setSubtreeIncludeState(
+                rootPath: root.path, relativePath: relative, state: state
+            )
+            MCPAuditLogger.shared.log([
+                ("tool", "panel.set_include_state"),
+                ("root", root.path.path),
+                ("path", relative),
+                ("state", state.rawValue),
+                ("resolved", resolved.rawValue),
+                ("recursive", "true"),
+                ("client", "gui"),
+                ("corr", corr),
+                ("ok", "true"),
+            ])
+            appState.refreshWalkerRoots()
+            MCPNotificationBus.shared.postDirectoriesChanged()
+            return true
+        } catch {
+            MCPAuditLogger.shared.log([
+                ("tool", "panel.set_include_state"),
+                ("root", root.path.path),
+                ("path", relative),
+                ("state", state.rawValue),
+                ("recursive", "true"),
+                ("client", "gui"),
+                ("corr", corr),
+                ("ok", "false"),
+                ("err", (error as? DirectoriesStoreError)?.auditCode ?? "unknown"),
+            ])
+            return false
+        }
+    }
+
+    /// include_checks.mdx §7.3 — switch the **entire tree** (every root
+    /// and every node) to `state` (the "Change Include ▸ Change Include
+    /// On / Off" folder-menu submenu, right_click.mdx §7.2). One batch
+    /// YAML write via `DirectoriesStore.setAllRootsIncludeState`, then one
+    /// mirror refresh + one notification.
+    @discardableResult
+    static func setEntireTree(
+        state: IncludeState,
+        appState: AppState
+    ) -> Bool {
+        let corr = MCPAuditLogger.newCorrelationId()
+        do {
+            let count = try DirectoriesStore.shared.setAllRootsIncludeState(state: state)
+            MCPAuditLogger.shared.log([
+                ("tool", "panel.set_include_state"),
+                ("scope", "entire_tree"),
+                ("state", state.rawValue),
+                ("roots", String(count)),
+                ("client", "gui"),
+                ("corr", corr),
+                ("ok", "true"),
+            ])
+            appState.refreshWalkerRoots()
+            MCPNotificationBus.shared.postDirectoriesChanged()
+            return true
+        } catch {
+            MCPAuditLogger.shared.log([
+                ("tool", "panel.set_include_state"),
+                ("scope", "entire_tree"),
+                ("state", state.rawValue),
+                ("client", "gui"),
+                ("corr", corr),
+                ("ok", "false"),
+                ("err", (error as? DirectoriesStoreError)?.auditCode ?? "unknown"),
+            ])
+            return false
+        }
+    }
+
     /// Cycle the explicit state of the row one step. Sub-rows go
     /// through `Include → Inherit → Don't Include → Include …` per
     /// §3; root rows flip between `Include ↔ Don't Include` per

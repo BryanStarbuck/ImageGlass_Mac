@@ -427,13 +427,15 @@ the menu. (§3.3)
 | 9 | Include in Scope | ⌃1 | `IncludeStateController.setState(path, .include, app)` | `include_checks.mdx` §7. Item carries a checkmark when this row's *explicit* state (not the resolved state) is `.include`. |
 | 10 | Inherit Include State | ⌃2 | `IncludeStateController.setState(path, .inherit, app)` | Checkmark when explicit state is `.inherit`. Disabled on the root rows (§1.0 of `include_checks.mdx`). |
 | 11 | Don't Include in Scope | ⌃3 | `IncludeStateController.setState(path, .exclude, app)` | Checkmark when explicit state is `.exclude`. |
+| 12 | Include On (including children) | — | `IncludeStateController.setSubtree(path, .include, app)` | `include_checks.mdx` §7.2. Recursive. On a file the subtree is just the file; the item is offered on every row so the same recursive gesture works uniformly on files and folders. |
+| 13 | Include Off (including children) | — | `IncludeStateController.setSubtree(path, .exclude, app)` | Recursive `.exclude` — see item 12. |
 | — | *(separator)* | | | |
-| 12 | Show in File List | — | `state.panelViewMode = .list` then `model.scrollTo(path)` (FileList panel) | Cross-panel convenience: hop the user from the tree to the flat List view with the same row selected. |
-| 13 | Show Metadata | ⌥⌘I | (toggles `state.metadataOverlayVisible` if implemented; v1 falls back to opening the on-canvas info overlay via `viewer.imageInfoOverlayVisible.toggle()`) | The metadata panel ships in v2; this item routes to the on-canvas overlay in v1. |
+| 14 | Show in File List | — | `state.panelViewMode = .list` then `model.scrollTo(path)` (FileList panel) | Cross-panel convenience: hop the user from the tree to the flat List view with the same row selected. |
+| 15 | Show Metadata | ⌥⌘I | (toggles `state.metadataOverlayVisible` if implemented; v1 falls back to opening the on-canvas info overlay via `viewer.imageInfoOverlayVisible.toggle()`) | The metadata panel ships in v2; this item routes to the on-canvas overlay in v1. |
 | — | *(separator)* | | | |
-| 14 | Set As Desktop Picture | — | `NSWorkspace.shared.setDesktopImageURL(url, for: NSScreen.main!)` | Disabled when the file's UTI is not in `kUTTypeImage`. |
-| 15 | Rename… | F2 | `FileActions.renameViaSheet(state:source:.context)` | `actions.mdx` §2. |
-| 16 | Move to Trash | ⌘⌫ | `FileActions.moveToTrash(state:source:.context)` | `actions.mdx` §3. Always the **last** item; HIG places destructive verbs at the bottom. |
+| 16 | Set As Desktop Picture | — | `NSWorkspace.shared.setDesktopImageURL(url, for: NSScreen.main!)` | Disabled when the file's UTI is not in `kUTTypeImage`. |
+| 17 | Rename… | F2 | `FileActions.renameViaSheet(state:source:.context)` | `actions.mdx` §2. |
+| 18 | Move to Trash | ⌘⌫ | `FileActions.moveToTrash(state:source:.context)` | `actions.mdx` §3. Always the **last** item; HIG places destructive verbs at the bottom. |
 
 #### 7.1.1 Sub-menu — Open With ▸
 
@@ -458,13 +460,16 @@ does not block the parent menu's open animation.
 #### 7.1.2 Disabled-state rules
 
 * If the file does not exist on disk (the panel is showing a
-  stale row), items 6, 7, 12, 13, 14, 15, 16 are disabled with
+  stale row), items 6, 7, 14, 15, 16, 17, 18 are disabled with
   tooltip *"This file no longer exists on disk."* Items 1–5 and
   8 are still enabled — opening, opening with, and copying the
   path are reasonable verbs even on a missing file (Copy Path
-  returns `ok=true note=missing` per `actions.mdx` §5.6).
+  returns `ok=true note=missing` per `actions.mdx` §5.6). The
+  recursive include items (12, 13) stay enabled — retargeting a
+  row's include state is meaningful even for a row whose file was
+  just deleted, because the override is keyed by path.
 * If the file's UTI is not `kUTTypeImage`, items 7 (Copy Image)
-  and 14 (Set As Desktop Picture) are disabled.
+  and 16 (Set As Desktop Picture) are disabled.
 
 ### 7.2 Context Menu — Folder (Subdirectory) Row in the Directory Panel
 
@@ -487,15 +492,39 @@ to `ContextMenuBuilders.folderRow(state:path:)`.
 | 5 | Copy Folder Path | ⌃⌘C | `FileActions.copyFilePath(state:source:.context)` — the target rule (`actions.mdx` §1.1) resolves the cursor's folder for the Copy Path verb. |
 | 6 | Open in Terminal | — | `NSWorkspace.shared.open([URL(fileURLWithPath: path)], withApplicationAt: terminalURL, …)` — falls back to AppleScript bridge when `terminalURL` is missing (rare; Terminal.app is system-bundled). |
 | — | *(separator)* | | |
-| 7 | Include in Scope | ⌃1 | Same as §7.1 item 9, scoped to this folder (and everything inside via inheritance). |
-| 8 | Inherit Include State | ⌃2 | Same as §7.1 item 10. |
-| 9 | Don't Include in Scope | ⌃3 | Same as §7.1 item 11. |
-| 10 | Edit Filter for This Folder… | — | Opens the per-folder filter sheet — see `mcp_and_filters_on_dirs.mdx` §5. v1 ships a read-only summary; v2 ships the editor. |
+| 7 | Include in Scope | ⌃1 | Set **this row's** explicit state to `.include` (only this folder; descendants follow via inheritance, `include_checks.mdx` §6.4). Same as §7.1 item 9. |
+| 8 | Inherit Include State | ⌃2 | Set this row to `.inherit`. Same as §7.1 item 10. |
+| 9 | Don't Include in Scope | ⌃3 | Set this row to `.exclude`. Same as §7.1 item 11. |
+| 10 | Include On (including children) | — | **Recursive.** Sets this folder **and every descendant** to `.include` in one atomic write: the folder gets an explicit `.include` override and every descendant override under it is cleared so the whole subtree resolves to `.include`. `include_checks.mdx` §7.2 / `ContextMenuActions.setIncludeStateRecursive(target: .include)` → `IncludeStateController.setSubtree`. |
+| 11 | Include Off (including children) | — | **Recursive.** Same as item 10 but sets the whole subtree to `.exclude`. |
+| 12 | Change Include ▸ | — | Sub-menu — see §7.2.2. Two items — *Change Include On* / *Change Include Off* — that switch the **entire tree** (every root and every node), not just this folder. |
+| 13 | Edit Filter for This Folder… | — | Opens the per-folder filter sheet — see `mcp_and_filters_on_dirs.mdx` §5. v1 ships a read-only summary; v2 ships the editor. |
 | — | *(separator)* | | |
-| 11 | Add Subfolder As Root | — | `DirectoriesStore.shared.addRoot(path: path)`. Useful to "promote" a deep folder you frequently work in. |
-| 12 | Remove Folder from Scope | — | Adds an `exclude` glob to the parent root's filter that vetoes this folder — see `include_checks.mdx` §9 for the compose rule. Disabled when this folder is itself a root (root rows offer *Remove Directory*, §7.3). |
+| 14 | Add Subfolder As Root | — | `DirectoriesStore.shared.addRoot(path: path)`. Useful to "promote" a deep folder you frequently work in. |
+| 15 | Remove Folder from Scope | — | Adds an `exclude` glob to the parent root's filter that vetoes this folder — see `include_checks.mdx` §9 for the compose rule. Disabled when this folder is itself a root (root rows offer *Remove Directory*, §7.3). |
 | — | *(separator)* | | |
-| 13 | Move Folder to Trash | ⇧⌘⌫ | `FileManager.default.trashItem(at: url, …)` wrapped in a confirm dialog. `⇧⌘⌫` is the "with-shift" variant; the bare `⌘⌫` is reserved for files (§7.1 item 16) so the keystroke on a focused folder does not accidentally trash the user's folder. |
+| 16 | Move Folder to Trash | ⇧⌘⌫ | `FileManager.default.trashItem(at: url, …)` wrapped in a confirm dialog. `⇧⌘⌫` is the "with-shift" variant; the bare `⌘⌫` is reserved for files (§7.1 item 16) so the keystroke on a focused folder does not accidentally trash the user's folder. |
+
+#### 7.2.2 Sub-menu — Change Include ▸ (whole-tree)
+
+Distinct from items 7–11, which touch this folder's subtree, the
+*Change Include* sub-menu operates on the **entire scope** — every
+root in `directories.yaml` and every node under it. It is the
+one-gesture "reset the whole tree's include state" affordance the
+user asked for. Include is **off by default** for the tree; these two
+items flip all of it at once.
+
+| # | Item | Action |
+|---|---|---|
+| 1 | Change Include On | Set every root's `default_include_state` to `.include` and clear **all** `include_overrides` on every root, so every row resolves to `.include`. `ContextMenuActions.changeIncludeWholeTree(target: .include)` → `IncludeStateController.setEntireTree` → `DirectoriesStore.setAllRootsIncludeState`. |
+| 2 | Change Include Off | Same, but sets every root to `.exclude` — the whole tree goes out of scope in one click. |
+
+Both write once (one atomic `directories.yaml` write), then trigger a
+single synchronous `refreshWalkerRoots()` and one
+`directories_changed` notification, so the panel re-renders in the
+next frame and the headless MCP server picks up the change. The audit
+line is `tool=panel.set_include_state scope=entire_tree state=…
+roots=N client=gui`.
 
 #### 7.2.1 Verbs not on folders
 
@@ -528,16 +557,19 @@ user added with *Add Directory…*).
 | 6 | Include in Scope | ⌃1 | Toggles `defaultIncludeState = .include`. Per `include_checks.mdx` §1.0, root rows are two-state — *Inherit* is **disabled** here. |
 | 7 | Inherit Include State | ⌃2 | **Disabled** on roots — tooltip *"A root has no ancestor to inherit from."* |
 | 8 | Don't Include in Scope | ⌃3 | Toggles `defaultIncludeState = .exclude`. |
+| 9 | Include On (including children) | — | **Recursive.** `IncludeStateController.setSubtree(rootPath, .include, app)` — sets this root's `default_include_state = .include` and clears all of *this root's* `include_overrides`, so the whole root subtree resolves to `.include`. `include_checks.mdx` §7.2. |
+| 10 | Include Off (including children) | — | **Recursive.** Same for `.exclude`. |
+| 11 | Change Include ▸ | — | Sub-menu (§7.2.2) — *Change Include On* / *Change Include Off* over the **entire tree** (all roots, not just this one). |
 | — | *(separator)* | | |
-| 9 | Edit Filter for This Root… | — | Opens the per-root filter sheet. Same source as §7.2 item 10. |
-| 10 | Clear Filter on This Root | — | `DirectoriesStore.shared.updateFilter(path:, filter: .empty)`. Disabled when the filter is already empty. |
+| 12 | Edit Filter for This Root… | — | Opens the per-root filter sheet. Same source as §7.2 item 13. |
+| 13 | Clear Filter on This Root | — | `DirectoriesStore.shared.updateFilter(path:, filter: .empty)`. Disabled when the filter is already empty. |
 | — | *(separator)* | | |
-| 11 | Move Root Up | — | Reorders the root in `directories.yaml`. The order is what the panel renders top-to-bottom. |
-| 12 | Move Root Down | — | |
-| 13 | Move Root to Top | — | |
-| 14 | Move Root to Bottom | — | |
+| 14 | Move Root Up | — | Reorders the root in `directories.yaml`. The order is what the panel renders top-to-bottom. |
+| 15 | Move Root Down | — | |
+| 16 | Move Root to Top | — | |
+| 17 | Move Root to Bottom | — | |
 | — | *(separator)* | | |
-| 15 | Remove Directory from Scope | ⇧⌘⌫ | `DirectoriesStore.shared.removeRoot(path:)`. The directory on disk is **not** touched — only the entry in `directories.yaml` is removed. Tooltip on hover: *"Removes this directory from the scope. Files on disk are not affected."* |
+| 18 | Remove Directory from Scope | ⇧⌘⌫ | `DirectoriesStore.shared.removeRoot(path:)`. The directory on disk is **not** touched — only the entry in `directories.yaml` is removed. Tooltip on hover: *"Removes this directory from the scope. Files on disk are not affected."* |
 
 The four *Move Root…* items reorder the YAML in place. They are
 disabled at the corresponding endpoints (Move Up disabled when the

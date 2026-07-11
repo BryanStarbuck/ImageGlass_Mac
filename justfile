@@ -17,7 +17,16 @@ swift_min_version := "5.10"
 
 # Where the Swift package lives. Kept in a subdirectory so the repo root
 # can host the justfile, vendor/, docs/, etc. without confusing SwiftPM.
-pkg := "code"
+#
+# `just` already resolves the nearest justfile when invoked from a
+# subdirectory (e.g. from `pm/`) and runs recipes with the working
+# directory set to this justfile's directory — so `just build` / `just
+# run` work from the repo root AND from any subdirectory. Anchoring the
+# package path to `justfile_directory()` makes that absolute and
+# invocation-directory-independent, so it keeps working even under
+# `just --working-directory …` or when a recipe is called from another
+# recipe.
+pkg := justfile_directory() / "code"
 
 # Default recipe: print the list.
 default:
@@ -129,7 +138,7 @@ debug:
     @pkill -x ImageGlass || true
     @echo "==> opening {{pkg}}/Package.swift in Xcode and starting debugger"
     @osascript \
-        -e 'set pkgPath to "{{justfile_directory()}}/{{pkg}}/Package.swift"' \
+        -e 'set pkgPath to "{{pkg}}/Package.swift"' \
         -e 'tell application "Xcode"' \
         -e '  activate' \
         -e '  open pkgPath' \

@@ -174,9 +174,12 @@ recents:
 # replayed on the next launch so the user sees the same workspace they
 # left. This block is rewritten on every clean quit.
 #
-# Slideshow mode is intentionally NOT persisted: if the user quits
-# while slideshow is running, the next launch starts with slideshow
-# OFF. See §4.2.1.
+# Slideshow MODE *is* persisted (as of the slideshow local-storage
+# update): if the user quits while a slideshow is running, the next
+# launch restores it running. The per-window running flag lives in
+# settings_window_<N>.yaml (slideshow.was_running_on_quit); the
+# slideshow's configuration lives in the slideshow.* block. See §4.2.1
+# and slideshow.mdx §14.
 # ────────────────────────────────────────────────────────────────────
 session:
   # Main window geometry, in screen-space points. Restored exactly on
@@ -258,18 +261,20 @@ What is persisted:
   `dir_ui.mdx` §3.3 default rule) is recorded as an explicit
   `expanded_paths` map entry. On next launch the tree is
   re-materialized with the same nodes open and closed.
+* **Slideshow mode.** If the user quits while a slideshow is
+  running, the next launch restores it **running**. The per-window
+  running flag (`slideshow.was_running_on_quit`, plus
+  `current_index`) is written to `settings_window_<N>.yaml` on quit
+  by `WindowStateController.persistSlideshowStateOnQuit()` and read
+  at launch by `restoreSlideshowIfNeeded()`, which restarts the
+  show once the scope resolves. The slideshow's **configuration**
+  (interval, randomness, loop, etc.) lives in the `slideshow.*`
+  block (see §4.2 and slideshow.mdx §14). This is a deliberate
+  reversal of the earlier "slideshow mode is discarded" rule — the
+  user asked for the mode to survive a restart.
 
 What is **not** persisted:
 
-* **Slideshow mode.** If the user quits while a slideshow is
-  running, the next launch starts with slideshow off and the viewer
-  parked on the last shown file. The rationale: slideshow is an
-  active workflow the user explicitly entered, not a workspace
-  preference. Restoring a running slideshow on launch would be
-  surprising and would race with the user's first input. The
-  slideshow's **configuration** (interval, randomness, etc.) is
-  still in `settings.yaml` (see §4.2); only the live "is running
-  right now" state is discarded.
 * **Transient UI states** — modal sheets that were open, the
   contents of inline search fields, drag-in-progress state, the
   currently-tooltipped row, the visible hover preview on a

@@ -151,6 +151,11 @@ enum ContextMenuBuilders {
         // Include / Inherit / Don't Include — three states cycle.
         appendIncludeStateItems(to: menu, state: state, path: path,
                                 isRoot: false, surface: .fileRow)
+        // include_checks.mdx §7.2 — recursive include on/off. On a file
+        // "including children" is just the file itself, but the item is
+        // offered for consistency so the same gesture works on any row.
+        appendRecursiveIncludeItems(to: menu, state: state, path: path,
+                                    surface: .fileRow)
         menu.addItem(NSMenuItem.separator())
 
         menu.addItem(item("Show in File List", id: .showInFileList,
@@ -225,6 +230,10 @@ enum ContextMenuBuilders {
 
         appendIncludeStateItems(to: menu, state: state, path: path,
                                 isRoot: false, surface: .folderRow)
+        appendRecursiveIncludeItems(to: menu, state: state, path: path,
+                                    surface: .folderRow)
+        menu.addItem(changeIncludeSubmenu(state: state, path: path,
+                                          surface: .folderRow))
         menu.addItem(disabledItem("Edit Filter for This Folder…",
                                   id: .editFilter,
                                   tooltip: "Per-folder filter editor coming in v2."))
@@ -289,6 +298,10 @@ enum ContextMenuBuilders {
         // Item 7 *Inherit* is disabled.
         appendIncludeStateItems(to: menu, state: state, path: path,
                                 isRoot: true, surface: .rootRow)
+        appendRecursiveIncludeItems(to: menu, state: state, path: path,
+                                    surface: .rootRow)
+        menu.addItem(changeIncludeSubmenu(state: state, path: path,
+                                          surface: .rootRow))
         menu.addItem(NSMenuItem.separator())
 
         menu.addItem(disabledItem("Edit Filter for This Root…",
@@ -722,6 +735,51 @@ enum ContextMenuBuilders {
                                                target: .exclude,
                                                menu: surface)
         })
+    }
+
+    /// include_checks.mdx §7.2 — the two recursive items that set this
+    /// row **and every descendant** to include / exclude in one shot
+    /// (right_click.mdx §7.1 item / §7.2). Distinct from the three
+    /// single-row items above, which only touch the clicked row.
+    private static func appendRecursiveIncludeItems(
+        to menu: NSMenu, state: AppState, path: String,
+        surface: ContextMenuActions.SurfaceID
+    ) {
+        menu.addItem(item("Include On (including children)",
+                          id: .includeChildren) {
+            ContextMenuActions.setIncludeStateRecursive(
+                state: state, path: path, target: .include, menu: surface)
+        })
+        menu.addItem(item("Include Off (including children)",
+                          id: .dontIncludeChildren) {
+            ContextMenuActions.setIncludeStateRecursive(
+                state: state, path: path, target: .exclude, menu: surface)
+        })
+    }
+
+    /// include_checks.mdx §7.3 — the "Change Include ▸" submenu that
+    /// switches the **entire tree** (all roots + all nodes) to include /
+    /// exclude (right_click.mdx §7.2). Include is off by default; these
+    /// two items flip the whole scope at once.
+    private static func changeIncludeSubmenu(
+        state: AppState, path: String,
+        surface: ContextMenuActions.SurfaceID
+    ) -> NSMenuItem {
+        let parent = NSMenuItem(title: "Change Include", action: nil,
+                                keyEquivalent: "")
+        parent.identifier = NSUserInterfaceItemIdentifier(
+            rawValue: ContextMenuActions.ItemID.changeInclude.rawValue)
+        let sub = NSMenu(title: "Change Include")
+        sub.addItem(item("Change Include On", id: .changeIncludeOn) {
+            ContextMenuActions.changeIncludeWholeTree(
+                state: state, target: .include, menu: surface, path: path)
+        })
+        sub.addItem(item("Change Include Off", id: .changeIncludeOff) {
+            ContextMenuActions.changeIncludeWholeTree(
+                state: state, target: .exclude, menu: surface, path: path)
+        })
+        parent.submenu = sub
+        return parent
     }
 
     private static func clipboardContainsFolderPath() -> Bool {

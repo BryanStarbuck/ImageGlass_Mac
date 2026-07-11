@@ -546,6 +546,124 @@ the next tick.
 
 ---
 
+## 3A. Reliable Toggle — `S` Always Flips Play/Stop
+
+This section is the contract for the bug the user reported: *"the
+slideshow was stopping on its own, and pressing `S` didn't reliably
+turn it back off."* The rule is now unambiguous:
+
+> **`S` (and `Space`, and View ▸ Start/Stop Slideshow, and MCP
+> `set_slideshow`) is a true toggle. If any slideshow is running,
+> the toggle STOPS it. If none is running, the toggle STARTS one.
+> There is no third outcome and no way for a bare `S` to spawn a
+> second run.**
+
+### 3A.1 Why it used to be unreliable
+
+Every toggle surface funnels into
+`SlideshowController.toggle(appState:source:windowID:)`
+(`code/Sources/ImageGlass/Viewer/SlideshowWindow.swift`). When the
+keypress carries **no** explicit `windowID` (every bare `S` / `Space`
+does), the controller resolves the target with
+`resolveTargetWindowID()` = `WindowRegistry.frontmostWindowID`. If the
+run was keyed under a *different* window id than the one currently
+resolved as frontmost — the frontmost changed since the run started,
+or MCP started the run under a different resolved target — then
+`isRunning(windowID: target)` was `false`, so the toggle took the
+`start` branch and opened a **second** run instead of stopping the
+visible one. The user experienced this as "`S` doesn't stop it."
+
+### 3A.2 The rule, exact
+
+`toggle(appState:source:windowID:)` now decides in this order:
+
+1. If the resolved `target` window is running a slideshow → **stop**
+   it (`reason=user_toggle`). This is the normal single-window case.
+2. Else, if the caller passed **no** explicit `windowID` **and** any
+   window is running a slideshow → **stop that run**
+   (`runs.keys.sorted().first`). A bare `S` therefore always stops a
+   visible slideshow regardless of which window the run is keyed
+   under.
+3. Else → **start** a run on `target`.
+
+Implemented in
+`SlideshowController.toggle(...)`. The explicit-`windowID` path
+(MCP targeting a specific window, multi_window.mdx §7.2) is
+untouched — only the no-window keyboard/menu path gains the
+"stop whatever is running" fallback.
+
+### 3A.3 Verify
+
+* Start a slideshow with `S`. Click a Finder window, then click back
+  onto the ImageGlass window (this can re-resolve the frontmost id).
+  Press `S`. Expected: the slideshow **stops**. It must not open a
+  second run or leave the first running.
+* On disk: exactly one `slideshow.toggle on=false … source=key:S`
+  line follows, and there is **no** second `slideshow.toggle on=true`
+  line for that press.
+
+---
+
+## 3B. A Transient Empty List Pauses — It Never Auto-Stops
+
+The second half of the "stops on its own" bug. The advance loop
+reads `AppState.orderedNavigationFiles` **live on every tick** (§0A.1,
+§2.3). That list is recomputed from the walker snapshot, so a scope
+re-evaluation, a directory refresh, or an FSEvents-driven rewalk can
+leave it **transiently empty** for a frame or two — even though the
+user did nothing and files still exist on disk.
+
+### 3B.1 Old behavior (the bug)
+
+`advance()` hit `files.isEmpty` and called
+`stop(reason: "no_in_scope_files")`, tearing the whole run down. To
+the user the slideshow "just stopped by itself" mid-show.
+
+### 3B.2 New behavior
+
+An empty navigation list at advance time is treated as a **paused
+tick**, not a stop:
+
+1. The run stays alive; `SlideshowController.runs[windowID]` is
+   **not** removed.
+2. The countdown is re-armed for another full interval via
+   `scheduleTick(windowID:every:)`.
+3. On the next tick the list is re-read. As soon as **any** in-scope
+   file is present, the slideshow advances normally.
+
+Implemented in `SlideshowController.advance(windowID:)` — the
+`files.isEmpty` branch now re-arms the tick instead of calling
+`stop`.
+
+### 3B.3 The only things that stop a running slideshow
+
+After this spec, a running slideshow stops **only** for one of:
+
+| Cause | `reason=` | Section |
+| --- | --- | --- |
+| User toggles it off (`S` / `Space` / menu / MCP) | `user_toggle` | §3, §3A |
+| End of list with `loop == false` | `end_of_list` | §7.7 |
+| App quit / window close | *(no stop line; state flushed)* | §14 |
+
+A transient or even total empty list no longer appears in this
+table. Excluding every file (include_checks.mdx §10) now **pauses**
+the show on its current frame; it resumes when a file is re-included.
+This supersedes the old `reason=no_in_scope_files` auto-stop
+(include_checks.mdx §10.3 is updated in lockstep).
+
+### 3B.4 Verify
+
+* Start a slideshow over `~/Pictures/tour/`. From an MCP client, run
+  `refresh_directory` (forces a rewalk) a few times while the show
+  runs. Expected: the slideshow keeps advancing; it does **not**
+  stop. No `slideshow.stop reason=no_in_scope_files` line appears.
+* Exclude every root (`Change Include ▸ Change Include Off`,
+  include_checks.mdx §7.3). Expected: the current image stays on
+  screen, the countdown keeps re-arming, and no stop line is written.
+  Re-include a root and the show advances again within one interval.
+
+---
+
 ## 4. Change Interval From Settings — Slider + Editable Number Field
 
 This is the only place a user adjusts the interval persistently.
@@ -1268,7 +1386,126 @@ vice versa.
 
 ---
 
-## 13. End-to-End Acceptance
+## 14. Local Storage — YAML-Backed Slideshow State
+
+The user asked for two things beyond the toggle fix: *"we want a local
+storage folder with YAML files for settings … our own directory … save
+a lot of settings, like whether we are in slideshow mode or not, so we
+restart and reload the state we had before."* This section is the
+contract for that persistence.
+
+### 14.1 The directory — our own, already ours
+
+ImageGlass_Mac keeps all of its plain-text state under **one directory
+it owns**:
+
+```
+~/Library/Application Support/ImageGlass_Mac/
+```
+
+defined by `AppPaths.macAppSupportDir`
+(`code/Sources/ImageGlassCore/Paths.swift`, `macAppName =
+"ImageGlass_Mac"`). This is the "local storage folder" — see
+[local_storage.mdx](../local_storage.mdx) for the full layout. Every
+file in it is human-readable YAML the user (or the MCP server) can open
+and edit. The files relevant to the slideshow:
+
+| File | What it holds |
+| --- | --- |
+| `settings.yaml` | App-level defaults, incl. the `slideshow.*` block (interval, loop, fullscreen, countdown, background, …). |
+| `settings_window_<N>.yaml` | Per-window workspace state, incl. the per-window `slideshow:` block that records whether a slideshow was running at quit. |
+| `directories.yaml` | Walker roots + `include_overrides` (what the slideshow walks). |
+
+This mirrors how the **sister apps** persist state: each ships a
+`justfile` and keeps its state as flat files under a per-app directory
+(see the repo `CLAUDE.md` "Local Web Apps" and "Sister Web Apps"
+tables). ImageGlass_Mac follows the same convention — one owned
+directory, plain-text files, atomic writes.
+
+### 14.2 The slideshow settings that persist
+
+Two kinds of slideshow state are saved, in two different files:
+
+1. **Configuration** (how the slideshow behaves) lives in the
+   app-level `slideshow.*` block in `settings.yaml` /
+   `SlideshowSettings`
+   (`code/Sources/ImageGlassCore/Config/Settings.swift`):
+   `interval_seconds`, `interval_to_seconds`, `use_random_interval`,
+   `loop`, `fullscreen`, `show_countdown`, `hide_main_window`,
+   `notify_every`, `notify_sound`, `background`, and
+   `enabled_on_launch`. Documented in
+   [settings.mdx §4.6](../settings.mdx#46-slideshow). These are
+   written atomically by `SettingsStore` on every debounced change
+   (§4.4).
+
+2. **Mode / running state** (were we in slideshow mode?) lives in the
+   per-window `slideshow:` block of `settings_window_<N>.yaml`
+   (`WindowSlideshowState`,
+   `code/Sources/ImageGlassCore/Config/WindowScopedSettings.swift`):
+
+   ```yaml
+   slideshow:
+     was_running_on_quit: true    # were we mid-show when the app quit?
+     current_index: 12            # which file the show was on
+   ```
+
+### 14.3 Save on quit
+
+On clean quit (`NSApplication.willTerminateNotification`),
+`WindowStateController.persistSlideshowStateOnQuit()` walks every open
+window and calls `WindowState.persistSlideshow()`, which copies the
+live `WindowState.slideshow.isRunning` flag (set by
+`SlideshowController.start` / `.stop`) into
+`slideshow.was_running_on_quit`, plus `current_index`, and flushes the
+per-window YAML atomically.
+
+So: quit while a slideshow is playing → `was_running_on_quit: true`.
+Press `S` to stop, then quit → `was_running_on_quit: false`.
+
+### 14.4 Restore on launch
+
+At launch, after `bootstrap()` resolves the scope and the navigation
+list is populated, `WindowStateController.restoreSlideshowIfNeeded()`
+reads the target window's persisted flag. If
+`slideshow.was_running_on_quit == true`, it calls
+`SlideshowController.shared.start(source: "launch:restore")` so the app
+comes back up **in the same slideshow mode the user left it in** — the
+show is already playing, on the same interval, from the restored
+selection.
+
+This intentionally **reverses** the old "slideshow mode is not
+persisted" rule (the previous
+[local_storage.mdx §4.2.1](../local_storage.mdx#421-session-state--save-on-quit)
+discarded it). The user explicitly wants the mode to survive a
+restart, and it now does.
+
+Best-effort guarantee: if the walk has not finished and
+`orderedNavigationFiles` is still empty when the restore fires,
+`start()` no-ops with a `no_files_available` audit line and the user
+simply presses `S` to begin. No crash, no half-started run.
+
+### 14.5 Verify the round-trip
+
+* Press `S` to start a slideshow. Let it advance to `002.jpg`. Quit
+  the app (`⌘Q`).
+* On disk:
+
+  ```sh
+  grep -A2 'slideshow:' ~/Library/Application\ Support/ImageGlass_Mac/settings_window_1.yaml
+  ```
+
+  reads `was_running_on_quit: true` and a non-zero `current_index`.
+* Relaunch. Expected: the slideshow is **already running** — the
+  countdown badge is visible and the image advances after the
+  interval, with no key press. `log.log` shows a
+  `slideshow.toggle on=true … source=launch:restore` line.
+* Press `S` (it stops — §3A), then quit and relaunch. Expected: the
+  app comes up **stopped**; `was_running_on_quit: false` was written
+  and no restore fired.
+
+---
+
+## 15. End-to-End Acceptance
 
 A run of this spec passes when **all of**:
 
@@ -1305,6 +1542,15 @@ A run of this spec passes when **all of**:
   last-displayed image, and leaves the main viewer's
   `ViewerState` untouched. `slideshow.toggle on=false` is in
   `log.log`.
+* §3A — `S` (and `Space`, menu, MCP with no explicit window) is a
+  dependable play/stop toggle: if any run is active it stops it
+  rather than spawning a second run, even when the frontmost
+  window id has drifted from the run's window id.
+* §3B — a transient or total empty `orderedNavigationFiles` at
+  advance time **pauses** (re-arms the tick) instead of tearing
+  the run down. The only stops are user-toggle, end-of-list with
+  loop off, and quit. No `slideshow.stop reason=no_in_scope_files`
+  is ever written.
 * §4 — Settings ▸ Slideshow ▸ Timing exposes a **Slider** and an
   **editable text field with stepper** that share the same
   `settings.slideshow.interval_seconds` binding. Edits in
@@ -1349,6 +1595,16 @@ A run of this spec passes when **all of**:
   `S` key, differentiated only by `source=mcp:set_slideshow`
   in `log.log`. A one-shot `interval` argument runs without
   persisting; a `set_setting` call persists.
+* §14 — slideshow state persists to the app's own YAML local
+  storage directory (`~/Library/Application Support/ImageGlass_Mac/`).
+  Configuration lives in `settings.yaml`/`SlideshowSettings`; the
+  running-mode flag lives in each `settings_window_<N>.yaml`
+  (`slideshow.was_running_on_quit` + `current_index`), written on
+  quit by `WindowStateController.persistSlideshowStateOnQuit()` and
+  read at launch by `restoreSlideshowIfNeeded()`. Quitting mid-show
+  and relaunching brings the slideshow back up running
+  (`source=launch:restore`); quitting stopped brings it back
+  stopped.
 
 If any step fails, the failing line in `log.log` (with its `corr=`
 correlation id) is the first place to look — `grep corr=<id>

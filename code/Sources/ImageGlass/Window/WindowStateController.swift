@@ -81,6 +81,9 @@ final class WindowStateController: NSObject {
         // it just needs `resolvedFiles` to be populated.
         restoreSelection()
 
+        // slideshow.mdx §14 — resume a slideshow that was running at quit.
+        restoreSlideshowIfNeeded()
+
         // Whenever the user changes selection going forward, debounce-save it.
         observeSelectionChanges()
     }
@@ -192,6 +195,31 @@ final class WindowStateController: NSObject {
         //       can still recover it (spec §7.4 last paragraph).
     }
 
+    /// slideshow.mdx §14 — restore slideshow mode across restarts. If the
+    /// target window's per-window YAML recorded
+    /// `slideshow.was_running_on_quit: true`, the user quit mid-show and
+    /// expects the slideshow to still be playing on relaunch. Start it now
+    /// that `bootstrap()` has resolved the scope and the navigation list is
+    /// populated. Best-effort: if the walk has not finished and the list is
+    /// still empty, `start()` no-ops with `no_files_available` and the user
+    /// simply presses `S` to begin fresh.
+    private func restoreSlideshowIfNeeded() {
+        guard let state = appState else { return }
+        let targetID = WindowRegistry.shared.frontmostWindowID
+            ?? WindowRegistry.shared.windows.keys.sorted().first
+        guard let id = targetID,
+              let ws = WindowRegistry.shared.window(id: id),
+              ws.settings.slideshow.wasRunningOnQuit,
+              !SlideshowController.shared.isRunning(windowID: id)
+        else { return }
+        SlideshowController.shared.start(
+            appState: state,
+            seconds: state.settings.slideshow.interval_seconds,
+            source: "launch:restore",
+            windowID: id
+        )
+    }
+
     // MARK: - Observation
 
     private func installWindowObservers(_ window: NSWindow) {
@@ -245,9 +273,30 @@ final class WindowStateController: NSObject {
             guard let self else { return }
             MainActor.assumeIsolated {
                 self.saveNow()
+                Self.persistSlideshowStateOnQuit()
             }
         }
         observers.append(token)
+    }
+
+    /// slideshow.mdx §14 — flush every open window's live slideshow
+    /// running flag to its per-window YAML (`slideshow.was_running_on_quit`)
+    /// so the next launch can resume a show that was playing at quit. The
+    /// runtime `WindowState.slideshow.isRunning` is set by
+    /// `SlideshowController.start` / `.stop`; `persistSlideshow()` copies it
+    /// (plus `current_index`) into `settings_window_<N>.yaml`.
+    static func persistSlideshowStateOnQuit() {
+        for state in WindowRegistry.shared.windows.values {
+            do {
+                try state.persistSlideshow()
+            } catch {
+                ErrorLog.log(
+                    "WindowStateController.persistSlideshowStateOnQuit failed for window_id=\(state.windowID)",
+                    error: error,
+                    class: "WindowStateController"
+                )
+            }
+        }
     }
 
     // MARK: - Save

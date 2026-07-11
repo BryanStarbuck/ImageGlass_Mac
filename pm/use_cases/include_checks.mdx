@@ -832,8 +832,78 @@ menu (⌃1 / ⌃2 / ⌃3 to set a state directly) will sometimes
 prefer the hotkey (`I` to cycle when they don't remember which
 state they want next), and the swatch click is always there as a
 direct-manipulation fallback. All three surfaces share one code
-path — `IncludeOverridesStore.setState(...)` — so the only thing
+path — `IncludeStateController.setState(...)` — so the only thing
 that varies between them is how the user expresses intent.
+
+### 7.2 Recursive menu items — "Include On / Off (including children)"
+
+The single-row items (⌃1 / ⌃2 / ⌃3) touch **only** the clicked
+row and rely on the inheritance walk (§6.4) to carry the decision
+to descendants. Sometimes the user wants to force an entire subtree
+regardless of any per-child overrides already in it. Two additional
+context-menu items do that (right_click.mdx §7.1 item 12/13, §7.2
+item 10/11, §7.3 item 9/10):
+
+| Menu item label | Action on the clicked row + all descendants |
+| --- | --- |
+| `Include On (including children)` | Set the whole subtree's resolved state to `.include`. |
+| `Include Off (including children)` | Set the whole subtree's resolved state to `.exclude`. |
+
+The implementation is one atomic write, not a per-node loop:
+
+* On a **folder or file** row, the node gets one explicit override
+  (`.include` / `.exclude`) and **every descendant override under
+  it is removed**, so the subtree resolves uniformly to the chosen
+  state by inheritance (§6.4). Removing the descendants' overrides
+  is what makes it recursive — any child the user had previously
+  set to the opposite state is reset to inherit and now follows the
+  parent.
+* On a **root** row, the root's `default_include_state` is set and
+  **all** of that root's `include_overrides` are cleared — the whole
+  root subtree flips.
+
+Code: `ContextMenuActions.setIncludeStateRecursive(...)` →
+`IncludeStateController.setSubtree(absolutePath:state:appState:)` →
+`DirectoriesStore.setSubtreeIncludeState(rootPath:relativePath:state:)`.
+The store method does one `directories.yaml` load + mutate + atomic
+save; the controller then does one synchronous
+`refreshWalkerRoots()` and one `directories_changed` post (§5.6).
+The audit line carries `recursive=true`:
+
+```
+ts=… tool=panel.set_include_state root=…/tour path=beach state=exclude resolved=exclude recursive=true client=gui corr=… ok=true
+```
+
+`inherit` is **not** offered for the recursive verb — a recursive
+"make everything inherit" has no well-defined target, and the store
+rejects `.inherit` for this call.
+
+### 7.3 Whole-tree submenu — "Change Include ▸ Change Include On / Off"
+
+A second folder/root context-menu affordance switches the **entire
+tree** — every root in `directories.yaml` and every node under it —
+in one gesture. It lives under a `Change Include ▸` submenu
+(right_click.mdx §7.2.2):
+
+| Submenu item | Action on the whole tree |
+| --- | --- |
+| `Change Include On` | Every root's `default_include_state = .include`; every root's `include_overrides` cleared. All rows resolve to `.include`. |
+| `Change Include Off` | Every root's `default_include_state = .exclude`; overrides cleared. All rows resolve to `.exclude`. |
+
+Include is **off by default** for the tree as a whole (a fresh root
+still defaults to `.include` per §8, but this control lets the user
+carve the whole scope out and then re-include selectively). It is
+the "reset everything" companion to the per-row and per-subtree
+items.
+
+Code: `ContextMenuActions.changeIncludeWholeTree(...)` →
+`IncludeStateController.setEntireTree(state:appState:)` →
+`DirectoriesStore.setAllRootsIncludeState(state:)` — one atomic
+write across all roots, one refresh, one notification. Audit:
+
+```
+ts=… tool=panel.set_include_state scope=entire_tree state=exclude roots=3 client=gui corr=… ok=true
+```
 
 ---
 
@@ -972,11 +1042,16 @@ though the excluded one were not in the list.
   not vanish instantly — the user sees one more tick of it before
   the show moves on. (This avoids a jarring "the image just
   disappeared" experience.)
-* **Every file in scope is excluded.** The slideshow stops with
-  a `slideshow_stopped reason=no_in_scope_files` audit line and
-  the viewer reverts to the §9.2 empty state from mcp_file.mdx.
-  This is symmetric with "the slideshow ran out of files
-  because all roots were removed."
+* **Every file in scope is excluded.** The slideshow **pauses** on
+  its current frame — it does **not** stop. Per
+  [slideshow.mdx §3B](./slideshow.mdx#3b-a-transient-empty-list-pauses--it-never-auto-stops),
+  an empty `orderedNavigationFiles` at advance time re-arms the
+  countdown instead of tearing the run down (the old
+  `reason=no_in_scope_files` auto-stop is removed). As soon as the
+  user re-includes any file — via the swatch, the `I` hotkey, or a
+  `Change Include ▸ Change Include On` — the show advances again
+  within one interval. Only a user toggle, an end-of-list with
+  loop off, or app quit stops a running slideshow.
 * **A new file is added to a directory whose state is `exclude`.**
   The walker picks up the new file via `FSEventStream`, gives it
   `passesFilter = true` (the filter logic is unchanged), but

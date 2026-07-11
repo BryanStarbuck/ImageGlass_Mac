@@ -94,9 +94,22 @@ final class SlideshowController {
     /// multi_window.mdx §7.2 — per-window. When `windowID` is nil the
     /// frontmost window is the implicit target.
     func toggle(appState: AppState, source: String, windowID: Int? = nil) {
-        let target = windowID ?? resolveTargetWindowID()
+        let explicit = windowID
+        let target = explicit ?? resolveTargetWindowID()
         if isRunning(windowID: target) {
             stop(windowID: target, reason: "user_toggle", source: source)
+        } else if explicit == nil, let running = runs.keys.sorted().first {
+            // slideshow.mdx §3 (reliable toggle) — a bare `S` / Space /
+            // menu toggle carries no explicit window, so `target` is
+            // whatever `resolveTargetWindowID()` reports as frontmost.
+            // That can drift from the window the run is actually keyed
+            // under (the frontmost changed since the run started, or MCP
+            // started it under a different resolved target). Without this
+            // branch the toggle would `start()` a *second* run instead of
+            // stopping the visible one — the "S doesn't stop it" bug.
+            // Falling back to stopping any active run makes `S` a
+            // dependable play/stop toggle regardless of window focus.
+            stop(windowID: running, reason: "user_toggle", source: source)
         } else {
             start(
                 appState: appState,
@@ -354,10 +367,21 @@ final class SlideshowController {
 
         let fromPath = appState.selectedFile ?? ""
 
-        // §10.3 — every in-scope file got carved out. Stop with a
-        // distinct reason so the audit log records the cause.
+        // slideshow.mdx §3B — the navigation list is recomputed live on
+        // every tick from the walker snapshot (`orderedNavigationFiles`).
+        // A scope re-evaluation, a directory refresh, or an FSEvents-
+        // driven rewalk can transiently empty it for a frame or two. The
+        // old behavior tore the whole run down here with
+        // `reason=no_in_scope_files` — that is the root cause of the
+        // "slideshow stops by itself" bug the user reported. Instead,
+        // treat an empty list as a *paused* tick: keep the run alive,
+        // re-arm the countdown, and try again next interval. The show
+        // resumes automatically as soon as any in-scope file returns.
+        // The ONLY things that stop a running slideshow are now the user
+        // (`S` / Space / menu / MCP), an end-of-list with loop off, and
+        // app quit — nothing else pulls it down unexpectedly.
         if files.isEmpty {
-            stop(windowID: windowID, reason: "no_in_scope_files", source: "")
+            scheduleTick(windowID: windowID, every: interval)
             return
         }
 

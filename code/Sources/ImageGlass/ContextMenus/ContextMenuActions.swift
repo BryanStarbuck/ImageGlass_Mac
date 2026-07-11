@@ -34,6 +34,11 @@ enum ContextMenuActions {
         case include
         case inherit
         case dontInclude = "dont-include"
+        case includeChildren = "include-including-children"
+        case dontIncludeChildren = "dont-include-including-children"
+        case changeInclude = "change-include"
+        case changeIncludeOn = "change-include.on"
+        case changeIncludeOff = "change-include.off"
         case showInFileList = "show-in-file-list"
         case showInTreeView = "show-in-tree-view"
         case showMetadata = "show-metadata"
@@ -454,6 +459,37 @@ enum ContextMenuActions {
         _ = IncludeStateController.setState(absolutePath: path,
                                             state: target,
                                             appState: state)
+    }
+
+    /// include_checks.mdx §7.2 — "Include On / Off (including children)".
+    /// Recursively set `path` and every descendant to `target`
+    /// (right_click.mdx §7.1 item / §7.2). `target` is `.include` or
+    /// `.exclude`; `.inherit` is not offered for the recursive verb.
+    static func setIncludeStateRecursive(state: AppState, path: String,
+                                         target: IncludeState,
+                                         menu: SurfaceID) {
+        let itemID: ItemID = target == .include
+            ? .includeChildren : .dontIncludeChildren
+        _ = recordClick(menu: menu, item: itemID,
+                        extra: [("path", path), ("recursive", "true")])
+        _ = IncludeStateController.setSubtree(absolutePath: path,
+                                              state: target,
+                                              appState: state)
+    }
+
+    /// include_checks.mdx §7.3 — "Change Include ▸ Change Include On /
+    /// Off". Switch the entire tree (all roots + all nodes) to `target`
+    /// (right_click.mdx §7.2). Default is off; "Change Include On" sets
+    /// every row to `.include`, "Change Include Off" to `.exclude`.
+    static func changeIncludeWholeTree(state: AppState,
+                                       target: IncludeState,
+                                       menu: SurfaceID, path: String) {
+        let itemID: ItemID = target == .include
+            ? .changeIncludeOn : .changeIncludeOff
+        _ = recordClick(menu: menu, item: itemID,
+                        extra: [("path", path), ("scope", "entire_tree")])
+        _ = IncludeStateController.setEntireTree(state: target,
+                                                 appState: state)
     }
 
     // MARK: - Panel-empty / panel-header verbs

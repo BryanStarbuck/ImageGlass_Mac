@@ -430,6 +430,83 @@ public final class DirectoriesStore: @unchecked Sendable {
         try saveUnlocked(file)
     }
 
+    /// include_checks.mdx §7.2 — recursively set a node **and every
+    /// descendant** to `state` in one atomic write. On a folder or file
+    /// (`relativePath` non-empty) the node's own override is set to
+    /// `state` and every descendant override is dropped so the whole
+    /// subtree resolves to `state` by inheritance (§6.4). On the root
+    /// itself (`relativePath` empty) the root default is set and all of
+    /// that root's overrides are cleared. `inherit` is rejected — a
+    /// recursive "make this inherit" has no well-defined meaning at the
+    /// root and would just be "clear overrides" at a node.
+    @discardableResult
+    public func setSubtreeIncludeState(
+        rootPath: URL,
+        relativePath: String,
+        state: IncludeState
+    ) throws -> IncludeState {
+        let _trace = PerformanceLog.shared.start("LocalStorage.MutateDirectories")
+        defer { _trace.finish() }
+        guard state != .inherit else {
+            throw DirectoriesStoreError.invalidIncludeState("inherit")
+        }
+        lock.lock()
+        defer { lock.unlock() }
+        var file = (try? loadUnlocked()) ?? DirectoriesFile()
+        guard let idx = file.roots.firstIndex(where: { $0.path == rootPath }) else {
+            throw DirectoriesStoreError.pathNotFound(rootPath.path)
+        }
+        var root = file.roots[idx]
+        let normalized = RootDirectory.normalize(relativePath)
+        if normalized.isEmpty {
+            // The root itself — "including children" is the whole root
+            // subtree. Set the default and drop every override so the
+            // entire root resolves to `state` uniformly.
+            root.defaultIncludeState = state
+            root.includeOverrides.removeAll()
+        } else {
+            // Drop the node's own override and every descendant override,
+            // then write one explicit override on the node. Descendants
+            // carry no entry, so they inherit the node's new decision.
+            let prefix = normalized + "/"
+            root.includeOverrides.removeAll { entry in
+                let n = RootDirectory.normalize(entry.path)
+                return n == normalized || n.hasPrefix(prefix)
+            }
+            root.includeOverrides.append(
+                IncludeOverrideEntry(path: normalized, state: state)
+            )
+        }
+        file.roots[idx] = root
+        try saveUnlocked(file)
+        return root.effectiveState(for: normalized)
+    }
+
+    /// include_checks.mdx §7.3 — switch the **entire tree** (every root
+    /// and every node under it) to `state` in one atomic write. Sets each
+    /// root's `default_include_state` and clears all `include_overrides`
+    /// so every row resolves uniformly to `state`. `include` is the
+    /// factory default; the "Change Include Off" menu item sets
+    /// `exclude`. Returns the number of roots affected. `inherit` is
+    /// rejected (roots need a concrete default, §5.2).
+    @discardableResult
+    public func setAllRootsIncludeState(state: IncludeState) throws -> Int {
+        let _trace = PerformanceLog.shared.start("LocalStorage.MutateDirectories")
+        defer { _trace.finish() }
+        guard state != .inherit else {
+            throw DirectoriesStoreError.invalidIncludeState("inherit")
+        }
+        lock.lock()
+        defer { lock.unlock() }
+        var file = (try? loadUnlocked()) ?? DirectoriesFile()
+        for i in file.roots.indices {
+            file.roots[i].defaultIncludeState = state
+            file.roots[i].includeOverrides.removeAll()
+        }
+        try saveUnlocked(file)
+        return file.roots.count
+    }
+
     /// Update the cached `last_walked` timestamp for one root after the
     /// walker completes a pass.
     public func setLastWalked(path: URL, at date: Date) throws {
