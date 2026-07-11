@@ -1265,6 +1265,43 @@ public final class AppState {
             )
         }
         self.walkerRoots = merged
+        // menus.mdx View ▸ Left File Tree ▸ "Only Show Included Items" —
+        // the flag lives in the same YAML the merge just loaded, so pull
+        // it through here too. This is the single funnel called at
+        // bootstrap, on every walk change, and after an external
+        // (MCP-driven) edit, so the toggle state stays honest without a
+        // second file read. Guarded so re-assigning the same value never
+        // spuriously invalidates the panel.
+        if self.onlyShowIncludedItems != yaml.onlyShowIncludedItems {
+            self.onlyShowIncludedItems = yaml.onlyShowIncludedItems
+        }
+    }
+
+    /// menus.mdx View ▸ Left File Tree ▸ "Only Show Included Items" —
+    /// the one entry point the menu toggle calls. Writes the flag into
+    /// this window's `directories_window_<N>.yaml`, updates the
+    /// in-memory mirror synchronously so the file-tree panel re-renders
+    /// in the next frame (ahead of the file watcher), journals the
+    /// change, and posts the cross-process notification so a headless
+    /// MCP client sees the same truth.
+    public func setOnlyShowIncludedItems(_ enabled: Bool) {
+        guard onlyShowIncludedItems != enabled else { return }
+        do {
+            try DirectoriesStore.shared.setOnlyShowIncludedItems(enabled)
+        } catch {
+            ErrorLog.log("setOnlyShowIncludedItems failed",
+                         error: error,
+                         class: String(describing: Self.self))
+            return
+        }
+        onlyShowIncludedItems = enabled
+        MCPAuditLogger.shared.log([
+            ("tool", "panel.set_only_show_included_items"),
+            ("enabled", enabled ? "true" : "false"),
+            ("client", "gui"),
+            ("ok", "true"),
+        ])
+        MCPNotificationBus.shared.postDirectoriesChanged()
     }
 
     private func startViewModeWatcher() {

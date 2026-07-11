@@ -103,8 +103,12 @@ clean-deps:
 # Build, run, test.
 # ---------------------------------------------------------------------------
 
-# Build everything (debug).
+# Build everything (debug). Kills any running ImageGlass first so the
+# build never fights a live process holding the binary, matching the
+# `run` recipe's kill-then-act contract.
 build:
+    @echo "==> killing any existing ImageGlass process"
+    @pkill -x ImageGlass || true
     cd {{pkg}} && swift build
 
 # Build everything (release).

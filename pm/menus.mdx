@@ -170,6 +170,34 @@ image-specific copy items.
 | Appearance | submenu | *Match System*, *Light*, *Dark*. |
 | Show Status Bar | — | Toggle. Bottom-of-window info bar. |
 | Show File Info Overlay | ⌘ I | Toggle the on-image metadata overlay. |
+| Tree View | submenu | Picks the tree rendering technology — *AppKit* (⌃⌥⌘1), *SwiftUI* (⌃⌥⌘2), *Catalyst* (⌃⌥⌘3). The active one is checkmarked. |
+| Left File Tree **(new)** | submenu | View filters over the left file tree. See §4.4.1. |
+
+#### 4.4.1 View ▸ Left File Tree
+
+A submenu of view filters that change **what the left file tree
+shows** without changing any include/exclude decision on disk.
+
+| Item | Toggle | Default | Notes |
+| --- | --- | --- | --- |
+| Only Show Included Items **(new)** | on/off | **off** | When on, the file tree hides every row whose *resolved* include state (`RootDirectory.effectiveState`, `include_checks.mdx` §6) is `exclude`, leaving only green-checked `include` rows and inherit-include rows whose ancestor chain is all-include. When off, the full hierarchy is shown, red-X rows included. A directory is shown when any descendant is visible, so an explicitly-included file stays reachable even under an excluded ancestor. |
+
+Persistence: the toggle is a **window-level** preference stored in the
+same per-window `directories_window_<N>.yaml` as the include overrides
+it filters, under a top-level `only_show_included_items: true` key
+(absent ⇒ off). It survives a relaunch: the app reads it back through
+`AppState.refreshWalkerRoots()` on launch and re-applies it. The
+factory default is **off** for every customer; the key is emitted to
+disk only when on, so a customer who never touches it produces a
+byte-identical file.
+
+Implemented in the menu at
+`code/Sources/ImageGlass/ImageGlassApp.swift` (View ▸ Left File Tree
+submenu), state + persistence in `AppState.setOnlyShowIncludedItems`
+and `DirectoriesStore.setOnlyShowIncludedItems`, on-disk schema in
+`DirectoriesYAML` (`only_show_included_items`), and the render-time
+filter in `DesignTreeNode.isIncluded` /
+`DesignTreeNode.anyVisible`.
 
 ### 4.5 Image
 

@@ -132,6 +132,20 @@ struct ImageGlassApp: App {
                     treeRenderTechItem(.swiftUI, key: "2")
                     treeRenderTechItem(.catalyst, key: "3")
                 }
+                // menus.mdx View ▸ Left File Tree — a submenu of view
+                // filters over the left file tree. "Only Show Included
+                // Items" hides every row whose resolved include state is
+                // exclude (include_checks.mdx §6); off by default for
+                // every customer, persisted per-window in
+                // directories_window_<N>.yaml. The custom Binding routes
+                // the set through `setOnlyShowIncludedItems` so the YAML
+                // write + in-memory mirror stay in lockstep.
+                Menu("Left File Tree") {
+                    Toggle("Only Show Included Items", isOn: Binding(
+                        get: { state.onlyShowIncludedItems },
+                        set: { state.setOnlyShowIncludedItems($0) }
+                    ))
+                }
                 Button("Re-evaluate Active Scope") {
                     Task { await state.reevaluateActive() }
                 }

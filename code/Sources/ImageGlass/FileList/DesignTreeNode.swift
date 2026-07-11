@@ -65,7 +65,7 @@ struct DesignTreeNode: View {
                     nav.setExpanded(node.id, true)
                 }
             }
-        } else if matches(node.fullPath ?? node.name) {
+        } else if matches(node.fullPath ?? node.name) && isIncluded(node) {
             fileRow
         }
     }
@@ -284,23 +284,41 @@ struct DesignTreeNode: View {
     // MARK: - Filtering
 
     private var visibleChildren: [DirectoryFilenamePanel.NodeView] {
-        (node.children ?? []).filter { child in
-            child.isDirectory
-                ? Self.anyVisibleDescendant(child, matches: matches)
-                : matches(child.fullPath ?? child.name)
-        }
+        (node.children ?? []).filter { anyVisible($0) }
     }
 
     private var hasVisibleDescendant: Bool {
-        Self.anyVisibleDescendant(node, matches: matches)
+        anyVisible(node)
     }
 
-    private static func anyVisibleDescendant(
-        _ n: DirectoryFilenamePanel.NodeView,
-        matches: (String) -> Bool
-    ) -> Bool {
-        if !n.isDirectory { return matches(n.fullPath ?? n.name) }
-        return (n.children ?? []).contains { anyVisibleDescendant($0, matches: matches) }
+    /// A node contributes to the tree iff — for a file — it passes the
+    /// search filter AND the "Only Show Included Items" filter, or — for
+    /// a directory — at least one descendant does. Directory visibility
+    /// stays descendant-based (same as the search filter) so an
+    /// explicitly-included file remains reachable even when an ancestor
+    /// directory resolves to exclude.
+    private func anyVisible(_ n: DirectoryFilenamePanel.NodeView) -> Bool {
+        if !n.isDirectory {
+            return matches(n.fullPath ?? n.name) && isIncluded(n)
+        }
+        return (n.children ?? []).contains { anyVisible($0) }
+    }
+
+    /// menus.mdx View ▸ Left File Tree ▸ "Only Show Included Items".
+    /// When the toggle is off, every row is included (only the search
+    /// filter applies). When on, a row is included iff its resolved
+    /// include state — walking inheritance up the chain
+    /// (include_checks.mdx §6) — is `.include`. Rows with no resolvable
+    /// walker root (legacy scope-driven rows) are always shown so the
+    /// filter never blanks a tree it cannot reason about.
+    private func isIncluded(_ n: DirectoryFilenamePanel.NodeView) -> Bool {
+        guard let app = appState, app.onlyShowIncludedItems else { return true }
+        let absPath = n.fullPath ?? n.id
+        guard let root = IncludeStateController.root(for: absPath, in: walkerRoots) else {
+            return true
+        }
+        let relative = IncludePath.relative(absolutePath: absPath, root: root.path)
+        return root.effectiveState(for: relative) == .include
     }
 
     private func iconName(_ kind: FileKind?) -> String {
