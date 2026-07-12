@@ -297,6 +297,81 @@ When the session block is written:
    `settings.mdx` §4.5. The intent is that `session.*` is the app's
    own workspace memory, not a remote-control surface.
 
+### 4.2.2 Last Viewed Image — Live Persistence and Restore
+
+The single most important piece of workspace memory is **which image
+the user was looking at**. The contract: *quit while viewing any image,
+relaunch, and the viewer reopens on that exact image.*
+
+The value being persisted is `AppState.currentImage` (the single global
+cursor — the image on the viewer canvas; see `menus.mdx` §6 and
+`slideshow.mdx` §0A). It is an absolute POSIX path (or `~/`-prefixed).
+
+**Where it is stored (config YAML is authoritative).** The current image
+is mirrored into the frontmost window's **config YAML**,
+`settings_window_<N>.yaml`, under:
+
+```yaml
+session:
+  selection:
+    current_file: "/Users/you/Pictures/tour/beach/002.jpg"
+```
+
+This is the canonical "config.yaml" record of the last viewed image. Two
+sibling copies exist for redundancy and cross-surface reads —
+`settings.window.last_selected_file` in `settings.json` and the
+`ig.last_selected_file` UserDefaults key — but the per-window YAML is the
+human-readable source the user (or an MCP client) can inspect and edit.
+
+**When it is written — on every cursor change, not only on quit.** Unlike
+the rest of the `session:` block (which is a save-on-quit snapshot),
+`current_file` is flushed **live** whenever the cursor moves — a panel
+click, `←`/`→`, bare `N`/`P`, a slideshow advance, a drag-drop, or an
+MCP `select_file`. So even after a crash or force-quit, the YAML holds
+the image the user was actually on.
+
+The write is **debounced** so rapid navigation coalesces: a 250 ms
+selection poll detects the change and a 500 ms save debounce batches the
+atomic YAML write. During a slideshow (default 4 s interval) every
+advance is captured; during arrow-key mashing many moves collapse into
+one write.
+
+* Live/debounced write:
+  `code/Sources/ImageGlass/Window/WindowStateController.swift`,
+  `WindowStateController.saveNow()` → `WindowState.persistSelection(_:)`.
+  A terminate observer also calls `saveNow()` so the very last move is on
+  disk before exit.
+* The write path is `WindowState.persistSelection` in
+  `code/Sources/ImageGlass/Window/WindowState.swift`, which does an
+  atomic `settings_window_<N>.yaml` rewrite via `settingsStore.mutate`.
+
+**How it is restored on launch.** At bootstrap the app seeds the cursor
+from the persisted value, in this order (later wins only if readable):
+
+1. `WindowState.init` seeds `selectedFile` from the YAML's
+   `session.selection.current_file`, and `AppState.bindToFrontmostWindow`
+   mirrors it into `AppState.currentImage` before first paint.
+2. `WindowStateController.restoreSelection()` applies
+   `settings.window.last_selected_file` from `settings.json`.
+3. `AppState.restoreLastSelectedFileIfAvailable()` applies the
+   `ig.last_selected_file` UserDefaults value.
+
+Every path validates the file still exists (`ImageCanvasView.validate`);
+a stale path is skipped — and left on disk — so a later re-mount of a
+detached volume can still recover it. If the restored file is not in the
+active scope's resolved list, it is inserted at the front so `←`/`→`
+navigation still works.
+
+**Verify.** Open an image, quit (`⌘Q`), then:
+
+```sh
+grep -A2 'selection:' \
+  ~/Library/Application\ Support/ImageGlass_Mac/settings_window_1.yaml
+```
+
+shows `current_file:` set to that image. Relaunch — the viewer reopens on
+it.
+
 ### 4.3 Defaults
 
 The bootstrap-time defaults match the schema above verbatim. Each

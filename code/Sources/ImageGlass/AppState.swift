@@ -87,6 +87,22 @@ public final class AppState {
             }
         }
     }
+    /// menus.mdx §4.2 / slideshow.mdx §0A / local_storage.mdx §"Last
+    /// Viewed Image" — the image **currently being viewed** on the main
+    /// canvas, as an absolute POSIX (or `~/`-prefixed) path, or `nil`
+    /// when the viewer is empty. This is the single global cursor: it is
+    /// the same value the directory panel highlights, the slideshow reads
+    /// on every tick, and the "Copy Current Image Path" menu item copies.
+    /// It is a thin alias over `selectedFile` so every surface that cycles
+    /// images (arrow keys, `N`/`P`, panel clicks, slideshow advance, MCP
+    /// `select_file`) keeps `currentImage` up to date automatically, and
+    /// so the last value is persisted to the per-window config YAML for
+    /// restore-on-relaunch (see `WindowState.persistSelection`).
+    public var currentImage: String? {
+        get { selectedFile }
+        set { selectedFile = newValue }
+    }
+
     public var lastEvaluated: Date? = nil
 
     /// Visibility of the left file panel column. Computed off

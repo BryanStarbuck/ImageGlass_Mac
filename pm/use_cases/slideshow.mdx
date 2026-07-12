@@ -152,6 +152,17 @@ The consequence: any UI gesture that moves the cursor is
   file tree's top-down order (§1A) — not whatever was "next" in
   a stale `resolvedFiles` index.
 
+### 0A.3 The cursor is persisted for restore-on-relaunch
+
+The same cursor is the value the app remembers across quit/restart.
+Every time it moves — including a slideshow advance — the new path is
+flushed (debounced) into the per-window config YAML
+(`settings_window_<N>.yaml#session.selection.current_file`), so quitting
+mid-show and relaunching reopens the viewer on the last image shown.
+`AppState.currentImage` is the public alias for this cursor. See
+[local_storage.mdx §4.2.2](../local_storage.mdx) ("Last Viewed Image")
+and [menus.mdx §6](../menus.mdx).
+
 ---
 
 ## 1A. Ordering — Navigation Follows the File Tree's Visible Order

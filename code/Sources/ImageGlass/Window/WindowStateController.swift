@@ -321,6 +321,26 @@ final class WindowStateController: NSObject {
         Task { [weak state] in
             await state?.saveSettings()
         }
+        // local_storage.mdx §"Last Viewed Image" — also flush the current
+        // image into the frontmost window's config YAML
+        // (`settings_window_<N>.yaml#session.selection.current_file`) so a
+        // relaunch reopens the exact image the user was on. This mirrors
+        // `settings.window.last_selected_file` (JSON) into the per-window
+        // YAML config; both are written on the same debounce tick and on
+        // quit. `persistSelection` is a small atomic YAML write, gated by
+        // the 250 ms selection poll + 500 ms save debounce so rapid
+        // arrow-key navigation coalesces into one write.
+        if let window = state.boundWindow {
+            do {
+                try window.persistSelection(state.currentImage)
+            } catch {
+                ErrorLog.log(
+                    "WindowStateController.saveNow: persistSelection failed for window_id=\(window.windowID)",
+                    error: error,
+                    class: "WindowStateController"
+                )
+            }
+        }
     }
 
     /// Pure capture: read the window + selection and write into a

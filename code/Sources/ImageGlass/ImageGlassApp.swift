@@ -122,7 +122,9 @@ struct ImageGlassApp: App {
                        : "Show Second Viewer") {
                     SecondViewerWindowController.shared.toggle(state: state)
                 }
-                .keyboardShortcut("2", modifiers: [.command, .option, .control])
+                // menus.mdx §7 — moved off ⌃⌥⌘2 (which collided with
+                // View ▸ Tree View ▸ SwiftUI) to ⌃⌥⌘V ("V" for Viewer).
+                .keyboardShortcut("v", modifiers: [.command, .option, .control])
                 // docs/list_of_files.mdx §3D — submenu lets the user
                 // pick which of the three tree rendering technologies
                 // draws the file tree (in both the inline panel and the
@@ -145,11 +147,16 @@ struct ImageGlassApp: App {
                         get: { state.onlyShowIncludedItems },
                         set: { state.setOnlyShowIncludedItems($0) }
                     ))
+                    // menus.mdx §7 — a chord so the view filter can be
+                    // toggled without opening the submenu.
+                    .keyboardShortcut("i", modifiers: [.command, .option, .control])
                 }
+                // menus.mdx §7 — moved off ⇧⌘R (which collided with
+                // Viewer ▸ Rotate 90° CW) to ⌃⌘R (the reserved slot).
                 Button("Re-evaluate Active Scope") {
                     Task { await state.reevaluateActive() }
                 }
-                .keyboardShortcut("R", modifiers: [.command])
+                .keyboardShortcut("r", modifiers: [.command, .control])
             }
             CommandGroup(replacing: .newItem) {
                 // docs/use_cases/actions.mdx §7 — New Window. Spawns a
@@ -182,14 +189,16 @@ struct ImageGlassApp: App {
                 .keyboardShortcut(.delete, modifiers: [.command])
                 .disabled(state.selectedFile == nil)
                 Divider()
-                // docs/use_cases/actions.mdx §5 — Copy File Path.
-                // ⌃⌘C is the cross-context twin of the bare `P`
-                // viewer key (handled in HotkeyHandlers).
-                Button("Copy File Path") {
+                // docs/use_cases/actions.mdx §5 / menus.mdx §4.2 — Copy
+                // the absolute POSIX path of `AppState.currentImage` (the
+                // image currently on the viewer canvas). ⌃⌘C is the
+                // cross-context twin of the bare `⇧P` viewer key (handled
+                // in HotkeyHandlers).
+                Button("Copy Current Image Path") {
                     _ = FileActions.copyFilePath(state: state, source: .keyCtrlCmdC)
                 }
                 .keyboardShortcut("c", modifiers: [.control, .command])
-                .disabled(state.selectedFile == nil)
+                .disabled(state.currentImage == nil)
                 Divider()
                 // docs/use_cases/actions.mdx §6 — Print.
                 Button("Print…") {
@@ -285,9 +294,13 @@ struct ImageGlassApp: App {
             .keyboardShortcut("c", modifiers: [.command])
             .disabled(!state.crop.isActive || state.crop.rect == nil)
             Divider()
+            // menus.mdx §7 — crop-K family: ⌘K opens, ⌃⌘K resets,
+            // ⌥⌘K cycles the grid overlay.
             Button("Reset Selection") { state.crop.resetSelection() }
+                .keyboardShortcut("k", modifiers: [.command, .control])
                 .disabled(!state.crop.isActive)
             Button("Cycle Grid Overlay") { state.crop.cycleGrid() }
+                .keyboardShortcut("k", modifiers: [.command, .option])
                 .disabled(!state.crop.isActive)
         }
     }
@@ -580,9 +593,12 @@ struct ImageGlassApp: App {
             // focus.
             Button("Zoom to Width") { state.viewer.zoomToWidth() }
                 .keyboardShortcut("9", modifiers: [.command, .option])
-            // hotkeys.mdx §7 — menu twins for the bare `C` and `N`.
-            // No menu chord; the bare-letter binding lives on the viewer.
+            // hotkeys.mdx §7 / menus.mdx §7 — menu chords added so every
+            // item is reachable without opening the menu. The bare `C`
+            // (center) and `M` (normalize) viewer keys remain as the
+            // in-canvas twins.
             Button("Center") { state.viewer.centerImage() }
+                .keyboardShortcut("c", modifiers: [.command, .shift])
             Button("Normalize Zoom") {
                 let lastRaw = UserDefaults.standard.string(forKey: ViewerState.lastZoomModeKey)
                 state.viewer.normalizeZoom(
@@ -590,13 +606,17 @@ struct ImageGlassApp: App {
                     lastMode: lastRaw.flatMap(ZoomMode.init(rawValue:))
                 )
             }
+            .keyboardShortcut("m", modifiers: [.command, .control])
             Divider()
             Button("Rotate 90° CW")  { state.viewer.rotateClockwise() }
                 .keyboardShortcut("r", modifiers: [.command, .shift])
             Button("Rotate 90° CCW") { state.viewer.rotateCounterClockwise() }
                 .keyboardShortcut("l", modifiers: [.command, .shift])
+            // menus.mdx §7 — flip pair on the ⌃⌘H / ⌃⌥⌘H family.
             Button("Flip Horizontal") { state.viewer.toggleFlipHorizontal() }
+                .keyboardShortcut("h", modifiers: [.command, .control])
             Button("Flip Vertical")   { state.viewer.toggleFlipVertical() }
+                .keyboardShortcut("h", modifiers: [.command, .option, .control])
             Divider()
             Toggle("Smooth Interpolation", isOn: $state.viewer.smoothInterpolation)
             Menu("Color Channel") {
@@ -619,11 +639,15 @@ struct ImageGlassApp: App {
                     .keyboardShortcut(.leftArrow, modifiers: [.command])
                 Button("Next Frame") { state.viewer.nextFrame() }
                     .keyboardShortcut(.rightArrow, modifiers: [.command])
+                // menus.mdx §7 — moved off ⌘P (which collided with
+                // File ▸ Print…) to ⌥⌘P.
                 Toggle("Pause Animation", isOn: $state.viewer.isAnimationPaused)
-                    .keyboardShortcut("p", modifiers: [.command])
+                    .keyboardShortcut("p", modifiers: [.command, .option])
                 Divider()
                 Button("Save Current Frame…") { saveCurrentFrame() }
+                    .keyboardShortcut("s", modifiers: [.command, .control])
                 Button("Export All Frames…") { exportAllFrames() }
+                    .keyboardShortcut("s", modifiers: [.command, .option, .control])
             }
             Divider()
             Button("Toggle Full Screen") {
@@ -637,9 +661,12 @@ struct ImageGlassApp: App {
                     WindowModes.toggleFrameless(v)
                 }
             ))
+            // menus.mdx §7 — ⇧⌘F (was unbound).
+            .keyboardShortcut("f", modifiers: [.command, .shift])
             Button("Fit Window to Image") {
-                WindowModes.fitWindowToImage(path: state.selectedFile)
+                WindowModes.fitWindowToImage(path: state.currentImage)
             }
+            .keyboardShortcut("j", modifiers: [.command, .control])
             Divider()
             // Slideshow toggle. slideshow.mdx §1 / §3 / §10.1 — `⌥⌘S` is
             // the unconditional, focus-context-free menu shortcut. The

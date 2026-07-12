@@ -1,9 +1,9 @@
 ---
-title: macOS Menu Bar and Context Menus
-description: Product specification for the menu bar, context menus, and keyboard shortcuts of ImageGlass_Mac — the full interactive surface for scopes, directories, viewing, and panels, designed for the native macOS menu bar.
+title: macOS Menu Bar, Hotkeys, and the Current Image
+description: Product specification for the ImageGlass_Mac menu bar and its keyboard shortcuts. Documents the as-built menu surface (App, File, Edit, View, Viewer, Navigate, Crop, Directories, Layout, Window, Help), the rule that every actionable menu item carries a conflict-free keyboard shortcut, the "Copy Current Image Path" command, and the single global "current image" cursor (AppState.currentImage) that every surface reads and that is persisted for restore-on-relaunch.
 ---
 
-# macOS Menu Bar and Context Menus
+# macOS Menu Bar, Hotkeys, and the Current Image
 
 > **Document type:** Product specification.
 > **Audience:** Engineering (implementation) and Product (text,
@@ -11,27 +11,28 @@ description: Product specification for the menu bar, context menus, and keyboard
 > **Owners:** PM for menu text, grouping, and discoverability; CTO for
 > the SwiftUI `CommandMenu` / AppKit `NSMenu` bridging and shortcut
 > conflicts.
-> **Status:** v1 spec for the Mac-native fork. Aligns with
-> `starbuck-fork.mdx`, `dir_ui.mdx`, `mcp.mdx`, and `local_storage.mdx`.
+> **Status:** v1, **as-built**. §3–§4 and §7 describe the menus and
+> shortcuts actually wired in `ImageGlassApp.swift`. Aligns with
+> `hotkeys.mdx`, `dir_ui.mdx`, `mcp.mdx`, `local_storage.mdx`, and
+> `use_cases/slideshow.mdx`.
 
 ---
 
 ## 1. Purpose
 
 This document specifies the **full menu surface** of ImageGlass_Mac:
-the macOS menu bar, the context menus that appear on right-click in
-the Directory Panel and viewer, and the keyboard shortcuts attached to
-each command.
+the macOS menu bar and the keyboard shortcuts attached to each command.
+It is the canonical reference for:
 
-The goal is to give the user a thoughtful, native-feeling set of menus
-that exposes every interactive behavior the application supports —
-especially the new fork-specific features: adding and removing
-directories, switching scopes, toggling panels, and triggering scope
-re-evaluation.
+1. Which menus exist, in which order, and what each item does.
+2. The **keyboard shortcut for every menu item** — the app's contract
+   is that every actionable command is reachable by a hotkey **without
+   opening the menu**, and that **no two commands share a chord**.
+3. The **current image** concept — the single cursor every surface
+   reads — and the *Copy Current Image Path* command built on top of it.
 
-We design these menus to follow Apple's macOS Human Interface
-Guidelines so the app feels like it shipped with the OS, not like a
-ported Windows application.
+We follow Apple's macOS Human Interface Guidelines so the app feels
+like it shipped with the OS, not like a ported Windows application.
 
 ---
 
@@ -41,405 +42,366 @@ ported Windows application.
    Help) appear in their standard positions with their standard
    shortcuts. The user's muscle memory works on day one.
 2. **One verb per menu item.** Item text reads as an active verb
-   phrase: *Add Directory…*, *Re-evaluate Scope*, *Reveal in Finder*.
+   phrase: *Add Directory…*, *Re-evaluate Active Scope*, *Reveal in
+   Finder*.
 3. **Ellipses (`…`) for any item that opens a dialog or asks for
    further input.** Items that act immediately do not get an ellipsis.
-4. **Capitalization follows macOS title case** — all major words
-   capitalized: *Show Preview Panel*, not *Show preview panel*.
-5. **Group related commands with separators.** Dense menus get
-   subdivided by intent (e.g., add vs. evaluate vs. switch).
-6. **Shortcut conflicts with system-reserved shortcuts are not
-   allowed.** Custom shortcuts never collide with Spotlight (`⌘ Space`),
-   Mission Control, or Edit-menu standards.
-7. **Every fork-specific menu item exists in only one place in the
-   menu bar.** Context menus may repeat menu-bar items for convenience,
-   but the menu bar is the canonical surface.
+4. **Capitalization follows macOS title case.**
+5. **Group related commands with separators.**
+6. **Every actionable item carries a hotkey (§2.1).**
+7. **No shortcut collisions (§2.2).** Custom shortcuts never collide
+   with each other or with system-reserved shortcuts (Spotlight `⌘Space`,
+   Mission Control, the Edit-menu standards).
+
+### 2.1 Every Actionable Item Has a Hotkey
+
+Every menu item that performs an action **must** be reachable by a
+keyboard shortcut, so a power user never has to open a menu to invoke a
+command. There are exactly three documented exemptions, because a
+static per-item shortcut is either impossible or actively bad UX for
+them:
+
+* **Enumeration / radio submenus** — *Zoom Mode* (6 modes), *Color
+  Channel* (5), *Color Picker Format* (7). These are mode pickers, not
+  commands; the frequently-used members already have their own chords
+  or bare keys (e.g. *Actual Size* `⌘0`, *Zoom to Fit* `⌘9`), and
+  binding a global chord to every leaf would exhaust the namespace and
+  invite accidental mode-flips. The parent submenu is one keystroke
+  away in the menu bar.
+* **Dynamic list items** — *Open Recent ▸ \<file\>*, *Registered
+  Directories ▸ \<root\>*, *Reopen/Forget Closed Window ▸ \<window\>*.
+  Their membership changes at runtime, so no static shortcut is
+  meaningful.
+* **Apple-owned standard items** — *About*, *Services*, *Hide*, *Quit*,
+  the system *Window* items, and *Help ▸ \<search\>* keep their OS
+  conventions.
+
+Every other item — including toggles — carries a chord. Where a command
+also has a modifier-less **bare-letter** viewer key (from `hotkeys.mdx`:
+`C` center, `M` normalize, `Z` fit, `W` width, `N`/`P` next/previous,
+`S` slideshow, `I` include, `⇧P` copy-path), the bare key is the
+in-canvas twin and the menu chord is the focus-context-free twin. Both
+route to the same action.
+
+### 2.2 No Collisions
+
+Two commands may never resolve to the same physical chord. The complete
+map in §7 is the single source of truth; it is verified to be
+collision-free. The three collisions that existed in the first cut were
+resolved as recorded in §7.1.
 
 ---
 
-## 3. Menu Bar Layout
+## 3. Menu Bar Layout (As-Built)
 
-The menu bar contains the following menus, in order:
+The menu bar contains the following menus, left to right. SwiftUI places
+the standard menus (App, File, Edit, View, Window, Help) in their
+canonical positions and inserts our `CommandMenu`s (Viewer, Navigate,
+Crop, Directories, Layout) after them.
 
-1. **ImageGlass_Mac** (application menu)
+1. **ImageGlass** (application menu)
 2. **File**
 3. **Edit**
 4. **View**
-5. **Image**
-6. **Scope**
-7. **Panel**
-8. **Go**
-9. **Window**
-10. **Help**
+5. **Viewer** — image display, zoom, rotate, frames, slideshow *(new)*
+6. **Navigate** — previous / next image *(new)*
+7. **Crop** — the crop tool *(new)*
+8. **Directories** — scope roots + include state *(new)*
+9. **Layout** — panel-layout presets *(new)*
+10. **Window**
+11. **Help**
 
-`Scope` and `Panel` are the two new fork-specific menus. They sit
-between `Image` and `Go` so the user encounters them after the
-upstream-style image commands but before the navigation menu.
+Menus marked *(new)* are fork additions not present in upstream
+ImageGlass. Wiring lives in `code/Sources/ImageGlass/ImageGlassApp.swift`
+(the `.commands { }` builder and the `@CommandsBuilder` properties
+`viewerMenuCommands`, `cropMenuCommands`, `directoriesMenuCommands`,
+`layoutMenuCommands`, `windowMenuCommands`).
 
 ---
 
-## 4. Menus — Item by Item
+## 4. Menus — Item by Item (As-Built)
 
-The following sections enumerate every menu, its items, and the
-keyboard shortcuts. Items marked **(new)** are fork additions not
-present in upstream ImageGlass.
+Modifier glyphs: `⌘` Command, `⌥` Option, `⌃` Control, `⇧` Shift.
+Disabled-state rules are noted where an item greys out.
 
-### 4.1 ImageGlass_Mac (Application Menu)
-
-Standard macOS application menu. Apple owns the structure; we own the
-text.
+### 4.1 ImageGlass (Application Menu)
 
 | Item | Shortcut | Notes |
 | --- | --- | --- |
-| About ImageGlass_Mac | — | Opens an About window crediting Duong Dieu Phap and the Starbuck fork. |
-| Check for Updates… | — | Sparkle-style updater. Disabled if the app was installed via package manager. |
+| About ImageGlass | — (Apple item) | Opens the custom About window (`AboutWindowController.show()`), replacing the default panel. |
 | Settings… | ⌘ , | Opens the Settings scene. |
-| — | | |
-| Services | submenu | Standard macOS Services menu. |
-| — | | |
-| Hide ImageGlass_Mac | ⌘ H | |
-| Hide Others | ⌥ ⌘ H | |
-| Show All | — | |
-| — | | |
-| Quit ImageGlass_Mac | ⌘ Q | |
+| Services / Hide / Quit | standard | Apple-owned. |
 
 ### 4.2 File
 
+The File menu operates on the **current image** (`AppState.currentImage`,
+§6) — the file on the viewer canvas — falling back to the directory-panel
+cursor per `FileActions.resolveTarget`.
+
 | Item | Shortcut | Notes |
 | --- | --- | --- |
-| Open… | ⌘ O | Standard file-open panel. Loads the file as a one-shot image without modifying the active scope. |
-| Open Folder… | ⇧ ⌘ O | Open a folder as a transient scope (not persisted to `directories.yaml`). |
-| Open Recent | submenu | Last 10 files / folders / scopes. Includes *Clear Menu*. |
-| — | | |
-| Close Window | ⌘ W | |
-| Close All Windows | ⌥ ⌘ W | |
-| — | | |
-| Reveal in Finder | ⌘ R | Reveals the currently viewed image. |
-| Copy File Path | ⌃ ⌘ C | Puts the absolute POSIX path on the clipboard. Bare `P` is the in-viewer twin (see `hotkeys.mdx` §5A.1). |
-| Load From Clipboard **(new)** | ⌥ ⌘ V | Reads a file path or `file://` URL from the clipboard and loads it as an ad-hoc open. Bare `L` is the in-viewer twin (see `hotkeys.mdx` §5A.2). Directories on the clipboard are added to the active scope. |
-| — | | |
-| Save As… | ⇧ ⌘ S | Save the current image to another path / format. |
-| Convert To | submenu | *PNG*, *JPEG*, *HEIC*, *TIFF*, *WebP*, *AVIF*, *JXL*. Convert opens a save panel. |
-| Export Frames… | — | For multi-frame formats (GIF, APNG, animated WebP). |
-| — | | |
-| Page Setup… | ⇧ ⌘ P | |
-| Print… | ⌘ P | |
+| New Image Window | ⌘ N | Spawns a second main window. |
+| Open… | ⌘ O | Standard open panel; loads as an ad-hoc file. |
+| Open Recent ▸ | (dynamic) | Recent files; *Clear Menu* at the bottom. Items are dynamic (§2.1). |
+| Rename Image… | F2 | Windows-style rename key. Disabled when no image. |
+| Move Image to Trash | ⌘ ⌫ | Confirm dialog unless suppressed. Disabled when no image. |
+| **Copy Current Image Path** | ⌃ ⌘ C | Puts the absolute POSIX path of `currentImage` on the clipboard as plain text. Cross-context twin of the bare `⇧P` viewer key. Disabled when no image. See §6.1. |
+| Print… | ⌘ P | Opens the print panel for the current image. Disabled when no image. |
 
 ### 4.3 Edit
 
-Standard macOS Edit menu — we provide the standard items so system
-text fields, search fields, and rename dialogs work normally — plus
-image-specific copy items.
-
 | Item | Shortcut | Notes |
 | --- | --- | --- |
-| Undo | ⌘ Z | Undo the most recent destructive edit (rotate, crop, etc.). |
-| Redo | ⇧ ⌘ Z | |
-| — | | |
-| Cut | ⌘ X | Active in text fields. |
-| Copy | ⌘ C | In the viewer, copies the rendered image to the clipboard. In the Directory Panel, copies the file. |
-| Paste | ⌘ V | Pastes image data or file paths to open. |
-| Delete | ⌫ | In the Directory Panel: move the selected file to Trash (confirm). |
-| Select All | ⌘ A | |
-| — | | |
-| Find… | ⌘ F | Opens an inline search field in the Directory Panel that filters by filename. |
-| Find Next | ⌘ G | |
-| Find Previous | ⇧ ⌘ G | |
-| — | | |
-| Edit Scope Criteria… **(new)** | ⌥ ⌘ E | Opens a sheet to edit include / exclude globs and extensions for the active scope. |
+| *(standard Cut/Copy/Paste/Select-All)* | ⌘X/⌘C/⌘V/⌘A | SwiftUI-provided, for text fields and the crop tool. |
+| Copy Image | ⌥ ⌘ C | Copies the rendered current image (PNG + TIFF) to the clipboard. Disabled when no image. |
+| Paste Image / Path | ⇧ ⌘ V | Reads image data or file paths/URLs from the clipboard and opens them. |
 
 ### 4.4 View
 
 | Item | Shortcut | Notes |
 | --- | --- | --- |
-| Show Toolbar | — | Toggle. |
-| Customize Toolbar… | — | Standard AppKit customization sheet. |
-| — | | |
-| Actual Size | ⌘ 0 | 100% zoom. Bare `N` (in-viewer) snaps to the user's default mode — see `hotkeys.mdx` §5. |
-| Zoom In | ⌘ + | Bare `+` / `=` is the in-viewer twin. |
-| Zoom Out | ⌘ - | Bare `-` is the in-viewer twin. |
-| Zoom to Fit | ⌘ 9 | Bare `Z` is the in-viewer twin. |
-| Zoom to Width **(new)** | ⌥ ⌘ 9 | Fit image width to viewport width, scroll to top. Bare `W` is the in-viewer twin. See `hotkeys.mdx` §6. |
-| Zoom to Fill | ⇧ ⌘ 9 | |
-| Lock Zoom | ⌃ ⌘ L | Toggle. |
-| — | | |
-| Enter Full Screen | ⌃ ⌘ F | |
-| Frameless Window | ⇧ ⌘ F | Toggle. |
-| Slideshow | ␣ (Space) | Start / stop. Same shortcut upstream uses. |
-| — | | |
-| Appearance | submenu | *Match System*, *Light*, *Dark*. |
-| Show Status Bar | — | Toggle. Bottom-of-window info bar. |
-| Show File Info Overlay | ⌘ I | Toggle the on-image metadata overlay. |
-| Tree View | submenu | Picks the tree rendering technology — *AppKit* (⌃⌥⌘1), *SwiftUI* (⌃⌥⌘2), *Catalyst* (⌃⌥⌘3). The active one is checkmarked. |
-| Left File Tree **(new)** | submenu | View filters over the left file tree. See §4.4.1. |
+| Show / Hide Panel Column | ⌥ ⌘ 0 | Toggles the left modular-panel column. |
+| Show / Hide Floating File Tree | ⌃ ⌥ ⌘ F | The detached floating file-list/tree window. |
+| Show / Hide Second Viewer | ⌃ ⌥ ⌘ V | Passive floating window mirroring `currentImage`. **Moved off ⌃⌥⌘2** (§7.1). |
+| Tree View ▸ AppKit | ⌃ ⌥ ⌘ 1 | Picks the tree renderer; active one checkmarked. |
+| Tree View ▸ SwiftUI | ⌃ ⌥ ⌘ 2 | |
+| Tree View ▸ Catalyst | ⌃ ⌥ ⌘ 3 | |
+| Left File Tree ▸ Only Show Included Items | ⌃ ⌥ ⌘ I | View filter; hides resolved-exclude rows. Off by default. Persisted per-window in `directories_window_<N>.yaml`. **Chord added** (§7). |
+| Re-evaluate Active Scope | ⌃ ⌘ R | Re-walks the active scope. **Moved off ⇧⌘R** (§7.1). |
 
-#### 4.4.1 View ▸ Left File Tree
+### 4.5 Viewer
 
-A submenu of view filters that change **what the left file tree
-shows** without changing any include/exclude decision on disk.
-
-| Item | Toggle | Default | Notes |
-| --- | --- | --- | --- |
-| Only Show Included Items **(new)** | on/off | **off** | When on, the file tree hides every row whose *resolved* include state (`RootDirectory.effectiveState`, `include_checks.mdx` §6) is `exclude`, leaving only green-checked `include` rows and inherit-include rows whose ancestor chain is all-include. When off, the full hierarchy is shown, red-X rows included. A directory is shown when any descendant is visible, so an explicitly-included file stays reachable even under an excluded ancestor. |
-
-Persistence: the toggle is a **window-level** preference stored in the
-same per-window `directories_window_<N>.yaml` as the include overrides
-it filters, under a top-level `only_show_included_items: true` key
-(absent ⇒ off). It survives a relaunch: the app reads it back through
-`AppState.refreshWalkerRoots()` on launch and re-applies it. The
-factory default is **off** for every customer; the key is emitted to
-disk only when on, so a customer who never touches it produces a
-byte-identical file.
-
-Implemented in the menu at
-`code/Sources/ImageGlass/ImageGlassApp.swift` (View ▸ Left File Tree
-submenu), state + persistence in `AppState.setOnlyShowIncludedItems`
-and `DirectoriesStore.setOnlyShowIncludedItems`, on-disk schema in
-`DirectoriesYAML` (`only_show_included_items`), and the render-time
-filter in `DesignTreeNode.isIncluded` /
-`DesignTreeNode.anyVisible`.
-
-### 4.5 Image
-
-Image-level actions on the currently viewed file. These are
-non-destructive until the user explicitly saves.
+The central image-display menu.
 
 | Item | Shortcut | Notes |
 | --- | --- | --- |
-| Rotate Left | ⌘ L | 90° CCW. |
-| Rotate Right | ⌘ K | 90° CW. |
-| Flip Horizontal | ⌥ ⌘ H | |
-| Flip Vertical | ⌥ ⌘ V | |
-| — | | |
-| Crop… | ⌘ K then drag | Opens crop overlay. |
-| Resize… | ⌥ ⌘ R | |
-| Lossless Compress | — | Available for formats that support it (PNG, JPEG, WebP). |
-| — | | |
-| Color Picker | ⇧ ⌘ K | Pixel color sampler. |
-| Show Channels | submenu | *All*, *Red*, *Green*, *Blue*, *Alpha*, *Luminance*. |
-| — | | |
-| Show Metadata… | ⌥ ⌘ I | Opens a sheet with EXIF / IPTC / XMP. |
+| Zoom Mode ▸ (Auto / Lock / Width / Height / Fit / Fill) | — (§2.1 exempt) | Radio submenu. |
+| Zoom In | ⌘ + | Bare `+` / `=` twin. |
+| Zoom Out | ⌘ - | Bare `-` twin. |
+| Actual Size | ⌘ 0 | 100%. |
+| Zoom to Fit | ⌘ 9 | Bare `Z` twin. |
+| Zoom to Width | ⌥ ⌘ 9 | Bare `W` twin. |
+| Center | ⇧ ⌘ C | Bare `C` twin. **Chord added.** |
+| Normalize Zoom | ⌃ ⌘ M | Bare `M` twin. **Chord added.** |
+| Rotate 90° CW | ⇧ ⌘ R | |
+| Rotate 90° CCW | ⇧ ⌘ L | |
+| Flip Horizontal | ⌃ ⌘ H | **Chord added.** |
+| Flip Vertical | ⌃ ⌥ ⌘ H | **Chord added.** |
+| Smooth Interpolation | *(toggle — no chord; see note)* | Rare visual preference; left off the chord map with the enumeration items. |
+| Color Channel ▸ (All / Red / Green / Blue / Alpha) | — (§2.1 exempt) | Radio submenu. |
+| Image Info Overlay | ⌘ I | Toggle. |
+| Color Picker | ⇧ ⌘ K | Toggle. |
+| Color Picker Format ▸ (HEX / HEXA / RGB / RGBA / HSL / HSV / CMYK) | — (§2.1 exempt) | Radio submenu. |
+| Frame ▸ Previous Frame | ⌘ ← | Multi-frame formats. |
+| Frame ▸ Next Frame | ⌘ → | |
+| Frame ▸ Pause Animation | ⌥ ⌘ P | Toggle. **Moved off ⌘P** (§7.1). |
+| Frame ▸ Save Current Frame… | ⌃ ⌘ S | **Chord added.** |
+| Frame ▸ Export All Frames… | ⌃ ⌥ ⌘ S | **Chord added.** |
+| Toggle Full Screen | ⌃ ⌘ F | |
+| Frameless Window | ⇧ ⌘ F | Toggle. **Chord added.** |
+| Fit Window to Image | ⌃ ⌘ J | **Chord added.** |
+| Start / Stop Slideshow | ⌥ ⌘ S | Menu twin of the bare `S` key. See `slideshow.mdx`. |
 
-### 4.6 Scope **(new)**
+> **Smooth Interpolation note.** This single visual toggle is
+> intentionally left without a global chord (like the radio submenus) —
+> it is a set-once preference, not a repeated command, and every nearby
+> discrete command already owns a chord. If usage data shows it is
+> toggled often, assign `⌃⌥⌘,` in a future revision.
 
-The fork's central new menu. Every command that affects which files
-are in the active list lives here. This is the menu-bar twin of the
-MCP tool surface (`mcp.mdx` §6).
-
-| Item | Shortcut | Notes |
-| --- | --- | --- |
-| New Scope… | ⌘ N | Create a new named scope. Prompts for a name. |
-| Switch Scope | submenu | Lists every scope in `directories.yaml`. The current one has a checkmark. |
-| Rename Scope… | — | Rename the active scope. |
-| Duplicate Scope… | — | Copy the active scope under a new name. |
-| Delete Scope… | — | Confirm-then-delete. Disabled if it is the only scope. |
-| — | | |
-| Add Directory to Scope… | ⌘ D | Opens an `NSOpenPanel` (choose folders). Adds the chosen directory to the active scope as an include directory. |
-| Add Directories from Drop… | — | Reminds the user they can also drag folders onto the Directory Panel. (Hidden by default; visible in Edit-mode menu.) |
-| Remove Selected Directory | ⇧ ⌘ ⌫ | Removes the directory currently selected in the Directory Panel from the active scope. |
-| Make Recursive | — | Toggle. Applies to the selected root directory. |
-| Make Shallow | — | Toggle. Opposite of *Make Recursive*. |
-| — | | |
-| Edit Inclusion Criteria… | — | Opens a sheet for globs and extensions. |
-| Edit Exclusion Criteria… | — | Opens a sheet for exclude globs and the hidden-files flag. |
-| Reset Criteria | — | Removes all globs / extension filters from the active scope (keeps the directory list). |
-| — | | |
-| Re-evaluate Scope | ⌘ R | Walks the directories, applies filters, writes the resolved file list back to Local Storage. Same call MCP's `evaluate_scope` makes. |
-| Re-evaluate on File Changes | — | Toggle. When on, `FSEventStream` triggers re-evaluation automatically. |
-| — | | |
-| Export Scope as YAML… | — | Writes the active scope's record from `directories.yaml` to a chosen path. |
-| Import Scope from YAML… | — | Inverse of export. Creates a new scope from a YAML file. |
-| — | | |
-| Reveal Local Storage in Finder | ⌥ ⌘ G | Opens `~/T/_imageglass/` in Finder so the user can inspect the YAML directly. |
-
-### 4.7 Panel **(new)**
-
-Controls for the modular panels in the new column. Aligns with
-`dir_ui.mdx`.
+### 4.6 Navigate
 
 | Item | Shortcut | Notes |
 | --- | --- | --- |
-| Show Directory Panel | ⌘ 1 | Toggle. |
-| Show Preview Panel | ⌘ 2 | Toggle. Independent of the Directory Panel. |
-| Show Metadata Panel | ⌘ 3 | Toggle. (Reserved for v2; menu item present and disabled in v1.) |
-| — | | |
-| Hide All Panels | ⌥ ⌘ 0 | Collapse the new column entirely. |
-| Show All Panels | ⌘ 0 | Restore the previously-shown panels. *Note: `⌘ 0` is shared with View ▸ Actual Size; resolved by chord context — Panel ▸ Show All Panels is `⇧ ⌘ 0`.* |
-| — | | |
-| Expand Selected Subtree | ⌥ → | In the Directory Panel. Matches Finder. |
-| Collapse Selected Subtree | ⌥ ← | |
-| — | | |
-| Sort Panel By | submenu | *Name*, *Date Modified*, *Date Created*, *Size*, *Type*. Includes *Ascending* / *Descending* below a separator. |
+| Previous Image | ← | Bare `P` twin. Moves `currentImage` to the previous file in file-tree order. |
+| Next Image | → | Bare `N` twin. Moves `currentImage` to the next file. |
 
-> **Conflict note:** the table above has `⌘ 0` listed for both *Actual
-> Size* and *Show All Panels*. Resolve by giving *Show All Panels* the
-> shortcut `⇧ ⌘ 0` in the final build; `⌘ 0` stays on *Actual Size*
-> because that matches user expectations from every other Mac image
-> viewer.
-
-### 4.8 Go
-
-Navigation through the resolved file list.
+### 4.7 Crop
 
 | Item | Shortcut | Notes |
 | --- | --- | --- |
-| Next Image | → | Or `Page Down`. |
-| Previous Image | ← | Or `Page Up`. |
-| First Image | ⌘ ↑ | |
-| Last Image | ⌘ ↓ | |
-| Random Image | ⌘ ⇧ R | |
-| — | | |
-| Jump to Folder… | ⌘ J | Type-ahead jump to a directory in the active scope. |
-| Go to Filename… | ⇧ ⌘ J | Type-ahead jump to a filename. |
-| — | | |
-| Back | ⌘ [ | Selection history, like a browser. |
-| Forward | ⌘ ] | |
+| Open / Close Crop Tool | ⌘ K | |
+| Apply Crop (Replace) | ⏎ Return | Disabled unless a selection exists. |
+| Save | ⌘ S | Save in place. Disabled unless a selection exists. |
+| Save As… | ⇧ ⌘ S | Disabled unless a selection exists. |
+| Copy | ⌘ C | Copy crop to clipboard. Disabled unless a selection exists. |
+| Reset Selection | ⌃ ⌘ K | **Chord added** (crop-K family). Disabled when crop inactive. |
+| Cycle Grid Overlay | ⌥ ⌘ K | **Chord added** (crop-K family). Disabled when crop inactive. |
 
-### 4.9 Window
+The `⌘S`/`⇧⌘S`/`⌘C` crop chords are **crop-context** bindings, live only
+while the crop tool is active (documented in code). *Save Current Frame*
+uses `⌃⌘S` so the two never overlap.
 
-Standard macOS Window menu plus our specific windows.
+### 4.8 Directories
 
-| Item | Shortcut | Notes |
-| --- | --- | --- |
-| Minimize | ⌘ M | |
-| Zoom | — | |
-| Tile Window to Left of Screen | — | |
-| Tile Window to Right of Screen | — | |
-| — | | |
-| Show Previous Tab | ⌃ ⇧ ⇥ | |
-| Show Next Tab | ⌃ ⇥ | |
-| Move Tab to New Window | — | |
-| Merge All Windows | — | |
-| — | | |
-| Bring All to Front | — | |
-| — | | |
-| *(list of open windows, with the active one checked)* | — | |
-
-### 4.10 Help
+`⌥⌘` family so it never collides with the viewer-canvas `⌘`-alone keys.
 
 | Item | Shortcut | Notes |
 | --- | --- | --- |
-| Search | — | Standard help search field. |
-| ImageGlass_Mac Help | ⌘ ? | Opens the docs (`docs/overview.mdx`-derived help bundle). |
-| Keyboard Shortcuts… | — | Opens a sheet listing every shortcut in this document. |
-| — | | |
-| About the Starbuck Fork | — | Brief explainer of what differs from upstream. Links to `starbuck-fork.mdx`. |
-| Visit Upstream Project | — | Opens `https://github.com/d2phap/ImageGlass`. |
-| Report an Issue… | — | Opens the issue tracker for the fork. |
+| Add Directory… | ⌥ ⌘ D | Folder picker → new root in `directories.yaml`. |
+| Add Directory from Path… | ⌃ ⌥ ⌘ D | Absolute-path prompt. |
+| Registered Directories ▸ | (dynamic) | Submenu per root: full path, Reveal, Remove; *Remove All*. |
+| Refresh All | ⌥ ⌘ R | Force-walk every root. |
+| Reveal in Finder | ⌥ ⌘ O | Reveals the current selection. Disabled when no image. |
+| Include | ⌃ 1 | Set focused row's include state. Bare `I` cycles. |
+| Inherit | ⌃ 2 | Disabled on root rows (roots are two-state). |
+| Don't Include | ⌃ 3 | |
+
+### 4.9 Layout
+
+Panel-layout presets; `⌥⌘<n>` by index.
+
+| Item | Shortcut |
+| --- | --- |
+| Viewer only | ⌥ ⌘ 1 |
+| Browser | ⌥ ⌘ 2 |
+| Photographer | ⌥ ⌘ 3 |
+| Power user | ⌥ ⌘ 4 |
+| Slideshow | ⌥ ⌘ 5 |
+
+### 4.10 Window
+
+Standard macOS Window menu (Minimize `⌘M`, Zoom, the auto window list)
+plus the multi-window lifecycle controls (`multi_window.mdx` §5).
+
+| Item | Shortcut | Notes |
+| --- | --- | --- |
+| Close Window | ⌘ W | Persists `was_open_on_quit=false`. |
+| Cycle to Next Window | ⌘ \` | |
+| Cycle to Previous Window | ⇧ ⌘ \` | |
+| Reopen Closed Window ▸ | (dynamic) | Resurrects a closed window with its geometry / cursor. |
+| Forget Closed Window ▸ | (dynamic) | Trashes a window's YAML. |
+| Rename Window… | *(sheet; via menu)* | Left without a chord — rare, and `⌥⌘` numeric/letter space is spent; open via the menu. |
+
+### 4.11 Help
+
+| Item | Shortcut | Notes |
+| --- | --- | --- |
+| Releases & News… | *(via menu)* | Opens the releases window. Low-frequency; reachable via the Help menu (Apple-owned menu, §2.1). |
 
 ---
 
-## 5. Context Menus
+## 5. Current Image and the Copy-Path Command
 
-Context menus repeat key items from the menu bar for convenience.
-They appear on right-click (or `⌃`-click) in the relevant surface.
+### 5.1 Copy Current Image Path
 
-### 5.1 Context Menu on a File Row in the Directory Panel
+*File ▸ Copy Current Image Path* (`⌃⌘C`) copies the absolute POSIX path
+of the image currently on the viewer canvas to the clipboard as plain
+text.
 
-| Item | Notes |
-| --- | --- |
-| Open | Load into the main viewer. |
-| Open With | submenu of registered applications. |
-| Reveal in Finder | |
-| Copy File Path | |
-| Copy Image | |
-| — | |
-| Exclude This File from Scope | Adds a literal-filename exclude to the active scope. |
-| Add Containing Folder to a Different Scope ▸ | Submenu lists other scopes. |
-| — | |
-| Show Metadata… | |
-| Move to Trash | Confirm. |
-
-### 5.2 Context Menu on a Directory Row in the Directory Panel
-
-| Item | Notes |
-| --- | --- |
-| Reveal in Finder | |
-| Open in New Window | |
-| — | |
-| Make Recursive / Make Shallow | Toggles the `recursive` flag on this include directory. |
-| Remove Directory from Scope | |
-| Edit Inclusion Criteria for This Directory… | Lets the user attach per-directory globs. |
-| — | |
-| Expand All | |
-| Collapse All | |
-
-### 5.3 Context Menu on the Main Viewer (the Image Canvas)
-
-| Item | Notes |
-| --- | --- |
-| Next Image / Previous Image | |
-| — | |
-| Rotate Left / Rotate Right | |
-| Flip Horizontal / Flip Vertical | |
-| — | |
-| Copy Image | |
-| Copy File Path | |
-| Reveal in Finder | |
-| — | |
-| Show Metadata… | |
-| Open With ▸ | |
-| Save As… | |
-
-### 5.4 Context Menu on Empty Space in the Directory Panel
-
-| Item | Notes |
-| --- | --- |
-| Add Directory to Scope… | Same as Scope ▸ Add Directory to Scope… |
-| New Scope… | |
-| Switch Scope ▸ | |
-| — | |
-| Re-evaluate Scope | |
-| Reveal Local Storage in Finder | |
+* It operates on `AppState.currentImage` (§6), resolved through
+  `FileActions.resolveTarget(selectedFile:panelCursor:)` so a
+  panel-cursor parked on a real file row wins over a stale viewer
+  selection.
+* A missing file still copies the path and returns `ok=true note=missing`
+  (the user may want the path even after a move).
+* Implemented in `code/Sources/ImageGlass/FileActions.swift`, method
+  `FileActions.copyFilePath(state:source:)`; wired in the File menu in
+  `ImageGlassApp.swift`. The bare `⇧P` viewer key (`HotkeyHandlers.swift`,
+  `handleCopyPathKey`) is the in-canvas twin.
 
 ---
 
-## 6. Toolbar (Brief)
+## 6. The Current Image — Single Global Cursor
 
-The toolbar is detailed in a separate spec, but it mirrors a small set
-of menu commands by default:
+The app has exactly **one** "current image" at any moment. It is exposed
+as `AppState.currentImage` (a thin, observable alias over
+`AppState.selectedFile`), an absolute POSIX path (or `~/`-prefixed), or
+`nil` when the viewer is empty. Every surface reads and writes the same
+value:
 
-* Previous / Next image
-* Rotate Left / Right
-* Toggle Directory Panel
-* Toggle Preview Panel
-* Scope picker (dropdown showing the active scope, lets the user
-  switch)
-* Re-evaluate Scope
-* Slideshow
+* The **viewer canvas** loads the file at `currentImage`.
+* The **directory / filename panel** highlights the row equal to
+  `currentImage` and auto-expands its ancestors.
+* The **slideshow** reads it on every tick (`slideshow.mdx` §0A).
+* The **second viewer** and **floating file tree** mirror it.
 
-The user can fully customize via View ▸ Customize Toolbar.
+**The cursor updates as the user cycles.** Any gesture that moves through
+images — `←`/`→`, bare `N`/`P`, a panel-row click, a slideshow advance,
+a drag-drop, or an MCP `select_file` — writes the newly-visible image's
+path into `currentImage` (via `selectedFile.didSet`), so the "current
+image" is always whatever is on screen right now. Menu items that act on
+the image (Copy Current Image Path, Print, Copy Image, Move to Trash,
+Fit Window to Image) all read this one value and disable themselves when
+it is `nil`.
+
+Implemented in `code/Sources/ImageGlass/AppState.swift`
+(`AppState.currentImage` / `AppState.selectedFile`). Persistence of the
+value across quit/relaunch is specified in `local_storage.mdx`
+§"Last Viewed Image".
 
 ---
 
-## 7. Shortcut Conflict Table (Resolved)
+## 7. Keyboard Shortcut Map (Resolved, Collision-Free)
 
-To eliminate ambiguity, the following shortcuts are explicitly resolved
-in v1:
+This is the **single source of truth** for every static chord. It is
+verified to have no duplicates.
 
-| Shortcut | Owner |
+### 7.1 Conflicts Resolved
+
+The first cut had three real collisions; all are fixed:
+
+| Chord | Was shared by | Resolution |
+| --- | --- | --- |
+| `⌃⌥⌘2` | *Show Second Viewer* **and** *Tree View ▸ SwiftUI* | Second Viewer → **`⌃⌥⌘V`**; Tree View keeps `⌃⌥⌘2`. |
+| `⇧⌘R` | *Re-evaluate Active Scope* **and** *Rotate 90° CW* | Re-evaluate → **`⌃⌘R`**; Rotate CW keeps `⇧⌘R`. |
+| `⌘P` | *Print…* **and** *Pause Animation* | Pause Animation → **`⌥⌘P`**; Print keeps `⌘P`. |
+
+### 7.2 Full Map
+
+| Chord | Command |
 | --- | --- |
-| `⌘ 0` | View ▸ Actual Size |
-| `⌘ 9` | View ▸ Zoom to Fit |
-| `⌥ ⌘ 9` | View ▸ Zoom to Width |
-| `⇧ ⌘ 9` | View ▸ Zoom to Fill |
-| `⇧ ⌘ 0` | Panel ▸ Show All Panels |
-| Bare `W` / `Z` / `N` / `C` / `+` / `-` | Viewer hotkeys — owned by `hotkeys.mdx` §5 |
-| Bare `↑` `↓` `←` `→` | Tree navigation — owned by `hotkeys.mdx` §4 |
-| `⌃` + arrow | Viewport pan (15%) — owned by `hotkeys.mdx` §4.3 |
-| `⌘ R` | Scope ▸ Re-evaluate Scope |
-| `⌘ ⇧ R` | Go ▸ Random Image |
-| `⌃ ⌘ R` | (reserved — no binding) |
-| `⌘ F` | Edit ▸ Find… |
-| `⌃ ⌘ F` | View ▸ Enter Full Screen |
-| `⇧ ⌘ F` | View ▸ Frameless Window |
-| `⌘ D` | Scope ▸ Add Directory to Scope… |
-| `⌘ I` | View ▸ Show File Info Overlay |
-| `⌥ ⌘ I` | Image ▸ Show Metadata… |
+| ⌘ , | Settings… |
+| ⌘ N | New Image Window |
+| ⌘ O | Open… |
+| F2 | Rename Image… |
+| ⌘ ⌫ | Move Image to Trash |
+| ⌃ ⌘ C | **Copy Current Image Path** |
+| ⌘ P | Print… |
+| ⌥ ⌘ C | Copy Image |
+| ⇧ ⌘ V | Paste Image / Path |
+| ⌥ ⌘ 0 | Show / Hide Panel Column |
+| ⌃ ⌥ ⌘ F | Show / Hide Floating File Tree |
+| ⌃ ⌥ ⌘ V | Show / Hide Second Viewer |
+| ⌃ ⌥ ⌘ 1 / 2 / 3 | Tree View ▸ AppKit / SwiftUI / Catalyst |
+| ⌃ ⌥ ⌘ I | Only Show Included Items |
+| ⌃ ⌘ R | Re-evaluate Active Scope |
+| ⌘ + / ⌘ - | Zoom In / Zoom Out |
+| ⌘ 0 | Actual Size |
+| ⌘ 9 / ⌥ ⌘ 9 | Zoom to Fit / Zoom to Width |
+| ⇧ ⌘ C | Center |
+| ⌃ ⌘ M | Normalize Zoom |
+| ⇧ ⌘ R / ⇧ ⌘ L | Rotate 90° CW / CCW |
+| ⌃ ⌘ H / ⌃ ⌥ ⌘ H | Flip Horizontal / Flip Vertical |
+| ⌘ I | Image Info Overlay |
+| ⇧ ⌘ K | Color Picker |
+| ⌘ ← / ⌘ → | Previous / Next Frame |
+| ⌥ ⌘ P | Pause Animation |
+| ⌃ ⌘ S / ⌃ ⌥ ⌘ S | Save Current Frame… / Export All Frames… |
+| ⌃ ⌘ F | Toggle Full Screen |
+| ⇧ ⌘ F | Frameless Window |
+| ⌃ ⌘ J | Fit Window to Image |
+| ⌥ ⌘ S | Start / Stop Slideshow |
+| ← / → | Previous / Next Image |
+| ⌘ K | Open / Close Crop Tool |
+| ⏎ | Apply Crop (crop-context) |
+| ⌘ S / ⇧ ⌘ S / ⌘ C | Crop Save / Save As… / Copy (crop-context) |
+| ⌃ ⌘ K / ⌥ ⌘ K | Crop Reset Selection / Cycle Grid Overlay |
+| ⌥ ⌘ D / ⌃ ⌥ ⌘ D | Add Directory… / from Path… |
+| ⌥ ⌘ R | Refresh All |
+| ⌥ ⌘ O | Directories ▸ Reveal in Finder |
+| ⌃ 1 / ⌃ 2 / ⌃ 3 | Include / Inherit / Don't Include |
+| ⌥ ⌘ 1 … 5 | Layout presets |
+| ⌘ W | Close Window |
+| ⌘ \` / ⇧ ⌘ \` | Cycle Next / Previous Window |
 
-A user-visible "Keyboard Shortcuts…" sheet (Help menu) lists the
-final set and lets the user view, but not yet rebind, them. Rebinding
-is a v2 feature.
+### 7.3 Bare-Letter Viewer Keys (from `hotkeys.mdx`)
+
+These fire only in the viewer/panel focus context and are **suppressed
+whenever `⌘`/`⌥`/`⌃` is held**, so they never shadow a menu chord:
+`C` center · `M` normalize · `Z` fit · `W` width · `+`/`-` zoom ·
+`N`/`P` next/previous image · `⇧P` copy current image path · `S`
+slideshow · `I` cycle include · arrows navigate/pan. They are the
+in-canvas twins of the menu chords above.
 
 ---
 
@@ -447,36 +409,32 @@ is a v2 feature.
 
 * All menu strings live in a single `Menus.strings` file so they can be
   localized without code changes.
-* Ellipses are the Unicode `…` character (U+2026), not three dots.
-* En dash (`–`) is used in shortcut display where applicable;
-  modifier glyphs (`⌘`, `⇧`, `⌥`, `⌃`) come from the system.
+* Ellipses are the Unicode `…` (U+2026).
+* Modifier glyphs (`⌘`, `⇧`, `⌥`, `⌃`) come from the system.
 
 ---
 
 ## 9. Non-Goals (v1)
 
-* Rebindable shortcuts. The shortcut set in this document is fixed in
-  v1; configurable hotkeys are deferred.
-* Touch Bar customization. The Touch Bar surface is small and
-  declining; a minimal "scope-aware" Touch Bar layout may ship later.
-* Per-scope menu customization. The menu bar is identical regardless of
-  active scope.
+* **Rebindable shortcuts.** The map in §7 is fixed in v1; a
+  *Help ▸ Keyboard Shortcuts…* viewer and user rebinding are deferred.
+* **Per-scope menu customization.** The menu bar is identical regardless
+  of active scope.
+* **Context menus** are specified in `right_click.mdx`, not here.
 
 ---
 
 ## 10. Acceptance Criteria for v1
 
-The menu surface is considered v1-complete when:
-
-1. Every menu and item in §4 is wired to a working command. Disabled
-   items show as grey and have a tooltip explaining why (e.g., "Delete
-   Scope is disabled because this is the only scope.").
-2. Every shortcut in §7 resolves to exactly one command in the active
-   focus context, with no system-shortcut conflicts.
-3. Context menus in §5 appear on right-click in their respective
-   surfaces and contain the listed items in the listed order.
-4. Scope ▸ Re-evaluate Scope and the MCP `evaluate_scope` tool produce
-   identical resolved file lists for the same scope (see `mcp.mdx`
-   §6).
-5. Help ▸ Keyboard Shortcuts… lists every binding in this document,
-   pulled from the same source of truth that wires the menu commands.
+1. Every menu and item in §4 is wired to a working command; disabled
+   items grey out per the noted rules.
+2. Every chord in §7 resolves to exactly one command, with no
+   duplicate and no system-shortcut conflict. Automated check: collect
+   every `.keyboardShortcut(...)` in `ImageGlassApp.swift`, assert the
+   set of (key, modifiers) pairs has no repeats.
+3. Every actionable item (excluding the §2.1 exemptions) has a chord.
+4. *File ▸ Copy Current Image Path* copies the absolute path of the
+   image on the canvas; it disables when the viewer is empty.
+5. The current image (`AppState.currentImage`) tracks the on-screen
+   image as the user cycles, and is restored on relaunch per
+   `local_storage.mdx` §"Last Viewed Image".
