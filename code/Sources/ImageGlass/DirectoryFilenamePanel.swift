@@ -29,6 +29,12 @@ struct DirectoryFilenamePanel: View {
     /// Live filter over filenames (design: filepanel.jsx search field).
     @State private var searchText: String = ""
 
+    /// Drives initial first-responder placement onto the "Filter files"
+    /// field when the window opens (per product request). The bare-`S`
+    /// slideshow toggle still works from here because
+    /// `SlideshowHotkeyMonitor` intercepts the key before the field.
+    @FocusState private var filterFocused: Bool
+
     var body: some View {
         VStack(spacing: 0) {
             header
@@ -78,6 +84,11 @@ struct DirectoryFilenamePanel: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(IG.sidebarC)
+        // Open with the "Filter files" field focused (per product
+        // request). The bare-`S` slideshow toggle still fires from here
+        // via `SlideshowHotkeyMonitor`, which grabs the key ahead of the
+        // field.
+        .task { filterFocused = true }
     }
 
     /// hotkeys.mdx §4.4 — Space, when the panel has focus.
@@ -187,6 +198,7 @@ struct DirectoryFilenamePanel: View {
                     .textFieldStyle(.plain)
                     .font(.system(size: 12.5))
                     .foregroundStyle(IG.textC)
+                    .focused($filterFocused)
                 if !searchText.isEmpty {
                     Button { searchText = "" } label: {
                         Image(systemName: "xmark.circle.fill")

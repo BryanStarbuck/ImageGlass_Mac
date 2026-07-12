@@ -35,6 +35,11 @@ struct ContentView: View {
             // viewer window to the multi-monitor state controller. See
             // docs/multi_monitor.mdx §5.1.
             WindowStateController.shared.bootstrap(appState: state)
+            // slideshow.mdx §3 — install the app-level bare-`S` monitor
+            // so the slideshow toggles no matter where focus is (incl.
+            // the "Filter files" text field, which otherwise swallows
+            // the keystroke). Idempotent; only the first window installs.
+            SlideshowHotkeyMonitor.shared.installIfNeeded(appState: state)
             // Drain any Finder-supplied file URLs that arrived before SwiftUI
             // mounted (cold-launch Open With).
             AboutAppDelegate.registerListenerAndFlush()
